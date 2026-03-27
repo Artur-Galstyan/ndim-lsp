@@ -63,8 +63,7 @@ impl LanguageServer for Backend {
         let Some(text) = doc_lock.get(&uri.to_string()) else {
             return Ok(None);
         };
-
-        self.on_hover(&uri, text, &pos).await
+        self.on_hover(text, &pos).await
     }
 }
 
@@ -142,6 +141,55 @@ impl Backend {
                     .await;
             }
 
+            let mut assignment_nodes: Vec<Node<'_>> = Vec::new();
+            find_node_by_kind(node, "assignment", &mut assignment_nodes);
+
+            for assignment in assignment_nodes {
+                let Some(right_child) = assignment.child_by_field_name("right") else {
+                    continue;
+                };
+
+                if !(right_child.kind() == "binary_operator") {
+                    continue;
+                }
+                let Some(op) = right_child.child_by_field_name("operator") else {
+                    continue;
+                };
+                let op_text = op
+                    .utf8_text(&text.as_bytes())
+                    .expect("Operator has no text");
+
+                if op_text != "@" {
+                    continue;
+                }
+
+                let Some((left_param_name, right_param_name)) =
+                    get_child_param_names(right_child, &text)
+                else {
+                    continue;
+                };
+
+                let left_dims = params
+                    .get(&left_param_name)
+                    .expect("Failed to find left child param in params hashmap");
+                let right_dims = params
+                    .get(&right_param_name)
+                    .expect("Failed to find right child param in params hashmap");
+
+                let result_dims = vec![
+                    left_dims.first().unwrap().clone(),
+                    right_dims.last().unwrap().clone(),
+                ];
+
+                let Some(assign_left) = assignment.child_by_field_name("left") else {
+                    continue;
+                };
+                let Ok(var_name) = assign_left.utf8_text(text.as_bytes()) else {
+                    continue;
+                };
+                params.insert(var_name.to_string(), result_dims);
+            }
+
             let mut binary_operator_nodes: Vec<Node<'_>> = Vec::new();
             find_node_by_kind(node, "binary_operator", &mut binary_operator_nodes);
 
@@ -158,25 +206,17 @@ impl Backend {
                     continue;
                 }
 
-                let left_child = binary_operator
-                    .child_by_field_name("left")
-                    .expect("Failed to find left child");
-                let left_child_param_name = left_child
-                    .utf8_text(&text.as_bytes())
-                    .expect("Failed to get param name of left child");
-
-                let right_child = binary_operator
-                    .child_by_field_name("right")
-                    .expect("Failed to find right child");
-                let right_child_param_name = right_child
-                    .utf8_text(&text.as_bytes())
-                    .expect("Failed to get param name of right child");
+                let Some((left_child_param_name, right_child_param_name)) =
+                    get_child_param_names(binary_operator, &text)
+                else {
+                    continue;
+                };
 
                 let left_dims = params
-                    .get(left_child_param_name)
+                    .get(&left_child_param_name)
                     .expect("Failed to find left child param in params hashmap");
                 let right_dims = params
-                    .get(right_child_param_name)
+                    .get(&right_child_param_name)
                     .expect("Failed to find right child param in params hashmap");
 
                 if left_dims.last().unwrap() != right_dims.first().unwrap() {
@@ -224,7 +264,7 @@ impl Backend {
         *shapes_lock = shapes;
     }
 
-    async fn on_hover(&self, uri: &Url, text: &str, pos: &Position) -> Result<Option<Hover>> {
+    async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
         let mut parser = Parser::new();
         let language = tree_sitter_python::LANGUAGE;
         parser
@@ -245,23 +285,30 @@ impl Backend {
             return Ok(None);
         };
 
-        let shapes_lock = self.shapes.read().await;
+        let Some(parent) = get_first_matching_parent(node, "function_definition") else {
+            return Ok(None);
+        };
 
-        for shape_fn in shapes_lock.iter() {
-            let (_, map) = shape_fn;
-            let Some(param) = map.get(name) else {
-                continue;
-            };
-            return Ok(Some(Hover {
-                contents: HoverContents::Scalar(MarkedString::String(format!(
-                    "shape: {:?}",
-                    param
-                ))),
-                range: None,
-            }));
+        let mut function_name = None;
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            function_name = name_node.utf8_text(&text.as_bytes()).ok();
         }
 
-        Ok(None)
+        let shapes_lock = self.shapes.read().await;
+        let Some(fn_name) = function_name else {
+            return Ok(None);
+        };
+        let Some(fn_shapes) = shapes_lock.get(fn_name) else {
+            return Ok(None);
+        };
+        let Some(param) = fn_shapes.get(name) else {
+            return Ok(None);
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(format!("shape: {:?}", param))),
+            range: None,
+        }))
     }
 }
 
@@ -275,4 +322,39 @@ fn find_node_by_kind<'a>(node: Node<'a>, kind: &str, results: &mut Vec<Node<'a>>
     for child in node.children(&mut cursor) {
         find_node_by_kind(child, kind, results);
     }
+}
+
+fn get_child_param_names(binary_operator: Node<'_>, text: &str) -> Option<(String, String)> {
+    let left_child = binary_operator
+        .child_by_field_name("left")
+        .expect("Failed to find left child");
+    let left_child_param_name = left_child
+        .utf8_text(&text.as_bytes())
+        .expect("Failed to get param name of left child");
+
+    let right_child = binary_operator
+        .child_by_field_name("right")
+        .expect("Failed to find right child");
+    let right_child_param_name = right_child
+        .utf8_text(&text.as_bytes())
+        .expect("Failed to get param name of right child");
+
+    Some((
+        left_child_param_name.to_string(),
+        right_child_param_name.to_string(),
+    ))
+}
+
+fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<Node<'a>> {
+    let mut parent = node.parent();
+
+    while let Some(p) = parent {
+        if p.kind() == target_type {
+            return Some(p);
+        } else {
+            parent = p.parent();
+        }
+    }
+
+    return None;
 }
