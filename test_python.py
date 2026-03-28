@@ -1,9 +1,11 @@
 from jaxtyping import Array, Float
 
 
+"""
 # valid matmul: b matches b
 def valid_matmul(x: Float[Array, "a b"], y: Float[Array, "b c"]):
-    return x @ y
+    z = x @ y
+    return z
 
 
 # invalid matmul: b != c
@@ -41,11 +43,61 @@ def sequential(x: Float[Array, "a b"], y: Float[Array, "b c"], v: Float[Array, "
     w = z @ v
     return w
  
-"""
 
-# chained: x @ y @ w in one expression (won't work yet)
-def chained_expr(
-    x: Float[Array, "a b"], y: Float[Array, "b c"], w: Float[Array, "c d"]
-):
-    return x @ y @ w
 """
+def chaos(
+    a: Float[Array, "i j"],
+    b: Float[Array, "j k"],
+    c: Float[Array, "k l"],
+    d: Float[Array, "l m"],
+    e: Float[Array, "m n"],
+    f: Float[Array, "x y"],
+):
+    # (i, j) @ (j, k) = (i, k) ✓
+    ab = a @ b
+    # (i, k) @ (k, l) = (i, l) ✓
+    abc = ab @ c
+    # (i, l) @ (l, m) = (i, m) ✓
+    abcd = abc @ d
+    # (i, m) @ (m, n) = (i, n) ✓
+    abcde = abcd @ e
+    # (i, n) @ (x, y) → n != x ✗ squiggle
+    bad = abcde @ f
+    # (x, y) @ (i, j) → y != i ✗ squiggle
+    worse = f @ a
+    # (i, j) @ (j, k) = (i, k) ✓
+    ok = a @ b
+    # (i,j)@(j,k)=(i,k) → (i,k)@(k,l)=(i,l) → (i,l)@(l,m)=(i,m) → (i,m)@(m,n)=(i,n) ✓
+    chain = a @ b @ c @ d @ e
+    # same as chain but then (i,n)@(x,y) → n != x ✗ squiggle
+    bad_chain = a @ b @ c @ d @ e @ f
+    return abcde
+
+
+def elementwise(x: Float[Array, "a b"], y: Float[Array, "a b"], z: Float[Array, "c d"]):
+    # (a, b) + (a, b) = (a, b) ✓
+    good = x + y
+    # (a, b) - (c, d) → a != c ✗ squiggle
+    bad = x - z
+    # (a, b) * (a, b) = (a, b) ✓ then (a, b) + (c, d) ✗ squiggle
+    mixed = (x * y) + z
+
+def parens_and_transpose(
+    x: Float[Array, "a b"],
+    y: Float[Array, "b c"],
+    w: Float[Array, "c a"],
+):
+    # parens: (a,b) @ (b,c) = (a,c) ✓
+    p = (x @ y)
+    # transpose: w is (c,a), w.T is (a,c) ✓
+    wt = w.T
+    # parens + matmul: (a,c) @ (c,a) = (a,a) ✓
+    combo = (x @ y) @ w
+    # transpose in matmul: (a,b) @ (a,b).T = (a,b) @ (b,a) = (a,a) ✓
+    xtx = x @ x.T
+    # chained with transpose: (a,b) @ (b,c) = (a,c), then (a,c) @ (a,c).T = (a,c) @ (c,a) = (a,a) ✓
+    chain_t = (x @ y) @ (x @ y).T
+    # invalid: x is (a,b), y.T is (c,b), b != c ✗ squiggle
+    bad_t = x @ y.T
+    # invalid parens: (a,b) @ (b,c) = (a,c), (a,c) + (a,b) → c != b ✗ squiggle
+    bad_parens = (x @ y) + x

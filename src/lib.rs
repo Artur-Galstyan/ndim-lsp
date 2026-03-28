@@ -93,21 +93,23 @@ impl Backend {
 
         let mut shapes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
 
-        for node in typed_functions {
-            let Some(node_name) = node.child_by_field_name("name") else {
+        // ITERATE OVER EVERY FUNCTION DEFINITION
+        for function_node in typed_functions {
+            let Some(function_node_name) = function_node.child_by_field_name("name") else {
                 continue;
             };
 
-            let Ok(function_name) = node_name.utf8_text(&text.as_bytes()) else {
+            let Ok(function_name) = function_node_name.utf8_text(&text.as_bytes()) else {
                 continue;
             };
 
+            // START: GET SHAPES FROM FUNCTION ARGS
             let mut typed_params: Vec<Node<'_>> = Vec::new();
-            find_node_by_kind(node, "typed_parameter", &mut typed_params);
+            find_node_by_kind(function_node, "typed_parameter", &mut typed_params);
             let mut params = HashMap::new();
 
-            for node in typed_params {
-                let Some(node_identifier) = node.child(0) else {
+            for param_node in typed_params {
+                let Some(node_identifier) = param_node.child(0) else {
                     return;
                 };
 
@@ -115,7 +117,7 @@ impl Backend {
                     .utf8_text(text.as_bytes())
                     .expect("Failed to get node identifier");
 
-                let Some(node_type) = node.child_by_field_name("type") else {
+                let Some(node_type) = param_node.child_by_field_name("type") else {
                     return;
                 };
 
@@ -140,98 +142,58 @@ impl Backend {
                     .log_message(MessageType::INFO, format!("{:?}", params))
                     .await;
             }
+            // END: GET SHAPES FROM FUNCTION ARGS
 
             let mut assignment_nodes: Vec<Node<'_>> = Vec::new();
-            find_node_by_kind(node, "assignment", &mut assignment_nodes);
+            find_node_by_kind(function_node, "assignment", &mut assignment_nodes);
 
-            for assignment in assignment_nodes {
-                let Some(right_child) = assignment.child_by_field_name("right") else {
+            for assignment_node in assignment_nodes {
+                let Some(right_child) = assignment_node.child_by_field_name("right") else {
                     continue;
                 };
 
-                if !(right_child.kind() == "binary_operator") {
-                    continue;
-                }
-                let Some(op) = right_child.child_by_field_name("operator") else {
-                    continue;
-                };
-                let op_text = op
-                    .utf8_text(&text.as_bytes())
-                    .expect("Operator has no text");
-
-                if op_text != "@" {
-                    continue;
-                }
-
-                let Some((left_param_name, right_param_name)) =
-                    get_child_param_names(right_child, &text)
-                else {
+                let Some(resolved_shape) = resolve_shape(right_child, &params, text) else {
                     continue;
                 };
 
-                let left_dims = params
-                    .get(&left_param_name)
-                    .expect("Failed to find left child param in params hashmap");
-                let right_dims = params
-                    .get(&right_param_name)
-                    .expect("Failed to find right child param in params hashmap");
-
-                let result_dims = vec![
-                    left_dims.first().unwrap().clone(),
-                    right_dims.last().unwrap().clone(),
-                ];
-
-                let Some(assign_left) = assignment.child_by_field_name("left") else {
+                let Some(assign_left) = assignment_node.child_by_field_name("left") else {
                     continue;
                 };
                 let Ok(var_name) = assign_left.utf8_text(text.as_bytes()) else {
                     continue;
                 };
-                params.insert(var_name.to_string(), result_dims);
+                params.insert(var_name.to_string(), resolved_shape);
             }
 
             let mut binary_operator_nodes: Vec<Node<'_>> = Vec::new();
-            find_node_by_kind(node, "binary_operator", &mut binary_operator_nodes);
+            find_node_by_kind(function_node, "binary_operator", &mut binary_operator_nodes);
 
-            for binary_operator in binary_operator_nodes {
-                let Some(op) = binary_operator.child_by_field_name("operator") else {
-                    continue;
-                };
+            for binary_operator_node in binary_operator_nodes {
+                if resolve_shape(binary_operator_node, &params, text).is_none() {
+                    let left_node = binary_operator_node.child_by_field_name("left");
+                    let right_node = binary_operator_node.child_by_field_name("right");
 
-                let op_text = op
-                    .utf8_text(&text.as_bytes())
-                    .expect("Operator has no text");
+                    let (Some(left), Some(right)) = (left_node, right_node) else {
+                        continue;
+                    };
 
-                if op_text != "@" {
-                    continue;
-                }
+                    let Some(left_shape) = resolve_shape(left, &params, text) else {
+                        continue;
+                    };
 
-                let Some((left_child_param_name, right_child_param_name)) =
-                    get_child_param_names(binary_operator, &text)
-                else {
-                    continue;
-                };
+                    let Some(right_shape) = resolve_shape(right, &params, text) else {
+                        continue;
+                    };
 
-                let left_dims = params
-                    .get(&left_child_param_name)
-                    .expect("Failed to find left child param in params hashmap");
-                let right_dims = params
-                    .get(&right_child_param_name)
-                    .expect("Failed to find right child param in params hashmap");
+                    let start = binary_operator_node.start_position();
+                    let end = binary_operator_node.end_position();
+                    let Some(op) = binary_operator_node.child_by_field_name("operator") else {
+                        continue;
+                    };
 
-                if left_dims.last().unwrap() != right_dims.first().unwrap() {
-                    self.client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!(
-                                "can't matmut with these shapes {:?} @ {:?}",
-                                left_dims, right_dims
-                            ),
-                        )
-                        .await;
-
-                    let start = binary_operator.start_position();
-                    let end = binary_operator.end_position();
+                    let op_text = op
+                        .utf8_text(&text.as_bytes())
+                        .expect("Operator has no text");
 
                     diagnostics.push(Diagnostic {
                         range: Range {
@@ -247,8 +209,8 @@ impl Backend {
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("ndim-lsp".to_string()),
                         message: format!(
-                            "can't matmul with these shapes {:?} @ {:?}",
-                            left_dims, right_dims
+                            "Invalid shapes for this operation: {:?} {} {:?}",
+                            left_shape, op_text, right_shape
                         ),
                         ..Default::default()
                     });
@@ -357,4 +319,98 @@ fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<No
     }
 
     return None;
+}
+
+fn resolve_shape(
+    node: Node<'_>,
+    params: &HashMap<String, Vec<String>>,
+    text: &str,
+) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => {
+            let param_name = node
+                .utf8_text(text.as_bytes())
+                .expect("Failed to get node identifier");
+            return params.get(param_name).cloned();
+        }
+        "parenthesized_expression" => {
+            let binary_operator_child = node
+                .named_child(0)
+                .expect("A parenthesized_expression always has a child");
+
+            return resolve_shape(binary_operator_child, params, text);
+        }
+        "attribute" => {
+            let Some(attribute_identifier_node) = node.child_by_field_name("attribute") else {
+                return None;
+            };
+
+            let attribute_name = attribute_identifier_node
+                .utf8_text(text.as_bytes())
+                .expect("Failed to get node identifier");
+
+            match attribute_name {
+                "T" => {
+                    let Some(object_node) = node.child_by_field_name("object") else {
+                        return None;
+                    };
+                    let mut shape = resolve_shape(object_node, params, text)?;
+                    shape.reverse();
+                    Some(shape)
+                }
+                _ => None,
+            }
+        }
+        "binary_operator" => {
+            let Some(op) = node.child_by_field_name("operator") else {
+                return None;
+            };
+
+            let op_text = op
+                .utf8_text(&text.as_bytes())
+                .expect("Operator has no text");
+
+            let left_node = node.child_by_field_name("left")?;
+            let right_node = node.child_by_field_name("right")?;
+            let Some(left_shape) = resolve_shape(left_node, params, text) else {
+                return None;
+            };
+            let Some(right_shape) = resolve_shape(right_node, params, text) else {
+                return None;
+            };
+
+            match op_text {
+                "@" => {
+                    if &left_shape.last().unwrap() != &right_shape.first().unwrap() {
+                        return None;
+                    } else {
+                        return Some(vec![
+                            left_shape.first().unwrap().clone(),
+                            right_shape.last().unwrap().clone(),
+                        ]);
+                    }
+                }
+                "+" | "-" | "*" | "/" => handle_elementwise_ops(left_shape, right_shape),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    }
+}
+
+fn handle_elementwise_ops(
+    left_shape: Vec<String>,
+    right_shape: Vec<String>,
+) -> Option<Vec<String>> {
+    if left_shape.len() != right_shape.len() {
+        return None;
+    }
+
+    for i in 0..left_shape.len() {
+        if left_shape[i] != right_shape[i] {
+            return None;
+        }
+    }
+
+    return Some(left_shape.clone());
 }
