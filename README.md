@@ -41,7 +41,7 @@ A Rust-based LSP that detects tensor shape mismatches in NumPy/JAX code using ja
 - [x] Per-function scoping of shapes
 - [ ] Hover on expressions (not just variables)
 - [ ] Go-to-definition for dimension names
-- [ ] Inlay hints showing shapes inline
+- [x] Inlay hints showing shapes inline
 - [ ] Code actions (e.g. "insert .T here")
 
 ### Architecture

@@ -7,15 +7,23 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    MarkedString, MessageType, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
+    InlayHint, InlayHintClientCapabilities, InlayHintKind, InlayHintLabel, InlayHintParams,
+    MarkedString, MessageType, OneOf, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Node, Parser};
 
+pub struct ShapeInfo {
+    dims: Vec<String>,
+    line: u32,
+    character: u32,
+    is_inferred: bool,
+}
+
 pub struct Backend {
     pub client: Client,
-    pub shapes: RwLock<HashMap<String, HashMap<String, Vec<String>>>>,
+    pub shapes: RwLock<HashMap<String, HashMap<String, ShapeInfo>>>,
     pub document_text: RwLock<HashMap<String, String>>,
 }
 
@@ -28,6 +36,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -65,6 +74,35 @@ impl LanguageServer for Backend {
         };
         self.on_hover(text, &pos).await
     }
+
+    async fn inlay_hint(&self, _params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let mut hints = Vec::new();
+
+        let shapes_lock = self.shapes.read().await;
+
+        for (_, fn_shapes) in shapes_lock.iter() {
+            for (_name, info) in fn_shapes {
+                if !info.is_inferred {
+                    continue;
+                }
+                hints.push(InlayHint {
+                    position: Position {
+                        line: info.line,
+                        character: info.character,
+                    },
+                    label: InlayHintLabel::String(format!(": ({})", info.dims.join(", "))),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                });
+            }
+        }
+
+        Ok(Some(hints))
+    }
 }
 
 impl Backend {
@@ -91,7 +129,7 @@ impl Backend {
         let mut typed_functions: Vec<Node<'_>> = Vec::new();
         find_node_by_kind(root, "function_definition", &mut typed_functions);
 
-        let mut shapes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut shapes: HashMap<String, HashMap<String, ShapeInfo>> = HashMap::new();
 
         // ITERATE OVER EVERY FUNCTION DEFINITION
         for function_node in typed_functions {
@@ -137,10 +175,13 @@ impl Backend {
                     .split_whitespace()
                     .map(String::from)
                     .collect();
-                params.insert(param_name.to_string(), dims);
-                self.client
-                    .log_message(MessageType::INFO, format!("{:?}", params))
-                    .await;
+                let shape_info = ShapeInfo {
+                    dims,
+                    line: 0,
+                    character: 0,
+                    is_inferred: false,
+                };
+                params.insert(param_name.to_string(), shape_info);
             }
             // END: GET SHAPES FROM FUNCTION ARGS
 
@@ -162,7 +203,15 @@ impl Backend {
                 let Ok(var_name) = assign_left.utf8_text(text.as_bytes()) else {
                     continue;
                 };
-                params.insert(var_name.to_string(), resolved_shape);
+                params.insert(
+                    var_name.to_string(),
+                    ShapeInfo {
+                        dims: resolved_shape,
+                        line: assignment_node.end_position().row as u32,
+                        character: assignment_node.end_position().column as u32,
+                        is_inferred: true,
+                    },
+                );
             }
 
             let mut binary_operator_nodes: Vec<Node<'_>> = Vec::new();
@@ -195,6 +244,8 @@ impl Backend {
                         .utf8_text(&text.as_bytes())
                         .expect("Operator has no text");
 
+                    let error_msg = get_descriptive_err_msg(op_text, &left_shape, &right_shape);
+
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: Position {
@@ -208,10 +259,7 @@ impl Backend {
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("ndim-lsp".to_string()),
-                        message: format!(
-                            "Invalid shapes for this operation: {:?} {} {:?}",
-                            left_shape, op_text, right_shape
-                        ),
+                        message: error_msg.expect("Error message expected"),
                         ..Default::default()
                     });
                 }
@@ -268,7 +316,10 @@ impl Backend {
         };
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(format!("shape: {:?}", param))),
+            contents: HoverContents::Scalar(MarkedString::String(format!(
+                "shape: {:?}",
+                param.dims
+            ))),
             range: None,
         }))
     }
@@ -323,7 +374,7 @@ fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<No
 
 fn resolve_shape(
     node: Node<'_>,
-    params: &HashMap<String, Vec<String>>,
+    params: &HashMap<String, ShapeInfo>,
     text: &str,
 ) -> Option<Vec<String>> {
     match node.kind() {
@@ -331,7 +382,7 @@ fn resolve_shape(
             let param_name = node
                 .utf8_text(text.as_bytes())
                 .expect("Failed to get node identifier");
-            return params.get(param_name).cloned();
+            return params.get(param_name).map(|info| info.dims.clone());
         }
         "parenthesized_expression" => {
             let binary_operator_child = node
@@ -413,4 +464,46 @@ fn handle_elementwise_ops(
     }
 
     return Some(left_shape.clone());
+}
+
+fn get_descriptive_err_msg(
+    operand: &str,
+    left_shape: &[String],
+    right_shape: &[String],
+) -> Option<String> {
+    match operand {
+        "@" => {
+            if left_shape.last().unwrap() != right_shape.first().unwrap() {
+                return Some(format!(
+                    "Invalid dimensions: left matrix has last dim {}, right matrix has first dim {}",
+                    left_shape.last().unwrap(),
+                    right_shape.first().unwrap()
+                ));
+            } else {
+                return None;
+            }
+        }
+        "+" | "-" | "*" | "/" => {
+            if left_shape.len() != right_shape.len() {
+                return Some(format!(
+                    "Invalid dimensions: left operand has {} elements, right operand has {} elements",
+                    left_shape.len(),
+                    right_shape.len()
+                ));
+            }
+
+            let mut err_msg_buffer = String::new();
+            err_msg_buffer.push_str("Found invalid dimensions: ");
+            for i in 0..left_shape.len() {
+                if left_shape[i] != right_shape[i] {
+                    err_msg_buffer.push_str(&format!("{} != {}", left_shape[i], right_shape[i]));
+                    if i != left_shape.len() - 1 {
+                        err_msg_buffer.push_str(", ");
+                    }
+                }
+            }
+            Some(err_msg_buffer)
+        }
+        _ => return None,
+    }
 }
