@@ -1,17 +1,14 @@
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::str::FromStr;
 use tokio::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHint, InlayHintClientCapabilities, InlayHintKind, InlayHintLabel, InlayHintParams,
-    MarkedString, MessageType, OneOf, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf,
+    Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp::{Client, LanguageServer};
 use tree_sitter::{Node, Parser};
 
 pub struct ShapeInfo {
@@ -141,49 +138,9 @@ impl Backend {
                 continue;
             };
 
-            // START: GET SHAPES FROM FUNCTION ARGS
-            let mut typed_params: Vec<Node<'_>> = Vec::new();
-            find_node_by_kind(function_node, "typed_parameter", &mut typed_params);
             let mut params = HashMap::new();
-
-            for param_node in typed_params {
-                let Some(node_identifier) = param_node.child(0) else {
-                    return;
-                };
-
-                let param_name = node_identifier
-                    .utf8_text(text.as_bytes())
-                    .expect("Failed to get node identifier");
-
-                let Some(node_type) = param_node.child_by_field_name("type") else {
-                    return;
-                };
-
-                let mut string_content_results: Vec<Node<'_>> = Vec::new();
-                find_node_by_kind(node_type, "string_content", &mut string_content_results);
-
-                let string_content_node = string_content_results
-                    .into_iter()
-                    .next()
-                    .expect("Expected to find at least one string_content");
-
-                let string_content = string_content_node
-                    .utf8_text(&text.as_bytes())
-                    .expect("Failed to get string_content");
-
-                let dims: Vec<String> = string_content
-                    .split_whitespace()
-                    .map(String::from)
-                    .collect();
-                let shape_info = ShapeInfo {
-                    dims,
-                    line: 0,
-                    character: 0,
-                    is_inferred: false,
-                };
-                params.insert(param_name.to_string(), shape_info);
-            }
-            // END: GET SHAPES FROM FUNCTION ARGS
+            // Fill the shapes from the fn args into params dict
+            get_shapes_from_fn_args(function_node, &mut params, text);
 
             let mut assignment_nodes: Vec<Node<'_>> = Vec::new();
             find_node_by_kind(function_node, "assignment", &mut assignment_nodes);
@@ -337,27 +294,6 @@ fn find_node_by_kind<'a>(node: Node<'a>, kind: &str, results: &mut Vec<Node<'a>>
     }
 }
 
-fn get_child_param_names(binary_operator: Node<'_>, text: &str) -> Option<(String, String)> {
-    let left_child = binary_operator
-        .child_by_field_name("left")
-        .expect("Failed to find left child");
-    let left_child_param_name = left_child
-        .utf8_text(&text.as_bytes())
-        .expect("Failed to get param name of left child");
-
-    let right_child = binary_operator
-        .child_by_field_name("right")
-        .expect("Failed to find right child");
-    let right_child_param_name = right_child
-        .utf8_text(&text.as_bytes())
-        .expect("Failed to get param name of right child");
-
-    Some((
-        left_child_param_name.to_string(),
-        right_child_param_name.to_string(),
-    ))
-}
-
 fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<Node<'a>> {
     let mut parent = node.parent();
 
@@ -505,5 +441,52 @@ fn get_descriptive_err_msg(
             Some(err_msg_buffer)
         }
         _ => return None,
+    }
+}
+
+fn get_shapes_from_fn_args(
+    function_node: Node<'_>,
+    params: &mut HashMap<String, ShapeInfo>,
+    text: &str,
+) {
+    let mut typed_params: Vec<Node<'_>> = Vec::new();
+    find_node_by_kind(function_node, "typed_parameter", &mut typed_params);
+
+    for param_node in typed_params {
+        let Some(node_identifier) = param_node.child(0) else {
+            return;
+        };
+
+        let param_name = node_identifier
+            .utf8_text(text.as_bytes())
+            .expect("Failed to get node identifier");
+
+        let Some(node_type) = param_node.child_by_field_name("type") else {
+            return;
+        };
+
+        let mut string_content_results: Vec<Node<'_>> = Vec::new();
+        find_node_by_kind(node_type, "string_content", &mut string_content_results);
+
+        let string_content_node = string_content_results
+            .into_iter()
+            .next()
+            .expect("Expected to find at least one string_content");
+
+        let string_content = string_content_node
+            .utf8_text(&text.as_bytes())
+            .expect("Failed to get string_content");
+
+        let dims: Vec<String> = string_content
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let shape_info = ShapeInfo {
+            dims,
+            line: 0,
+            character: 0,
+            is_inferred: false,
+        };
+        params.insert(param_name.to_string(), shape_info);
     }
 }
