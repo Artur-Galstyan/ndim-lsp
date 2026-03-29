@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::usize;
 use tokio::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
@@ -350,7 +351,7 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
 
                 match (obj_name, attr_name) {
                     ("jnp", "transpose") => {
-                        let Some(input_node) = args_node.named_child(0) else {
+                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
                         };
                         let input_shape = match resolve_shape(input_node, params, text) {
@@ -358,9 +359,10 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                             other => return other,
                         };
 
-                        let Some(tuple_node) = args_node.named_child(1) else {
+                        let Some(tuple_node) = get_arg(args_node, 1, "axes", text) else {
                             return ShapeResult::Unknown;
                         };
+
                         let mut new_shape = Vec::new();
                         let mut cursor = tuple_node.walk();
                         for child in tuple_node.named_children(&mut cursor) {
@@ -385,55 +387,88 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                         }
                         ShapeResult::Ok(new_shape)
                     }
-                    ("jnp", "sum") => {
-                        let Some(input_node) = args_node.named_child(0) else {
+                    ("jnp", "sum") | ("jnp", "mean") | ("jnp", "max") | ("jnp", "min") => {
+                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
                         };
+
                         let input_shape = match resolve_shape(input_node, params, text) {
                             ShapeResult::Ok(dims) => dims,
                             other => return other,
                         };
 
-                        let mut cursor = args_node.walk();
-                        for child in args_node.named_children(&mut cursor) {
-                            if child.kind() == "keyword_argument" {
-                                let Some(name_node) = child.child_by_field_name("name") else {
-                                    continue;
-                                };
-                                let Some(name) = name_node.utf8_text(text.as_bytes()).ok() else {
-                                    continue;
-                                };
+                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
+                            return ShapeResult::Unknown;
+                        };
 
-                                if name == "axis" {
-                                    let Some(value_node) = child.child_by_field_name("value")
-                                    else {
-                                        continue;
-                                    };
+                        let Ok(axis_str) = axis_node.utf8_text(text.as_bytes()) else {
+                            return ShapeResult::Unknown;
+                        };
 
-                                    let Ok(axis_str) = value_node.utf8_text(text.as_bytes()) else {
-                                        continue;
-                                    };
+                        let Ok(parsed_axis) = axis_str.parse::<usize>() else {
+                            return ShapeResult::Unknown;
+                        };
 
-                                    let Ok(parsed_axis) = axis_str.parse::<usize>() else {
-                                        continue;
-                                    };
-
-                                    if parsed_axis >= input_shape.len() {
-                                        return ShapeResult::Error(format!(
-                                            "Axis index {} is out of bounds for shape with {} dimensions",
-                                            parsed_axis,
-                                            input_shape.len()
-                                        ));
-                                    }
-
-                                    let mut result = input_shape.clone();
-                                    result.remove(parsed_axis);
-                                    return ShapeResult::Ok(result);
-                                }
-                            }
+                        if parsed_axis >= input_shape.len() {
+                            return ShapeResult::Error(format!(
+                                "Axis index {} is out of bounds for shape with {} dimensions",
+                                parsed_axis,
+                                input_shape.len()
+                            ));
                         }
 
-                        return ShapeResult::Unknown;
+                        let keepdims = match get_arg(args_node, 4, "keepdims", text) {
+                            Some(n) => n.utf8_text(text.as_bytes()).ok() == Some("True"),
+                            None => false,
+                        };
+                        let mut result = input_shape.clone();
+
+                        if keepdims {
+                            result[parsed_axis] = "1".to_string();
+                        } else {
+                            result.remove(parsed_axis);
+                        }
+                        return ShapeResult::Ok(result);
+                    }
+                    ("jnp", "expand_dims") => {
+                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to get input shape"
+                            ));
+                        };
+                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to get axis"
+                            ));
+                        };
+
+                        let shape = match resolve_shape(input_node, params, text) {
+                            ShapeResult::Ok(items) => items,
+                            other => return other,
+                        };
+
+                        let Ok(axis_str) = axis_node.utf8_text(text.as_bytes()) else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to get axis string"
+                            ));
+                        };
+
+                        let Ok(parsed_axis) = axis_str.parse::<usize>() else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to parse axis string"
+                            ));
+                        };
+
+                        let mut current_dims = shape.clone();
+                        if parsed_axis > shape.len() {
+                            return ShapeResult::Error(format!(
+                                "Axis {} is out of bounds for expand_dims on shape with {} dims",
+                                parsed_axis,
+                                shape.len()
+                            ));
+                        }
+                        current_dims.insert(parsed_axis, "1".to_string());
+                        return ShapeResult::Ok(current_dims);
                     }
                     _ => return ShapeResult::Unknown,
                 }
@@ -595,4 +630,28 @@ fn get_shapes_from_fn_args(
         };
         params.insert(param_name.to_string(), shape_info);
     }
+}
+
+// usize::MAX is a sentinel to indicate that I only care about the kwargs
+fn get_arg<'a>(args_node: Node<'a>, position: usize, name: &str, text: &str) -> Option<Node<'a>> {
+    let mut positional_index = 0;
+    let mut cursor = args_node.walk();
+
+    for child in args_node.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            let name_node = child.child_by_field_name("name")?;
+            let kw_name = name_node.utf8_text(text.as_bytes()).ok()?;
+            if kw_name == name {
+                return child.child_by_field_name("value");
+            }
+        } else {
+            if positional_index == position {
+                return Some(child);
+            } else {
+                positional_index += 1;
+            }
+        }
+    }
+
+    None
 }
