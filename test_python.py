@@ -115,3 +115,24 @@ def transpose_tests(
     valid = t1 @ x
     # (b, a) + (a, b) → b != a ✗ squiggle
     bad = t1 + x
+
+
+from jaxtyping import Array, Float
+
+def sum_tests(
+    x: Float[Array, "a b"],
+    y: Float[Array, "a b c"],
+):
+    # (a, b) sum axis=0 → (b) ✓
+    s1 = jnp.sum(x, axis=0)
+    # (a, b) sum axis=1 → (a) ✓
+    s2 = jnp.sum(x, axis=1)
+    # (a, b, c) sum axis=1 → (a, c) ✓
+    s3 = jnp.sum(y, axis=1)
+    # (a, c) @ (c, b) — but we don't have (c, b), so let's use transpose
+    # (a, b, c) sum axis=0 → (b, c), transpose → (c, b), then (a, c) @ (c, b) = (a, b) ✓
+    s4 = jnp.sum(y, axis=0)
+    s4t = jnp.transpose(s4, (1, 0))
+    valid = s3 @ s4t
+    # (b) + (a) → b != a ✗ squiggle
+    bad = s1 + s2

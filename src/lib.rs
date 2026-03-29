@@ -11,6 +11,12 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 use tree_sitter::{Node, Parser};
 
+enum ShapeResult {
+    Ok(Vec<String>),
+    Error(String),
+    Unknown,
+}
+
 pub struct ShapeInfo {
     dims: Vec<String>,
     line: u32,
@@ -150,8 +156,30 @@ impl Backend {
                     continue;
                 };
 
-                let Some(resolved_shape) = resolve_shape(right_child, &params, text) else {
-                    continue;
+                let resolved_shape = match resolve_shape(right_child, &params, text) {
+                    ShapeResult::Ok(shape) => shape,
+                    ShapeResult::Error(msg) => {
+                        let start = right_child.start_position();
+                        let end = right_child.end_position();
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: start.row as u32,
+                                    character: start.column as u32,
+                                },
+                                end: Position {
+                                    line: end.row as u32,
+                                    character: end.column as u32,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("ndim-lsp".to_string()),
+                            message: msg,
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                    ShapeResult::Unknown => continue,
                 };
 
                 let Some(assign_left) = assignment_node.child_by_field_name("left") else {
@@ -175,50 +203,29 @@ impl Backend {
             find_node_by_kind(function_node, "binary_operator", &mut binary_operator_nodes);
 
             for binary_operator_node in binary_operator_nodes {
-                if resolve_shape(binary_operator_node, &params, text).is_none() {
-                    let left_node = binary_operator_node.child_by_field_name("left");
-                    let right_node = binary_operator_node.child_by_field_name("right");
-
-                    let (Some(left), Some(right)) = (left_node, right_node) else {
-                        continue;
-                    };
-
-                    let Some(left_shape) = resolve_shape(left, &params, text) else {
-                        continue;
-                    };
-
-                    let Some(right_shape) = resolve_shape(right, &params, text) else {
-                        continue;
-                    };
-
-                    let start = binary_operator_node.start_position();
-                    let end = binary_operator_node.end_position();
-                    let Some(op) = binary_operator_node.child_by_field_name("operator") else {
-                        continue;
-                    };
-
-                    let op_text = op
-                        .utf8_text(&text.as_bytes())
-                        .expect("Operator has no text");
-
-                    let error_msg = get_descriptive_err_msg(op_text, &left_shape, &right_shape);
-
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: start.row as u32,
-                                character: start.column as u32,
+                match resolve_shape(binary_operator_node, &params, text) {
+                    ShapeResult::Ok(_) => {}
+                    ShapeResult::Error(msg) => {
+                        let start = binary_operator_node.start_position();
+                        let end = binary_operator_node.end_position();
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: start.row as u32,
+                                    character: start.column as u32,
+                                },
+                                end: Position {
+                                    line: end.row as u32,
+                                    character: end.column as u32,
+                                },
                             },
-                            end: Position {
-                                line: end.row as u32,
-                                character: end.column as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("ndim-lsp".to_string()),
-                        message: error_msg.expect("Error message expected"),
-                        ..Default::default()
-                    });
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("ndim-lsp".to_string()),
+                            message: msg,
+                            ..Default::default()
+                        });
+                    }
+                    ShapeResult::Unknown => {}
                 }
             }
             shapes.insert(function_name.to_string(), params);
@@ -308,49 +315,130 @@ fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<No
     return None;
 }
 
-fn resolve_shape(
-    node: Node<'_>,
-    params: &HashMap<String, ShapeInfo>,
-    text: &str,
-) -> Option<Vec<String>> {
+fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str) -> ShapeResult {
     match node.kind() {
         "identifier" => {
             let param_name = node
                 .utf8_text(text.as_bytes())
                 .expect("Failed to get node identifier");
-            return params.get(param_name).map(|info| info.dims.clone());
+            match params.get(param_name) {
+                Some(info) => ShapeResult::Ok(info.dims.clone()),
+                None => ShapeResult::Unknown,
+            }
         }
         "call" => {
-            let func_node = node.child_by_field_name("function")?;
-            let args_node = node.child_by_field_name("arguments")?;
+            let Some(func_node) = node.child_by_field_name("function") else {
+                return ShapeResult::Unknown;
+            };
+            let Some(args_node) = node.child_by_field_name("arguments") else {
+                return ShapeResult::Unknown;
+            };
 
             if func_node.kind() == "attribute" {
-                let obj = func_node.child_by_field_name("object")?;
-                let attr = func_node.child_by_field_name("attribute")?;
-                let obj_name = obj.utf8_text(text.as_bytes()).ok()?;
-                let attr_name = attr.utf8_text(text.as_bytes()).ok()?;
+                let Some(obj) = func_node.child_by_field_name("object") else {
+                    return ShapeResult::Unknown;
+                };
+                let Some(attr) = func_node.child_by_field_name("attribute") else {
+                    return ShapeResult::Unknown;
+                };
+                let Some(obj_name) = obj.utf8_text(text.as_bytes()).ok() else {
+                    return ShapeResult::Unknown;
+                };
+                let Some(attr_name) = attr.utf8_text(text.as_bytes()).ok() else {
+                    return ShapeResult::Unknown;
+                };
 
                 match (obj_name, attr_name) {
                     ("jnp", "transpose") => {
-                        let input_node = args_node.named_child(0)?;
-                        let input_shape = resolve_shape(input_node, params, text)?;
+                        let Some(input_node) = args_node.named_child(0) else {
+                            return ShapeResult::Unknown;
+                        };
+                        let input_shape = match resolve_shape(input_node, params, text) {
+                            ShapeResult::Ok(dims) => dims,
+                            other => return other,
+                        };
 
-                        let tuple_node = args_node.named_child(1)?;
+                        let Some(tuple_node) = args_node.named_child(1) else {
+                            return ShapeResult::Unknown;
+                        };
                         let mut new_shape = Vec::new();
                         let mut cursor = tuple_node.walk();
                         for child in tuple_node.named_children(&mut cursor) {
                             if child.kind() == "integer" {
-                                let idx: usize =
-                                    child.utf8_text(text.as_bytes()).ok()?.parse().ok()?;
-                                new_shape.push(input_shape.get(idx)?.clone());
+                                let Ok(text) = child.utf8_text(text.as_bytes()) else {
+                                    return ShapeResult::Unknown;
+                                };
+                                let Ok(idx) = text.parse::<usize>() else {
+                                    return ShapeResult::Unknown;
+                                };
+
+                                let Some(dim) = input_shape.get(idx) else {
+                                    return ShapeResult::Error(format!(
+                                        "Axis {} is out of bounds for shape with {} dims",
+                                        idx,
+                                        input_shape.len()
+                                    ));
+                                };
+
+                                new_shape.push(dim.clone());
                             }
                         }
-                        Some(new_shape)
+                        ShapeResult::Ok(new_shape)
                     }
-                    _ => None,
+                    ("jnp", "sum") => {
+                        let Some(input_node) = args_node.named_child(0) else {
+                            return ShapeResult::Unknown;
+                        };
+                        let input_shape = match resolve_shape(input_node, params, text) {
+                            ShapeResult::Ok(dims) => dims,
+                            other => return other,
+                        };
+
+                        let mut cursor = args_node.walk();
+                        for child in args_node.named_children(&mut cursor) {
+                            if child.kind() == "keyword_argument" {
+                                let Some(name_node) = child.child_by_field_name("name") else {
+                                    continue;
+                                };
+                                let Some(name) = name_node.utf8_text(text.as_bytes()).ok() else {
+                                    continue;
+                                };
+
+                                if name == "axis" {
+                                    let Some(value_node) = child.child_by_field_name("value")
+                                    else {
+                                        continue;
+                                    };
+
+                                    let Ok(axis_str) = value_node.utf8_text(text.as_bytes()) else {
+                                        continue;
+                                    };
+
+                                    let Ok(parsed_axis) = axis_str.parse::<usize>() else {
+                                        continue;
+                                    };
+
+                                    if parsed_axis >= input_shape.len() {
+                                        return ShapeResult::Error(format!(
+                                            "Axis index {} is out of bounds for shape with {} dimensions",
+                                            parsed_axis,
+                                            input_shape.len()
+                                        ));
+                                    }
+
+                                    let mut result = input_shape.clone();
+                                    result.remove(parsed_axis);
+                                    return ShapeResult::Ok(result);
+                                }
+                            }
+                        }
+
+                        return ShapeResult::Unknown;
+                    }
+                    _ => return ShapeResult::Unknown,
                 }
             } else {
-                None
+                return ShapeResult::Unknown;
             }
         }
         "parenthesized_expression" => {
@@ -362,7 +450,7 @@ fn resolve_shape(
         }
         "attribute" => {
             let Some(attribute_identifier_node) = node.child_by_field_name("attribute") else {
-                return None;
+                return ShapeResult::Unknown;
             };
 
             let attribute_name = attribute_identifier_node
@@ -372,109 +460,94 @@ fn resolve_shape(
             match attribute_name {
                 "T" => {
                     let Some(object_node) = node.child_by_field_name("object") else {
-                        return None;
+                        return ShapeResult::Error(format!(
+                            "Unexpected TS error: Failed to get object child from attribute node"
+                        ));
                     };
-                    let mut shape = resolve_shape(object_node, params, text)?;
+                    let mut shape = match resolve_shape(object_node, params, text) {
+                        ShapeResult::Ok(shape) => shape,
+                        other => return other,
+                    };
                     shape.reverse();
-                    Some(shape)
+                    return ShapeResult::Ok(shape);
                 }
-                _ => None,
+                _ => ShapeResult::Unknown,
             }
         }
         "binary_operator" => {
             let Some(op) = node.child_by_field_name("operator") else {
-                return None;
+                return ShapeResult::Error(
+                    "Unexpected TS error: Failed to get operator child from binary_operator node"
+                        .to_string(),
+                );
             };
 
             let op_text = op
                 .utf8_text(&text.as_bytes())
                 .expect("Operator has no text");
 
-            let left_node = node.child_by_field_name("left")?;
-            let right_node = node.child_by_field_name("right")?;
-            let Some(left_shape) = resolve_shape(left_node, params, text) else {
-                return None;
+            let Some(left_node) = node.child_by_field_name("left") else {
+                return ShapeResult::Error(
+                    "Unexpected TS error: Failed to get left child from binary_operator node"
+                        .to_string(),
+                );
             };
-            let Some(right_shape) = resolve_shape(right_node, params, text) else {
-                return None;
+            let Some(right_node) = node.child_by_field_name("right") else {
+                return ShapeResult::Error(
+                    "Unexpected TS error: Failed to get right child from binary_operator node"
+                        .to_string(),
+                );
+            };
+
+            let left_shape = match resolve_shape(left_node, params, text) {
+                ShapeResult::Ok(shape) => shape,
+                other => return other,
+            };
+            let right_shape = match resolve_shape(right_node, params, text) {
+                ShapeResult::Ok(shape) => shape,
+                other => return other,
             };
 
             match op_text {
                 "@" => {
                     if &left_shape.last().unwrap() != &right_shape.first().unwrap() {
-                        return None;
+                        return ShapeResult::Error(format!(
+                            "Invalid shapes found: {:?} and {:?}",
+                            left_shape, right_shape
+                        ));
                     } else {
-                        return Some(vec![
+                        return ShapeResult::Ok(vec![
                             left_shape.first().unwrap().clone(),
                             right_shape.last().unwrap().clone(),
                         ]);
                     }
                 }
                 "+" | "-" | "*" | "/" => handle_elementwise_ops(left_shape, right_shape),
-                _ => return None,
+                _ => return ShapeResult::Unknown,
             }
         }
-        _ => return None,
+        _ => return ShapeResult::Unknown,
     }
 }
 
-fn handle_elementwise_ops(
-    left_shape: Vec<String>,
-    right_shape: Vec<String>,
-) -> Option<Vec<String>> {
+fn handle_elementwise_ops(left_shape: Vec<String>, right_shape: Vec<String>) -> ShapeResult {
     if left_shape.len() != right_shape.len() {
-        return None;
+        return ShapeResult::Error(format!(
+            "Invalid shapes found: {:?} and {:?}",
+            left_shape, right_shape
+        ));
     }
 
     for i in 0..left_shape.len() {
         if left_shape[i] != right_shape[i] {
-            return None;
+            return ShapeResult::Error(format!(
+                "Invalid shapes found: {:?} and {:?}",
+                left_shape, right_shape
+            ));
         }
     }
 
-    return Some(left_shape.clone());
-}
-
-fn get_descriptive_err_msg(
-    operand: &str,
-    left_shape: &[String],
-    right_shape: &[String],
-) -> Option<String> {
-    match operand {
-        "@" => {
-            if left_shape.last().unwrap() != right_shape.first().unwrap() {
-                return Some(format!(
-                    "Invalid dimensions: left matrix has last dim {}, right matrix has first dim {}",
-                    left_shape.last().unwrap(),
-                    right_shape.first().unwrap()
-                ));
-            } else {
-                return None;
-            }
-        }
-        "+" | "-" | "*" | "/" => {
-            if left_shape.len() != right_shape.len() {
-                return Some(format!(
-                    "Invalid dimensions: left operand has {} elements, right operand has {} elements",
-                    left_shape.len(),
-                    right_shape.len()
-                ));
-            }
-
-            let mut err_msg_buffer = String::new();
-            err_msg_buffer.push_str("Found invalid dimensions: ");
-            for i in 0..left_shape.len() {
-                if left_shape[i] != right_shape[i] {
-                    err_msg_buffer.push_str(&format!("{} != {}", left_shape[i], right_shape[i]));
-                    if i != left_shape.len() - 1 {
-                        err_msg_buffer.push_str(", ");
-                    }
-                }
-            }
-            Some(err_msg_buffer)
-        }
-        _ => return None,
-    }
+    return ShapeResult::Ok(left_shape.clone());
 }
 
 fn get_shapes_from_fn_args(
