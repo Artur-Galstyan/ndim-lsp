@@ -1,4 +1,5 @@
 from jaxtyping import Array, Float
+import jax.numpy as jnp
 
 
 """
@@ -101,3 +102,16 @@ def parens_and_transpose(
     bad_t = x @ y.T
     # invalid parens: (a,b) @ (b,c) = (a,c), (a,c) + (a,b) → c != b ✗ squiggle
     bad_parens = (x @ y) + x
+
+def transpose_tests(
+    x: Float[Array, "a b"],
+    y: Float[Array, "a b c"],
+):
+    # (a, b) → (b, a) ✓
+    t1 = jnp.transpose(x, (1, 0))
+    # (a, b, c) → (c, a, b) ✓
+    t2 = jnp.transpose(y, (2, 0, 1))
+    # (b, a) @ (a, b) = (b, b) ✓
+    valid = t1 @ x
+    # (b, a) + (a, b) → b != a ✗ squiggle
+    bad = t1 + x

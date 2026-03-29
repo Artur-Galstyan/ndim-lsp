@@ -320,6 +320,39 @@ fn resolve_shape(
                 .expect("Failed to get node identifier");
             return params.get(param_name).map(|info| info.dims.clone());
         }
+        "call" => {
+            let func_node = node.child_by_field_name("function")?;
+            let args_node = node.child_by_field_name("arguments")?;
+
+            if func_node.kind() == "attribute" {
+                let obj = func_node.child_by_field_name("object")?;
+                let attr = func_node.child_by_field_name("attribute")?;
+                let obj_name = obj.utf8_text(text.as_bytes()).ok()?;
+                let attr_name = attr.utf8_text(text.as_bytes()).ok()?;
+
+                match (obj_name, attr_name) {
+                    ("jnp", "transpose") => {
+                        let input_node = args_node.named_child(0)?;
+                        let input_shape = resolve_shape(input_node, params, text)?;
+
+                        let tuple_node = args_node.named_child(1)?;
+                        let mut new_shape = Vec::new();
+                        let mut cursor = tuple_node.walk();
+                        for child in tuple_node.named_children(&mut cursor) {
+                            if child.kind() == "integer" {
+                                let idx: usize =
+                                    child.utf8_text(text.as_bytes()).ok()?.parse().ok()?;
+                                new_shape.push(input_shape.get(idx)?.clone());
+                            }
+                        }
+                        Some(new_shape)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
         "parenthesized_expression" => {
             let binary_operator_child = node
                 .named_child(0)
