@@ -28,6 +28,7 @@ pub struct ShapeInfo {
 pub struct Backend {
     pub client: Client,
     pub shapes: RwLock<HashMap<String, HashMap<String, ShapeInfo>>>,
+    pub import_alias_map: RwLock<HashMap<String, String>>,
     pub document_text: RwLock<HashMap<String, String>>,
 }
 
@@ -130,6 +131,8 @@ impl Backend {
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
         let root = tree.root_node();
 
+        let import_alias_map = build_import_map(root, text);
+
         let mut typed_functions: Vec<Node<'_>> = Vec::new();
         find_node_by_kind(root, "function_definition", &mut typed_functions);
 
@@ -157,31 +160,32 @@ impl Backend {
                     continue;
                 };
 
-                let resolved_shape = match resolve_shape(right_child, &params, text) {
-                    ShapeResult::Ok(shape) => shape,
-                    ShapeResult::Error(msg) => {
-                        let start = right_child.start_position();
-                        let end = right_child.end_position();
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: start.row as u32,
-                                    character: start.column as u32,
+                let resolved_shape =
+                    match resolve_shape(right_child, &params, &import_alias_map, text) {
+                        ShapeResult::Ok(shape) => shape,
+                        ShapeResult::Error(msg) => {
+                            let start = right_child.start_position();
+                            let end = right_child.end_position();
+                            diagnostics.push(Diagnostic {
+                                range: Range {
+                                    start: Position {
+                                        line: start.row as u32,
+                                        character: start.column as u32,
+                                    },
+                                    end: Position {
+                                        line: end.row as u32,
+                                        character: end.column as u32,
+                                    },
                                 },
-                                end: Position {
-                                    line: end.row as u32,
-                                    character: end.column as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("ndim-lsp".to_string()),
-                            message: msg,
-                            ..Default::default()
-                        });
-                        continue;
-                    }
-                    ShapeResult::Unknown => continue,
-                };
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                source: Some("ndim-lsp".to_string()),
+                                message: msg,
+                                ..Default::default()
+                            });
+                            continue;
+                        }
+                        ShapeResult::Unknown => continue,
+                    };
 
                 let Some(assign_left) = assignment_node.child_by_field_name("left") else {
                     continue;
@@ -204,7 +208,7 @@ impl Backend {
             find_node_by_kind(function_node, "binary_operator", &mut binary_operator_nodes);
 
             for binary_operator_node in binary_operator_nodes {
-                match resolve_shape(binary_operator_node, &params, text) {
+                match resolve_shape(binary_operator_node, &params, &import_alias_map, text) {
                     ShapeResult::Ok(_) => {}
                     ShapeResult::Error(msg) => {
                         let start = binary_operator_node.start_position();
@@ -237,6 +241,8 @@ impl Backend {
 
         let mut shapes_lock = self.shapes.write().await;
         *shapes_lock = shapes;
+        let mut import_alias_map_lock = self.import_alias_map.write().await;
+        *import_alias_map_lock = import_alias_map;
     }
 
     async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
@@ -316,7 +322,12 @@ fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<No
     return None;
 }
 
-fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str) -> ShapeResult {
+fn resolve_shape(
+    node: Node<'_>,
+    params: &HashMap<String, ShapeInfo>,
+    import_alias_map: &HashMap<String, String>,
+    text: &str,
+) -> ShapeResult {
     match node.kind() {
         "identifier" => {
             let param_name = node
@@ -348,16 +359,20 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                 let Some(attr_name) = attr.utf8_text(text.as_bytes()).ok() else {
                     return ShapeResult::Unknown;
                 };
-
-                match (obj_name, attr_name) {
-                    ("jnp", "transpose") => {
+                let resolved_object = import_alias_map
+                    .get(obj_name)
+                    .map(|s| s.as_str())
+                    .unwrap_or(obj_name);
+                match (resolved_object, attr_name) {
+                    ("jax.numpy", "transpose") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
                         };
-                        let input_shape = match resolve_shape(input_node, params, text) {
-                            ShapeResult::Ok(dims) => dims,
-                            other => return other,
-                        };
+                        let input_shape =
+                            match resolve_shape(input_node, params, import_alias_map, text) {
+                                ShapeResult::Ok(dims) => dims,
+                                other => return other,
+                            };
 
                         let Some(tuple_node) = get_arg(args_node, 1, "axes", text) else {
                             return ShapeResult::Unknown;
@@ -387,15 +402,19 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                         }
                         ShapeResult::Ok(new_shape)
                     }
-                    ("jnp", "sum") | ("jnp", "mean") | ("jnp", "max") | ("jnp", "min") => {
+                    ("jax.numpy", "sum")
+                    | ("jax.numpy", "mean")
+                    | ("jax.numpy", "max")
+                    | ("jax.numpy", "min") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
                         };
 
-                        let input_shape = match resolve_shape(input_node, params, text) {
-                            ShapeResult::Ok(dims) => dims,
-                            other => return other,
-                        };
+                        let input_shape =
+                            match resolve_shape(input_node, params, import_alias_map, text) {
+                                ShapeResult::Ok(dims) => dims,
+                                other => return other,
+                            };
 
                         let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
                             return ShapeResult::Unknown;
@@ -430,7 +449,7 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                         }
                         return ShapeResult::Ok(result);
                     }
-                    ("jnp", "expand_dims") => {
+                    ("jax.numpy", "expand_dims") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Error(format!(
                                 "Unexpected TS error: failed to get input shape"
@@ -442,7 +461,8 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                             ));
                         };
 
-                        let shape = match resolve_shape(input_node, params, text) {
+                        let shape = match resolve_shape(input_node, params, import_alias_map, text)
+                        {
                             ShapeResult::Ok(items) => items,
                             other => return other,
                         };
@@ -470,16 +490,17 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                         current_dims.insert(parsed_axis, "1".to_string());
                         return ShapeResult::Ok(current_dims);
                     }
-                    ("jnp", "squeeze") => {
+                    ("jax.numpy", "squeeze") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Error(format!(
                                 "Unexpected TS error: failed to get input shape"
                             ));
                         };
-                        let input_shape = match resolve_shape(input_node, params, text) {
-                            ShapeResult::Ok(items) => items,
-                            other => return other,
-                        };
+                        let input_shape =
+                            match resolve_shape(input_node, params, import_alias_map, text) {
+                                ShapeResult::Ok(items) => items,
+                                other => return other,
+                            };
 
                         let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
                             let result: Vec<String> =
@@ -523,7 +544,7 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                 .named_child(0)
                 .expect("A parenthesized_expression always has a child");
 
-            return resolve_shape(binary_operator_child, params, text);
+            return resolve_shape(binary_operator_child, params, import_alias_map, text);
         }
         "attribute" => {
             let Some(attribute_identifier_node) = node.child_by_field_name("attribute") else {
@@ -541,7 +562,8 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                             "Unexpected TS error: Failed to get object child from attribute node"
                         ));
                     };
-                    let mut shape = match resolve_shape(object_node, params, text) {
+                    let mut shape = match resolve_shape(object_node, params, import_alias_map, text)
+                    {
                         ShapeResult::Ok(shape) => shape,
                         other => return other,
                     };
@@ -576,11 +598,11 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                 );
             };
 
-            let left_shape = match resolve_shape(left_node, params, text) {
+            let left_shape = match resolve_shape(left_node, params, import_alias_map, text) {
                 ShapeResult::Ok(shape) => shape,
                 other => return other,
             };
-            let right_shape = match resolve_shape(right_node, params, text) {
+            let right_shape = match resolve_shape(right_node, params, import_alias_map, text) {
                 ShapeResult::Ok(shape) => shape,
                 other => return other,
             };
@@ -706,4 +728,78 @@ fn parse_axis(axis_node: Node<'_>, text: &str) -> Option<usize> {
         return None;
     };
     Some(parsed_axis)
+}
+
+fn build_import_map(root: Node, text: &str) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut import_alias_nodes: Vec<Node<'_>> = Vec::new();
+    find_node_by_kind(root, "import_statement", &mut import_alias_nodes);
+
+    for node in import_alias_nodes {
+        let Some(name_child) = node.child_by_field_name("name") else {
+            continue;
+        };
+
+        if name_child.kind() == "aliased_import" {
+            let Some(dotted) = name_child.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(alias) = name_child.child_by_field_name("alias") else {
+                continue;
+            };
+            let Ok(full_name) = dotted.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            let Ok(alias_name) = alias.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            map.insert(alias_name.to_string(), full_name.to_string());
+        } else if name_child.kind() == "dotted_name" {
+            let Ok(full_name) = name_child.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            map.insert(full_name.to_string(), full_name.to_string());
+        }
+    }
+
+    let mut import_from_nodes = Vec::new();
+    find_node_by_kind(root, "import_from_statement", &mut import_from_nodes);
+
+    for node in import_from_nodes {
+        let Some(module_node) = node.child_by_field_name("module_name") else {
+            continue;
+        };
+        let Ok(module_name) = module_node.utf8_text(text.as_bytes()) else {
+            continue;
+        };
+        let Some(name_child) = node.child_by_field_name("name") else {
+            continue;
+        };
+
+        if name_child.kind() == "aliased_import" {
+            let Some(dotted) = name_child.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(alias) = name_child.child_by_field_name("alias") else {
+                continue;
+            };
+            let Ok(original) = dotted.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            let Ok(alias_name) = alias.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            map.insert(
+                alias_name.to_string(),
+                format!("{}.{}", module_name, original),
+            );
+        } else if name_child.kind() == "dotted_name" {
+            let Ok(name) = name_child.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            map.insert(name.to_string(), format!("{}.{}", module_name, name));
+        }
+    }
+
+    map
 }

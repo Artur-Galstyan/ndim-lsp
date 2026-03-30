@@ -10,6 +10,7 @@ async fn main() {
         client,
         shapes: Default::default(),
         document_text: Default::default(),
+        import_alias_map: Default::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
