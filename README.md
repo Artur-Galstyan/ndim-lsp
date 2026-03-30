@@ -16,7 +16,7 @@ A Rust-based LSP that detects tensor shape mismatches in NumPy/JAX code using ja
 - [x] Transpose (`.T`) — reverses dimensions
 - [x] `jnp.transpose(x, axes=(...))` — permute specific axes
 - [ ] `jnp.reshape(x, shape)` — reshape tracking
-- [ ] `jnp.expand_dims` / `jnp.squeeze`
+- [x] `jnp.expand_dims` / `jnp.squeeze`
 - [ ] `jnp.concatenate` / `jnp.stack`
 - [x] `jnp.sum` / `jnp.mean` with axis argument (dimension reduction)
 - [ ] Broadcasting rules

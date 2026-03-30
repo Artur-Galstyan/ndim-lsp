@@ -136,3 +136,25 @@ def sum_tests(
     valid = s3 @ s4t
     # (b) + (a) → b != a ✗ squiggle
     bad = s1 + s2
+
+
+def squeeze_tests(
+    x: Float[Array, "a b"],
+    y: Float[Array, "a b c"],
+):
+    # expand then squeeze: (a, b) → (1, a, b) → (a, b) ✓
+    expanded = jnp.expand_dims(x, axis=0)
+    back = jnp.squeeze(expanded, axis=0)
+    # expand at end then squeeze: (a, b) → (a, b, 1) → (a, b) ✓
+    expanded2 = jnp.expand_dims(x, axis=2)
+    back2 = jnp.squeeze(expanded2, axis=2)
+    # double expand then squeeze all: (a, b) → (1, a, b) → (1, a, 1, b) → (a, b) ✓
+    double = jnp.expand_dims(jnp.expand_dims(x, axis=0), axis=2)
+    squeezed_all = jnp.squeeze(double)
+    # squeeze symbolic dim: (a, b) squeeze axis=0 → a is not "1" ✗ squiggle
+    bad = jnp.squeeze(x, axis=0)
+    # squeeze out of bounds: (a, b) squeeze axis=5 ✗ squiggle
+    oob = jnp.squeeze(x, axis=5)
+    # keepdims then squeeze: (a, b, c) sum axis=1 keepdims → (a, 1, c) → squeeze axis=1 → (a, c) ✓
+    kept = jnp.sum(y, axis=1, keepdims=True)
+    unsqueezed = jnp.squeeze(kept, axis=1)

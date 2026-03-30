@@ -470,6 +470,48 @@ fn resolve_shape(node: Node<'_>, params: &HashMap<String, ShapeInfo>, text: &str
                         current_dims.insert(parsed_axis, "1".to_string());
                         return ShapeResult::Ok(current_dims);
                     }
+                    ("jnp", "squeeze") => {
+                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to get input shape"
+                            ));
+                        };
+                        let input_shape = match resolve_shape(input_node, params, text) {
+                            ShapeResult::Ok(items) => items,
+                            other => return other,
+                        };
+
+                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
+                            let result: Vec<String> =
+                                input_shape.into_iter().filter(|d| d != "1").collect();
+                            return ShapeResult::Ok(result);
+                        };
+
+                        let Some(parsed_axis) = parse_axis(axis_node, text) else {
+                            return ShapeResult::Error(format!(
+                                "Unexpected TS error: failed to parse axis string"
+                            ));
+                        };
+
+                        if parsed_axis >= input_shape.len() {
+                            return ShapeResult::Error(format!(
+                                "Axis {} is out of bounds for shape with {} dims",
+                                parsed_axis,
+                                input_shape.len()
+                            ));
+                        }
+
+                        if input_shape[parsed_axis] != "1" {
+                            return ShapeResult::Error(format!(
+                                "Cannot squeeze axis {} with dim '{}' — only dims of size 1 can be squeezed",
+                                parsed_axis, input_shape[parsed_axis]
+                            ));
+                        }
+
+                        let mut new_dims = input_shape.clone();
+                        new_dims.remove(parsed_axis);
+                        return ShapeResult::Ok(new_dims);
+                    }
                     _ => return ShapeResult::Unknown,
                 }
             } else {
@@ -654,4 +696,14 @@ fn get_arg<'a>(args_node: Node<'a>, position: usize, name: &str, text: &str) -> 
     }
 
     None
+}
+
+fn parse_axis(axis_node: Node<'_>, text: &str) -> Option<usize> {
+    let Ok(axis_str) = axis_node.utf8_text(text.as_bytes()) else {
+        return None;
+    };
+    let Ok(parsed_axis) = axis_str.parse::<usize>() else {
+        return None;
+    };
+    Some(parsed_axis)
 }
