@@ -27,9 +27,20 @@ pub struct ShapeInfo {
 
 pub struct Backend {
     pub client: Client,
-    pub shapes: RwLock<HashMap<String, HashMap<String, ShapeInfo>>>,
+    pub shapes: RwLock<HashMap<String, HashMap<String, ParamKind>>>,
     pub import_alias_map: RwLock<HashMap<String, String>>,
     pub document_text: RwLock<HashMap<String, String>>,
+}
+
+pub enum ParamKind {
+    Shape(ShapeInfo),
+    Layer(LayerInfo),
+}
+
+pub struct LayerInfo {
+    layer_type: String,
+    in_features: String,
+    out_features: String,
 }
 
 #[tower_lsp::async_trait]
@@ -86,7 +97,10 @@ impl LanguageServer for Backend {
         let shapes_lock = self.shapes.read().await;
 
         for (_, fn_shapes) in shapes_lock.iter() {
-            for (_name, info) in fn_shapes {
+            for (_name, param_kind) in fn_shapes {
+                let ParamKind::Shape(info) = param_kind else {
+                    continue;
+                };
                 if !info.is_inferred {
                     continue;
                 }
@@ -136,7 +150,7 @@ impl Backend {
         let mut typed_functions: Vec<Node<'_>> = Vec::new();
         find_node_by_kind(root, "function_definition", &mut typed_functions);
 
-        let mut shapes: HashMap<String, HashMap<String, ShapeInfo>> = HashMap::new();
+        let mut shapes: HashMap<String, HashMap<String, ParamKind>> = HashMap::new();
 
         // ITERATE OVER EVERY FUNCTION DEFINITION
         for function_node in typed_functions {
@@ -159,6 +173,22 @@ impl Backend {
                 let Some(right_child) = assignment_node.child_by_field_name("right") else {
                     continue;
                 };
+
+                if right_child.kind() == "call" {
+                    if let Some(layer_info) =
+                        try_parse_layer_constructor(right_child, &import_alias_map, text)
+                    {
+                        let Some(var_name) = assignment_node
+                            .child_by_field_name("left")
+                            .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                        else {
+                            continue;
+                        };
+
+                        params.insert(var_name.to_string(), ParamKind::Layer(layer_info));
+                        continue;
+                    }
+                }
 
                 let resolved_shape =
                     match resolve_shape(right_child, &params, &import_alias_map, text) {
@@ -195,12 +225,12 @@ impl Backend {
                 };
                 params.insert(
                     var_name.to_string(),
-                    ShapeInfo {
+                    ParamKind::Shape(ShapeInfo {
                         dims: resolved_shape,
                         line: assignment_node.end_position().row as u32,
                         character: assignment_node.end_position().column as u32,
                         is_inferred: true,
-                    },
+                    }),
                 );
             }
 
@@ -282,7 +312,7 @@ impl Backend {
         let Some(fn_shapes) = shapes_lock.get(fn_name) else {
             return Ok(None);
         };
-        let Some(param) = fn_shapes.get(name) else {
+        let Some(ParamKind::Shape(param)) = fn_shapes.get(name) else {
             return Ok(None);
         };
 
@@ -324,7 +354,7 @@ fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Option<No
 
 fn resolve_shape(
     node: Node<'_>,
-    params: &HashMap<String, ShapeInfo>,
+    params: &HashMap<String, ParamKind>,
     import_alias_map: &HashMap<String, String>,
     text: &str,
 ) -> ShapeResult {
@@ -333,8 +363,10 @@ fn resolve_shape(
             let param_name = node
                 .utf8_text(text.as_bytes())
                 .expect("Failed to get node identifier");
+
             match params.get(param_name) {
-                Some(info) => ShapeResult::Ok(info.dims.clone()),
+                Some(ParamKind::Shape(info)) => ShapeResult::Ok(info.dims.clone()),
+                Some(ParamKind::Layer(_)) => ShapeResult::Unknown,
                 None => ShapeResult::Unknown,
             }
         }
@@ -359,11 +391,19 @@ fn resolve_shape(
                 let Some(attr_name) = attr.utf8_text(text.as_bytes()).ok() else {
                     return ShapeResult::Unknown;
                 };
-                let resolved_object = import_alias_map
-                    .get(obj_name)
-                    .map(|s| s.as_str())
-                    .unwrap_or(obj_name);
-                match (resolved_object, attr_name) {
+                let resolved_object = if let Some((prefix, rest)) = obj_name.split_once('.') {
+                    match import_alias_map.get(prefix) {
+                        Some(resolved) => format!("{}.{}", resolved, rest),
+                        None => obj_name.to_string(),
+                    }
+                } else {
+                    import_alias_map
+                        .get(obj_name)
+                        .cloned()
+                        .unwrap_or(obj_name.to_string())
+                };
+
+                match (resolved_object.as_str(), attr_name) {
                     ("jax.numpy", "transpose") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
@@ -535,6 +575,43 @@ fn resolve_shape(
                     }
                     _ => return ShapeResult::Unknown,
                 }
+            } else if func_node.kind() == "identifier" {
+                let Ok(func_name) = func_node.utf8_text(text.as_bytes()) else {
+                    return ShapeResult::Unknown;
+                };
+
+                match params.get(func_name) {
+                    Some(ParamKind::Layer(layer)) => {
+                        let Some(input_node) = args_node.named_child(0) else {
+                            return ShapeResult::Unknown;
+                        };
+
+                        let input_shape =
+                            match resolve_shape(input_node, params, import_alias_map, text) {
+                                ShapeResult::Ok(items) => items,
+                                other => return other,
+                            };
+
+                        match layer.layer_type.as_str() {
+                            "Linear" => {
+                                if input_shape.last().map(|s| s.as_str())
+                                    != Some(&layer.in_features)
+                                {
+                                    return ShapeResult::Error(format!(
+                                        "Linear layer expects last dim '{}', got '{}'",
+                                        layer.in_features,
+                                        input_shape.last().unwrap_or(&"?".to_string())
+                                    ));
+                                }
+                                let mut result = input_shape.clone();
+                                *result.last_mut().unwrap() = layer.out_features.clone();
+                                ShapeResult::Ok(result)
+                            }
+                            _ => return ShapeResult::Unknown,
+                        }
+                    }
+                    _ => return ShapeResult::Unknown,
+                }
             } else {
                 return ShapeResult::Unknown;
             }
@@ -651,7 +728,7 @@ fn handle_elementwise_ops(left_shape: Vec<String>, right_shape: Vec<String>) -> 
 
 fn get_shapes_from_fn_args(
     function_node: Node<'_>,
-    params: &mut HashMap<String, ShapeInfo>,
+    params: &mut HashMap<String, ParamKind>,
     text: &str,
 ) {
     let mut typed_params: Vec<Node<'_>> = Vec::new();
@@ -692,7 +769,7 @@ fn get_shapes_from_fn_args(
             character: 0,
             is_inferred: false,
         };
-        params.insert(param_name.to_string(), shape_info);
+        params.insert(param_name.to_string(), ParamKind::Shape(shape_info));
     }
 }
 
@@ -802,4 +879,64 @@ fn build_import_map(root: Node, text: &str) -> HashMap<String, String> {
     }
 
     map
+}
+
+fn try_parse_layer_constructor(
+    node: Node<'_>,
+    import_alias_map: &HashMap<String, String>,
+    text: &str,
+) -> Option<LayerInfo> {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return None;
+    };
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return None;
+    };
+
+    let Some(obj) = func_node.child_by_field_name("object") else {
+        return None;
+    };
+    let Some(attr) = func_node.child_by_field_name("attribute") else {
+        return None;
+    };
+    let Some(obj_name) = obj.utf8_text(text.as_bytes()).ok() else {
+        return None;
+    };
+    let Some(attr_name) = attr.utf8_text(text.as_bytes()).ok() else {
+        return None;
+    };
+    let resolved_object = if let Some((prefix, rest)) = obj_name.split_once('.') {
+        match import_alias_map.get(prefix) {
+            Some(resolved) => format!("{}.{}", resolved, rest),
+            None => obj_name.to_string(),
+        }
+    } else {
+        import_alias_map
+            .get(obj_name)
+            .cloned()
+            .unwrap_or(obj_name.to_string())
+    };
+
+    match (resolved_object.as_str(), attr_name) {
+        ("equinox.nn", "Linear") => {
+            let Some(in_node) = get_arg(args_node, 0, "in_features", text) else {
+                return None;
+            };
+            let Some(out_node) = get_arg(args_node, 1, "out_features", text) else {
+                return None;
+            };
+            let Ok(in_features) = in_node.utf8_text(text.as_bytes()) else {
+                return None;
+            };
+            let Ok(out_features) = out_node.utf8_text(text.as_bytes()) else {
+                return None;
+            };
+            Some(LayerInfo {
+                layer_type: "Linear".to_string(),
+                in_features: in_features.to_string(),
+                out_features: out_features.to_string(),
+            })
+        }
+        _ => None,
+    }
 }

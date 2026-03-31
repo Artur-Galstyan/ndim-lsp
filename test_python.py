@@ -1,6 +1,8 @@
 from jaxtyping import Array, Float
 import jax.numpy as jnp
-
+import equinox as eqx
+import jax.numpy as jnp
+import jax
 
 """
 # valid matmul: b matches b
@@ -158,3 +160,19 @@ def squeeze_tests(
     # keepdims then squeeze: (a, b, c) sum axis=1 keepdims → (a, 1, c) → squeeze axis=1 → (a, c) ✓
     kept = jnp.sum(y, axis=1, keepdims=True)
     unsqueezed = jnp.squeeze(kept, axis=1)
+
+
+
+
+
+def linear_tests(
+    x: Float[Array, "batch in_dim"],
+    y: Float[Array, "batch other_dim"],
+    key: Float[Array, "2"],
+):
+    # Linear: replaces last dim in_dim → out_dim
+    linear = eqx.nn.Linear(in_features=in_dim, out_features=out_dim, key=key)
+    # (batch, in_dim) → (batch, out_dim) ✓
+    z = linear(x)
+    # (batch, other_dim) → last dim is other_dim, not in_dim ✗ squiggle
+    bad = linear(y)
