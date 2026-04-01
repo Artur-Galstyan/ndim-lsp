@@ -176,3 +176,24 @@ def linear_tests(
     z = linear(x)
     # (batch, other_dim) → last dim is other_dim, not in_dim ✗ squiggle
     bad = linear(y)
+
+
+
+def concat_tests(
+    x: Float[Array, "a b"],
+    y: Float[Array, "a c"],
+    z: Float[Array, "a b"],
+    w: Float[Array, "d b"],
+):
+    # (a, b) and (a, c) along axis=1 → (a, b+c) ✓
+    c1 = jnp.concatenate([x, y], axis=1)
+    # (a, b) and (a, b) along axis=1 → (a, b+b) ✓
+    c2 = jnp.concatenate([x, z], axis=1)
+    # (a, b) and (a, b) along axis=0 → (a+a, b) ✓
+    c3 = jnp.concatenate([x, z], axis=0)
+    # three arrays: (a, b), (a, c), (a, b) along axis=1 → (a, b+c+b) ✓
+    c4 = jnp.concatenate([x, y, z], axis=1)
+    # dim mismatch: (a, b) and (d, b) along axis=1 → a != d ✗ squiggle
+    bad = jnp.concatenate([x, w], axis=1)
+    # axis out of bounds: (a, b) axis=5 ✗ squiggle
+    oob = jnp.concatenate([x, y], axis=5)

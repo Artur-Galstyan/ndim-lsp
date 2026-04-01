@@ -404,6 +404,78 @@ fn resolve_shape(
                 };
 
                 match (resolved_object.as_str(), attr_name) {
+                    ("jax.numpy", "concatenate") => {
+                        let Some(list_node) = get_arg(args_node, 0, "arrays", text) else {
+                            return ShapeResult::Unknown;
+                        };
+
+                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
+                            return ShapeResult::Unknown;
+                        };
+
+                        let Ok(axis_text) = axis_node.utf8_text(text.as_bytes()) else {
+                            return ShapeResult::Unknown;
+                        };
+
+                        let Some(parsed_axis) = parse_axis(axis_node, text) else {
+                            return ShapeResult::Unknown;
+                        };
+
+                        let mut cursor = list_node.walk();
+                        let mut all_shapes: Vec<Vec<String>> = Vec::new();
+
+                        for child in list_node.named_children(&mut cursor) {
+                            match resolve_shape(child, params, import_alias_map, text) {
+                                ShapeResult::Ok(dims) => all_shapes.push(dims),
+                                other => return other,
+                            }
+                        }
+
+                        if all_shapes.is_empty() {
+                            return ShapeResult::Unknown;
+                        }
+
+                        let ndim = all_shapes[0].len();
+                        for shape in &all_shapes {
+                            if shape.len() != ndim {
+                                return ShapeResult::Error(format!(
+                                    "All inputs to concatenate must have the same number of dims"
+                                ));
+                            }
+                        }
+
+                        if parsed_axis >= ndim {
+                            return ShapeResult::Error(format!(
+                                "Axis {} is out of bounds for shape with {} dims",
+                                parsed_axis, ndim
+                            ));
+                        }
+
+                        for dim_idx in 0..ndim {
+                            if dim_idx == parsed_axis {
+                                continue;
+                            }
+                            let first_dim = &all_shapes[0][dim_idx];
+                            for shape in &all_shapes[1..] {
+                                if &shape[dim_idx] != first_dim {
+                                    return ShapeResult::Error(format!(
+                                        "Dim mismatch at axis {}: '{}' vs '{}'",
+                                        dim_idx, first_dim, shape[dim_idx]
+                                    ));
+                                }
+                            }
+                        }
+
+                        let mut result = all_shapes[0].clone();
+                        let concat_dim = all_shapes
+                            .iter()
+                            .map(|s| s[parsed_axis].clone())
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        result[parsed_axis] = concat_dim;
+                        ShapeResult::Ok(result)
+                    }
+
                     ("jax.numpy", "transpose") => {
                         let Some(input_node) = get_arg(args_node, 0, "a", text) else {
                             return ShapeResult::Unknown;
