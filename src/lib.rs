@@ -1,5 +1,5 @@
 use crate::analyzer::analyze_document;
-use crate::shape_resolver::ParamKind;
+use crate::shape_resolvers::shape_resolver::ParamKind;
 use std::collections::HashMap;
 use std::usize;
 use tokio::sync::RwLock;
@@ -20,7 +20,7 @@ mod assignments;
 mod binary_operators;
 mod helpers;
 mod imports;
-mod shape_resolver;
+mod shape_resolvers;
 
 pub struct Backend {
     pub client: Client,

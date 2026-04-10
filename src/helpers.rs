@@ -1,6 +1,6 @@
-use crate::shape_resolver::LayerInfo;
-use crate::shape_resolver::ShapeInfo;
-use crate::shape_resolver::ShapeResult;
+use crate::shape_resolvers::shape_resolver::LayerInfo;
+use crate::shape_resolvers::shape_resolver::ShapeInfo;
+use crate::shape_resolvers::shape_resolver::ShapeResult;
 use std::collections::HashMap;
 
 use tree_sitter::Node;

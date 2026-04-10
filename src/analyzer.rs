@@ -1,9 +1,10 @@
 // analyzer.rs
 use crate::{
     assignments::get_assignments,
+    binary_operators::get_binary_operators,
     helpers::{self, get_functions},
     imports::get_imports,
-    shape_resolver::{ParamKind, ShapeInfo, ShapeResult, resolve_shape},
+    shape_resolvers::shape_resolver::{ParamKind, ShapeInfo, ShapeResult, resolve_shape},
 };
 use std::collections::HashMap;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -112,8 +113,9 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
             );
         }
 
-        let mut binary_operator_nodes: Vec<Node<'_>> = Vec::new();
-        helpers::find_node_by_kind(function_node, "binary_operator", &mut binary_operator_nodes);
+        let binary_operator_nodes: Vec<Node<'_>> = get_binary_operators(function_node, text)
+            .map_err(|e| e.to_string())
+            .ok()?;
 
         for binary_operator_node in binary_operator_nodes {
             match resolve_shape(binary_operator_node, &params, &imports, text) {
