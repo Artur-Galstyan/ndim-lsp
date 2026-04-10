@@ -16,6 +16,7 @@ use tree_sitter::Parser;
 
 mod analyzer;
 
+mod assignments;
 mod helpers;
 mod imports;
 mod shape_resolver;
