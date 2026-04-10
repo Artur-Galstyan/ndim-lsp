@@ -1,5 +1,6 @@
 // analyzer.rs
 use crate::{
+    assignments::get_assignments,
     helpers::{self, get_functions},
     imports::get_imports,
     shape_resolver::{ParamKind, ShapeInfo, ShapeResult, resolve_shape},
@@ -43,8 +44,9 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
         // Fill the shapes from the fn args into params dict
         helpers::get_shapes_from_fn_args(function_node, &mut params, text);
 
-        let mut assignment_nodes: Vec<Node<'_>> = Vec::new();
-        helpers::find_node_by_kind(function_node, "assignment", &mut assignment_nodes);
+        let assignment_nodes = get_assignments(function_node, text)
+            .map_err(|e| e.to_string())
+            .ok()?;
 
         for assignment_node in assignment_nodes {
             let Some(right_child) = assignment_node.child_by_field_name("right") else {

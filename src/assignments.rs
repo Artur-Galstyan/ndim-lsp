@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 pub fn get_assignments<'a>(node: Node<'a>, text: &str) -> Result<Vec<Node<'a>>, String> {
@@ -64,7 +62,6 @@ def my_func():
 
     #[test]
     fn test_multiple_target_assignment() {
-        // Python allows `a = b = 5` and `x, y = 1, 2`
         let code = r#"
     def multiple():
         a = b = 5
@@ -81,8 +78,6 @@ def my_func():
 
     #[test]
     fn test_annotated_assignment() {
-        // In python, `x: int = 5` is an `annotated_assignment`, NOT a regular `assignment`.
-        // A robust language server should catch these too!
         let code = r#"
     def annotated():
         x: int = 5
@@ -97,7 +92,6 @@ def my_func():
 
     #[test]
     fn test_augmented_assignment() {
-        // `x += 5` is an `augmented_assignment` in tree-sitter.
         let code = r#"
     def augmented():
         x = 5
@@ -107,8 +101,6 @@ def my_func():
 
         let assignments = get_assignments(tree.root_node(), code).unwrap();
 
-        // Whether you want to track augmented assignments is up to your LSP's logic,
-        // but typically you do if it alters the shape/type of `x`.
         assert_eq!(
             assignments.len(),
             2,
