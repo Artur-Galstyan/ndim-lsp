@@ -4,7 +4,9 @@ use tree_sitter::Node;
 
 use crate::{
     helpers::{get_arg, handle_elementwise_ops, parse_axis},
-    shape_resolvers::jax::{jax_numpy_concatenate, jax_numpy_reduce, jax_numpy_transpose},
+    shape_resolvers::jax::{
+        jax_expand_dims, jax_numpy_concatenate, jax_numpy_reduce, jax_numpy_transpose, jax_squeeze,
+    },
 };
 
 pub enum ParamKind {
@@ -100,88 +102,10 @@ pub fn resolve_shape(
                         jax_numpy_reduce(args_node, params, import_alias_map, text)
                     }
                     ("jax.numpy", "expand_dims") => {
-                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to get input shape"
-                            ));
-                        };
-                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to get axis"
-                            ));
-                        };
-
-                        let shape = match resolve_shape(input_node, params, import_alias_map, text)
-                        {
-                            ShapeResult::Ok(items) => items,
-                            other => return other,
-                        };
-
-                        let Ok(axis_str) = axis_node.utf8_text(text.as_bytes()) else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to get axis string"
-                            ));
-                        };
-
-                        let Ok(parsed_axis) = axis_str.parse::<usize>() else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to parse axis string"
-                            ));
-                        };
-
-                        let mut current_dims = shape.clone();
-                        if parsed_axis > shape.len() {
-                            return ShapeResult::Error(format!(
-                                "Axis {} is out of bounds for expand_dims on shape with {} dims",
-                                parsed_axis,
-                                shape.len()
-                            ));
-                        }
-                        current_dims.insert(parsed_axis, "1".to_string());
-                        return ShapeResult::Ok(current_dims);
+                        jax_expand_dims(args_node, params, import_alias_map, text)
                     }
                     ("jax.numpy", "squeeze") => {
-                        let Some(input_node) = get_arg(args_node, 0, "a", text) else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to get input shape"
-                            ));
-                        };
-                        let input_shape =
-                            match resolve_shape(input_node, params, import_alias_map, text) {
-                                ShapeResult::Ok(items) => items,
-                                other => return other,
-                            };
-
-                        let Some(axis_node) = get_arg(args_node, 1, "axis", text) else {
-                            let result: Vec<String> =
-                                input_shape.into_iter().filter(|d| d != "1").collect();
-                            return ShapeResult::Ok(result);
-                        };
-
-                        let Some(parsed_axis) = parse_axis(axis_node, text) else {
-                            return ShapeResult::Error(format!(
-                                "Unexpected TS error: failed to parse axis string"
-                            ));
-                        };
-
-                        if parsed_axis >= input_shape.len() {
-                            return ShapeResult::Error(format!(
-                                "Axis {} is out of bounds for shape with {} dims",
-                                parsed_axis,
-                                input_shape.len()
-                            ));
-                        }
-
-                        if input_shape[parsed_axis] != "1" {
-                            return ShapeResult::Error(format!(
-                                "Cannot squeeze axis {} with dim '{}' — only dims of size 1 can be squeezed",
-                                parsed_axis, input_shape[parsed_axis]
-                            ));
-                        }
-
-                        let mut new_dims = input_shape.clone();
-                        new_dims.remove(parsed_axis);
-                        return ShapeResult::Ok(new_dims);
+                        jax_squeeze(args_node, params, import_alias_map, text)
                     }
                     _ => return ShapeResult::Unknown,
                 }
