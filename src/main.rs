@@ -11,6 +11,8 @@ async fn main() {
         shapes: Default::default(),
         document_text: Default::default(),
         import_alias_map: Default::default(),
+        site_packages_path: Default::default(),
+        global_state: Default::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;

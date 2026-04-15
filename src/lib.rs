@@ -1,6 +1,9 @@
 use crate::analyzer::analyze_document;
 use crate::shape_resolvers::shape_resolver::ParamKind;
+use core::str;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
 use std::usize;
 use tokio::sync::RwLock;
 
@@ -9,10 +12,11 @@ use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
     InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    ServerCapabilities, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Url,
 };
 use tower_lsp::{Client, LanguageServer};
-use tree_sitter::Parser;
+use tree_sitter::{Parser, Tree};
 
 mod analyzer;
 
@@ -29,6 +33,15 @@ pub struct Backend {
     pub shapes: RwLock<HashMap<String, HashMap<String, ParamKind>>>,
     pub import_alias_map: RwLock<HashMap<String, String>>,
     pub document_text: RwLock<HashMap<Url, String>>,
+    pub site_packages_path: RwLock<String>,
+    pub global_state: GlobalState,
+}
+
+#[derive(Default)]
+pub struct GlobalState {
+    trees: HashMap<Url, Tree>,
+    module_resolution: HashMap<String, Url>,
+    signatures: HashMap<Url, HashMap<String, SignatureInformation>>,
 }
 
 #[tower_lsp::async_trait]
@@ -55,6 +68,37 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "File opened")
             .await;
+
+        let mut py_path = PathBuf::from(".venv/bin/python");
+
+        if !py_path.exists() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "No virtual env found, using system python",
+                )
+                .await;
+            py_path = PathBuf::from("python3");
+        }
+
+        let site_packages_res = Command::new(&py_path)
+            .args(["-c", "import site; print(site.getsitepackages())"])
+            .output()
+            .ok();
+
+        if let Some(output) = site_packages_res {
+            if let Ok(site_packages) = std::str::from_utf8(&output.stdout) {
+                let trimmed = site_packages.trim().to_string();
+                {
+                    let mut site_packages_lock = self.site_packages_path.write().await;
+                    *site_packages_lock = trimmed.clone();
+                }
+
+                self.client
+                    .log_message(MessageType::INFO, self.site_packages_path.read().await)
+                    .await;
+            }
+        }
 
         self.on_change(&params.text_document.uri, &params.text_document.text)
             .await

@@ -177,7 +177,6 @@ def linear_tests(
     # (batch, in_dim) → (batch, out_dim) ✓
     z = linear(x)
     # (batch, other_dim) → last dim is other_dim, not in_dim ✗ squiggle
-
     bad = linear(y)
 
 
