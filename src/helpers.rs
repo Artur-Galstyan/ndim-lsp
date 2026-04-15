@@ -1,4 +1,3 @@
-use crate::shape_resolvers::shape_resolver::LayerInfo;
 use crate::shape_resolvers::shape_resolver::ShapeInfo;
 use crate::shape_resolvers::shape_resolver::ShapeResult;
 use std::collections::HashMap;
@@ -80,66 +79,6 @@ pub fn get_shapes_from_fn_args(
             is_inferred: false,
         };
         params.insert(param_name.to_string(), ParamKind::Shape(shape_info));
-    }
-}
-
-pub fn try_parse_layer_constructor(
-    node: Node<'_>,
-    import_alias_map: &HashMap<String, String>,
-    text: &str,
-) -> Option<LayerInfo> {
-    let Some(func_node) = node.child_by_field_name("function") else {
-        return None;
-    };
-    let Some(args_node) = node.child_by_field_name("arguments") else {
-        return None;
-    };
-
-    let Some(obj) = func_node.child_by_field_name("object") else {
-        return None;
-    };
-    let Some(attr) = func_node.child_by_field_name("attribute") else {
-        return None;
-    };
-    let Some(obj_name) = obj.utf8_text(text.as_bytes()).ok() else {
-        return None;
-    };
-    let Some(attr_name) = attr.utf8_text(text.as_bytes()).ok() else {
-        return None;
-    };
-    let resolved_object = if let Some((prefix, rest)) = obj_name.split_once('.') {
-        match import_alias_map.get(prefix) {
-            Some(resolved) => format!("{}.{}", resolved, rest),
-            None => obj_name.to_string(),
-        }
-    } else {
-        import_alias_map
-            .get(obj_name)
-            .cloned()
-            .unwrap_or_else(|| obj_name.to_string())
-    };
-
-    match (resolved_object.as_str(), attr_name) {
-        ("equinox.nn", "Linear") => {
-            let Some(in_node) = get_arg(args_node, 0, "in_features", text) else {
-                return None;
-            };
-            let Some(out_node) = get_arg(args_node, 1, "out_features", text) else {
-                return None;
-            };
-            let Ok(in_features) = in_node.utf8_text(text.as_bytes()) else {
-                return None;
-            };
-            let Ok(out_features) = out_node.utf8_text(text.as_bytes()) else {
-                return None;
-            };
-            Some(LayerInfo {
-                layer_type: "Linear".to_string(),
-                in_features: in_features.to_string(),
-                out_features: out_features.to_string(),
-            })
-        }
-        _ => None,
     }
 }
 

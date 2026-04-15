@@ -4,6 +4,7 @@ use crate::{
     binary_operators::get_binary_operators,
     helpers::{self, get_functions},
     imports::get_imports,
+    layers::layers::try_parse_layer_constructor,
     shape_resolvers::shape_resolver::{ParamKind, ShapeInfo, ShapeResult, resolve_shape},
 };
 use std::collections::HashMap;
@@ -55,9 +56,7 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
             };
 
             if right_child.kind() == "call" {
-                if let Some(layer_info) =
-                    helpers::try_parse_layer_constructor(right_child, &imports, text)
-                {
+                if let Some(layer_info) = try_parse_layer_constructor(right_child, &imports, text) {
                     let Some(var_name) = assignment_node
                         .child_by_field_name("left")
                         .and_then(|n| n.utf8_text(text.as_bytes()).ok())

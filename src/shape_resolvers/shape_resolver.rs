@@ -4,6 +4,7 @@ use tree_sitter::Node;
 
 use crate::{
     helpers::{get_arg, handle_elementwise_ops, parse_axis},
+    layers::layers::{Framework, LayerInfo, LayerType},
     shape_resolvers::jax::{
         jax_expand_dims, jax_numpy_concatenate, jax_numpy_reduce, jax_numpy_transpose, jax_squeeze,
     },
@@ -18,12 +19,6 @@ pub enum ShapeResult {
     Ok(Vec<String>),
     Error(String),
     Unknown,
-}
-
-pub struct LayerInfo {
-    pub layer_type: String,
-    pub in_features: String,
-    pub out_features: String,
 }
 
 pub struct ShapeInfo {
@@ -115,19 +110,20 @@ pub fn resolve_shape(
                 };
 
                 match params.get(func_name) {
-                    Some(ParamKind::Layer(layer)) => {
-                        let Some(input_node) = args_node.named_child(0) else {
-                            return ShapeResult::Unknown;
-                        };
+                    Some(ParamKind::Layer(layer)) => match layer.layer_type {
+                        LayerType::Linear => match layer.framework {
+                            Framework::Equinox => {
+                                let Some(input_node) = get_arg(args_node, 0, "x", text) else {
+                                    return ShapeResult::Unknown;
+                                };
 
-                        let input_shape =
-                            match resolve_shape(input_node, params, import_alias_map, text) {
-                                ShapeResult::Ok(items) => items,
-                                other => return other,
-                            };
+                                let input_shape =
+                                    match resolve_shape(input_node, params, import_alias_map, text)
+                                    {
+                                        ShapeResult::Ok(items) => items,
+                                        other => return other,
+                                    };
 
-                        match layer.layer_type.as_str() {
-                            "Linear" => {
                                 if input_shape.last().map(|s| s.as_str())
                                     != Some(&layer.in_features)
                                 {
@@ -141,9 +137,11 @@ pub fn resolve_shape(
                                 *result.last_mut().unwrap() = layer.out_features.clone();
                                 ShapeResult::Ok(result)
                             }
-                            _ => return ShapeResult::Unknown,
-                        }
-                    }
+                            Framework::Flax => return ShapeResult::Unknown,
+                            Framework::PyTorch => return ShapeResult::Unknown,
+                        },
+                        _ => return ShapeResult::Unknown,
+                    },
                     _ => return ShapeResult::Unknown,
                 }
             } else {

@@ -1,8 +1,8 @@
-from jaxtyping import Array, Float
-import jax.numpy as jnp
 import equinox as eqx
-import jax.numpy as jnp
 import jax
+import jax.numpy as jnp
+from equinox.nn import Linear
+from jaxtyping import Array, Float
 
 """
 # valid matmul: b matches b
@@ -45,9 +45,11 @@ def sequential(x: Float[Array, "a b"], y: Float[Array, "b c"], v: Float[Array, "
     z = x @ y
     w = z @ v
     return w
- 
+
 
 """
+
+
 def chaos(
     a: Float[Array, "i j"],
     b: Float[Array, "j k"],
@@ -85,13 +87,14 @@ def elementwise(x: Float[Array, "a b"], y: Float[Array, "a b"], z: Float[Array, 
     # (a, b) * (a, b) = (a, b) ✓ then (a, b) + (c, d) ✗ squiggle
     mixed = (x * y) + z
 
+
 def parens_and_transpose(
     x: Float[Array, "a b"],
     y: Float[Array, "b c"],
     w: Float[Array, "c a"],
 ):
     # parens: (a,b) @ (b,c) = (a,c) ✓
-    p = (x @ y)
+    p = x @ y
     # transpose: w is (c,a), w.T is (a,c) ✓
     wt = w.T
     # parens + matmul: (a,c) @ (c,a) = (a,a) ✓
@@ -104,6 +107,7 @@ def parens_and_transpose(
     bad_t = x @ y.T
     # invalid parens: (a,b) @ (b,c) = (a,c), (a,c) + (a,b) → c != b ✗ squiggle
     bad_parens = (x @ y) + x
+
 
 def transpose_tests(
     x: Float[Array, "a b"],
@@ -120,6 +124,7 @@ def transpose_tests(
 
 
 from jaxtyping import Array, Float
+
 
 def sum_tests(
     x: Float[Array, "a b"],
@@ -162,9 +167,6 @@ def squeeze_tests(
     unsqueezed = jnp.squeeze(kept, axis=1)
 
 
-
-
-
 def linear_tests(
     x: Float[Array, "batch in_dim"],
     y: Float[Array, "batch other_dim"],
@@ -175,8 +177,8 @@ def linear_tests(
     # (batch, in_dim) → (batch, out_dim) ✓
     z = linear(x)
     # (batch, other_dim) → last dim is other_dim, not in_dim ✗ squiggle
-    bad = linear(y)
 
+    bad = linear(y)
 
 
 def concat_tests(
