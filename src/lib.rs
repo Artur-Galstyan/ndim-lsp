@@ -26,6 +26,7 @@ mod calls;
 mod helpers;
 mod imports;
 mod layers;
+mod module_resolver;
 mod shape_resolvers;
 
 pub struct Backend {
