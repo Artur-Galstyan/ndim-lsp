@@ -72,9 +72,7 @@ pub fn get_imports<'a>(node: Node<'a>, text: &str) -> Result<HashMap<String, Str
             }
         }
 
-        let key = alias
-            .or(name.clone())
-            .ok_or("Import name is missing".to_string())?;
+        let key = alias.or(name).ok_or("Import name is missing".to_string())?;
         let n = name.ok_or("Import name is missing")?;
         let value = match module {
             Some(m) => format!("{}.{}", m, n),

@@ -23,9 +23,7 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
     parser
         .set_language(&language.into())
         .expect("Failed to set language");
-    let Some(tree) = parser.parse(text, None) else {
-        return None;
-    };
+    let tree = parser.parse(text, None)?;
     let root = tree.root_node();
 
     let mut shapes: HashMap<String, HashMap<String, ParamKind>> = HashMap::new();
@@ -38,7 +36,7 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
             continue;
         };
 
-        let Ok(function_name) = function_node_name.utf8_text(&text.as_bytes()) else {
+        let Ok(function_name) = function_node_name.utf8_text(text.as_bytes()) else {
             continue;
         };
 
@@ -55,18 +53,18 @@ pub fn analyze_document(text: &str) -> Option<AnalysisResult> {
                 continue;
             };
 
-            if right_child.kind() == "call" {
-                if let Some(layer_info) = try_parse_layer_constructor(right_child, &imports, text) {
-                    let Some(var_name) = assignment_node
-                        .child_by_field_name("left")
-                        .and_then(|n| n.utf8_text(text.as_bytes()).ok())
-                    else {
-                        continue;
-                    };
-
-                    params.insert(var_name.to_string(), ParamKind::Layer(layer_info));
+            if right_child.kind() == "call"
+                && let Some(layer_info) = try_parse_layer_constructor(right_child, &imports, text)
+            {
+                let Some(var_name) = assignment_node
+                    .child_by_field_name("left")
+                    .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                else {
                     continue;
-                }
+                };
+
+                params.insert(var_name.to_string(), ParamKind::Layer(layer_info));
+                continue;
             }
 
             let resolved_shape = match resolve_shape(right_child, &params, &imports, text) {

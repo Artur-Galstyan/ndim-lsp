@@ -32,7 +32,7 @@ pub fn get_first_matching_parent<'a>(node: Node<'a>, target_type: &str) -> Optio
         }
     }
 
-    return None;
+    None
 }
 
 pub fn get_shapes_from_fn_args(
@@ -65,7 +65,7 @@ pub fn get_shapes_from_fn_args(
             .expect("Expected to find at least one string_content");
 
         let string_content = string_content_node
-            .utf8_text(&text.as_bytes())
+            .utf8_text(text.as_bytes())
             .expect("Failed to get string_content");
 
         let dims: Vec<String> = string_content
@@ -98,12 +98,10 @@ pub fn get_arg<'a>(
             if kw_name == name {
                 return child.child_by_field_name("value");
             }
+        } else if positional_index == position {
+            return Some(child);
         } else {
-            if positional_index == position {
-                return Some(child);
-            } else {
-                positional_index += 1;
-            }
+            positional_index += 1;
         }
     }
 
@@ -127,7 +125,7 @@ pub fn handle_elementwise_ops(left_shape: Vec<String>, right_shape: Vec<String>)
         }
     }
 
-    return ShapeResult::Ok(left_shape.clone());
+    ShapeResult::Ok(left_shape.clone())
 }
 
 pub fn parse_axis(axis_node: Node<'_>, text: &str) -> Option<usize> {

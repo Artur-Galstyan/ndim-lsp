@@ -4,7 +4,6 @@ use core::str;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::usize;
 use tokio::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
@@ -87,18 +86,18 @@ impl LanguageServer for Backend {
             .output()
             .ok();
 
-        if let Some(output) = site_packages_res {
-            if let Ok(site_packages) = std::str::from_utf8(&output.stdout) {
-                let trimmed = site_packages.trim().to_string();
-                {
-                    let mut site_packages_lock = self.site_packages_path.write().await;
-                    *site_packages_lock = trimmed.clone();
-                }
-
-                self.client
-                    .log_message(MessageType::INFO, self.site_packages_path.read().await)
-                    .await;
+        if let Some(output) = site_packages_res
+            && let Ok(site_packages) = std::str::from_utf8(&output.stdout)
+        {
+            let trimmed = site_packages.trim().to_string();
+            {
+                let mut site_packages_lock = self.site_packages_path.write().await;
+                *site_packages_lock = trimmed.clone();
             }
+
+            self.client
+                .log_message(MessageType::INFO, self.site_packages_path.read().await)
+                .await;
         }
 
         self.on_change(&params.text_document.uri, &params.text_document.text)
@@ -130,7 +129,7 @@ impl LanguageServer for Backend {
         let shapes_lock = self.shapes.read().await;
 
         for (_, fn_shapes) in shapes_lock.iter() {
-            for (_name, param_kind) in fn_shapes {
+            for param_kind in fn_shapes.values() {
                 let ParamKind::Shape(info) = param_kind else {
                     continue;
                 };
@@ -208,7 +207,7 @@ impl Backend {
 
         let mut function_name = None;
         if let Some(name_node) = parent.child_by_field_name("name") {
-            function_name = name_node.utf8_text(&text.as_bytes()).ok();
+            function_name = name_node.utf8_text(text.as_bytes()).ok();
         }
 
         let shapes_lock = self.shapes.read().await;
