@@ -1,6 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
-use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Node, Parser, Query, QueryCursor, Range, StreamingIterator};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ReExport {
@@ -138,6 +142,113 @@ pub fn resolve_module(dotted_path: &str, roots: &[PathBuf]) -> Option<(PathBuf, 
     }
 
     None
+}
+
+pub fn find_definition<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a>> {
+    let query = r#"
+        (module (class_definition name: (identifier) @def_name) @def_node)
+        (module (function_definition name: (identifier) @def_name) @def_node)
+        (module (expression_statement (assignment left: (identifier) @def_name) @def_node))
+    "#;
+
+    let language = tree_sitter_python::LANGUAGE.into();
+    let mut definition: Option<Node<'a>> = None;
+    let query = Query::new(&language, query).unwrap();
+    let mut cursor = QueryCursor::new();
+
+    let def_idx = query.capture_index_for_name("def_name")?;
+    let def_node_idx = query.capture_index_for_name("def_node")?;
+
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    while let Some(match_) = matches.next() {
+        let mut name_match = false;
+        let mut def_node: Option<Node<'a>> = None;
+
+        for capture in match_.captures {
+            if capture.index == def_idx {
+                let text_val = capture.node.utf8_text(text.as_bytes()).ok()?;
+                if text_val == name {
+                    name_match = true;
+                }
+            } else if capture.index == def_node_idx {
+                def_node = Some(capture.node);
+            }
+        }
+
+        if name_match {
+            return def_node;
+        }
+    }
+
+    None
+}
+
+fn reexport_to_absolute_path(
+    current_file: &Path,
+    package_roots: &[PathBuf],
+    reexport: &ReExport,
+) -> Option<String> {
+    match reexport {
+        ReExport::Absolute { path, name } => {
+            return Some(format!("{}.{}", path, name));
+        }
+        ReExport::Relative { dots, path, name } => {
+            for package in package_roots {
+                if let Ok(rel) = current_file.strip_prefix(package) {
+                    let parent = rel.parent()?.to_string_lossy().into_owned();
+                    let mut to_dotted = parent.replace('/', ".");
+                    let mut dot_counter = *dots;
+                    while dot_counter > 1 {
+                        let mut parts = to_dotted.split('.').collect::<Vec<_>>();
+                        parts.pop();
+                        to_dotted = parts.join(".");
+                        dot_counter -= 1;
+                    }
+                    let mut result = to_dotted;
+                    if let Some(p) = path {
+                        result = format!("{}.{}", result, p);
+                    }
+                    return Some(format!("{}.{}", result, name));
+                }
+            }
+        }
+    };
+    None
+}
+
+pub fn resolve_definition(
+    dotted_path: &str,
+    roots: &[PathBuf],
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+) -> Option<(PathBuf, Range)> {
+    if depth == 0 {
+        return None;
+    }
+    let (file_path, leftover_args) = resolve_module(dotted_path, roots)?;
+
+    if visited.contains(&file_path) {
+        return None;
+    }
+    visited.insert(file_path.clone());
+    let last_arg = leftover_args.last()?;
+    let mut parser = Parser::new();
+    let language = tree_sitter_python::LANGUAGE;
+    parser.set_language(&language.into()).unwrap();
+
+    let file_content = fs::read_to_string(&file_path).ok()?;
+    let tree = parser.parse(&file_content, None)?;
+
+    let def_found = find_definition(tree.root_node(), last_arg, &file_content);
+
+    match def_found {
+        Some(def) => Some((file_path, def.range())),
+        None => {
+            let import = import_finder(tree.root_node(), last_arg, &file_content)?;
+            let abs_path = reexport_to_absolute_path(&file_path, roots, &import)?;
+            resolve_definition(&abs_path, roots, visited, depth - 1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +651,486 @@ from .activations import ReLU
                 name: "ReLU".to_string(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod find_definition_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn get_ast(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    #[test]
+    fn test_finds_top_level_class() {
+        let code = "class Linear:\n    pass";
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "Linear", code);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind(), "class_definition");
+    }
+
+    #[test]
+    fn test_finds_top_level_function() {
+        let code = "def my_func():\n    pass";
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "my_func", code);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind(), "function_definition");
+    }
+
+    #[test]
+    fn test_finds_top_level_assignment() {
+        let code = "Linear = _Linear";
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "Linear", code);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind(), "assignment");
+    }
+
+    #[test]
+    fn test_returns_none_when_not_defined() {
+        let code = "class Foo:\n    pass";
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "Bar", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_returns_none_in_empty_file() {
+        let code = "";
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "anything", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ignores_nested_class_inside_function() {
+        let code = r#"
+def wrapper():
+    class Hidden:
+        pass
+"#;
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "Hidden", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ignores_nested_function_inside_function() {
+        let code = r#"
+def outer():
+    def inner():
+        pass
+"#;
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "inner", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ignores_method_inside_class() {
+        let code = r#"
+class Foo:
+    def method(self):
+        pass
+"#;
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "method", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ignores_nested_assignment_inside_function() {
+        let code = r#"
+def wrapper():
+    hidden = 5
+"#;
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "hidden", code);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_finds_among_many_definitions() {
+        let code = r#"
+class Foo:
+    pass
+
+def bar():
+    pass
+
+Baz = something
+"#;
+        let tree = get_ast(code);
+
+        assert!(find_definition(tree.root_node(), "Foo", code).is_some());
+        assert!(find_definition(tree.root_node(), "bar", code).is_some());
+        assert!(find_definition(tree.root_node(), "Baz", code).is_some());
+        assert!(find_definition(tree.root_node(), "Missing", code).is_none());
+    }
+
+    #[test]
+    fn test_top_level_wins_over_nested_same_name() {
+        let code = r#"
+class Linear:
+    pass
+
+def wrapper():
+    class Linear:
+        pass
+"#;
+        let tree = get_ast(code);
+        let result = find_definition(tree.root_node(), "Linear", code);
+        assert!(result.is_some());
+        let node = result.unwrap();
+        assert_eq!(node.kind(), "class_definition");
+        assert_eq!(node.start_position().row, 1);
+    }
+}
+
+#[cfg(test)]
+mod reexport_to_absolute_path_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_absolute_reexport_passthrough() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/torch/nn/__init__.py");
+        let reexport = ReExport::Absolute {
+            path: "torch.nn.modules.linear".to_string(),
+            name: "Linear".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.modules.linear.Linear".to_string()));
+    }
+
+    #[test]
+    fn test_relative_single_dot_with_path() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/torch/nn/__init__.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: Some("modules.linear".to_string()),
+            name: "Linear".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.modules.linear.Linear".to_string()));
+    }
+
+    #[test]
+    fn test_relative_from_dot_import_name() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/torch/nn/__init__.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: None,
+            name: "Linear".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.Linear".to_string()));
+    }
+
+    #[test]
+    fn test_relative_two_dots_pops_parent() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/torch/nn/modules/linear.py");
+        let reexport = ReExport::Relative {
+            dots: 2,
+            path: Some("functional".to_string()),
+            name: "relu".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.functional.relu".to_string()));
+    }
+
+    #[test]
+    fn test_picks_correct_root_when_multiple() {
+        let roots = vec![
+            PathBuf::from("/project/src"),
+            PathBuf::from("/site-packages"),
+        ];
+        let current = Path::new("/site-packages/torch/nn/__init__.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: Some("modules".to_string()),
+            name: "Linear".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.modules.Linear".to_string()));
+    }
+
+    #[test]
+    fn test_works_with_project_root() {
+        let roots = vec![PathBuf::from("/project/src")];
+        let current = Path::new("/project/src/mypkg/utils/__init__.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: Some("helpers".to_string()),
+            name: "foo".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("mypkg.utils.helpers.foo".to_string()));
+    }
+
+    #[test]
+    fn test_returns_none_when_file_not_under_any_root() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/somewhere/else/foo.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: Some("bar".to_string()),
+            name: "baz".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_regular_py_file_not_init() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/torch/nn/modules/linear.py");
+        let reexport = ReExport::Relative {
+            dots: 1,
+            path: None,
+            name: "Linear".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("torch.nn.modules.Linear".to_string()));
+    }
+
+    #[test]
+    fn test_three_dots_pops_two_levels() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/site-packages/a/b/c/d/__init__.py");
+        let reexport = ReExport::Relative {
+            dots: 3,
+            path: Some("x".to_string()),
+            name: "y".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("a.b.x.y".to_string()));
+    }
+
+    #[test]
+    fn test_absolute_variant_ignores_current_file() {
+        let roots = vec![PathBuf::from("/site-packages")];
+        let current = Path::new("/anywhere/random.py");
+        let reexport = ReExport::Absolute {
+            path: "jax.numpy".to_string(),
+            name: "zeros".to_string(),
+        };
+
+        let result = reexport_to_absolute_path(current, &roots, &reexport);
+        assert_eq!(result, Some("jax.numpy.zeros".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod resolve_definition_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write(path: &PathBuf, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_finds_class_defined_in_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("foo.py"), "class Linear:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result =
+            resolve_definition("foo.Linear", std::slice::from_ref(&root), &mut visited, 10);
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("foo.py"));
+    }
+
+    #[test]
+    fn test_finds_function_defined_in_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("utils.py"), "def helper():\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition(
+            "utils.helper",
+            std::slice::from_ref(&root),
+            &mut visited,
+            10,
+        );
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("utils.py"));
+    }
+
+    #[test]
+    fn test_follows_absolute_reexport() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(
+            &root.join("mypkg/__init__.py"),
+            "from mypkg.impl import Linear",
+        );
+        write(&root.join("mypkg/impl.py"), "class Linear:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition(
+            "mypkg.Linear",
+            std::slice::from_ref(&root),
+            &mut visited,
+            10,
+        );
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("mypkg/impl.py"));
+    }
+
+    #[test]
+    fn test_follows_relative_reexport() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("mypkg/__init__.py"), "from .impl import Linear");
+        write(&root.join("mypkg/impl.py"), "class Linear:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition(
+            "mypkg.Linear",
+            std::slice::from_ref(&root),
+            &mut visited,
+            10,
+        );
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("mypkg/impl.py"));
+    }
+
+    #[test]
+    fn test_returns_none_when_name_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("foo.py"), "class Other:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result =
+            resolve_definition("foo.Missing", std::slice::from_ref(&root), &mut visited, 10);
+
+        assert!(result.is_none());
+    }
+    #[test]
+    fn test_follows_multi_hop_chain() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(
+            &root.join("mypkg/__init__.py"),
+            "from .middle import Linear",
+        );
+        write(&root.join("mypkg/middle.py"), "from .impl import Linear");
+        write(&root.join("mypkg/impl.py"), "class Linear:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition(
+            "mypkg.Linear",
+            std::slice::from_ref(&root),
+            &mut visited,
+            10,
+        );
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("mypkg/impl.py"));
+    }
+
+    #[test]
+    fn test_detects_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("a.py"), "from b import X");
+        write(&root.join("b.py"), "from a import X");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition("a.X", std::slice::from_ref(&root), &mut visited, 10);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_respects_depth_limit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("a.py"), "from b import X");
+        write(&root.join("b.py"), "from c import X");
+        write(&root.join("c.py"), "from d import X");
+        write(&root.join("d.py"), "class X:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition("a.X", std::slice::from_ref(&root), &mut visited, 2);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_reaches_def_within_depth() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root.join("a.py"), "from b import X");
+        write(&root.join("b.py"), "class X:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition("a.X", std::slice::from_ref(&root), &mut visited, 2);
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("b.py"));
+    }
+
+    #[test]
+    fn test_aliased_reexport_chain() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(
+            &root.join("mypkg/__init__.py"),
+            "from .impl import _Linear as Linear",
+        );
+        write(&root.join("mypkg/impl.py"), "class _Linear:\n    pass");
+
+        let mut visited = HashSet::new();
+        let result = resolve_definition(
+            "mypkg.Linear",
+            std::slice::from_ref(&root),
+            &mut visited,
+            10,
+        );
+
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        assert_eq!(path, root.join("mypkg/impl.py"));
     }
 }
