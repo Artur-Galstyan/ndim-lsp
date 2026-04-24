@@ -1,4 +1,3 @@
-// analyzer.rs
 use crate::{
     assignments::get_assignments,
     binary_operators::get_binary_operators,

@@ -19,7 +19,7 @@ pub enum ReExport {
     },
 }
 
-pub fn import_finder(node: Node, attribute_name: &str, text: &str) -> Option<ReExport> {
+fn import_finder(node: Node, attribute_name: &str, text: &str) -> Option<ReExport> {
     let language = tree_sitter_python::LANGUAGE.into();
 
     let query_str = r#"
@@ -114,7 +114,7 @@ pub fn import_finder(node: Node, attribute_name: &str, text: &str) -> Option<ReE
     None
 }
 
-pub fn resolve_module(dotted_path: &str, roots: &[PathBuf]) -> Option<(PathBuf, Vec<String>)> {
+fn resolve_module(dotted_path: &str, roots: &[PathBuf]) -> Option<(PathBuf, Vec<String>)> {
     let paths = dotted_path.replace(".", "/");
     for root in roots {
         let mut stripped_paths = Vec::new();
@@ -144,7 +144,7 @@ pub fn resolve_module(dotted_path: &str, roots: &[PathBuf]) -> Option<(PathBuf, 
     None
 }
 
-pub fn find_definition<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a>> {
+fn find_definition<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a>> {
     let query = r#"
         (module (class_definition name: (identifier) @def_name) @def_node)
         (module (function_definition name: (identifier) @def_name) @def_node)
