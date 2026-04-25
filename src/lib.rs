@@ -10,7 +10,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
-    InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf, Position, Range,
+    InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf, Position,
     ServerCapabilities, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
     Url,
 };

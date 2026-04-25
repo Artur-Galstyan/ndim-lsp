@@ -152,7 +152,7 @@ fn find_definition<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a
     "#;
 
     let language = tree_sitter_python::LANGUAGE.into();
-    let mut definition: Option<Node<'a>> = None;
+    let definition: Option<Node<'a>> = None;
     let query = Query::new(&language, query).unwrap();
     let mut cursor = QueryCursor::new();
 

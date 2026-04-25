@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tree_sitter::Node;
 
 use crate::{
-    helpers::{get_arg, handle_elementwise_ops, parse_axis},
+    helpers::{get_arg, handle_elementwise_ops},
     layers::layers::{Framework, LayerInfo, LayerType},
     shape_resolvers::jax::{
         jax_expand_dims, jax_numpy_concatenate, jax_numpy_reduce, jax_numpy_transpose, jax_squeeze,
@@ -102,7 +102,7 @@ pub fn resolve_shape(
                     ("jax.numpy", "squeeze") => {
                         jax_squeeze(args_node, params, import_alias_map, text)
                     }
-                    _ => return ShapeResult::Unknown,
+                    _ => ShapeResult::Unknown,
                 }
             } else if func_node.kind() == "identifier" {
                 let Ok(func_name) = func_node.utf8_text(text.as_bytes()) else {
@@ -137,15 +137,15 @@ pub fn resolve_shape(
                                 *result.last_mut().unwrap() = layer.out_features.clone();
                                 ShapeResult::Ok(result)
                             }
-                            Framework::Flax => return ShapeResult::Unknown,
-                            Framework::PyTorch => return ShapeResult::Unknown,
+                            Framework::Flax => ShapeResult::Unknown,
+                            Framework::PyTorch => ShapeResult::Unknown,
                         },
-                        _ => return ShapeResult::Unknown,
+                        _ => ShapeResult::Unknown,
                     },
-                    _ => return ShapeResult::Unknown,
+                    _ => ShapeResult::Unknown,
                 }
             } else {
-                return ShapeResult::Unknown;
+                ShapeResult::Unknown
             }
         }
         "parenthesized_expression" => {
@@ -153,7 +153,7 @@ pub fn resolve_shape(
                 .named_child(0)
                 .expect("A parenthesized_expression always has a child");
 
-            return resolve_shape(binary_operator_child, params, import_alias_map, text);
+            resolve_shape(binary_operator_child, params, import_alias_map, text)
         }
         "attribute" => {
             let Some(attribute_identifier_node) = node.child_by_field_name("attribute") else {
@@ -167,9 +167,10 @@ pub fn resolve_shape(
             match attribute_name {
                 "T" => {
                     let Some(object_node) = node.child_by_field_name("object") else {
-                        return ShapeResult::Error(format!(
+                        return ShapeResult::Error(
                             "Unexpected TS error: Failed to get object child from attribute node"
-                        ));
+                                .to_string(),
+                        );
                     };
                     let mut shape = match resolve_shape(object_node, params, import_alias_map, text)
                     {
@@ -177,7 +178,7 @@ pub fn resolve_shape(
                         other => return other,
                     };
                     shape.reverse();
-                    return ShapeResult::Ok(shape);
+                    ShapeResult::Ok(shape)
                 }
                 _ => ShapeResult::Unknown,
             }
@@ -190,9 +191,7 @@ pub fn resolve_shape(
                 );
             };
 
-            let op_text = op
-                .utf8_text(&text.as_bytes())
-                .expect("Operator has no text");
+            let op_text = op.utf8_text(text.as_bytes()).expect("Operator has no text");
 
             let Some(left_node) = node.child_by_field_name("left") else {
                 return ShapeResult::Error(
@@ -218,22 +217,22 @@ pub fn resolve_shape(
 
             match op_text {
                 "@" => {
-                    if &left_shape.last().unwrap() != &right_shape.first().unwrap() {
-                        return ShapeResult::Error(format!(
+                    if left_shape.last().unwrap() != right_shape.first().unwrap() {
+                        ShapeResult::Error(format!(
                             "Invalid shapes found: {:?} and {:?}",
                             left_shape, right_shape
-                        ));
+                        ))
                     } else {
-                        return ShapeResult::Ok(vec![
+                        ShapeResult::Ok(vec![
                             left_shape.first().unwrap().clone(),
                             right_shape.last().unwrap().clone(),
-                        ]);
+                        ])
                     }
                 }
                 "+" | "-" | "*" | "/" => handle_elementwise_ops(left_shape, right_shape),
-                _ => return ShapeResult::Unknown,
+                _ => ShapeResult::Unknown,
             }
         }
-        _ => return ShapeResult::Unknown,
+        _ => ShapeResult::Unknown,
     }
 }

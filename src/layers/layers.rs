@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tree_sitter::Node;
 
-use crate::{helpers::get_arg, layers::equinox::equinox_linear};
+use crate::layers::equinox::equinox_linear;
 
 #[derive(Debug)]
 pub enum Framework {

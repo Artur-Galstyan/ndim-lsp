@@ -43,9 +43,9 @@ pub fn jax_numpy_concatenate(
     let ndim = all_shapes[0].len();
     for shape in &all_shapes {
         if shape.len() != ndim {
-            return ShapeResult::Error(format!(
-                "All inputs to concatenate must have the same number of dims"
-            ));
+            return ShapeResult::Error(
+                "All inputs to concatenate must have the same number of dims".to_string(),
+            );
         }
     }
 
@@ -209,7 +209,7 @@ pub fn jax_numpy_reduce(
         }
     }
 
-    return ShapeResult::Ok(result);
+    ShapeResult::Ok(result)
 }
 
 pub fn jax_expand_dims(
@@ -219,7 +219,7 @@ pub fn jax_expand_dims(
     text: &str,
 ) -> ShapeResult {
     let Some(input_node) = get_arg(args_node, 0, "a", text) else {
-        return ShapeResult::Error(format!("Unexpected TS error: failed to get input shape"));
+        return ShapeResult::Error("Unexpected TS error: failed to get input shape".to_string());
     };
 
     let shape = match resolve_shape(input_node, params, import_alias_map, text) {
@@ -255,7 +255,7 @@ pub fn jax_expand_dims(
             _ => return ShapeResult::Unknown,
         }
     } else {
-        return ShapeResult::Error(format!("Axis argument is required for expand_dims"));
+        return ShapeResult::Error("Axis argument is required for expand_dims".to_string());
     }
 
     let mut current_dims = shape.clone();
@@ -272,7 +272,7 @@ pub fn jax_expand_dims(
         current_dims.insert(axis, "1".to_string());
     }
 
-    return ShapeResult::Ok(current_dims);
+    ShapeResult::Ok(current_dims)
 }
 
 pub fn jax_squeeze(
@@ -282,7 +282,7 @@ pub fn jax_squeeze(
     text: &str,
 ) -> ShapeResult {
     let Some(input_node) = get_arg(args_node, 0, "a", text) else {
-        return ShapeResult::Error(format!("Unexpected TS error: failed to get input shape"));
+        return ShapeResult::Error("Unexpected TS error: failed to get input shape".to_string());
     };
     let input_shape = match resolve_shape(input_node, params, import_alias_map, text) {
         ShapeResult::Ok(items) => items,
@@ -292,7 +292,7 @@ pub fn jax_squeeze(
     let mut axes_to_squeeze: Vec<usize> = Vec::new();
     let axis_node_opt = get_arg(args_node, 1, "axis", text);
 
-    if axis_node_opt.map_or(true, |n| n.kind() == "none") {
+    if axis_node_opt.is_none_or(|n| n.kind() == "none") {
         let new_dims: Vec<String> = input_shape.into_iter().filter(|d| d != "1").collect();
         return ShapeResult::Ok(new_dims);
     }
@@ -351,5 +351,5 @@ pub fn jax_squeeze(
         new_dims.remove(axis);
     }
 
-    return ShapeResult::Ok(new_dims);
+    ShapeResult::Ok(new_dims)
 }
