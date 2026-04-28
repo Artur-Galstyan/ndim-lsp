@@ -454,4 +454,15 @@ from ..core import Base
         let map = build_import_map(tree.root_node(), code).unwrap();
         assert_eq!(map.get("random"), Some(&ip(0, &["jax"], "random")));
     }
+
+    #[test]
+    fn test_multiple_relative_aliased_imports() {
+        let code = "from . import utils as u, helpers as h";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("u"), Some(&ip(1, &[], "utils")));
+        assert_eq!(map.get("h"), Some(&ip(1, &[], "helpers")));
+        assert_eq!(map.get("utils"), None);
+        assert_eq!(map.get("helpers"), None);
+    }
 }
