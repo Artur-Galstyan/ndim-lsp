@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ImportPath {
+    pub dots: usize,         // 0 = absolute, 1 = ".", 2 = "..", etc.
+    pub module: Vec<String>, // ["jax", "numpy"] or ["utils"]
+    pub name: String,        // "random", "Array", "MyLinear"
+}
+
 /// Builds a map from local name (what you type in code) to dotted path (what it resolves to).
 ///
 /// Examples:
@@ -36,6 +43,8 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, node, text.as_bytes());
 
+    let mut import_map: HashMap<String, ImportPath> = HashMap::new();
+
     while let Some(match_) = matches.next() {
         if match_.pattern_index == 0 {
             for capture in match_.captures {
@@ -46,7 +55,27 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                                 .node
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?;
-                            result.insert(value.to_string(), value.to_string());
+                            let parts: Vec<&str> = value.split(".").collect();
+                            let module: Vec<String> = parts[..parts.len() - 1]
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect();
+                            let Some(name) = parts.last() else {
+                                return Err(
+                                    "Failed to fetch the last part of the import path".to_string()
+                                );
+                            };
+                            let Some(first) = parts.first() else {
+                                return Err("Empty import path".to_string());
+                            };
+                            import_map.insert(
+                                first.to_string(),
+                                ImportPath {
+                                    dots: 0,
+                                    module: module.clone(),
+                                    name: name.to_string(),
+                                },
+                            );
                         }
                         "aliased_import" => {
                             let Some(name_child) = capture.node.child_by_field_name("name") else {
@@ -54,8 +83,17 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                             };
                             let name = name_child
                                 .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?
-                                .to_string();
+                                .map_err(|e| e.to_string())?;
+                            let parts: Vec<&str> = name.split(".").collect();
+                            let module: Vec<String> = parts[..parts.len() - 1]
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect();
+                            let Some(name) = parts.last() else {
+                                return Err(
+                                    "Failed to fetch the last part of the import path".to_string()
+                                );
+                            };
 
                             let Some(alias_node) = capture.node.child_by_field_name("alias") else {
                                 return Err("Failed to capture child of aliased_import".to_string());
@@ -64,7 +102,14 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?
                                 .to_string();
-                            result.insert(alias, name);
+                            import_map.insert(
+                                alias,
+                                ImportPath {
+                                    dots: 0,
+                                    module: module.clone(),
+                                    name: name.to_string(),
+                                },
+                            );
                         }
                         _ => {}
                     }
@@ -73,7 +118,61 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
         } else if match_.pattern_index == 1 {
             let mut module_name = String::new();
             let mut name = String::new();
-            for capture in match_.captures {}
+            for capture in match_.captures {
+                if capture.index == module_name_idx {
+                    let n = capture.node;
+                    match n.kind() {
+                        "dotted_name" => {
+                            let identifier =
+                                n.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?;
+                            module_name = identifier.to_string();
+                        }
+                        "relative_import" => {
+                            let Some(import_prefix_node) = n.child_by_field_name("import_prefix")
+                            else {
+                                return Err(
+                                    "Failed to get import prefix for relative import".to_string()
+                                );
+                            };
+                            let import_prefix = import_prefix_node
+                                .utf8_text(text.as_bytes())
+                                .map_err(|e| e.to_string())?;
+                            let mut dotted_name = String::new();
+                            match n.child_by_field_name("dotted_name") {
+                                Some(c) => {
+                                    dotted_name = c
+                                        .utf8_text(text.as_bytes())
+                                        .map_err(|e| e.to_string())?
+                                        .to_string();
+                                }
+                                None => dotted_name = "".to_string(),
+                            }
+                            module_name = format!("{}.{}", import_prefix, dotted_name);
+                        }
+                        _ => {}
+                    }
+                } else if capture.index == name_idx {
+                    let n = capture.node;
+                    match n.kind() {
+                        "dotted_name" => {
+                            name = n
+                                .utf8_text(text.as_bytes())
+                                .map_err(|e| e.to_string())?
+                                .to_string();
+                        }
+                        "aliased_import" => {
+                            let Some(alias_child_node) = n.child_by_field_name("alias") else {
+                                return Err("aliased_import has no alias field".to_string());
+                            };
+                            name = alias_child_node
+                                .utf8_text(text.as_bytes())
+                                .map_err(|e| e.to_string())?
+                                .to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
