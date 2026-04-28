@@ -4,23 +4,28 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImportPath {
-    pub dots: usize,         // 0 = absolute, 1 = ".", 2 = "..", etc.
-    pub module: Vec<String>, // ["jax", "numpy"] or ["utils"]
-    pub name: String,        // "random", "Array", "MyLinear"
+    pub dots: usize,
+    pub module: Vec<String>,
+    pub name: String,
 }
 
-/// Builds a map from local name (what you type in code) to dotted path (what it resolves to).
-///
-/// Examples:
-///   import jax              → {"jax": "jax"}
-///   import jax.numpy as jnp → {"jnp": "jax.numpy"}
-///   from jax import random  → {"random": "jax.random"}
-///   from . import utils     → {"utils": ".utils"}
-///   from ..core import Base → {"Base": "..core.Base"}
-///
-/// Star imports are skipped (can't know what's imported statically).
-pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String>, String> {
-    let mut result: HashMap<String, String> = HashMap::new();
+pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
+    fn plain_import_dotted_name_to_vec(
+        dotted_name: &str,
+    ) -> Result<(Vec<String>, String, String), String> {
+        let parts: Vec<&str> = dotted_name.split(".").collect();
+        let module: Vec<String> = parts[..parts.len() - 1]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let Some(name) = parts.last() else {
+            return Err("Failed to fetch the last part of the import path".to_string());
+        };
+        let Some(first) = parts.first() else {
+            return Err("Empty import path".to_string());
+        };
+        Ok((module, name.to_string(), first.to_string()))
+    }
 
     let query_string = r#"
         (import_statement name: (_) @import)
@@ -51,63 +56,45 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                 if capture.index == import_statement_idx {
                     match capture.node.kind() {
                         "dotted_name" => {
-                            let value = capture
+                            let dotted_name = capture
                                 .node
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?;
-                            let parts: Vec<&str> = value.split(".").collect();
-                            let module: Vec<String> = parts[..parts.len() - 1]
-                                .iter()
-                                .map(|p| p.to_string())
-                                .collect();
-                            let Some(name) = parts.last() else {
-                                return Err(
-                                    "Failed to fetch the last part of the import path".to_string()
-                                );
-                            };
-                            let Some(first) = parts.first() else {
-                                return Err("Empty import path".to_string());
-                            };
+                            let (module, name, first) =
+                                plain_import_dotted_name_to_vec(dotted_name)
+                                    .map_err(|e| e.to_string())?;
                             import_map.insert(
                                 first.to_string(),
                                 ImportPath {
                                     dots: 0,
-                                    module: module.clone(),
+                                    module,
                                     name: name.to_string(),
                                 },
                             );
                         }
                         "aliased_import" => {
                             let Some(name_child) = capture.node.child_by_field_name("name") else {
-                                return Err("Failed to capture child of aliased_import".to_string());
+                                return Err("aliased_import missing name".to_string());
                             };
-                            let name = name_child
+                            let dotted_name = name_child
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?;
-                            let parts: Vec<&str> = name.split(".").collect();
-                            let module: Vec<String> = parts[..parts.len() - 1]
-                                .iter()
-                                .map(|p| p.to_string())
-                                .collect();
-                            let Some(name) = parts.last() else {
-                                return Err(
-                                    "Failed to fetch the last part of the import path".to_string()
-                                );
-                            };
+                            let (module, name, _) = plain_import_dotted_name_to_vec(dotted_name)?;
 
                             let Some(alias_node) = capture.node.child_by_field_name("alias") else {
-                                return Err("Failed to capture child of aliased_import".to_string());
+                                return Err("aliased_import missing alias".to_string());
                             };
                             let alias = alias_node
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?
                                 .to_string();
+
                             import_map.insert(
                                 alias,
                                 ImportPath {
                                     dots: 0,
-                                    module: module.clone(),
-                                    name: name.to_string(),
+                                    module,
+                                    name,
                                 },
                             );
                         }
@@ -116,8 +103,10 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                 }
             }
         } else if match_.pattern_index == 1 {
-            let mut module_name = String::new();
+            let mut module: Vec<String> = Vec::new();
             let mut name = String::new();
+            let mut alias = String::new();
+            let mut dots = 0;
             for capture in match_.captures {
                 if capture.index == module_name_idx {
                     let n = capture.node;
@@ -125,29 +114,27 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                         "dotted_name" => {
                             let identifier =
                                 n.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?;
-                            module_name = identifier.to_string();
+                            module = identifier.split(".").map(|f| f.to_string()).collect();
                         }
                         "relative_import" => {
-                            let Some(import_prefix_node) = n.child_by_field_name("import_prefix")
-                            else {
-                                return Err(
-                                    "Failed to get import prefix for relative import".to_string()
-                                );
-                            };
-                            let import_prefix = import_prefix_node
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?;
-                            let mut dotted_name = String::new();
-                            match n.child_by_field_name("dotted_name") {
-                                Some(c) => {
-                                    dotted_name = c
-                                        .utf8_text(text.as_bytes())
-                                        .map_err(|e| e.to_string())?
-                                        .to_string();
+                            let mut child_cursor = n.walk();
+                            for child in n.named_children(&mut child_cursor) {
+                                match child.kind() {
+                                    "import_prefix" => {
+                                        let prefix = child
+                                            .utf8_text(text.as_bytes())
+                                            .map_err(|e| e.to_string())?;
+                                        dots = prefix.len();
+                                    }
+                                    "dotted_name" => {
+                                        let dotted = child
+                                            .utf8_text(text.as_bytes())
+                                            .map_err(|e| e.to_string())?;
+                                        module = dotted.split(".").map(|f| f.to_string()).collect();
+                                    }
+                                    _ => {}
                                 }
-                                None => dotted_name = "".to_string(),
                             }
-                            module_name = format!("{}.{}", import_prefix, dotted_name);
                         }
                         _ => {}
                     }
@@ -159,24 +146,36 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, String
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?
                                 .to_string();
+                            alias = name.clone();
                         }
                         "aliased_import" => {
                             let Some(alias_child_node) = n.child_by_field_name("alias") else {
                                 return Err("aliased_import has no alias field".to_string());
                             };
-                            name = alias_child_node
+                            alias = alias_child_node
                                 .utf8_text(text.as_bytes())
                                 .map_err(|e| e.to_string())?
                                 .to_string();
+
+                            let Some(dotted_name_idx) = n.child_by_field_name("name") else {
+                                return Err("aliased_import has no name field".to_string());
+                            };
+                            let dotted_name = dotted_name_idx
+                                .utf8_text(text.as_bytes())
+                                .map_err(|e| e.to_string())?
+                                .to_string();
+                            name = dotted_name;
                         }
                         _ => {}
                     }
                 }
             }
+
+            import_map.insert(alias, ImportPath { dots, module, name });
         }
     }
 
-    Ok(result)
+    Ok(import_map)
 }
 
 #[cfg(test)]
@@ -191,12 +190,20 @@ mod import_map_tests {
         parser.parse(code, None).unwrap()
     }
 
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: module.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+        }
+    }
+
     #[test]
     fn test_plain_import() {
         let code = "import jax";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("jax"), Some(&"jax".to_string()));
+        assert_eq!(map.get("jax"), Some(&ip(0, &[], "jax")));
     }
 
     #[test]
@@ -204,7 +211,7 @@ mod import_map_tests {
         let code = "import jax.numpy";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("jax"), Some(&"jax".to_string()));
+        assert_eq!(map.get("jax"), Some(&ip(0, &["jax"], "numpy")));
     }
 
     #[test]
@@ -212,7 +219,7 @@ mod import_map_tests {
         let code = "import jax.numpy as jnp";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("jnp"), Some(&"jax.numpy".to_string()));
+        assert_eq!(map.get("jnp"), Some(&ip(0, &["jax"], "numpy")));
         assert_eq!(map.get("jax"), None);
     }
 
@@ -221,7 +228,7 @@ mod import_map_tests {
         let code = "import equinox.nn as nn";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("nn"), Some(&"equinox.nn".to_string()));
+        assert_eq!(map.get("nn"), Some(&ip(0, &["equinox"], "nn")));
     }
 
     #[test]
@@ -229,7 +236,7 @@ mod import_map_tests {
         let code = "from jax import random";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("random"), Some(&"jax.random".to_string()));
+        assert_eq!(map.get("random"), Some(&ip(0, &["jax"], "random")));
     }
 
     #[test]
@@ -237,8 +244,8 @@ mod import_map_tests {
         let code = "from jaxtyping import Float, Array";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("Float"), Some(&"jaxtyping.Float".to_string()));
-        assert_eq!(map.get("Array"), Some(&"jaxtyping.Array".to_string()));
+        assert_eq!(map.get("Float"), Some(&ip(0, &["jaxtyping"], "Float")));
+        assert_eq!(map.get("Array"), Some(&ip(0, &["jaxtyping"], "Array")));
     }
 
     #[test]
@@ -246,7 +253,7 @@ mod import_map_tests {
         let code = "from jaxtyping import Array as Arr";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("Arr"), Some(&"jaxtyping.Array".to_string()));
+        assert_eq!(map.get("Arr"), Some(&ip(0, &["jaxtyping"], "Array")));
         assert_eq!(map.get("Array"), None);
     }
 
@@ -257,10 +264,10 @@ mod import_map_tests {
         let map = build_import_map(tree.root_node(), code).unwrap();
         assert_eq!(
             map.get("transform"),
-            Some(&"mypackage.transform".to_string())
+            Some(&ip(0, &["mypackage"], "transform"))
         );
-        assert_eq!(map.get("ML"), Some(&"mypackage.MyLinear".to_string()));
-        assert_eq!(map.get("helper"), Some(&"mypackage.helper".to_string()));
+        assert_eq!(map.get("ML"), Some(&ip(0, &["mypackage"], "MyLinear")));
+        assert_eq!(map.get("helper"), Some(&ip(0, &["mypackage"], "helper")));
         assert_eq!(map.get("MyLinear"), None);
     }
 
@@ -271,7 +278,7 @@ mod import_map_tests {
         let map = build_import_map(tree.root_node(), code).unwrap();
         assert_eq!(
             map.get("GCSBucket"),
-            Some(&"google.cloud.storage.bucket.Bucket".to_string())
+            Some(&ip(0, &["google", "cloud", "storage", "bucket"], "Bucket"))
         );
     }
 
@@ -280,7 +287,7 @@ mod import_map_tests {
         let code = "from . import utils";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("utils"), Some(&".utils".to_string()));
+        assert_eq!(map.get("utils"), Some(&ip(1, &[], "utils")));
     }
 
     #[test]
@@ -288,7 +295,7 @@ mod import_map_tests {
         let code = "from .layers import MyLinear";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("MyLinear"), Some(&".layers.MyLinear".to_string()));
+        assert_eq!(map.get("MyLinear"), Some(&ip(1, &["layers"], "MyLinear")));
     }
 
     #[test]
@@ -296,7 +303,7 @@ mod import_map_tests {
         let code = "from ..utils import helper as h";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("h"), Some(&"..utils.helper".to_string()));
+        assert_eq!(map.get("h"), Some(&ip(2, &["utils"], "helper")));
     }
 
     #[test]
@@ -306,7 +313,7 @@ mod import_map_tests {
         let map = build_import_map(tree.root_node(), code).unwrap();
         assert_eq!(
             map.get("BaseModel"),
-            Some(&"...core.base.BaseModel".to_string())
+            Some(&ip(3, &["core", "base"], "BaseModel"))
         );
     }
 
@@ -315,8 +322,8 @@ mod import_map_tests {
         let code = "from . import utils, helpers";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("utils"), Some(&".utils".to_string()));
-        assert_eq!(map.get("helpers"), Some(&".helpers".to_string()));
+        assert_eq!(map.get("utils"), Some(&ip(1, &[], "utils")));
+        assert_eq!(map.get("helpers"), Some(&ip(1, &[], "helpers")));
     }
 
     #[test]
@@ -324,8 +331,8 @@ mod import_map_tests {
         let code = "import sys, os";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("sys"), Some(&"sys".to_string()));
-        assert_eq!(map.get("os"), Some(&"os".to_string()));
+        assert_eq!(map.get("sys"), Some(&ip(0, &[], "sys")));
+        assert_eq!(map.get("os"), Some(&ip(0, &[], "os")));
     }
 
     #[test]
@@ -364,16 +371,87 @@ from ..core import Base
 "#;
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("jax"), Some(&"jax".to_string()));
-        assert_eq!(map.get("eqx"), Some(&"equinox".to_string()));
-        assert_eq!(map.get("Float"), Some(&"jaxtyping.Float".to_string()));
-        assert_eq!(map.get("Array"), Some(&"jaxtyping.Array".to_string()));
+        assert_eq!(map.get("jax"), Some(&ip(0, &[], "jax")));
+        assert_eq!(map.get("eqx"), Some(&ip(0, &[], "equinox")));
+        assert_eq!(map.get("Float"), Some(&ip(0, &["jaxtyping"], "Float")));
+        assert_eq!(map.get("Array"), Some(&ip(0, &["jaxtyping"], "Array")));
         assert_eq!(
             map.get("ML"),
-            Some(&"mypackage.layers.MyLinear".to_string())
+            Some(&ip(0, &["mypackage", "layers"], "MyLinear"))
         );
-        assert_eq!(map.get("utils"), Some(&".utils".to_string()));
-        assert_eq!(map.get("Base"), Some(&"..core.Base".to_string()));
+        assert_eq!(map.get("utils"), Some(&ip(1, &[], "utils")));
+        assert_eq!(map.get("Base"), Some(&ip(2, &["core"], "Base")));
         assert_eq!(map.len(), 7);
+    }
+
+    #[test]
+    fn test_relative_import_with_alias() {
+        let code = "from . import utils as u";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("u"), Some(&ip(1, &[], "utils")));
+        assert_eq!(map.get("utils"), None);
+    }
+
+    #[test]
+    fn test_relative_import_with_path_and_alias() {
+        let code = "from .layers import MyLinear as ML";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("ML"), Some(&ip(1, &["layers"], "MyLinear")));
+        assert_eq!(map.get("MyLinear"), None);
+    }
+
+    #[test]
+    fn test_deeply_nested_plain_import() {
+        let code = "import a.b.c.d";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("a"), Some(&ip(0, &["a", "b", "c"], "d")));
+    }
+
+    #[test]
+    fn test_comma_separated_aliased_imports() {
+        let code = "import jax.numpy as jnp, equinox as eqx";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("jnp"), Some(&ip(0, &["jax"], "numpy")));
+        assert_eq!(map.get("eqx"), Some(&ip(0, &[], "equinox")));
+    }
+
+    #[test]
+    fn test_parenthesized_from_import() {
+        let code = "from jax import (\n    random,\n    numpy\n)";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("random"), Some(&ip(0, &["jax"], "random")));
+        assert_eq!(map.get("numpy"), Some(&ip(0, &["jax"], "numpy")));
+    }
+
+    #[test]
+    fn test_duplicate_import_last_wins() {
+        let code = "import jax\nimport jax.numpy as jax";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("jax"), Some(&ip(0, &["jax"], "numpy")));
+    }
+
+    #[test]
+    fn test_from_import_single_segment_module() {
+        let code = "from os import path, getcwd, listdir";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("path"), Some(&ip(0, &["os"], "path")));
+        assert_eq!(map.get("getcwd"), Some(&ip(0, &["os"], "getcwd")));
+        assert_eq!(map.get("listdir"), Some(&ip(0, &["os"], "listdir")));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn test_backslash_continuation_import() {
+        let code = "from jax \\\n    import random";
+        let tree = parse(code);
+        let map = build_import_map(tree.root_node(), code).unwrap();
+        assert_eq!(map.get("random"), Some(&ip(0, &["jax"], "random")));
     }
 }
