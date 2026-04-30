@@ -1,12 +1,19 @@
 use std::collections::HashMap;
 
-use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Node, Query, QueryCursor, Range, StreamingIterator};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImportPath {
     pub dots: usize,
     pub module: Vec<String>,
     pub name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CallInfo {
+    pub variable: String,
+    pub target: String,
+    pub args_node_range: tree_sitter::Range,
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -176,6 +183,83 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
     }
 
     Ok(import_map)
+}
+
+pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
+    let mut result: Vec<CallInfo> = Vec::new();
+    let query_string = r#"
+        (assignment
+          left: (identifier) @var
+          right: (call
+            function: [
+              (identifier) @fn_id
+              (attribute) @fn_attr
+            ]
+          )
+        ) @assignment
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
+        .map_err(|e| e.to_string())?;
+
+    let Some(var_idx) = query.capture_index_for_name("var") else {
+        return Err("var not found".to_string());
+    };
+
+    let Some(fn_id_idx) = query.capture_index_for_name("fn_id") else {
+        return Err("fn_id not found".to_string());
+    };
+
+    let Some(fn_attr_idx) = query.capture_index_for_name("fn_attr") else {
+        return Err("fn_attr not found".to_string());
+    };
+
+    let Some(assignment_idx) = query.capture_index_for_name("assignment") else {
+        return Err("assignment not found".to_string());
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        let mut variable = String::new();
+        let mut target = String::new();
+        let mut args_node_range: Option<Range> = None;
+
+        for capture in match_.captures {
+            if capture.index == var_idx {
+                variable = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == assignment_idx {
+                let Some(right_child_node) = capture.node.child_by_field_name("right") else {
+                    return Err("right child not found".to_string());
+                };
+
+                let Some(arguments_node) = right_child_node.child_by_field_name("arguments") else {
+                    return Err("arguments child not found".to_string());
+                };
+                args_node_range = Some(arguments_node.range());
+            } else if capture.index == fn_id_idx || capture.index == fn_attr_idx {
+                target = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            }
+        }
+
+        let args_node_range = args_node_range.ok_or("args_node_range not found".to_string())?;
+        result.push(CallInfo {
+            variable,
+            target,
+            args_node_range,
+        });
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -464,5 +548,194 @@ from ..core import Base
         assert_eq!(map.get("h"), Some(&ip(1, &[], "helpers")));
         assert_eq!(map.get("utils"), None);
         assert_eq!(map.get("helpers"), None);
+    }
+}
+
+#[cfg(test)]
+mod extract_calls_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn args_text<'a>(text: &'a str, range: &tree_sitter::Range) -> &'a str {
+        &text[range.start_byte..range.end_byte]
+    }
+
+    #[test]
+    fn test_simple_identifier_call() {
+        let code = "x = foo()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "x");
+        assert_eq!(calls[0].target, "foo");
+        assert_eq!(args_text(code, &calls[0].args_node_range), "()");
+    }
+
+    #[test]
+    fn test_identifier_call_with_args() {
+        let code = "y = transform(x)";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "y");
+        assert_eq!(calls[0].target, "transform");
+        assert_eq!(args_text(code, &calls[0].args_node_range), "(x)");
+    }
+
+    #[test]
+    fn test_attribute_call() {
+        let code = "x = jnp.zeros((32, 64))";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "x");
+        assert_eq!(calls[0].target, "jnp.zeros");
+        assert_eq!(args_text(code, &calls[0].args_node_range), "((32, 64))");
+    }
+
+    #[test]
+    fn test_deep_attribute_call() {
+        let code = "layer = eqx.nn.Linear(128, 64)";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "layer");
+        assert_eq!(calls[0].target, "eqx.nn.Linear");
+        assert_eq!(args_text(code, &calls[0].args_node_range), "(128, 64)");
+    }
+
+    #[test]
+    fn test_multiple_calls() {
+        let code = "x = foo()\ny = bar(1, 2)\nz = jnp.zeros((3,))";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].variable, "x");
+        assert_eq!(calls[0].target, "foo");
+        assert_eq!(calls[1].variable, "y");
+        assert_eq!(calls[1].target, "bar");
+        assert_eq!(calls[2].variable, "z");
+        assert_eq!(calls[2].target, "jnp.zeros");
+    }
+
+    #[test]
+    fn test_skips_assignment_without_call() {
+        let code = "x = 5\ny = foo()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "y");
+    }
+
+    #[test]
+    fn test_skips_bare_call_without_assignment() {
+        let code = "foo()\nx = bar()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "x");
+    }
+
+    #[test]
+    fn test_skips_binary_op_assignment() {
+        let code = "x = a + b\ny = foo()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "y");
+    }
+
+    #[test]
+    fn test_nested_call_captures_outer_only() {
+        let code = "x = foo(bar())";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "x");
+        assert_eq!(calls[0].target, "foo");
+    }
+
+    #[test]
+    fn test_call_with_kwargs() {
+        let code = "layer = eqx.nn.Linear(128, 64, key=key)";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].target, "eqx.nn.Linear");
+        assert_eq!(
+            args_text(code, &calls[0].args_node_range),
+            "(128, 64, key=key)"
+        );
+    }
+
+    #[test]
+    fn test_empty_file() {
+        let code = "";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_no_calls() {
+        let code = "x = 5\ny = 'hello'\nz = [1, 2, 3]";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_inside_function() {
+        let code = r#"
+def forward(x):
+    y = jnp.matmul(x, w)
+    z = transform(y)
+"#;
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].target, "jnp.matmul");
+        assert_eq!(calls[1].target, "transform");
+    }
+
+    #[test]
+    fn test_mixed_module_and_function_level() {
+        let code = r#"
+x = jnp.zeros((32,))
+def forward(a):
+    b = transform(a)
+y = relu(x)
+"#;
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].target, "jnp.zeros");
+        assert_eq!(calls[1].target, "transform");
+        assert_eq!(calls[2].target, "relu");
+    }
+
+    #[test]
+    fn test_skips_tuple_unpack_assignment() {
+        let code = "a, b = foo()\nx = bar()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "x");
+    }
+
+    #[test]
+    fn test_skips_attribute_assignment() {
+        let code = "self.x = foo()\ny = bar()";
+        let tree = parse(code);
+        let calls = extract_calls(tree.root_node(), code).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].variable, "y");
     }
 }
