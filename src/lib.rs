@@ -145,6 +145,18 @@ pub fn resolve_import_path_from_package(
     Some(ResolvedTarget { dots: 0, parts })
 }
 
+pub fn follow_import_symbol_once(
+    current_package_parts: &[String],
+    symbol: &PythonSymbol,
+) -> Option<ResolvedTarget> {
+    match symbol {
+        PythonSymbol::Import { path, .. } => {
+            resolve_import_path_from_package(current_package_parts, path)
+        }
+        PythonSymbol::Class { .. } | PythonSymbol::Function { .. } => None,
+    }
+}
+
 pub fn find_top_level_symbol(
     node: Node,
     text: &str,
@@ -559,6 +571,106 @@ mod resolve_import_path_from_package_tests {
         let found = resolve_import_path_from_package(&parts(&["pkg"]), &ip(0, &[], "foo"));
 
         assert_eq!(found, Some(target(&["foo"])));
+    }
+}
+
+#[cfg(test)]
+mod follow_import_symbol_once_tests {
+    use super::*;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: parts(module),
+            name: name.to_string(),
+        }
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: self::parts(parts),
+        }
+    }
+
+    fn import(path: ImportPath) -> PythonSymbol {
+        PythonSymbol::Import {
+            name: path.name.clone(),
+            path,
+        }
+    }
+
+    #[test]
+    fn test_follows_relative_import_with_module() {
+        let found = follow_import_symbol_once(
+            &parts(&["equinox", "nn"]),
+            &import(ip(1, &["_linear"], "Linear")),
+        );
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "_linear", "Linear"])));
+    }
+
+    #[test]
+    fn test_follows_relative_import_without_module() {
+        let found =
+            follow_import_symbol_once(&parts(&["equinox", "nn"]), &import(ip(1, &[], "layers")));
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "layers"])));
+    }
+
+    #[test]
+    fn test_follows_relative_parent_import() {
+        let found = follow_import_symbol_once(
+            &parts(&["pkg", "sub"]),
+            &import(ip(2, &["layers"], "Linear")),
+        );
+
+        assert_eq!(found, Some(target(&["pkg", "layers", "Linear"])));
+    }
+
+    #[test]
+    fn test_follows_absolute_import() {
+        let found = follow_import_symbol_once(
+            &parts(&["equinox", "nn"]),
+            &import(ip(0, &["jax", "numpy"], "concatenate")),
+        );
+
+        assert_eq!(found, Some(target(&["jax", "numpy", "concatenate"])));
+    }
+
+    #[test]
+    fn test_too_many_relative_dots_returns_none() {
+        let found = follow_import_symbol_once(&parts(&["pkg"]), &import(ip(2, &["x"], "Y")));
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_class_returns_none() {
+        let found = follow_import_symbol_once(
+            &parts(&["equinox", "nn"]),
+            &PythonSymbol::Class {
+                name: "Linear".to_string(),
+            },
+        );
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_function_returns_none() {
+        let found = follow_import_symbol_once(
+            &parts(&["equinox", "nn"]),
+            &PythonSymbol::Function {
+                name: "linear".to_string(),
+            },
+        );
+
+        assert_eq!(found, None);
     }
 }
 
