@@ -157,6 +157,41 @@ pub fn follow_import_symbol_once(
     }
 }
 
+pub fn resolve_reexport_once(
+    resolved: &ResolvedModuleTarget,
+    node: Node,
+    text: &str,
+) -> Result<Option<ResolvedTarget>, String> {
+    let Some(first) = resolved.symbol_parts.first() else {
+        return Ok(None);
+    };
+
+    let Some(symbol) = find_top_level_symbol(node, text, first)? else {
+        return Ok(None);
+    };
+
+    Ok(follow_import_symbol_once(&resolved.module_parts, &symbol))
+}
+
+pub fn resolve_terminal_symbol_once(
+    resolved: &ResolvedModuleTarget,
+    node: Node,
+    text: &str,
+) -> Result<Option<PythonSymbol>, String> {
+    let Some(first) = resolved.symbol_parts.first() else {
+        return Ok(None);
+    };
+
+    let Some(symbol) = find_top_level_symbol(node, text, first)? else {
+        return Ok(None);
+    };
+
+    match symbol {
+        PythonSymbol::Class { .. } | PythonSymbol::Function { .. } => Ok(Some(symbol)),
+        PythonSymbol::Import { .. } => Ok(None),
+    }
+}
+
 pub fn find_top_level_symbol(
     node: Node,
     text: &str,
@@ -571,6 +606,234 @@ mod resolve_import_path_from_package_tests {
         let found = resolve_import_path_from_package(&parts(&["pkg"]), &ip(0, &[], "foo"));
 
         assert_eq!(found, Some(target(&["foo"])));
+    }
+}
+
+#[cfg(test)]
+mod resolve_reexport_once_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn resolved(module_parts: &[&str], symbol_parts: &[&str]) -> ResolvedModuleTarget {
+        ResolvedModuleTarget {
+            dots: 0,
+            module_parts: parts(module_parts),
+            file_path: PathBuf::from("unused.py"),
+            symbol_parts: parts(symbol_parts),
+        }
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: self::parts(parts),
+        }
+    }
+
+    #[test]
+    fn test_follows_relative_reexport() {
+        let code = "from ._linear import Linear";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["Linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "_linear", "Linear"])));
+    }
+
+    #[test]
+    fn test_follows_relative_package_reexport() {
+        let code = "from . import layers";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["layers", "Linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "layers"])));
+    }
+
+    #[test]
+    fn test_follows_absolute_reexport() {
+        let code = "from jax.numpy import concatenate";
+        let tree = parse(code);
+        let current = resolved(&["my", "pkg"], &["concatenate"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, Some(target(&["jax", "numpy", "concatenate"])));
+    }
+
+    #[test]
+    fn test_class_returns_none() {
+        let code = "class Linear: pass";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["Linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_function_returns_none() {
+        let code = "def linear(): pass";
+        let tree = parse(code);
+        let current = resolved(&["pkg"], &["linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_symbol_returns_none() {
+        let code = "from ._linear import Other";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["Linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_empty_symbol_parts_returns_none() {
+        let code = "from ._linear import Linear";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &[]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_too_many_relative_dots_returns_none() {
+        let code = "from ..x import Y";
+        let tree = parse(code);
+        let current = resolved(&["pkg"], &["Y"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_terminal_symbol_once_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn resolved(module_parts: &[&str], symbol_parts: &[&str]) -> ResolvedModuleTarget {
+        ResolvedModuleTarget {
+            dots: 0,
+            module_parts: parts(module_parts),
+            file_path: PathBuf::from("unused.py"),
+            symbol_parts: parts(symbol_parts),
+        }
+    }
+
+    #[test]
+    fn test_returns_class_symbol() {
+        let code = "class Linear: pass";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn", "_linear"], &["Linear"]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(
+            found,
+            Some(PythonSymbol::Class {
+                name: "Linear".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_returns_function_symbol() {
+        let code = "def concatenate(): pass";
+        let tree = parse(code);
+        let current = resolved(&["jax", "numpy"], &["concatenate"]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(
+            found,
+            Some(PythonSymbol::Function {
+                name: "concatenate".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_import_symbol_returns_none() {
+        let code = "from ._linear import Linear";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["Linear"]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_symbol_returns_none() {
+        let code = "class Other: pass";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &["Linear"]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_empty_symbol_parts_returns_none() {
+        let code = "class Linear: pass";
+        let tree = parse(code);
+        let current = resolved(&["equinox", "nn"], &[]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_uses_first_symbol_part_only() {
+        let code = "class nn: pass";
+        let tree = parse(code);
+        let current = resolved(&["torch"], &["nn", "Linear"]);
+
+        let found = resolve_terminal_symbol_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(
+            found,
+            Some(PythonSymbol::Class {
+                name: "nn".to_string()
+            })
+        );
     }
 }
 
