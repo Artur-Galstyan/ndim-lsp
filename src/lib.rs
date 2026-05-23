@@ -22,6 +22,14 @@ pub struct ResolvedTarget {
     pub parts: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ResolvedModuleTarget {
+    pub dots: usize,
+    pub module_parts: Vec<String>,
+    pub file_path: PathBuf,
+    pub symbol_parts: Vec<String>,
+}
+
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
@@ -78,6 +86,31 @@ pub fn resolve_call_target(
             parts: target_parts.iter().map(|p| p.to_string()).collect(),
         },
     }
+}
+
+pub fn resolve_target_on_disk(
+    target: &ResolvedTarget,
+    search_roots: &[PathBuf],
+) -> Option<ResolvedModuleTarget> {
+    if target.dots > 0 || target.parts.is_empty() {
+        return None;
+    }
+
+    for len in (1..=target.parts.len()).rev() {
+        let module_parts = &target.parts[..len];
+        let symbol_parts = &target.parts[len..];
+
+        if let Some(file_path) = resolve_python_module_on_disk(module_parts, search_roots) {
+            return Some(ResolvedModuleTarget {
+                dots: target.dots,
+                module_parts: module_parts.to_vec(),
+                file_path,
+                symbol_parts: symbol_parts.to_vec(),
+            });
+        }
+    }
+
+    None
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -460,6 +493,230 @@ mod resolve_call_target_tests {
         let resolved = resolve_call_target("layers.Linear", &import_map);
 
         assert_eq!(resolved, rt(1, &["layers", "Linear"]));
+    }
+}
+
+#[cfg(test)]
+mod resolve_target_on_disk_tests {
+    use super::*;
+    use std::fs;
+
+    fn target(dots: usize, parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots,
+            parts: parts.iter().map(|part| part.to_string()).collect(),
+        }
+    }
+
+    fn expected(
+        dots: usize,
+        module_parts: &[&str],
+        file_path: PathBuf,
+        symbol_parts: &[&str],
+    ) -> ResolvedModuleTarget {
+        ResolvedModuleTarget {
+            dots,
+            module_parts: module_parts.iter().map(|part| part.to_string()).collect(),
+            file_path,
+            symbol_parts: symbol_parts.iter().map(|part| part.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_resolves_exact_module_file_with_no_symbol_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
+        fs::write(tmp.path().join("foo/bar/baz.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo", "bar", "baz"],
+                tmp.path().join("foo/bar/baz.py"),
+                &[]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolves_exact_package_with_no_symbol_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar/baz")).unwrap();
+        fs::write(tmp.path().join("foo/bar/baz/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo", "bar", "baz"],
+                tmp.path().join("foo/bar/baz/__init__.py"),
+                &[]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolves_longest_module_prefix_and_keeps_symbol() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
+        fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "Baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo", "bar"],
+                tmp.path().join("foo/bar.py"),
+                &["Baz"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_falls_back_to_shorter_module_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        fs::write(tmp.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "Baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo"],
+                tmp.path().join("foo.py"),
+                &["bar", "Baz"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_prefers_longer_module_over_shorter_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        fs::write(tmp.path().join("foo.py"), "").unwrap();
+        fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "Baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo", "bar"],
+                tmp.path().join("foo/bar.py"),
+                &["Baz"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_module_file_wins_over_package_init_for_same_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
+        fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
+        fs::write(tmp.path().join("foo/bar/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar", "Baz"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo", "bar"],
+                tmp.path().join("foo/bar.py"),
+                &["Baz"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_searches_roots_in_order_for_same_prefix() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("foo.py"), "").unwrap();
+        fs::write(second.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "Bar"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(0, &["foo"], first.path().join("foo.py"), &["Bar"]))
+        );
+    }
+
+    #[test]
+    fn test_searches_later_roots_if_missing_in_first_root() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(second.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "Bar"]), &roots);
+
+        assert_eq!(
+            found,
+            Some(expected(
+                0,
+                &["foo"],
+                second.path().join("foo.py"),
+                &["Bar"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_empty_target_parts_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &[]), &roots);
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_empty_search_roots_returns_none() {
+        let found = resolve_target_on_disk(&target(0, &["foo"]), &[]);
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_module_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(0, &["foo", "bar"]), &roots);
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_relative_target_returns_none_until_base_package_is_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("layers")).unwrap();
+        fs::write(tmp.path().join("layers.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_target_on_disk(&target(1, &["layers", "Linear"]), &roots);
+
+        assert_eq!(found, None);
     }
 }
 
