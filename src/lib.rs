@@ -120,6 +120,31 @@ pub fn resolve_target_on_disk(
     None
 }
 
+pub fn resolve_import_path_from_package(
+    current_package_parts: &[String],
+    import_path: &ImportPath,
+) -> Option<ResolvedTarget> {
+    if import_path.dots == 0 {
+        let mut parts = import_path.module.clone();
+        parts.push(import_path.name.clone());
+        return Some(ResolvedTarget { dots: 0, parts });
+    }
+
+    let up = import_path.dots - 1;
+
+    if up >= current_package_parts.len() {
+        return None;
+    }
+
+    let base_len = current_package_parts.len() - up;
+    let mut parts = current_package_parts[..base_len].to_vec();
+
+    parts.extend(import_path.module.iter().cloned());
+    parts.push(import_path.name.clone());
+
+    Some(ResolvedTarget { dots: 0, parts })
+}
+
 pub fn find_top_level_symbol(
     node: Node,
     text: &str,
@@ -447,6 +472,94 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod resolve_import_path_from_package_tests {
+    use super::*;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: parts(module),
+            name: name.to_string(),
+        }
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: self::parts(parts),
+        }
+    }
+
+    #[test]
+    fn test_absolute_import_ignores_current_package() {
+        let found = resolve_import_path_from_package(
+            &parts(&["equinox", "nn"]),
+            &ip(0, &["jax"], "random"),
+        );
+
+        assert_eq!(found, Some(target(&["jax", "random"])));
+    }
+
+    #[test]
+    fn test_relative_import_same_package_with_module() {
+        let found = resolve_import_path_from_package(
+            &parts(&["equinox", "nn"]),
+            &ip(1, &["_linear"], "Linear"),
+        );
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "_linear", "Linear"])));
+    }
+
+    #[test]
+    fn test_relative_import_same_package_without_module() {
+        let found =
+            resolve_import_path_from_package(&parts(&["equinox", "nn"]), &ip(1, &[], "layers"));
+
+        assert_eq!(found, Some(target(&["equinox", "nn", "layers"])));
+    }
+
+    #[test]
+    fn test_relative_import_parent_package() {
+        let found = resolve_import_path_from_package(&parts(&["pkg", "sub"]), &ip(2, &["x"], "Y"));
+
+        assert_eq!(found, Some(target(&["pkg", "x", "Y"])));
+    }
+
+    #[test]
+    fn test_relative_import_grandparent_package() {
+        let found =
+            resolve_import_path_from_package(&parts(&["pkg", "sub", "inner"]), &ip(3, &["x"], "Y"));
+
+        assert_eq!(found, Some(target(&["pkg", "x", "Y"])));
+    }
+
+    #[test]
+    fn test_relative_import_too_many_dots_returns_none() {
+        let found = resolve_import_path_from_package(&parts(&["pkg", "sub"]), &ip(3, &["x"], "Y"));
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_relative_import_from_empty_package_returns_none() {
+        let found = resolve_import_path_from_package(&[], &ip(1, &["x"], "Y"));
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_empty_absolute_import_name_is_kept() {
+        let found = resolve_import_path_from_package(&parts(&["pkg"]), &ip(0, &[], "foo"));
+
+        assert_eq!(found, Some(target(&["foo"])));
+    }
 }
 
 #[cfg(test)]
