@@ -16,6 +16,12 @@ pub struct CallInfo {
     pub args_node_range: tree_sitter::Range,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ResolvedTarget {
+    pub dots: usize,
+    pub parts: Vec<String>,
+}
+
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
@@ -36,6 +42,42 @@ pub fn resolve_python_module_on_disk(
         }
     }
     None
+}
+
+pub fn resolve_call_target(
+    target: &str,
+    import_map: &HashMap<String, ImportPath>,
+) -> ResolvedTarget {
+    let target_parts = target
+        .split(".")
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+
+    let Some((first, rest)) = target_parts.split_first() else {
+        return ResolvedTarget {
+            dots: 0,
+            parts: target_parts.iter().map(|p| p.to_string()).collect(),
+        };
+    };
+
+    let imported = import_map.get(*first);
+
+    match imported {
+        Some(i) => {
+            let mut parts = i.module.clone();
+            parts.push(i.name.to_string());
+            parts.extend(rest.iter().map(|p| p.to_string()));
+
+            ResolvedTarget {
+                dots: i.dots,
+                parts,
+            }
+        }
+        None => ResolvedTarget {
+            dots: 0,
+            parts: target_parts.iter().map(|p| p.to_string()).collect(),
+        },
+    }
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -282,6 +324,143 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod resolve_call_target_tests {
+    use super::*;
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: module.iter().map(|part| part.to_string()).collect(),
+            name: name.to_string(),
+        }
+    }
+
+    fn rt(dots: usize, parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots,
+            parts: parts.iter().map(|part| part.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_unimported_single_segment_target_returns_itself() {
+        let import_map = HashMap::new();
+
+        let resolved = resolve_call_target("foo", &import_map);
+
+        assert_eq!(resolved, rt(0, &["foo"]));
+    }
+
+    #[test]
+    fn test_unimported_dotted_target_returns_itself() {
+        let import_map = HashMap::new();
+
+        let resolved = resolve_call_target("foo.bar.baz", &import_map);
+
+        assert_eq!(resolved, rt(0, &["foo", "bar", "baz"]));
+    }
+
+    #[test]
+    fn test_plain_import_alias_resolves_first_segment() {
+        let import_map = HashMap::from([("jnp".to_string(), ip(0, &["jax"], "numpy"))]);
+
+        let resolved = resolve_call_target("jnp.concatenate", &import_map);
+
+        assert_eq!(resolved, rt(0, &["jax", "numpy", "concatenate"]));
+    }
+
+    #[test]
+    fn test_plain_import_without_alias_resolves_first_segment() {
+        let import_map = HashMap::from([("jax".to_string(), ip(0, &[], "jax"))]);
+
+        let resolved = resolve_call_target("jax.numpy.concatenate", &import_map);
+
+        assert_eq!(resolved, rt(0, &["jax", "numpy", "concatenate"]));
+    }
+
+    #[test]
+    fn test_from_import_resolves_imported_name() {
+        let import_map = HashMap::from([("random".to_string(), ip(0, &["jax"], "random"))]);
+
+        let resolved = resolve_call_target("random.PRNGKey", &import_map);
+
+        assert_eq!(resolved, rt(0, &["jax", "random", "PRNGKey"]));
+    }
+
+    #[test]
+    fn test_from_import_alias_resolves_alias() {
+        let import_map = HashMap::from([("lin".to_string(), ip(0, &["equinox", "nn"], "Linear"))]);
+
+        let resolved = resolve_call_target("lin", &import_map);
+
+        assert_eq!(resolved, rt(0, &["equinox", "nn", "Linear"]));
+    }
+
+    #[test]
+    fn test_deep_import_alias_resolves_first_segment_only() {
+        let import_map = HashMap::from([("nn".to_string(), ip(0, &["equinox"], "nn"))]);
+
+        let resolved = resolve_call_target("nn.Linear", &import_map);
+
+        assert_eq!(resolved, rt(0, &["equinox", "nn", "Linear"]));
+    }
+
+    #[test]
+    fn test_only_exact_first_segment_is_resolved() {
+        let import_map = HashMap::from([("foo".to_string(), ip(0, &["real"], "foo"))]);
+
+        let resolved = resolve_call_target("foobar.baz", &import_map);
+
+        assert_eq!(resolved, rt(0, &["foobar", "baz"]));
+    }
+
+    #[test]
+    fn test_empty_target_returns_empty_parts() {
+        let import_map = HashMap::new();
+
+        let resolved = resolve_call_target("", &import_map);
+
+        assert_eq!(resolved, rt(0, &[]));
+    }
+
+    #[test]
+    fn test_extra_dots_are_ignored() {
+        let import_map = HashMap::new();
+
+        let resolved = resolve_call_target("foo..bar.", &import_map);
+
+        assert_eq!(resolved, rt(0, &["foo", "bar"]));
+    }
+
+    #[test]
+    fn test_relative_import_preserves_one_dot() {
+        let import_map = HashMap::from([("Linear".to_string(), ip(1, &["layers"], "Linear"))]);
+
+        let resolved = resolve_call_target("Linear", &import_map);
+
+        assert_eq!(resolved, rt(1, &["layers", "Linear"]));
+    }
+
+    #[test]
+    fn test_relative_import_preserves_multiple_dots() {
+        let import_map = HashMap::from([("Linear".to_string(), ip(2, &["layers"], "Linear"))]);
+
+        let resolved = resolve_call_target("Linear", &import_map);
+
+        assert_eq!(resolved, rt(2, &["layers", "Linear"]));
+    }
+
+    #[test]
+    fn test_relative_import_preserves_dots_with_remaining_target_parts() {
+        let import_map = HashMap::from([("layers".to_string(), ip(1, &[], "layers"))]);
+
+        let resolved = resolve_call_target("layers.Linear", &import_map);
+
+        assert_eq!(resolved, rt(1, &["layers", "Linear"]));
+    }
 }
 
 #[cfg(test)]
