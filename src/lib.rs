@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use tree_sitter::{Node, Query, QueryCursor, Range, StreamingIterator};
+use tree_sitter::{Node, Parser, Query, QueryCursor, Range, StreamingIterator};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImportPath {
@@ -35,6 +35,12 @@ pub enum PythonSymbol {
     Class { name: String },
     Function { name: String },
     Import { name: String, path: ImportPath },
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ResolvedImplementation {
+    pub target: ResolvedModuleTarget,
+    pub symbol: Option<PythonSymbol>,
 }
 
 pub fn resolve_python_module_on_disk(
@@ -190,6 +196,62 @@ pub fn resolve_terminal_symbol_once(
         PythonSymbol::Class { .. } | PythonSymbol::Function { .. } => Ok(Some(symbol)),
         PythonSymbol::Import { .. } => Ok(None),
     }
+}
+
+pub fn resolve_implementation<F>(
+    start: ResolvedTarget,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+) -> Result<Option<ResolvedImplementation>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+
+    let mut current = start;
+
+    for _ in 0..max_depth {
+        let Some(resolved) = resolve_target_on_disk(&current, search_roots) else {
+            return Ok(None);
+        };
+
+        if resolved.symbol_parts.is_empty() {
+            return Ok(Some(ResolvedImplementation {
+                target: resolved,
+                symbol: None,
+            }));
+        }
+
+        let Some(text) = read_file(&resolved.file_path) else {
+            return Ok(None);
+        };
+
+        let Some(tree) = parser.parse(&text, None) else {
+            return Err("failed to parse file".to_string());
+        };
+
+        let root = tree.root_node();
+
+        if let Some(symbol) = resolve_terminal_symbol_once(&resolved, root, &text)? {
+            return Ok(Some(ResolvedImplementation {
+                target: resolved,
+                symbol: Some(symbol),
+            }));
+        }
+
+        if let Some(next) = resolve_reexport_once(&resolved, root, &text)? {
+            current = next;
+            continue;
+        }
+
+        return Ok(None);
+    }
+
+    Ok(None)
 }
 
 pub fn find_top_level_symbol(
@@ -606,6 +668,208 @@ mod resolve_import_path_from_package_tests {
         let found = resolve_import_path_from_package(&parts(&["pkg"]), &ip(0, &[], "foo"));
 
         assert_eq!(found, Some(target(&["foo"])));
+    }
+}
+
+#[cfg(test)]
+mod resolve_implementation_tests {
+    use super::*;
+    use std::fs;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: self::parts(parts),
+        }
+    }
+
+    fn implementation(
+        module_parts: &[&str],
+        file_path: PathBuf,
+        symbol_parts: &[&str],
+        symbol: Option<PythonSymbol>,
+    ) -> ResolvedImplementation {
+        ResolvedImplementation {
+            target: ResolvedModuleTarget {
+                dots: 0,
+                module_parts: parts(module_parts),
+                file_path,
+                symbol_parts: parts(symbol_parts),
+            },
+            symbol,
+        }
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    #[test]
+    fn test_resolves_direct_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found =
+            resolve_implementation(target(&["pkg", "linear", "Linear"]), &roots, read, 5).unwrap();
+
+        assert_eq!(
+            found,
+            Some(implementation(
+                &["pkg", "linear"],
+                tmp.path().join("pkg/linear.py"),
+                &["Linear"],
+                Some(PythonSymbol::Class {
+                    name: "Linear".to_string()
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolves_direct_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("jax/numpy")).unwrap();
+        fs::write(
+            tmp.path().join("jax/numpy/api.py"),
+            "def concatenate(): pass",
+        )
+        .unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(
+            target(&["jax", "numpy", "api", "concatenate"]),
+            &roots,
+            read,
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            found,
+            Some(implementation(
+                &["jax", "numpy", "api"],
+                tmp.path().join("jax/numpy/api.py"),
+                &["concatenate"],
+                Some(PythonSymbol::Function {
+                    name: "concatenate".to_string()
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolves_module_itself_when_no_symbol_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/mod.py"), "VALUE = 1").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(target(&["pkg", "mod"]), &roots, read, 5).unwrap();
+
+        assert_eq!(
+            found,
+            Some(implementation(
+                &["pkg", "mod"],
+                tmp.path().join("pkg/mod.py"),
+                &[],
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn test_follows_reexport_then_resolves_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear: pass",
+        )
+        .unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found =
+            resolve_implementation(target(&["equinox", "nn", "Linear"]), &roots, read, 5).unwrap();
+
+        assert_eq!(
+            found,
+            Some(implementation(
+                &["equinox", "nn", "_linear"],
+                tmp.path().join("equinox/nn/_linear.py"),
+                &["Linear"],
+                Some(PythonSymbol::Class {
+                    name: "Linear".to_string()
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn test_missing_module_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found =
+            resolve_implementation(target(&["missing", "Linear"]), &roots, read, 5).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_read_failure_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("foo.py"), "class Foo: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, |_| None, 5).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_symbol_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("foo.py"), "class Bar: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 5).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_max_depth_zero_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("foo.py"), "class Foo: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 0).unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_cycle_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/__init__.py"), "from .a import X").unwrap();
+        fs::write(tmp.path().join("pkg/a.py"), "from . import X").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(target(&["pkg", "X"]), &roots, read, 10).unwrap();
+
+        assert_eq!(found, None);
     }
 }
 
