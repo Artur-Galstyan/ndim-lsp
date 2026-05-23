@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use tree_sitter::{Node, Query, QueryCursor, Range, StreamingIterator};
 
@@ -14,6 +14,28 @@ pub struct CallInfo {
     pub variable: String,
     pub target: String,
     pub args_node_range: tree_sitter::Range,
+}
+
+pub fn resolve_python_module_on_disk(
+    module: &[String],
+    search_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    if module.is_empty() {
+        return None;
+    }
+    for root in search_roots {
+        let module_path = root.join(module.join("/"));
+        let file_path = module_path.with_extension("py");
+        if file_path.exists() {
+            return Some(file_path);
+        }
+
+        let package_path = module_path.join("__init__.py");
+        if package_path.exists() {
+            return Some(package_path);
+        }
+    }
+    None
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -260,6 +282,152 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod resolve_python_module_on_disk_tests {
+    use super::*;
+    use std::fs;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn test_resolves_module_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/bar.py")));
+    }
+
+    #[test]
+    fn test_resolves_package_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
+        fs::write(tmp.path().join("foo/bar/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/bar/__init__.py")));
+    }
+
+    #[test]
+    fn test_module_file_wins_over_package_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
+        fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
+        fs::write(tmp.path().join("foo/bar/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/bar.py")));
+    }
+
+    #[test]
+    fn test_resolves_deeply_nested_module_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar/baz")).unwrap();
+        fs::write(tmp.path().join("foo/bar/baz/qux.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar", "baz", "qux"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/bar/baz/qux.py")));
+    }
+
+    #[test]
+    fn test_resolves_deeply_nested_package_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo/bar/baz/qux")).unwrap();
+        fs::write(tmp.path().join("foo/bar/baz/qux/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar", "baz", "qux"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/bar/baz/qux/__init__.py")));
+    }
+
+    #[test]
+    fn test_resolves_single_segment_module_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo.py")));
+    }
+
+    #[test]
+    fn test_resolves_single_segment_package_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        fs::write(tmp.path().join("foo/__init__.py"), "").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo"]), &roots);
+
+        assert_eq!(found, Some(tmp.path().join("foo/__init__.py")));
+    }
+
+    #[test]
+    fn test_searches_roots_in_order() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("foo.py"), "").unwrap();
+        fs::write(second.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo"]), &roots);
+
+        assert_eq!(found, Some(first.path().join("foo.py")));
+    }
+
+    #[test]
+    fn test_searches_later_roots_if_missing_in_first_root() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(second.path().join("foo.py"), "").unwrap();
+
+        let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo"]), &roots);
+
+        assert_eq!(found, Some(second.path().join("foo.py")));
+    }
+
+    #[test]
+    fn test_empty_module_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&[], &roots);
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_empty_search_roots_returns_none() {
+        let found = resolve_python_module_on_disk(&parts(&["foo"]), &[]);
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_module_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_python_module_on_disk(&parts(&["foo", "bar"]), &roots);
+
+        assert_eq!(found, None);
+    }
 }
 
 #[cfg(test)]
