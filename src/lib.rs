@@ -30,6 +30,13 @@ pub struct ResolvedModuleTarget {
     pub symbol_parts: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum PythonSymbol {
+    Class { name: String },
+    Function { name: String },
+    Import { name: String, path: ImportPath },
+}
+
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
@@ -111,6 +118,89 @@ pub fn resolve_target_on_disk(
     }
 
     None
+}
+
+pub fn find_top_level_symbol(
+    node: Node,
+    text: &str,
+    name: &str,
+) -> Result<Option<PythonSymbol>, String> {
+    let query_string = r#"
+        (module (class_definition name: (_) @cls_def))
+        (module (function_definition name: (_) @fn_def))
+        (module (import_statement) @import)
+        (module (import_from_statement) @import)
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
+        .map_err(|e| e.to_string())?;
+    let Some(class_idx) = query.capture_index_for_name("cls_def") else {
+        return Err("Failed to find capture index for 'cls_def'".to_string());
+    };
+
+    let Some(fn_idx) = query.capture_index_for_name("fn_def") else {
+        return Err("Failed to find capture index for 'fn_def'".to_string());
+    };
+    let Some(import_idx) = query.capture_index_for_name("import") else {
+        return Err("Failed to find capture index for 'import'".to_string());
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut found = None;
+
+    while let Some(match_) = matches.next() {
+        match match_.pattern_index {
+            0 => {
+                for capture in match_.captures {
+                    if capture.index == class_idx {
+                        let class_name = capture
+                            .node
+                            .utf8_text(text.as_bytes())
+                            .map_err(|e| e.to_string())?;
+
+                        if class_name == name {
+                            found = Some(PythonSymbol::Class {
+                                name: class_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            1 => {
+                for capture in match_.captures {
+                    if capture.index == fn_idx {
+                        let fn_name = capture
+                            .node
+                            .utf8_text(text.as_bytes())
+                            .map_err(|e| e.to_string())?;
+
+                        if fn_name == name {
+                            found = Some(PythonSymbol::Function {
+                                name: fn_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            2 | 3 => {
+                for capture in match_.captures {
+                    if capture.index == import_idx {
+                        let import_map = build_import_map(capture.node, text)?;
+                        if let Some(path) = import_map.get(name) {
+                            found = Some(PythonSymbol::Import {
+                                name: name.to_string(),
+                                path: path.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(found)
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -357,6 +447,199 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod find_top_level_symbol_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: module.iter().map(|part| part.to_string()).collect(),
+            name: name.to_string(),
+        }
+    }
+
+    fn class(name: &str) -> PythonSymbol {
+        PythonSymbol::Class {
+            name: name.to_string(),
+        }
+    }
+
+    fn function(name: &str) -> PythonSymbol {
+        PythonSymbol::Function {
+            name: name.to_string(),
+        }
+    }
+
+    fn import(name: &str, path: ImportPath) -> PythonSymbol {
+        PythonSymbol::Import {
+            name: name.to_string(),
+            path,
+        }
+    }
+
+    #[test]
+    fn test_finds_top_level_class() {
+        let code = "class Linear: pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, Some(class("Linear")));
+    }
+
+    #[test]
+    fn test_finds_top_level_function() {
+        let code = "def linear(): pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "linear").unwrap();
+
+        assert_eq!(found, Some(function("linear")));
+    }
+
+    #[test]
+    fn test_finds_plain_import() {
+        let code = "import foo";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "foo").unwrap();
+
+        assert_eq!(found, Some(import("foo", ip(0, &[], "foo"))));
+    }
+
+    #[test]
+    fn test_finds_plain_import_alias() {
+        let code = "import foo as bar";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "bar").unwrap();
+
+        assert_eq!(found, Some(import("bar", ip(0, &[], "foo"))));
+    }
+
+    #[test]
+    fn test_finds_deep_import_alias() {
+        let code = "import foo.bar as baz";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "baz").unwrap();
+
+        assert_eq!(found, Some(import("baz", ip(0, &["foo"], "bar"))));
+    }
+
+    #[test]
+    fn test_finds_from_import() {
+        let code = "from jax import random";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "random").unwrap();
+
+        assert_eq!(found, Some(import("random", ip(0, &["jax"], "random"))));
+    }
+
+    #[test]
+    fn test_finds_from_import_alias() {
+        let code = "from equinox.nn import Linear as Lin";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Lin").unwrap();
+
+        assert_eq!(
+            found,
+            Some(import("Lin", ip(0, &["equinox", "nn"], "Linear")))
+        );
+    }
+
+    #[test]
+    fn test_finds_relative_from_import() {
+        let code = "from ._linear import Linear";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, Some(import("Linear", ip(1, &["_linear"], "Linear"))));
+    }
+
+    #[test]
+    fn test_finds_relative_package_import() {
+        let code = "from . import layers";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "layers").unwrap();
+
+        assert_eq!(found, Some(import("layers", ip(1, &[], "layers"))));
+    }
+
+    #[test]
+    fn test_skips_nested_class() {
+        let code = "def outer():\n    class Linear: pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_skips_nested_function() {
+        let code = "def outer():\n    def inner(): pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "inner").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_star_import_does_not_define_named_symbol() {
+        let code = "from foo import *";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_symbol_returns_none() {
+        let code = "class Other: pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_last_top_level_definition_wins() {
+        let code = "from foo import Linear\nclass Linear: pass";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, Some(class("Linear")));
+    }
+
+    #[test]
+    fn test_last_top_level_import_wins() {
+        let code = "class Linear: pass\nfrom foo import Linear";
+        let tree = parse(code);
+
+        let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
+
+        assert_eq!(found, Some(import("Linear", ip(0, &["foo"], "Linear"))));
+    }
 }
 
 #[cfg(test)]
