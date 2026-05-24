@@ -83,6 +83,20 @@ pub struct LayerApplication {
     pub kind: LayerKind,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ShapeError {
+    pub variable: String,
+    pub message: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct LayerShapeAnalysis {
+    pub shapes: HashMap<String, Vec<String>>,
+    pub layers: HashMap<String, LayerKind>,
+    pub applications: Vec<LayerApplication>,
+    pub errors: Vec<ShapeError>,
+}
+
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
@@ -695,7 +709,7 @@ pub fn apply_layer_application(
 pub fn apply_layer_applications(
     apps: &[LayerApplication],
     shapes: &mut HashMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> Vec<ShapeError> {
     let mut errors = Vec::new();
 
     for app in apps {
@@ -704,11 +718,180 @@ pub fn apply_layer_applications(
                 shapes.insert(app.variable.clone(), output_shape);
             }
             Ok(None) => {}
-            Err(error) => errors.push(error),
+            Err(message) => errors.push(ShapeError {
+                variable: app.variable.clone(),
+                message,
+            }),
         }
     }
 
     errors
+}
+
+pub fn analyze_layer_shapes<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+) -> Result<LayerShapeAnalysis, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let mut shapes = extract_jaxtyping_shapes(node, text)?;
+    let layers = extract_layer_assignments(node, text, search_roots, read_file, max_depth)?;
+    let applications = extract_layer_applications(node, text, &layers)?;
+    let errors = apply_layer_applications(&applications, &mut shapes);
+
+    Ok(LayerShapeAnalysis {
+        shapes,
+        layers,
+        applications,
+        errors,
+    })
+}
+
+pub fn extract_jaxtyping_shapes(
+    node: Node,
+    text: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    fn node_text(node: Node, text: &str) -> Result<String, String> {
+        node.utf8_text(text.as_bytes())
+            .map(|s| s.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    fn first_identifier(node: Node, text: &str) -> Result<Option<String>, String> {
+        if node.kind() == "identifier" {
+            return Ok(Some(node_text(node, text)?));
+        }
+        if let Some(name) = node.child_by_field_name("name") {
+            return Ok(Some(node_text(name, text)?));
+        }
+        let type_node = node.child_by_field_name("type");
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            if type_node == Some(child) {
+                continue;
+            }
+            if let Some(name) = first_identifier(child, text)? {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_string_literal(node: Node, text: &str) -> Result<Option<String>, String> {
+        if node.kind() == "string" {
+            return Ok(Some(node_text(node, text)?));
+        }
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            if let Some(value) = find_string_literal(child, text)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn contains_array_type(node: Node, text: &str) -> Result<bool, String> {
+        let node_text = node_text(node, text)?;
+        if node.kind() == "identifier" && node_text == "Array" {
+            return Ok(true);
+        }
+        if node.kind() == "attribute" && node_text.ends_with(".Array") {
+            return Ok(true);
+        }
+
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            if contains_array_type(child, text)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn shape_dims(raw_string: &str) -> Vec<String> {
+        let trimmed = raw_string.trim();
+        let Some(quote_start) = trimmed.find(['"', '\'']) else {
+            return Vec::new();
+        };
+        let prefix = trimmed[..quote_start].to_ascii_lowercase();
+        if prefix.chars().any(|c| c != 'r' && c != 'u') {
+            return Vec::new();
+        }
+
+        let quoted = &trimmed[quote_start..];
+        let quote = quoted.chars().next().unwrap();
+        let triple = quote.to_string().repeat(3);
+        let unquoted = if quoted.starts_with(&triple) && quoted.ends_with(&triple) {
+            &quoted[3..quoted.len() - 3]
+        } else if quoted.starts_with(quote) && quoted.ends_with(quote) {
+            &quoted[1..quoted.len() - 1]
+        } else {
+            return Vec::new();
+        };
+
+        unquoted
+            .split_whitespace()
+            .filter(|dim| !dim.is_empty())
+            .map(|dim| dim.to_string())
+            .collect()
+    }
+
+    fn visit(
+        node: Node,
+        text: &str,
+        shapes: &mut HashMap<String, Vec<String>>,
+    ) -> Result<(), String> {
+        if node.kind() == "function_definition" {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                for i in 0..parameters.named_child_count() {
+                    let Some(parameter) = parameters.named_child(i as u32) else {
+                        continue;
+                    };
+                    let Some(type_node) = parameter.child_by_field_name("type") else {
+                        continue;
+                    };
+                    if !contains_array_type(type_node, text)? {
+                        continue;
+                    }
+                    let Some(raw_shape) = find_string_literal(type_node, text)? else {
+                        continue;
+                    };
+                    let dims = shape_dims(&raw_shape);
+                    if dims.is_empty() {
+                        continue;
+                    }
+                    let Some(name) = first_identifier(parameter, text)? else {
+                        continue;
+                    };
+                    shapes.insert(name, dims);
+                }
+            }
+        }
+
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            visit(child, text, shapes)?;
+        }
+
+        Ok(())
+    }
+
+    let mut shapes = HashMap::new();
+    visit(node, text, &mut shapes)?;
+    Ok(shapes)
 }
 
 pub fn find_top_level_symbol(
@@ -1129,6 +1312,337 @@ mod resolve_import_path_from_package_tests {
 }
 
 #[cfg(test)]
+mod extract_jaxtyping_shapes_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_extracts_single_jaxtyping_shape() {
+        let code = "def f(x: Float[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_extracts_concrete_integer_dimension() {
+        let code = "def f(x: Float[Array, \"batch 3\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+    }
+
+    #[test]
+    fn test_extracts_multiple_parameters() {
+        let code = "def f(x: Float[Array, \"b d\"], y: Int[Array, \"b\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
+        assert_eq!(shapes.get("y"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_extracts_typed_default_parameter() {
+        let code = "def f(x: Float[Array, \"b d\"] = default): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_skips_unannotated_parameter() {
+        let code = "def f(x, y: Float[Array, \"b d\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(!shapes.contains_key("x"));
+        assert_eq!(shapes.get("y"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_skips_annotation_without_shape_string() {
+        let code = "def f(x: int): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_extracts_shapes_inside_nested_function() {
+        let code = "def outer():\n    def inner(x: Float[Array, \"b d\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_extracts_single_quoted_shape() {
+        let code = "def f(x: Float[Array, 'batch features']): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_extracts_multiline_function_signature() {
+        let code = "def f(\n    x: Float[Array, \"batch features\"],\n    y: Float[Array, \"batch\"],\n): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_extracts_method_parameter_but_skips_self() {
+        let code = "class M:\n    def __call__(self, x: Float[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(!shapes.contains_key("self"));
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_return_annotation_is_ignored() {
+        let code = "def f(x) -> Float[Array, \"batch features\"]: pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_non_array_string_annotation_is_skipped() {
+        let code = "def f(x: Literal[\"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_notarray_identifier_is_not_treated_as_array() {
+        let code = "def f(x: Float[NotArray, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_qualified_jax_array_is_accepted() {
+        let code = "def f(x: Float[jax.Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_qualified_jaxtyping_array_is_accepted() {
+        let code = "def f(x: Float[jaxtyping.Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_shaped_array_annotation_is_accepted() {
+        let code = "def f(x: Shaped[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_optional_wrapped_array_annotation_is_accepted() {
+        let code = "def f(x: Optional[Float[Array, \"batch features\"]]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_raw_shape_string_is_accepted() {
+        let code = "def f(x: Float[Array, r\"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_triple_quoted_shape_string_is_accepted() {
+        let code = "def f(x: Float[Array, \"\"\"batch features\"\"\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_f_string_shape_is_skipped() {
+        let code = "def f(x: Float[Array, f\"batch {features}\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_annotated_varargs_are_extracted() {
+        let code = "def f(*xs: Float[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("xs"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_annotated_kwargs_are_extracted() {
+        let code = "def f(**kwargs: Float[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("kwargs"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_keyword_only_annotated_parameter_is_extracted() {
+        let code = "def f(*, x: Float[Array, \"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_positional_only_annotated_parameter_is_extracted() {
+        let code = "def f(x: Float[Array, \"batch features\"], /): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_deeply_nested_union_annotation_is_extracted() {
+        let code = "def f(x: Union[None, Float[Array, \"batch features\"]]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_bytes_shape_string_is_skipped() {
+        let code = "def f(x: Float[Array, b\"batch features\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_comment_near_annotation_does_not_affect_shape() {
+        let code = "def f(\n    x: Float[Array, \"batch features\"],  # important\n): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_empty_shape_string_is_skipped() {
+        let code = "def f(x: Float[Array, \"\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn test_extra_spaces_in_shape_string_are_ignored() {
+        let code = "def f(x: Float[Array, \"  batch   features  \"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_preserves_punctuation_inside_dimension_names() {
+        let code = "def f(x: Float[Array, \"batch hidden*2\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "hidden*2"])));
+    }
+
+    #[test]
+    fn test_later_parameter_name_wins() {
+        let code = "def f(x: Float[Array, \"a b\"]): pass\ndef g(x: Float[Array, \"c d\"]): pass";
+        let tree = parse(code);
+
+        let shapes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert_eq!(shapes.get("x"), Some(&shape(&["c", "d"])));
+    }
+}
+
+#[cfg(test)]
 mod apply_layer_application_tests {
     use super::*;
 
@@ -1352,7 +1866,8 @@ mod apply_layer_applications_tests {
         let errors = apply_layer_applications(&apps, &mut shapes);
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("bad_layer"));
+        assert_eq!(errors[0].variable, "bad");
+        assert!(errors[0].message.contains("bad_layer"));
         assert!(!shapes.contains_key("bad"));
         assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
     }
@@ -1384,6 +1899,161 @@ mod apply_layer_applications_tests {
 
         assert!(errors.is_empty());
         assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_collects_multiple_errors() {
+        let apps = vec![
+            app("a", "l1", "x", linear("4", "5")),
+            app("b", "l2", "x", linear("6", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].variable, "a");
+        assert!(errors[0].message.contains("l1"));
+        assert_eq!(errors[1].variable, "b");
+        assert!(errors[1].message.contains("l2"));
+        assert!(!shapes.contains_key("a"));
+        assert!(!shapes.contains_key("b"));
+    }
+
+    #[test]
+    fn test_scalar_error_does_not_stop_later_valid_application() {
+        let apps = vec![
+            app("bad", "l1", "scalar", linear("3", "5")),
+            app("good", "l2", "x", linear("3", "7")),
+        ];
+        let mut shapes = HashMap::from([
+            ("scalar".to_string(), Vec::new()),
+            ("x".to_string(), shape(&["batch", "3"])),
+        ]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "bad");
+        assert!(errors[0].message.contains("scalar input"));
+        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_shape_error_points_to_output_variable_not_input_variable() {
+        let apps = vec![app("projected", "projection", "x", linear("4", "5"))];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "projected");
+        assert!(errors[0].message.contains("projection"));
+        assert!(errors[0].message.contains("x"));
+    }
+
+    #[test]
+    fn test_missing_input_does_not_create_shape_error() {
+        let apps = vec![app("y", "layer", "unknown", linear("3", "5"))];
+        let mut shapes = HashMap::new();
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_empty_applications_preserve_existing_shapes() {
+        let apps = Vec::new();
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+    }
+
+    #[test]
+    fn test_failed_application_does_not_overwrite_existing_output_shape() {
+        let apps = vec![app("y", "bad_layer", "x", linear("4", "5"))];
+        let mut shapes = HashMap::from([
+            ("x".to_string(), shape(&["batch", "3"])),
+            ("y".to_string(), shape(&["old", "shape"])),
+        ]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "y");
+        assert_eq!(shapes.get("y"), Some(&shape(&["old", "shape"])));
+    }
+
+    #[test]
+    fn test_dependent_application_is_skipped_after_failed_producer() {
+        let apps = vec![
+            app("bad", "bad_layer", "x", linear("4", "5")),
+            app("z", "next_layer", "bad", linear("5", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "bad");
+        assert!(!shapes.contains_key("bad"));
+        assert!(!shapes.contains_key("z"));
+    }
+
+    #[test]
+    fn test_successful_application_after_unrelated_error_can_use_known_input() {
+        let apps = vec![
+            app("bad", "bad_layer", "x", linear("4", "5")),
+            app("good", "good_layer", "x", linear("3", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "bad");
+        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_multiple_errors_for_same_output_variable_are_preserved() {
+        let apps = vec![
+            app("y", "l1", "x", linear("4", "5")),
+            app("y", "l2", "x", linear("6", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].variable, "y");
+        assert!(errors[0].message.contains("l1"));
+        assert_eq!(errors[1].variable, "y");
+        assert!(errors[1].message.contains("l2"));
+        assert!(!shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_error_order_follows_application_order_with_successes_between() {
+        let apps = vec![
+            app("a", "l1", "x", linear("4", "5")),
+            app("good", "good_layer", "x", linear("3", "9")),
+            app("b", "l2", "x", linear("6", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].variable, "a");
+        assert!(errors[0].message.contains("l1"));
+        assert_eq!(errors[1].variable, "b");
+        assert!(errors[1].message.contains("l2"));
+        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "9"])));
     }
 }
 
@@ -1568,6 +2238,54 @@ mod extract_layer_applications_tests {
         assert_eq!(
             applications,
             vec![app("y", "layer", "preprocess(x)", linear("3", "5"))]
+        );
+    }
+
+    #[test]
+    fn test_keeps_subscript_input_text() {
+        let code = "y = layer(x[:, 0])";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![app("y", "layer", "x[:, 0]", linear("3", "5"))]
+        );
+    }
+
+    #[test]
+    fn test_keeps_parenthesized_input_text() {
+        let code = "y = layer((x))";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![app("y", "layer", "(x)", linear("3", "5"))]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_output_applications_are_kept_in_order() {
+        let code = "y = l1(x)\ny = l2(y)";
+        let tree = parse(code);
+        let layers = HashMap::from([
+            ("l1".to_string(), linear("3", "5")),
+            ("l2".to_string(), linear("5", "7")),
+        ]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![
+                app("y", "l1", "x", linear("3", "5")),
+                app("y", "l2", "y", linear("5", "7")),
+            ]
         );
     }
 
@@ -1820,6 +2538,349 @@ mod extract_layer_assignments_tests {
 }
 
 #[cfg(test)]
+mod analyze_layer_shapes_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn write_equinox_linear(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_analyzes_single_layer_shape_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.applications.len(), 1);
+    }
+
+    #[test]
+    fn test_analyzes_chained_layer_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(3, 5)\n    l2 = eqx.nn.Linear(5, 7)\n    y = l1(x)\n    z = l2(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(analysis.shapes.get("z"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_reports_layer_shape_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 4\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("expected input last dim 3")
+        );
+        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "4"])));
+        assert!(!analysis.shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_missing_input_shape_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code =
+            "import equinox as eqx\ndef f(x):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(analysis.shapes.is_empty());
+        assert_eq!(analysis.layers.len(), 1);
+        assert_eq!(analysis.applications.len(), 1);
+    }
+
+    #[test]
+    fn test_supports_from_import_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "from equinox.nn import Linear as Lin\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = Lin(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(analysis.layers.contains_key("layer"));
+    }
+
+    #[test]
+    fn test_non_layer_calls_are_ignored_in_analysis() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        fs::write(tmp.path().join("helpers.py"), "def transform(x): pass").unwrap();
+        let code = "import equinox as eqx\nimport helpers\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    a = helpers.transform(x)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.layers.len(), 1);
+        assert_eq!(analysis.applications.len(), 1);
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(!analysis.shapes.contains_key("a"));
+    }
+
+    #[test]
+    fn test_missing_layer_implementation_keeps_only_annotation_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(analysis.layers.is_empty());
+        assert!(analysis.applications.is_empty());
+        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert!(!analysis.shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_analysis_continues_after_one_application_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"], a: Float[Array, \"batch 4\"]):\n    bad_layer = eqx.nn.Linear(3, 5)\n    good_layer = eqx.nn.Linear(4, 6)\n    bad = bad_layer(a)\n    good = good_layer(a)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "bad");
+        assert!(analysis.errors[0].message.contains("bad_layer"));
+        assert!(!analysis.shapes.contains_key("bad"));
+        assert_eq!(analysis.shapes.get("good"), Some(&shape(&["batch", "6"])));
+    }
+
+    #[test]
+    fn test_analysis_collects_multiple_structured_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(4, 5)\n    l2 = eqx.nn.Linear(6, 7)\n    a = l1(x)\n    b = l2(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 2);
+        assert_eq!(analysis.errors[0].variable, "a");
+        assert!(analysis.errors[0].message.contains("l1"));
+        assert_eq!(analysis.errors[1].variable, "b");
+        assert!(analysis.errors[1].message.contains("l2"));
+        assert!(!analysis.shapes.contains_key("a"));
+        assert!(!analysis.shapes.contains_key("b"));
+    }
+
+    #[test]
+    fn test_analysis_error_order_with_success_between_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(4, 5)\n    good_layer = eqx.nn.Linear(3, 9)\n    l2 = eqx.nn.Linear(6, 7)\n    a = l1(x)\n    good = good_layer(x)\n    b = l2(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 2);
+        assert_eq!(analysis.errors[0].variable, "a");
+        assert_eq!(analysis.errors[1].variable, "b");
+        assert_eq!(analysis.shapes.get("good"), Some(&shape(&["batch", "9"])));
+    }
+
+    #[test]
+    fn test_analysis_failed_assignment_does_not_overwrite_existing_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(y: Float[Array, \"old shape\"], x: Float[Array, \"batch 3\"]):\n    bad_layer = eqx.nn.Linear(4, 5)\n    y = bad_layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["old", "shape"])));
+    }
+
+    #[test]
+    fn test_scalar_annotated_input_reports_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(!analysis.shapes.contains_key("x"));
+        assert!(!analysis.shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_keyword_constructor_analysis() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch features\"]):\n    layer = eqx.nn.Linear(out_features=hidden, in_features=features)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "hidden"])));
+    }
+
+    #[test]
+    fn test_duplicate_layer_assignment_affects_later_application() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 7\"]):\n    layer = eqx.nn.Linear(3, 5)\n    layer = eqx.nn.Linear(7, 11)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "11"])));
+    }
+
+    #[test]
+    fn test_symbolic_dims_propagate_through_analysis() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch features\"]):\n    layer = eqx.nn.Linear(features, hidden)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "hidden"])));
+    }
+
+    #[test]
+    fn test_application_source_order_is_respected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(3, 5)\n    l2 = eqx.nn.Linear(5, 7)\n    z = l2(y)\n    y = l1(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(!analysis.shapes.contains_key("z"));
+    }
+
+    #[test]
+    fn test_missing_input_does_not_block_later_valid_application() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    missing_out = layer(missing)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(!analysis.shapes.contains_key("missing_out"));
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_output_reassignment_shape_last_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(3, 5)\n    l2 = eqx.nn.Linear(5, 7)\n    y = l1(x)\n    y = l2(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_file_with_only_annotations_returns_initial_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"batch features\"], y: Float[Array, \"batch\"]):\n    pass";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(analysis.layers.is_empty());
+        assert!(analysis.applications.is_empty());
+        assert_eq!(
+            analysis.shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
+        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch"])));
+    }
+}
+
+#[cfg(test)]
 mod end_to_end_layer_shape_tests {
     use super::*;
     use std::fs;
@@ -1906,7 +2967,8 @@ mod end_to_end_layer_shape_tests {
         let errors = apply_layer_applications(&apps, &mut shapes);
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("expected input last dim 3"));
+        assert_eq!(errors[0].variable, "y");
+        assert!(errors[0].message.contains("expected input last dim 3"));
         assert!(!shapes.contains_key("y"));
     }
 
@@ -3877,6 +4939,616 @@ mod resolve_python_module_on_disk_tests {
 
         assert_eq!(found, None);
     }
+}
+
+#[cfg(test)]
+mod additional_edge_case_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: parts(module),
+            name: name.to_string(),
+        }
+    }
+
+    fn rt(dots: usize, parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots,
+            parts: self::parts(parts),
+        }
+    }
+
+    fn sig(owner: Option<&str>, params: &[&str]) -> PythonCallableSignature {
+        PythonCallableSignature {
+            owner: owner.map(|owner| owner.to_string()),
+            name: "f".to_string(),
+            params: parts(params),
+        }
+    }
+
+    fn pos(value: &str) -> CallArgument {
+        CallArgument::Positional {
+            value: value.to_string(),
+        }
+    }
+
+    fn kw(name: &str, value: &str) -> CallArgument {
+        CallArgument::Keyword {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear {
+            in_features: in_features.to_string(),
+            out_features: out_features.to_string(),
+        }
+    }
+
+    fn app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: "out".to_string(),
+            layer: "layer".to_string(),
+            input: input.to_string(),
+            kind,
+        }
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        parts(dims)
+    }
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    macro_rules! resolve_call_target_case {
+        ($name:ident, [$(($alias:expr, $path:expr)),*], $target:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let import_map = HashMap::from([
+                    $(($alias.to_string(), $path),)*
+                ]);
+                assert_eq!(resolve_call_target($target, &import_map), $expected);
+            }
+        };
+    }
+
+    resolve_call_target_case!(
+        call_target_alias_with_two_suffixes,
+        [("np", ip(0, &["numpy"], "random"))],
+        "np.default_rng.seed",
+        rt(0, &["numpy", "random", "default_rng", "seed"])
+    );
+    resolve_call_target_case!(
+        call_target_alias_exact_only,
+        [("np", ip(0, &["numpy"], "random"))],
+        "npx.foo",
+        rt(0, &["npx", "foo"])
+    );
+    resolve_call_target_case!(
+        call_target_from_import_with_suffix_chain,
+        [("Linear", ip(0, &["equinox", "nn"], "Linear"))],
+        "Linear.init.extra",
+        rt(0, &["equinox", "nn", "Linear", "init", "extra"])
+    );
+    resolve_call_target_case!(
+        call_target_relative_import_with_suffix_chain,
+        [("layers", ip(1, &[], "layers"))],
+        "layers.Linear.forward",
+        rt(1, &["layers", "Linear", "forward"])
+    );
+    resolve_call_target_case!(
+        call_target_empty_dots_with_import_map_still_empty,
+        [("x", ip(0, &["pkg"], "x"))],
+        "...",
+        rt(0, &[])
+    );
+    resolve_call_target_case!(
+        call_target_leading_dot_ignored_for_unimported,
+        [],
+        ".foo.bar",
+        rt(0, &["foo", "bar"])
+    );
+    resolve_call_target_case!(
+        call_target_trailing_dot_ignored_for_imported,
+        [("foo", ip(0, &["pkg"], "foo"))],
+        "foo.",
+        rt(0, &["pkg", "foo"])
+    );
+    resolve_call_target_case!(
+        call_target_many_empty_segments_ignored,
+        [],
+        "foo...bar..baz",
+        rt(0, &["foo", "bar", "baz"])
+    );
+
+    macro_rules! import_path_case {
+        ($name:ident, $current:expr, $path:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(
+                    resolve_import_path_from_package(&parts($current), &$path),
+                    $expected
+                );
+            }
+        };
+    }
+
+    import_path_case!(
+        import_abs_deep_module,
+        &["pkg"],
+        ip(0, &["a", "b", "c"], "D"),
+        Some(rt(0, &["a", "b", "c", "D"]))
+    );
+    import_path_case!(
+        import_abs_single_name,
+        &["pkg", "sub"],
+        ip(0, &[], "D"),
+        Some(rt(0, &["D"]))
+    );
+    import_path_case!(
+        import_rel_same_deep_module,
+        &["pkg", "sub"],
+        ip(1, &["a", "b"], "C"),
+        Some(rt(0, &["pkg", "sub", "a", "b", "C"]))
+    );
+    import_path_case!(
+        import_rel_parent_no_module,
+        &["pkg", "sub"],
+        ip(2, &[], "C"),
+        Some(rt(0, &["pkg", "C"]))
+    );
+    import_path_case!(
+        import_rel_exact_top_too_far,
+        &["pkg"],
+        ip(2, &[], "C"),
+        None
+    );
+    import_path_case!(import_rel_empty_current_too_far, &[], ip(1, &[], "C"), None);
+    import_path_case!(
+        import_rel_three_dots_from_four_parts,
+        &["a", "b", "c", "d"],
+        ip(3, &["x"], "Y"),
+        Some(rt(0, &["a", "b", "x", "Y"]))
+    );
+    import_path_case!(
+        import_rel_four_dots_from_four_parts,
+        &["a", "b", "c", "d"],
+        ip(4, &["x"], "Y"),
+        Some(rt(0, &["a", "x", "Y"]))
+    );
+
+    macro_rules! bind_case {
+        ($name:ident, $sig:expr, [$($arg:expr),*], [$(($param:expr, $value:expr)),*]) => {
+            #[test]
+            fn $name() {
+                let bindings = bind_call_arguments(&$sig, &[$($arg),*]);
+                let expected = HashMap::from([$(($param.to_string(), $value.to_string()),)*]);
+                assert_eq!(bindings, expected);
+            }
+        };
+    }
+
+    bind_case!(bind_no_args_empty, sig(None, &["x"]), [], []);
+    bind_case!(
+        bind_too_many_positionals_ignored,
+        sig(None, &["x"]),
+        [pos("a"), pos("b")],
+        [("x", "a")]
+    );
+    bind_case!(
+        bind_unknown_keyword_preserved,
+        sig(None, &["x"]),
+        [kw("extra", "1")],
+        [("extra", "1")]
+    );
+    bind_case!(
+        bind_keyword_before_positional_does_not_shift_positionals,
+        sig(None, &["x", "y"]),
+        [kw("y", "2"), pos("1")],
+        [("x", "1"), ("y", "2")]
+    );
+    bind_case!(
+        bind_class_skips_cls,
+        sig(Some("C"), &["cls", "x", "y"]),
+        [pos("1"), pos("2")],
+        [("x", "1"), ("y", "2")]
+    );
+    bind_case!(
+        bind_class_does_not_skip_this,
+        sig(Some("C"), &["this", "x"]),
+        [pos("a"), pos("b")],
+        [("this", "a"), ("x", "b")]
+    );
+    bind_case!(
+        bind_function_does_not_skip_self,
+        sig(None, &["self", "x"]),
+        [pos("a"), pos("b")],
+        [("self", "a"), ("x", "b")]
+    );
+    bind_case!(
+        bind_keyword_overwrites_unknown_then_known_order,
+        sig(None, &["x"]),
+        [kw("x", "1"), kw("x", "2")],
+        [("x", "2")]
+    );
+    bind_case!(
+        bind_positional_then_keyword_override,
+        sig(None, &["x"]),
+        [pos("1"), kw("x", "2")],
+        [("x", "2")]
+    );
+    bind_case!(
+        bind_keyword_then_positional_override_by_position,
+        sig(None, &["x"]),
+        [kw("x", "1"), pos("2")],
+        [("x", "2")]
+    );
+
+    macro_rules! apply_ok_case {
+        ($name:ident, $input:expr, $layer:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let app = app("x", $layer);
+                let shapes = HashMap::from([("x".to_string(), shape($input))]);
+                assert_eq!(
+                    apply_layer_application(&app, &shapes).unwrap(),
+                    Some(shape($expected))
+                );
+            }
+        };
+    }
+
+    apply_ok_case!(
+        apply_rank_three_numeric,
+        &["a", "b", "3"],
+        linear("3", "5"),
+        &["a", "b", "5"]
+    );
+    apply_ok_case!(
+        apply_rank_four_symbolic,
+        &["t", "b", "h", "features"],
+        linear("features", "out"),
+        &["t", "b", "h", "out"]
+    );
+    apply_ok_case!(
+        apply_single_dim_symbolic,
+        &["features"],
+        linear("features", "out"),
+        &["out"]
+    );
+    apply_ok_case!(
+        apply_numeric_no_leading_dims,
+        &["10"],
+        linear("10", "20"),
+        &["20"]
+    );
+    apply_ok_case!(
+        apply_preserves_duplicate_leading_dims,
+        &["batch", "batch", "features"],
+        linear("features", "out"),
+        &["batch", "batch", "out"]
+    );
+
+    macro_rules! apply_err_case {
+        ($name:ident, $input:expr, $layer:expr, $needle:expr) => {
+            #[test]
+            fn $name() {
+                let app = app("x", $layer);
+                let shapes = HashMap::from([("x".to_string(), shape($input))]);
+                let error = apply_layer_application(&app, &shapes).unwrap_err();
+                assert!(error.contains($needle));
+            }
+        };
+    }
+
+    apply_err_case!(
+        apply_mismatch_rank_three,
+        &["a", "b", "4"],
+        linear("3", "5"),
+        "got 4"
+    );
+    apply_err_case!(
+        apply_case_sensitive_symbols,
+        &["Batch", "Features"],
+        linear("features", "out"),
+        "got Features"
+    );
+    apply_err_case!(
+        apply_whitespace_not_normalized_in_dims,
+        &["features "],
+        linear("features", "out"),
+        "got features "
+    );
+    apply_err_case!(
+        apply_expression_dim_exact_mismatch,
+        &["hidden * 2"],
+        linear("hidden*2", "out"),
+        "got hidden * 2"
+    );
+    apply_err_case!(
+        apply_empty_last_dim_mismatch,
+        &[""],
+        linear("features", "out"),
+        "got "
+    );
+
+    macro_rules! annotation_case {
+        ($name:ident, $code:expr, [$(($param:expr, [$($dim:expr),*])),*]) => {
+            #[test]
+            fn $name() {
+                let tree = parse($code);
+                let shapes = extract_jaxtyping_shapes(tree.root_node(), $code).unwrap();
+                let expected = HashMap::from([
+                    $(($param.to_string(), vec![$($dim.to_string()),*]),)*
+                ]);
+                assert_eq!(shapes, expected);
+            }
+        };
+    }
+
+    annotation_case!(
+        ann_bool_array_shape,
+        "def f(x: Bool[Array, \"b d\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_complex_array_shape,
+        "def f(x: Complex[Array, \"b d\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_lowercase_array_rejected,
+        "def f(x: Float[array, \"b d\"]): pass",
+        []
+    );
+    annotation_case!(
+        ann_numpy_ndarray_rejected_for_now,
+        "def f(x: Float[np.ndarray, \"b d\"]): pass",
+        []
+    );
+    annotation_case!(
+        ann_list_wrapped_array_shape,
+        "def f(x: list[Float[Array, \"b d\"]]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_union_pipe_array_shape,
+        "def f(x: Float[Array, \"b d\"] | None): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_two_string_literals_uses_first,
+        "def f(x: Annotated[Float[Array, \"b d\"], \"meta\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_shape_with_comma_kept_as_token,
+        "def f(x: Float[Array, \"b, d\"]): pass",
+        [("x", ["b,", "d"])]
+    );
+    annotation_case!(
+        ann_newline_inside_shape_splits_whitespace,
+        "def f(x: Float[Array, \"b\\nd\"]): pass",
+        [("x", ["b\\nd"])]
+    );
+    annotation_case!(
+        ann_tab_inside_shape_splits_whitespace,
+        "def f(x: Float[Array, \"b\td\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_uppercase_raw_prefix,
+        "def f(x: Float[Array, R\"b d\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_unicode_raw_prefix,
+        "def f(x: Float[Array, ur\"b d\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_capital_f_string_rejected,
+        "def f(x: Float[Array, F\"b {d}\"]): pass",
+        []
+    );
+    annotation_case!(
+        ann_capital_b_string_rejected,
+        "def f(x: Float[Array, B\"b d\"]): pass",
+        []
+    );
+    annotation_case!(
+        ann_self_annotated_is_extracted_if_annotated,
+        "class C:\n    def f(self: Float[Array, \"b d\"]): pass",
+        [("self", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_cls_annotated_is_extracted_if_annotated,
+        "class C:\n    def f(cls: Float[Array, \"b d\"]): pass",
+        [("cls", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_tuple_wrapped_array_shape,
+        "def f(x: tuple[Float[Array, \"b d\"], int]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_dict_wrapped_array_shape,
+        "def f(x: dict[str, Float[Array, \"b d\"]]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_typing_optional_wrapped_array_shape,
+        "def f(x: typing.Optional[Float[Array, \"b d\"]]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_union_uses_first_shape_string,
+        "def f(x: Union[Float[Array, \"b d\"], Float[Array, \"b e\"]]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_underscore_dimension_name,
+        "def f(x: Float[Array, \"batch _features\"]): pass",
+        [("x", ["batch", "_features"])]
+    );
+    annotation_case!(
+        ann_question_mark_dimension_name_preserved,
+        "def f(x: Float[Array, \"batch features?\"]): pass",
+        [("x", ["batch", "features?"])]
+    );
+    annotation_case!(
+        ann_ellipsis_dimension_name_preserved,
+        "def f(x: Float[Array, \"batch ...\"]): pass",
+        [("x", ["batch", "..."])]
+    );
+    annotation_case!(
+        ann_colon_dimension_name_preserved,
+        "def f(x: Float[Array, \"batch time:2\"]): pass",
+        [("x", ["batch", "time:2"])]
+    );
+
+    apply_ok_case!(
+        apply_rank_five_symbolic,
+        &["a", "b", "c", "d", "features"],
+        linear("features", "out"),
+        &["a", "b", "c", "d", "out"]
+    );
+    apply_ok_case!(
+        apply_comma_dimension_exact_match,
+        &["batch", "features,"],
+        linear("features,", "out"),
+        &["batch", "out"]
+    );
+    apply_ok_case!(
+        apply_question_mark_dimension_exact_match,
+        &["batch", "features?"],
+        linear("features?", "out"),
+        &["batch", "out"]
+    );
+    apply_ok_case!(
+        apply_ellipsis_dimension_exact_match,
+        &["batch", "..."],
+        linear("...", "out"),
+        &["batch", "out"]
+    );
+    apply_err_case!(
+        apply_comma_dimension_mismatch,
+        &["batch", "features"],
+        linear("features,", "out"),
+        "got features"
+    );
+    apply_err_case!(
+        apply_question_mark_dimension_mismatch,
+        &["batch", "features"],
+        linear("features?", "out"),
+        "got features"
+    );
+    apply_err_case!(
+        apply_ellipsis_dimension_mismatch,
+        &["batch", "features"],
+        linear("...", "out"),
+        "got features"
+    );
+    apply_err_case!(
+        apply_colon_dimension_mismatch,
+        &["batch", "time"],
+        linear("time:2", "out"),
+        "got time"
+    );
+
+    macro_rules! classify_case {
+        ($name:ident, $module:expr, $owner:expr, $call_name:expr, [$(($key:expr, $value:expr)),*], $expected:expr) => {
+            #[test]
+            fn $name() {
+                let bindings = HashMap::from([
+                    $(($key.to_string(), $value.to_string()),)*
+                ]);
+                let call = ResolvedCallSignature {
+                    implementation: ResolvedImplementation {
+                        target: ResolvedModuleTarget {
+                            dots: 0,
+                            module_parts: parts($module),
+                            file_path: PathBuf::from("unused.py"),
+                            symbol_parts: Vec::new(),
+                        },
+                        symbol: $owner.map(|owner| PythonSymbol::Class {
+                            name: owner.to_string(),
+                        }),
+                    },
+                    signature: PythonCallableSignature {
+                        owner: $owner.map(|owner| owner.to_string()),
+                        name: $call_name.to_string(),
+                        params: Vec::new(),
+                    },
+                    arguments: Vec::new(),
+                    bindings,
+                };
+                assert_eq!(classify_layer_call(&call), $expected);
+            }
+        };
+    }
+
+    classify_case!(
+        classify_exact_equinox_nn_init,
+        &["equinox", "nn"],
+        Some("Linear"),
+        "__init__",
+        [("in_features", "1"), ("out_features", "2")],
+        Some(linear("1", "2"))
+    );
+    classify_case!(
+        classify_equinox_nn_deep_init,
+        &["equinox", "nn", "_linear"],
+        Some("Linear"),
+        "__init__",
+        [("in_features", "1"), ("out_features", "2")],
+        Some(linear("1", "2"))
+    );
+    classify_case!(
+        classify_case_sensitive_module_rejected,
+        &["Equinox", "nn"],
+        Some("Linear"),
+        "__init__",
+        [("in_features", "1"), ("out_features", "2")],
+        None
+    );
+    classify_case!(
+        classify_case_sensitive_owner_rejected,
+        &["equinox", "nn"],
+        Some("linear"),
+        "__init__",
+        [("in_features", "1"), ("out_features", "2")],
+        None
+    );
+    classify_case!(
+        classify_missing_bindings_rejected,
+        &["equinox", "nn"],
+        Some("Linear"),
+        "__init__",
+        [],
+        None
+    );
+    classify_case!(
+        classify_wrong_function_name_rejected,
+        &["equinox", "nn"],
+        Some("Linear"),
+        "__call__",
+        [("in_features", "1"), ("out_features", "2")],
+        None
+    );
 }
 
 #[cfg(test)]
