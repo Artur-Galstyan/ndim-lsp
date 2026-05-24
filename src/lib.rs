@@ -75,6 +75,14 @@ pub enum LayerKind {
     },
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct LayerApplication {
+    pub variable: String,
+    pub layer: String,
+    pub input: String,
+    pub kind: LayerKind,
+}
+
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
@@ -581,6 +589,128 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     })
 }
 
+pub fn extract_layer_assignments<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+) -> Result<HashMap<String, LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let import_map = build_import_map(node, text)?;
+    let calls = extract_calls(node, text)?;
+    let mut layers = HashMap::new();
+
+    for call in calls {
+        let Some(resolved_call) = resolve_call_signature(
+            &call,
+            text,
+            &import_map,
+            search_roots,
+            &read_file,
+            max_depth,
+        )?
+        else {
+            continue;
+        };
+        let Some(layer) = classify_layer_call(&resolved_call) else {
+            continue;
+        };
+        layers.insert(call.variable, layer);
+    }
+
+    Ok(layers)
+}
+
+pub fn extract_layer_applications(
+    node: Node,
+    text: &str,
+    layers: &HashMap<String, LayerKind>,
+) -> Result<Vec<LayerApplication>, String> {
+    let calls = extract_calls(node, text)?;
+    let mut applications = Vec::new();
+
+    for call in calls {
+        let Some(kind) = layers.get(&call.target) else {
+            continue;
+        };
+        let Some(args_node) = node.descendant_for_byte_range(
+            call.args_node_range.start_byte,
+            call.args_node_range.end_byte,
+        ) else {
+            continue;
+        };
+        let args = extract_call_arguments(args_node, text)?;
+        let Some(CallArgument::Positional { value }) = args.first() else {
+            continue;
+        };
+        applications.push(LayerApplication {
+            variable: call.variable,
+            layer: call.target,
+            input: value.clone(),
+            kind: kind.clone(),
+        });
+    }
+
+    Ok(applications)
+}
+
+pub fn apply_layer_application(
+    app: &LayerApplication,
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_shape) = shapes.get(&app.input) else {
+        return Ok(None);
+    };
+
+    match &app.kind {
+        LayerKind::Linear {
+            in_features,
+            out_features,
+        } => {
+            let Some(last_dim) = input_shape.last() else {
+                return Err(format!(
+                    "Cannot apply linear layer '{}' to scalar input '{}'",
+                    app.layer, app.input
+                ));
+            };
+
+            if last_dim != in_features {
+                return Err(format!(
+                    "Linear layer '{}' expected input last dim {}, got {} for '{}'",
+                    app.layer, in_features, last_dim, app.input
+                ));
+            }
+
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = out_features.clone();
+            Ok(Some(output_shape))
+        }
+    }
+}
+
+pub fn apply_layer_applications(
+    apps: &[LayerApplication],
+    shapes: &mut HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for app in apps {
+        match apply_layer_application(app, shapes) {
+            Ok(Some(output_shape)) => {
+                shapes.insert(app.variable.clone(), output_shape);
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+
+    errors
+}
+
 pub fn find_top_level_symbol(
     node: Node,
     text: &str,
@@ -995,6 +1125,825 @@ mod resolve_import_path_from_package_tests {
         let found = resolve_import_path_from_package(&parts(&["pkg"]), &ip(0, &[], "foo"));
 
         assert_eq!(found, Some(target(&["foo"])));
+    }
+}
+
+#[cfg(test)]
+mod apply_layer_application_tests {
+    use super::*;
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear {
+            in_features: in_features.to_string(),
+            out_features: out_features.to_string(),
+        }
+    }
+
+    fn app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: "y".to_string(),
+            layer: "layer".to_string(),
+            input: input.to_string(),
+            kind,
+        }
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_applies_linear_to_rank_2_shape() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_applies_linear_to_rank_1_shape() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["3"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn test_applies_linear_to_symbolic_shape() {
+        let app = app("x", linear("features", "hidden"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "hidden"])));
+    }
+
+    #[test]
+    fn test_preserves_leading_dimensions() {
+        let app = app("x", linear("features", "hidden"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["time", "batch", "features"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["time", "batch", "hidden"])));
+    }
+
+    #[test]
+    fn test_missing_input_shape_returns_none() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::new();
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_empty_input_shape_returns_error() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::from([("x".to_string(), Vec::new())]);
+
+        let error = apply_layer_application(&app, &shapes).unwrap_err();
+
+        assert!(error.contains("scalar input"));
+    }
+
+    #[test]
+    fn test_last_dim_mismatch_returns_error() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "4"]))]);
+
+        let error = apply_layer_application(&app, &shapes).unwrap_err();
+
+        assert!(error.contains("expected input last dim 3"));
+        assert!(error.contains("got 4"));
+    }
+
+    #[test]
+    fn test_symbolic_mismatch_returns_error() {
+        let app = app("x", linear("features", "hidden"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "other"]))]);
+
+        let error = apply_layer_application(&app, &shapes).unwrap_err();
+
+        assert!(error.contains("expected input last dim features"));
+        assert!(error.contains("got other"));
+    }
+
+    #[test]
+    fn test_numeric_and_symbolic_dims_do_not_match() {
+        let app = app("x", linear("features", "hidden"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let error = apply_layer_application(&app, &shapes).unwrap_err();
+
+        assert!(error.contains("expected input last dim features"));
+        assert!(error.contains("got 3"));
+    }
+
+    #[test]
+    fn test_same_in_and_out_features_is_allowed() {
+        let app = app("x", linear("features", "features"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_input_shape_map_is_not_mutated() {
+        let app = app("x", linear("3", "5"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "5"])));
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+    }
+
+    #[test]
+    fn test_error_mentions_layer_and_input_names() {
+        let mut app = app("input", linear("3", "5"));
+        app.layer = "projection".to_string();
+        let shapes = HashMap::from([("input".to_string(), shape(&["batch", "4"]))]);
+
+        let error = apply_layer_application(&app, &shapes).unwrap_err();
+
+        assert!(error.contains("projection"));
+        assert!(error.contains("input"));
+    }
+}
+
+#[cfg(test)]
+mod apply_layer_applications_tests {
+    use super::*;
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear {
+            in_features: in_features.to_string(),
+            out_features: out_features.to_string(),
+        }
+    }
+
+    fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: variable.to_string(),
+            layer: layer.to_string(),
+            input: input.to_string(),
+            kind,
+        }
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_applies_single_application_into_shape_map() {
+        let apps = vec![app("y", "layer", "x", linear("3", "5"))];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_applies_chained_applications_in_order() {
+        let apps = vec![
+            app("y", "l1", "x", linear("3", "5")),
+            app("z", "l2", "y", linear("5", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(shapes.get("z"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_missing_input_is_skipped_without_error() {
+        let apps = vec![app("y", "layer", "missing", linear("3", "5"))];
+        let mut shapes = HashMap::new();
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert!(!shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_mismatch_records_error_and_continues() {
+        let apps = vec![
+            app("bad", "bad_layer", "x", linear("4", "5")),
+            app("good", "good_layer", "x", linear("3", "7")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad_layer"));
+        assert!(!shapes.contains_key("bad"));
+        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_order_matters_for_chains() {
+        let apps = vec![
+            app("z", "l2", "y", linear("5", "7")),
+            app("y", "l1", "x", linear("3", "5")),
+        ];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(!shapes.contains_key("z"));
+    }
+
+    #[test]
+    fn test_later_assignment_overwrites_existing_output_shape() {
+        let apps = vec![app("y", "layer", "x", linear("3", "5"))];
+        let mut shapes = HashMap::from([
+            ("x".to_string(), shape(&["batch", "3"])),
+            ("y".to_string(), shape(&["old"])),
+        ]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+    }
+}
+
+#[cfg(test)]
+mod extract_layer_applications_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear {
+            in_features: in_features.to_string(),
+            out_features: out_features.to_string(),
+        }
+    }
+
+    fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: variable.to_string(),
+            layer: layer.to_string(),
+            input: input.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_extracts_simple_layer_application() {
+        let code = "y = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
+    }
+
+    #[test]
+    fn test_extracts_multiple_layer_applications() {
+        let code = "y = l1(x)\nz = l2(y)";
+        let tree = parse(code);
+        let layers = HashMap::from([
+            ("l1".to_string(), linear("3", "5")),
+            ("l2".to_string(), linear("5", "7")),
+        ]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![
+                app("y", "l1", "x", linear("3", "5")),
+                app("z", "l2", "y", linear("5", "7")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_skips_unknown_layer_call() {
+        let code = "y = layer(x)\nz = unknown(y)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
+    }
+
+    #[test]
+    fn test_skips_layer_call_without_arguments() {
+        let code = "y = layer()";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert!(applications.is_empty());
+    }
+
+    #[test]
+    fn test_skips_layer_call_with_keyword_only_input() {
+        let code = "y = layer(x=x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert!(applications.is_empty());
+    }
+
+    #[test]
+    fn test_keeps_expression_input_text() {
+        let code = "y = layer(x + residual)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![app("y", "layer", "x + residual", linear("3", "5"))]
+        );
+    }
+
+    #[test]
+    fn test_skips_attribute_layer_call_for_now() {
+        let code = "y = model.layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert!(applications.is_empty());
+    }
+
+    #[test]
+    fn test_uses_first_positional_arg_when_extra_args_are_present() {
+        let code = "y = layer(x, other, flag=True)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
+    }
+
+    #[test]
+    fn test_preserves_application_order_while_skipping_unknown_calls() {
+        let code = "a = l1(x)\nignored = unknown(a)\nb = l2(a)";
+        let tree = parse(code);
+        let layers = HashMap::from([
+            ("l1".to_string(), linear("3", "5")),
+            ("l2".to_string(), linear("5", "7")),
+        ]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![
+                app("a", "l1", "x", linear("3", "5")),
+                app("b", "l2", "a", linear("5", "7")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_layer_name_match_is_exact() {
+        let code = "y = layer2(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert!(applications.is_empty());
+    }
+
+    #[test]
+    fn test_extracts_layer_application_inside_function() {
+        let code = "def f(x):\n    y = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
+    }
+
+    #[test]
+    fn test_keeps_nested_call_input_text() {
+        let code = "y = layer(preprocess(x))";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            applications,
+            vec![app("y", "layer", "preprocess(x)", linear("3", "5"))]
+        );
+    }
+
+    #[test]
+    fn test_empty_layer_map_returns_empty_applications() {
+        let code = "y = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::new();
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert!(applications.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod extract_layer_assignments_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn write_equinox_linear(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_extracts_single_linear_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_extracts_multiple_linear_assignments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code =
+            "import equinox as eqx\na = eqx.nn.Linear(3, 5)\nb = eqx.nn.Linear(features, hidden)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(layers.len(), 2);
+        assert_eq!(
+            layers.get("a"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+        assert_eq!(
+            layers.get("b"),
+            Some(&LayerKind::Linear {
+                in_features: "features".to_string(),
+                out_features: "hidden".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_supports_from_import_alias_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code =
+            "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_skips_non_layer_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        fs::write(tmp.path().join("helpers.py"), "def make_layer(): pass").unwrap();
+        let code = "import equinox as eqx\nimport helpers\nlayer = eqx.nn.Linear(3, 5)\nother = helpers.make_layer()";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert!(layers.contains_key("layer"));
+        assert!(!layers.contains_key("other"));
+    }
+
+    #[test]
+    fn test_skips_missing_implementation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn test_supports_reversed_keyword_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(out_features=5, in_features=3)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_supports_extra_constructor_kwargs() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5, use_bias=False, key=key)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_keyword_overrides_positional_constructor_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 4, out_features=5)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_extracts_layer_assignment_inside_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef make():\n    layer = eqx.nn.Linear(3, 5)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_skips_layer_assignment_when_required_feature_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(in_features=3)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_layer_assignment_last_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code =
+            "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\nlayer = eqx.nn.Linear(7, 11)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "7".to_string(),
+                out_features: "11".to_string()
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod end_to_end_layer_shape_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn write_equinox_linear(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_extracts_layers_and_propagates_single_application() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_extracts_layers_and_propagates_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nl1 = eqx.nn.Linear(3, 5)\nl2 = eqx.nn.Linear(5, 7)\ny = l1(x)\nz = l2(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(shapes.get("z"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_reports_mismatch_in_end_to_end_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "4"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("expected input last dim 3"));
+        assert!(!shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_unknown_input_in_end_to_end_pipeline_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut shapes = HashMap::new();
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert!(!shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_in_place_layer_application_uses_old_input_shape_then_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\nx = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert!(errors.is_empty());
+        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "5"])));
     }
 }
 
