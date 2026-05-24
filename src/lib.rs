@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, Range, StreamingIterator};
 
@@ -41,6 +44,35 @@ pub enum PythonSymbol {
 pub struct ResolvedImplementation {
     pub target: ResolvedModuleTarget,
     pub symbol: Option<PythonSymbol>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct PythonCallableSignature {
+    pub owner: Option<String>,
+    pub name: String,
+    pub params: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum CallArgument {
+    Positional { value: String },
+    Keyword { name: String, value: String },
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ResolvedCallSignature {
+    pub implementation: ResolvedImplementation,
+    pub signature: PythonCallableSignature,
+    pub arguments: Vec<CallArgument>,
+    pub bindings: HashMap<String, String>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum LayerKind {
+    Linear {
+        in_features: String,
+        out_features: String,
+    },
 }
 
 pub fn resolve_python_module_on_disk(
@@ -176,7 +208,13 @@ pub fn resolve_reexport_once(
         return Ok(None);
     };
 
-    Ok(follow_import_symbol_once(&resolved.module_parts, &symbol))
+    let Some(mut next) = follow_import_symbol_once(&resolved.module_parts, &symbol) else {
+        return Ok(None);
+    };
+
+    next.parts
+        .extend(resolved.symbol_parts.iter().skip(1).cloned());
+    Ok(Some(next))
 }
 
 pub fn resolve_terminal_symbol_once(
@@ -214,7 +252,12 @@ where
 
     let mut current = start;
 
+    let mut visited = HashSet::new();
+
     for _ in 0..max_depth {
+        if !visited.insert(current.parts.clone()) {
+            return Ok(None);
+        }
         let Some(resolved) = resolve_target_on_disk(&current, search_roots) else {
             return Ok(None);
         };
@@ -252,6 +295,290 @@ where
     }
 
     Ok(None)
+}
+
+pub fn extract_callable_signature(
+    node: Node,
+    text: &str,
+    symbol: &PythonSymbol,
+) -> Result<Option<PythonCallableSignature>, String> {
+    fn node_text(node: Node, text: &str) -> Result<String, String> {
+        node.utf8_text(text.as_bytes())
+            .map(|s| s.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    fn definition_name(node: Node, text: &str) -> Result<Option<String>, String> {
+        node.child_by_field_name("name")
+            .map(|name| node_text(name, text))
+            .transpose()
+    }
+
+    fn parameter_name(node: Node, text: &str) -> Result<Option<String>, String> {
+        if node.kind() == "identifier" {
+            return Ok(Some(node_text(node, text)?));
+        }
+
+        if let Some(name) = node.child_by_field_name("name") {
+            return Ok(Some(node_text(name, text)?));
+        }
+
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            if child.kind() == "identifier" {
+                return Ok(Some(node_text(child, text)?));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn params_from_function(node: Node, text: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(params_node) = node.child_by_field_name("parameters") else {
+            return Ok(None);
+        };
+
+        let mut params = Vec::new();
+        for i in 0..params_node.named_child_count() {
+            let Some(child) = params_node.named_child(i as u32) else {
+                continue;
+            };
+            if let Some(name) = parameter_name(child, text)? {
+                params.push(name);
+            }
+        }
+
+        Ok(Some(params))
+    }
+
+    fn top_level_function_signature(
+        node: Node,
+        text: &str,
+        name: &str,
+    ) -> Result<Option<PythonCallableSignature>, String> {
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i as u32) else {
+                continue;
+            };
+            if child.kind() != "function_definition" {
+                continue;
+            }
+            if definition_name(child, text)?.as_deref() != Some(name) {
+                continue;
+            }
+            let Some(params) = params_from_function(child, text)? else {
+                return Ok(None);
+            };
+            return Ok(Some(PythonCallableSignature {
+                owner: None,
+                name: name.to_string(),
+                params,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn class_init_signature(
+        node: Node,
+        text: &str,
+        class_name: &str,
+    ) -> Result<Option<PythonCallableSignature>, String> {
+        for i in 0..node.named_child_count() {
+            let Some(class_node) = node.named_child(i as u32) else {
+                continue;
+            };
+            if class_node.kind() != "class_definition" {
+                continue;
+            }
+            if definition_name(class_node, text)?.as_deref() != Some(class_name) {
+                continue;
+            }
+
+            let Some(body) = class_node.child_by_field_name("body") else {
+                return Ok(None);
+            };
+
+            for j in 0..body.named_child_count() {
+                let Some(method) = body.named_child(j as u32) else {
+                    continue;
+                };
+                if method.kind() != "function_definition" {
+                    continue;
+                }
+                if definition_name(method, text)?.as_deref() != Some("__init__") {
+                    continue;
+                }
+                let Some(params) = params_from_function(method, text)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(PythonCallableSignature {
+                    owner: Some(class_name.to_string()),
+                    name: "__init__".to_string(),
+                    params,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    match symbol {
+        PythonSymbol::Class { name } => class_init_signature(node, text, name),
+        PythonSymbol::Function { name } => top_level_function_signature(node, text, name),
+        PythonSymbol::Import { .. } => Ok(None),
+    }
+}
+
+pub fn resolve_call_signature<F>(
+    call: &CallInfo,
+    source_text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+) -> Result<Option<ResolvedCallSignature>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let target = resolve_call_target(&call.target, import_map);
+    let Some(implementation) = resolve_implementation(target, search_roots, &read_file, max_depth)?
+    else {
+        return Ok(None);
+    };
+    let Some(symbol) = &implementation.symbol else {
+        return Ok(None);
+    };
+
+    let Some(implementation_text) = read_file(&implementation.target.file_path) else {
+        return Ok(None);
+    };
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+
+    let Some(implementation_tree) = parser.parse(&implementation_text, None) else {
+        return Err("failed to parse implementation file".to_string());
+    };
+
+    let Some(signature) = extract_callable_signature(
+        implementation_tree.root_node(),
+        &implementation_text,
+        symbol,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let Some(source_tree) = parser.parse(source_text, None) else {
+        return Err("failed to parse source file".to_string());
+    };
+    let Some(args_node) = source_tree.root_node().descendant_for_byte_range(
+        call.args_node_range.start_byte,
+        call.args_node_range.end_byte,
+    ) else {
+        return Ok(None);
+    };
+
+    let arguments = extract_call_arguments(args_node, source_text)?;
+    let bindings = bind_call_arguments(&signature, &arguments);
+
+    Ok(Some(ResolvedCallSignature {
+        implementation,
+        signature,
+        arguments,
+        bindings,
+    }))
+}
+
+pub fn extract_call_arguments(args_node: Node, text: &str) -> Result<Vec<CallArgument>, String> {
+    let mut args = Vec::new();
+
+    for i in 0..args_node.named_child_count() {
+        let Some(child) = args_node.named_child(i as u32) else {
+            continue;
+        };
+
+        if child.kind() == "keyword_argument" {
+            let Some(name_node) = child.child_by_field_name("name") else {
+                return Err("keyword_argument missing name".to_string());
+            };
+            let Some(value_node) = child.child_by_field_name("value") else {
+                return Err("keyword_argument missing value".to_string());
+            };
+            args.push(CallArgument::Keyword {
+                name: name_node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string(),
+                value: value_node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string(),
+            });
+        } else {
+            args.push(CallArgument::Positional {
+                value: child
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(args)
+}
+
+pub fn bind_call_arguments(
+    signature: &PythonCallableSignature,
+    args: &[CallArgument],
+) -> HashMap<String, String> {
+    let mut params = signature.params.as_slice();
+    if signature.owner.is_some()
+        && matches!(params.first(), Some(first) if first == "self" || first == "cls")
+    {
+        params = &params[1..];
+    }
+
+    let mut bindings = HashMap::new();
+    let mut positional_index = 0;
+
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if let Some(param) = params.get(positional_index) {
+                    bindings.insert((*param).clone(), value.clone());
+                }
+                positional_index += 1;
+            }
+            CallArgument::Keyword { name, value } => {
+                bindings.insert(name.clone(), value.clone());
+            }
+        }
+    }
+
+    bindings
+}
+
+pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
+    let is_equinox_module = call.implementation.target.module_parts.len() >= 2
+        && call.implementation.target.module_parts[0] == "equinox"
+        && call.implementation.target.module_parts[1] == "nn";
+    let is_linear_init =
+        call.signature.owner.as_deref() == Some("Linear") && call.signature.name == "__init__";
+
+    if !is_equinox_module || !is_linear_init {
+        return None;
+    }
+
+    Some(LayerKind::Linear {
+        in_features: call.bindings.get("in_features")?.clone(),
+        out_features: call.bindings.get("out_features")?.clone(),
+    })
 }
 
 pub fn find_top_level_symbol(
@@ -672,6 +999,672 @@ mod resolve_import_path_from_package_tests {
 }
 
 #[cfg(test)]
+mod classify_layer_call_tests {
+    use super::*;
+
+    fn call(
+        module_parts: &[&str],
+        owner: Option<&str>,
+        name: &str,
+        bindings: &[(&str, &str)],
+    ) -> ResolvedCallSignature {
+        ResolvedCallSignature {
+            implementation: ResolvedImplementation {
+                target: ResolvedModuleTarget {
+                    dots: 0,
+                    module_parts: module_parts.iter().map(|p| p.to_string()).collect(),
+                    file_path: PathBuf::from("unused.py"),
+                    symbol_parts: vec![owner.unwrap_or(name).to_string()],
+                },
+                symbol: owner.map(|owner| PythonSymbol::Class {
+                    name: owner.to_string(),
+                }),
+            },
+            signature: PythonCallableSignature {
+                owner: owner.map(|owner| owner.to_string()),
+                name: name.to_string(),
+                params: Vec::new(),
+            },
+            arguments: Vec::new(),
+            bindings: bindings
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_classifies_equinox_linear() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_classifies_symbolic_equinox_linear() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "features"), ("out_features", "hidden")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Linear {
+                in_features: "features".to_string(),
+                out_features: "hidden".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_missing_in_features_returns_none() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("out_features", "5")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_missing_out_features_returns_none() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "3")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_non_equinox_linear_returns_none() {
+        let call = call(
+            &["my_project", "layers"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_non_constructor_returns_none() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "forward",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_nested_equinox_nn_module_is_accepted() {
+        let call = call(
+            &["equinox", "nn", "layers", "linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_equinox_not_nn_returns_none() {
+        let call = call(
+            &["equinox", "experimental"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_wrong_owner_returns_none() {
+        let call = call(
+            &["equinox", "nn"],
+            Some("Dense"),
+            "__init__",
+            &[("in_features", "3"), ("out_features", "5")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_function_call_returns_none() {
+        let call = call(&["jax", "numpy"], None, "concatenate", &[("arrays", "xs")]);
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_call_signature_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn write_equinox_linear(tmp: &tempfile::TempDir, init_source: &str) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("equinox/nn/_linear.py"), init_source).unwrap();
+    }
+
+    #[test]
+    fn test_resolves_call_signature_through_reexport() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(
+            &tmp,
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
+        );
+
+        let source = "import equinox as eqx\nlayer = eqx.nn.Linear(3, out_features=5)";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.signature.owner, Some("Linear".to_string()));
+        assert_eq!(found.signature.name, "__init__");
+        assert_eq!(found.bindings.get("in_features"), Some(&"3".to_string()));
+        assert_eq!(found.bindings.get("out_features"), Some(&"5".to_string()));
+        assert_eq!(found.bindings.get("self"), None);
+    }
+
+    #[test]
+    fn test_classifies_real_resolved_equinox_linear_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(
+            &tmp,
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
+        );
+
+        let source = "import equinox as eqx\nlayer = eqx.nn.Linear(features, hidden)";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            classify_layer_call(&found),
+            Some(LayerKind::Linear {
+                in_features: "features".to_string(),
+                out_features: "hidden".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_resolves_from_imported_linear_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(
+            &tmp,
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        );
+
+        let source = "from equinox.nn import Linear as Lin\nlayer = Lin(3, 5)";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.bindings.get("in_features"), Some(&"3".to_string()));
+        assert_eq!(found.bindings.get("out_features"), Some(&"5".to_string()));
+        assert_eq!(
+            classify_layer_call(&found),
+            Some(LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_classmethod_cls_param_is_skipped_for_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(
+            &tmp,
+            "class Linear:\n    def __init__(cls, in_features, out_features): pass",
+        );
+
+        let source = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.bindings.get("in_features"), Some(&"3".to_string()));
+        assert_eq!(found.bindings.get("out_features"), Some(&"5".to_string()));
+        assert_eq!(found.bindings.get("cls"), None);
+    }
+
+    #[test]
+    fn test_resolves_top_level_function_call_signature() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("jax/numpy")).unwrap();
+        fs::write(
+            tmp.path().join("jax/numpy/__init__.py"),
+            "def concatenate(arrays, axis=0): pass",
+        )
+        .unwrap();
+
+        let source = "import jax.numpy as jnp\nout = jnp.concatenate(xs, axis=1)";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.signature.owner, None);
+        assert_eq!(found.signature.name, "concatenate");
+        assert_eq!(found.bindings.get("arrays"), Some(&"xs".to_string()));
+        assert_eq!(found.bindings.get("axis"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_returns_none_when_implementation_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "import missing\nx = missing.Foo()";
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let found =
+            resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5).unwrap();
+
+        assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
+mod call_argument_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_args(code: &str) -> (tree_sitter::Tree, String) {
+        let wrapped = format!("x = f({code})");
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        let tree = parser.parse(&wrapped, None).unwrap();
+        (tree, wrapped)
+    }
+
+    fn args_node<'tree>(tree: &'tree tree_sitter::Tree, text: &str) -> Node<'tree> {
+        let root = tree.root_node();
+        let call = root
+            .descendant_for_byte_range(text.find("f(").unwrap(), text.len())
+            .unwrap();
+        call.child_by_field_name("arguments").unwrap()
+    }
+
+    fn sig(owner: Option<&str>, params: &[&str]) -> PythonCallableSignature {
+        PythonCallableSignature {
+            owner: owner.map(|s| s.to_string()),
+            name: "f".to_string(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_extracts_positional_arguments() {
+        let (tree, text) = parse_args("x, y + 1");
+        let args = extract_call_arguments(args_node(&tree, &text), &text).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                CallArgument::Positional {
+                    value: "x".to_string()
+                },
+                CallArgument::Positional {
+                    value: "y + 1".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extracts_keyword_arguments() {
+        let (tree, text) = parse_args("in_features=3, out_features=features");
+        let args = extract_call_arguments(args_node(&tree, &text), &text).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                CallArgument::Keyword {
+                    name: "in_features".to_string(),
+                    value: "3".to_string()
+                },
+                CallArgument::Keyword {
+                    name: "out_features".to_string(),
+                    value: "features".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_binds_function_positional_and_keyword_arguments() {
+        let signature = sig(None, &["x", "axis", "keepdims"]);
+        let args = vec![
+            CallArgument::Positional {
+                value: "arr".to_string(),
+            },
+            CallArgument::Keyword {
+                name: "keepdims".to_string(),
+                value: "True".to_string(),
+            },
+        ];
+
+        let bindings = bind_call_arguments(&signature, &args);
+
+        assert_eq!(bindings.get("x"), Some(&"arr".to_string()));
+        assert_eq!(bindings.get("keepdims"), Some(&"True".to_string()));
+        assert_eq!(bindings.get("axis"), None);
+    }
+
+    #[test]
+    fn test_binds_class_constructor_skipping_self() {
+        let signature = sig(Some("Linear"), &["self", "in_features", "out_features"]);
+        let args = vec![
+            CallArgument::Positional {
+                value: "3".to_string(),
+            },
+            CallArgument::Keyword {
+                name: "out_features".to_string(),
+                value: "5".to_string(),
+            },
+        ];
+
+        let bindings = bind_call_arguments(&signature, &args);
+
+        assert_eq!(bindings.get("in_features"), Some(&"3".to_string()));
+        assert_eq!(bindings.get("out_features"), Some(&"5".to_string()));
+        assert_eq!(bindings.get("self"), None);
+    }
+
+    #[test]
+    fn test_keyword_overrides_positional_binding() {
+        let signature = sig(None, &["x", "axis"]);
+        let args = vec![
+            CallArgument::Positional {
+                value: "arr".to_string(),
+            },
+            CallArgument::Positional {
+                value: "0".to_string(),
+            },
+            CallArgument::Keyword {
+                name: "axis".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+
+        let bindings = bind_call_arguments(&signature, &args);
+
+        assert_eq!(bindings.get("axis"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_extra_positional_arguments_are_ignored() {
+        let signature = sig(None, &["x"]);
+        let args = vec![
+            CallArgument::Positional {
+                value: "arr".to_string(),
+            },
+            CallArgument::Positional {
+                value: "extra".to_string(),
+            },
+        ];
+
+        let bindings = bind_call_arguments(&signature, &args);
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get("x"), Some(&"arr".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod extract_callable_signature_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn signature(owner: Option<&str>, name: &str, params: &[&str]) -> PythonCallableSignature {
+        PythonCallableSignature {
+            owner: owner.map(|s| s.to_string()),
+            name: name.to_string(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_extracts_top_level_function_params() {
+        let code = "def concatenate(arrays, axis=0): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Function {
+                name: "concatenate".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            found,
+            Some(signature(None, "concatenate", &["arrays", "axis"]))
+        );
+    }
+
+    #[test]
+    fn test_extracts_annotated_function_params() {
+        let code = "def f(x: Array, y: int = 1) -> Array: pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Function {
+                name: "f".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found, Some(signature(None, "f", &["x", "y"])));
+    }
+
+    #[test]
+    fn test_extracts_varargs_and_kwargs() {
+        let code = "def f(x, *args, **kwargs): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Function {
+                name: "f".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found, Some(signature(None, "f", &["x", "args", "kwargs"])));
+    }
+
+    #[test]
+    fn test_extracts_class_init_params() {
+        let code =
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Class {
+                name: "Linear".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            found,
+            Some(signature(
+                Some("Linear"),
+                "__init__",
+                &["self", "in_features", "out_features", "use_bias"]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_ignores_nested_init_inside_method() {
+        let code = "class Linear:\n    def outer(self):\n        def __init__(x): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Class {
+                name: "Linear".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_extracts_keyword_only_params() {
+        let code = "def f(x, *, axis=0, keepdims=False): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Function {
+                name: "f".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            found,
+            Some(signature(None, "f", &["x", "axis", "keepdims"]))
+        );
+    }
+
+    #[test]
+    fn test_import_symbol_returns_none() {
+        let code = "from ._linear import Linear";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Import {
+                name: "Linear".to_string(),
+                path: ImportPath {
+                    dots: 1,
+                    module: vec!["_linear".to_string()],
+                    name: "Linear".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_function_returns_none() {
+        let code = "def other(): pass";
+        let tree = parse(code);
+
+        let found = extract_callable_signature(
+            tree.root_node(),
+            code,
+            &PythonSymbol::Function {
+                name: "f".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
 mod resolve_implementation_tests {
     use super::*;
     use std::fs;
@@ -860,6 +1853,31 @@ mod resolve_implementation_tests {
     }
 
     #[test]
+    fn test_reexport_preserves_remaining_symbol_parts_across_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("realpkg")).unwrap();
+        fs::write(tmp.path().join("aliaspkg.py"), "from realpkg import layers").unwrap();
+        fs::write(tmp.path().join("realpkg/layers.py"), "class Linear: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let found =
+            resolve_implementation(target(&["aliaspkg", "layers", "Linear"]), &roots, read, 10)
+                .unwrap();
+
+        assert_eq!(
+            found,
+            Some(implementation(
+                &["realpkg", "layers"],
+                tmp.path().join("realpkg/layers.py"),
+                &["Linear"],
+                Some(PythonSymbol::Class {
+                    name: "Linear".to_string()
+                })
+            ))
+        );
+    }
+
+    #[test]
     fn test_cycle_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("pkg")).unwrap();
@@ -924,7 +1942,18 @@ mod resolve_reexport_once_tests {
 
         let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
 
-        assert_eq!(found, Some(target(&["equinox", "nn", "layers"])));
+        assert_eq!(found, Some(target(&["equinox", "nn", "layers", "Linear"])));
+    }
+
+    #[test]
+    fn test_preserves_remaining_symbol_parts_after_reexport() {
+        let code = "from . import layers";
+        let tree = parse(code);
+        let current = resolved(&["pkg"], &["layers", "nn", "Linear"]);
+
+        let found = resolve_reexport_once(&current, tree.root_node(), code).unwrap();
+
+        assert_eq!(found, Some(target(&["pkg", "layers", "nn", "Linear"])));
     }
 
     #[test]
