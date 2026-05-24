@@ -901,6 +901,52 @@ fn flattened_dim(dims: &[String]) -> String {
     dims.join("*")
 }
 
+fn multiply_dim(dim: &str, factor: &str) -> String {
+    if factor == "1" {
+        return dim.to_string();
+    }
+    if dim == "1" {
+        return factor.to_string();
+    }
+    if let (Ok(dim), Ok(factor)) = (dim.parse::<usize>(), factor.parse::<usize>()) {
+        return (dim * factor).to_string();
+    }
+    format!("{}*{}", dim, factor)
+}
+
+fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>, String> {
+    let rank = left.len().max(right.len());
+    let mut result = Vec::new();
+
+    for i in 0..rank {
+        let left_dim = left
+            .get(left.len().wrapping_sub(1 + i))
+            .map(String::as_str)
+            .unwrap_or("1");
+        let right_dim = right
+            .get(right.len().wrapping_sub(1 + i))
+            .map(String::as_str)
+            .unwrap_or("1");
+
+        let dim = if left_dim == right_dim {
+            left_dim.to_string()
+        } else if left_dim == "1" {
+            right_dim.to_string()
+        } else if right_dim == "1" {
+            left_dim.to_string()
+        } else {
+            return Err(format!(
+                "cannot broadcast dimensions {} and {}",
+                left_dim, right_dim
+            ));
+        };
+        result.push(dim);
+    }
+
+    result.reverse();
+    Ok(result)
+}
+
 fn concat_dim(dims: &[String]) -> String {
     let parsed = dims
         .iter()
@@ -927,6 +973,29 @@ pub fn apply_known_function(
         KnownFunction::Transpose | KnownFunction::Permute => apply_known_transpose(args, shapes),
         KnownFunction::SwapAxes => apply_known_swapaxes(args, shapes),
         KnownFunction::MoveAxis => apply_known_moveaxis(args, shapes),
+        KnownFunction::ExpandDims => apply_known_expand_dims(args, shapes),
+        KnownFunction::Squeeze => apply_known_squeeze(args, shapes),
+        KnownFunction::AtLeast1D => apply_known_atleast(args, shapes, 1),
+        KnownFunction::AtLeast2D => apply_known_atleast(args, shapes, 2),
+        KnownFunction::AtLeast3D => apply_known_atleast(args, shapes, 3),
+        KnownFunction::Zeros | KnownFunction::Ones | KnownFunction::Full => {
+            apply_known_shape_constructor(args)
+        }
+        KnownFunction::Arange => apply_known_arange(args),
+        KnownFunction::Eye => apply_known_eye(args),
+        KnownFunction::Array | KnownFunction::AsArray => apply_known_shape_preserving(args, shapes),
+        KnownFunction::Diag => apply_known_diag(args, shapes),
+        KnownFunction::Diagonal => apply_known_diagonal(args, shapes),
+        KnownFunction::Trace => apply_known_trace(args, shapes),
+        KnownFunction::Take => apply_known_take(args, shapes),
+        KnownFunction::BroadcastTo => apply_known_broadcast_to(args, shapes),
+        KnownFunction::BroadcastArrays => apply_known_broadcast_arrays(args, shapes),
+        KnownFunction::Tile => apply_known_tile(args, shapes),
+        KnownFunction::Repeat => apply_known_repeat(args, shapes),
+        KnownFunction::Roll | KnownFunction::Flip | KnownFunction::Triu | KnownFunction::Tril => {
+            apply_known_shape_preserving(args, shapes)
+        }
+        KnownFunction::Where => apply_known_where(args, shapes),
         KnownFunction::Sum
         | KnownFunction::Mean
         | KnownFunction::Max
@@ -1394,6 +1463,429 @@ fn apply_known_moveaxis(
     ))
 }
 
+fn apply_known_expand_dims(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+    let output_rank = input_shape.len() + 1;
+    let mut axis = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                axis = parse_axis(value);
+            }
+            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
+                axis = parse_axis(value);
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(axis) = axis else {
+        return Ok(None);
+    };
+    let axis = if axis < 0 {
+        output_rank as isize + axis
+    } else {
+        axis
+    };
+    if axis < 0 || axis as usize > input_shape.len() {
+        return Err(format!(
+            "expand_dims axis {} out of bounds for output rank {}",
+            axis, output_rank
+        ));
+    }
+    let mut output = input_shape.clone();
+    output.insert(axis as usize, "1".to_string());
+    Ok(Some(output))
+}
+
+fn apply_known_squeeze(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+    let mut axes = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                axes = parse_axis_list(value);
+            }
+            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
+                axes = parse_axis_list(value);
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+
+    let rank = input_shape.len();
+    let axes = if let Some(axes) = axes {
+        axes.into_iter()
+            .map(|axis| normalize_axis(axis, rank, "squeeze"))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        (0..rank)
+            .filter(|axis| input_shape[*axis] == "1")
+            .collect::<Vec<_>>()
+    };
+
+    for axis in &axes {
+        if input_shape[*axis] != "1" {
+            return Err(format!(
+                "cannot squeeze axis {} with dimension {}",
+                axis, input_shape[*axis]
+            ));
+        }
+    }
+
+    let output = input_shape
+        .iter()
+        .enumerate()
+        .filter(|(axis, _)| !axes.contains(axis))
+        .map(|(_, dim)| dim.clone())
+        .collect();
+    Ok(Some(output))
+}
+
+fn apply_known_atleast(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+    min_rank: usize,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+    if input_shape.len() >= min_rank {
+        return Ok(Some(input_shape.clone()));
+    }
+    let mut output = input_shape.clone();
+    while output.len() < min_rank {
+        output.insert(0, "1".to_string());
+    }
+    Ok(Some(output))
+}
+
+fn positional_arg_values(args: &[CallArgument]) -> Vec<String> {
+    args.iter()
+        .filter_map(|arg| match arg {
+            CallArgument::Positional { value } => Some(value.clone()),
+            CallArgument::Keyword { .. } => None,
+        })
+        .collect()
+}
+
+fn numeric_min_dim(left: &str, right: &str) -> String {
+    if left == right {
+        return left.to_string();
+    }
+    if let (Ok(left), Ok(right)) = (left.parse::<usize>(), right.parse::<usize>()) {
+        return left.min(right).to_string();
+    }
+    format!("min({},{})", left, right)
+}
+
+fn apply_known_shape_constructor(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(first) = args.first() else { return Ok(None); };
+    let value = match first {
+        CallArgument::Positional { value } => value,
+        CallArgument::Keyword { name, value } if name == "shape" || name == "size" => value,
+        CallArgument::Keyword { .. } => return Ok(None),
+    };
+    Ok(parse_shape_value(value))
+}
+
+fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() == 1 {
+        return Ok(Some(vec![values[0].clone()]));
+    }
+    if let (Ok(start), Ok(stop)) = (values[0].parse::<isize>(), values[1].parse::<isize>()) {
+        return Ok(Some(vec![(stop - start).max(0).to_string()]));
+    }
+    Ok(Some(vec![format!("{}-{}", values[1], values[0])]))
+}
+
+fn apply_known_eye(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    let Some(n) = values.first() else { return Ok(None); };
+    let m = values.get(1).unwrap_or(n);
+    Ok(Some(vec![n.clone(), m.clone()]))
+}
+
+fn apply_known_diag(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else { return Ok(None); };
+    let Some(input_shape) = shapes.get(input_name) else { return Ok(None); };
+    match input_shape.as_slice() {
+        [n] => Ok(Some(vec![n.clone(), n.clone()])),
+        [m, n] => Ok(Some(vec![numeric_min_dim(m, n)])),
+        _ => Err(format!("diag expects rank 1 or 2, got rank {}", input_shape.len())),
+    }
+}
+
+fn apply_known_diagonal(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else { return Ok(None); };
+    let Some(input_shape) = shapes.get(input_name) else { return Ok(None); };
+    if input_shape.len() < 2 {
+        return Err(format!("diagonal expects rank >= 2, got rank {}", input_shape.len()));
+    }
+    let mut output = input_shape[..input_shape.len() - 2].to_vec();
+    output.push(numeric_min_dim(
+        &input_shape[input_shape.len() - 2],
+        &input_shape[input_shape.len() - 1],
+    ));
+    Ok(Some(output))
+}
+
+fn apply_known_trace(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else { return Ok(None); };
+    let Some(input_shape) = shapes.get(input_name) else { return Ok(None); };
+    if input_shape.len() < 2 {
+        return Err(format!("trace expects rank >= 2, got rank {}", input_shape.len()));
+    }
+    Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
+}
+
+fn apply_known_take(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    if values.len() < 2 {
+        return Ok(None);
+    }
+    let Some(input_shape) = shapes.get(&values[0]) else { return Ok(None); };
+    let Some(indices_shape) = shapes.get(&values[1]) else { return Ok(None); };
+    let mut axis = None;
+    for arg in args.iter().skip(2) {
+        match arg {
+            CallArgument::Positional { value } => axis = parse_axis(value),
+            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => axis = parse_axis(value),
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(axis) = axis else { return Ok(Some(indices_shape.clone())); };
+    let axis = normalize_axis(axis, input_shape.len(), "take")?;
+    let mut output = input_shape[..axis].to_vec();
+    output.extend(indices_shape.clone());
+    output.extend(input_shape[axis + 1..].to_vec());
+    Ok(Some(output))
+}
+
+fn apply_known_broadcast_to(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    if !shapes.contains_key(input_name) {
+        return Ok(None);
+    }
+
+    let mut shape_value = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                shape_value = Some(value.as_str());
+            }
+            CallArgument::Keyword { name, value } if name == "shape" => shape_value = Some(value),
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+
+    Ok(shape_value.and_then(parse_shape_value))
+}
+
+fn apply_known_broadcast_arrays(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    let input_names = if values.len() == 1 {
+        parse_simple_sequence_names(&values[0]).unwrap_or(values)
+    } else {
+        values
+    };
+    if input_names.is_empty() {
+        return Ok(None);
+    }
+
+    let mut output = Vec::new();
+    for input_name in input_names {
+        let Some(shape) = shapes.get(&input_name) else {
+            return Ok(None);
+        };
+        output = broadcast_two_shapes(&output, shape)?;
+    }
+    Ok(Some(output))
+}
+
+fn apply_known_tile(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+
+    let mut reps_value = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                reps_value = Some(value.as_str());
+            }
+            CallArgument::Keyword { name, value } if name == "reps" || name == "dims" => {
+                reps_value = Some(value);
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(reps) = reps_value.and_then(parse_shape_value) else {
+        return Ok(None);
+    };
+
+    let rank = input_shape.len().max(reps.len());
+    let mut shape = vec!["1".to_string(); rank - input_shape.len()];
+    shape.extend(input_shape.clone());
+    let mut reps_padded = vec!["1".to_string(); rank - reps.len()];
+    reps_padded.extend(reps);
+
+    Ok(Some(
+        shape
+            .iter()
+            .zip(reps_padded.iter())
+            .map(|(dim, rep)| multiply_dim(dim, rep))
+            .collect(),
+    ))
+}
+
+fn apply_known_repeat(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+
+    let mut repeats = None;
+    let mut axis = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                if repeats.is_none() {
+                    repeats = Some(value.as_str());
+                } else if axis.is_none() {
+                    axis = parse_axis(value);
+                }
+            }
+            CallArgument::Keyword { name, value } if name == "repeats" => repeats = Some(value),
+            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
+                axis = parse_axis(value)
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(repeats) = repeats else {
+        return Ok(None);
+    };
+
+    if let Some(axis) = axis {
+        let axis = normalize_axis(axis, input_shape.len(), "repeat")?;
+        let mut output = input_shape.clone();
+        output[axis] = multiply_dim(&output[axis], repeats);
+        return Ok(Some(output));
+    }
+
+    Ok(Some(vec![multiply_dim(
+        &flattened_dim(input_shape),
+        repeats,
+    )]))
+}
+
+fn apply_known_shape_preserving(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    Ok(shapes.get(input_name).cloned())
+}
+
+fn apply_known_where(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    if values.len() < 3 {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    for value in values.iter().take(3) {
+        let Some(shape) = shapes.get(value) else {
+            return Ok(None);
+        };
+        output = broadcast_two_shapes(&output, shape)?;
+    }
+    Ok(Some(output))
+}
+
 fn apply_known_reduction(
     args: &[CallArgument],
     shapes: &HashMap<String, Vec<String>>,
@@ -1406,6 +1898,7 @@ fn apply_known_reduction(
     };
 
     let mut axes: Option<Vec<isize>> = None;
+    let mut invalid_axis = false;
     let mut keepdims = false;
     let mut seen_first_positional = false;
 
@@ -1417,11 +1910,17 @@ fn apply_known_reduction(
                     continue;
                 }
                 if axes.is_none() {
-                    axes = parse_axis_list(value);
+                    match parse_axis_list(value) {
+                        Some(parsed) => axes = Some(parsed),
+                        None => invalid_axis = true,
+                    }
                 }
             }
             CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
-                axes = parse_axis_list(value);
+                match parse_axis_list(value) {
+                    Some(parsed) => axes = Some(parsed),
+                    None => invalid_axis = true,
+                }
             }
             CallArgument::Keyword { name, value } if name == "keepdims" || name == "keepdim" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -1430,6 +1929,10 @@ fn apply_known_reduction(
             }
             CallArgument::Keyword { .. } => {}
         }
+    }
+
+    if invalid_axis {
+        return Ok(None);
     }
 
     let rank = input_shape.len();
@@ -6637,6 +7140,346 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
+    fn test_expand_dims_axis_0() {
+        let args = vec![pos("x"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ExpandDims, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "batch", "features"])));
+    }
+
+    #[test]
+    fn test_expand_dims_negative_axis() {
+        let args = vec![pos("x"), kw("axis", "-1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ExpandDims, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features", "1"])));
+    }
+
+    #[test]
+    fn test_expand_dims_missing_axis_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ExpandDims, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_squeeze_all_unit_dims() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["1", "batch", "1", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Squeeze, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_squeeze_specific_axis() {
+        let args = vec![pos("x"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["1", "batch", "1"]))]);
+
+        let output = apply_known_function(&KnownFunction::Squeeze, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "1"])));
+    }
+
+    #[test]
+    fn test_squeeze_non_unit_axis_errors() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["1", "batch", "1"]))]);
+
+        let error = apply_known_function(&KnownFunction::Squeeze, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("cannot squeeze"));
+    }
+
+    #[test]
+    fn test_atleast_1d_scalar() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), Vec::new())]);
+
+        let output = apply_known_function(&KnownFunction::AtLeast1D, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1"])));
+    }
+
+    #[test]
+    fn test_atleast_2d_vector() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["features"]))]);
+
+        let output = apply_known_function(&KnownFunction::AtLeast2D, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "features"])));
+    }
+
+    #[test]
+    fn test_atleast_3d_matrix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::AtLeast3D, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "batch", "features"])));
+    }
+
+    #[test]
+    fn test_atleast_preserves_sufficient_rank() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+
+        let output = apply_known_function(&KnownFunction::AtLeast2D, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["a", "b", "c"])));
+    }
+
+    #[test]
+    fn test_zeros_shape_constructor() {
+        let args = vec![pos("(batch, features)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Zeros, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_ones_shape_keyword() {
+        let args = vec![kw("shape", "(2, 3)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Ones, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_arange_single_stop() {
+        let args = vec![pos("10")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Arange, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["10"])));
+    }
+
+    #[test]
+    fn test_arange_start_stop() {
+        let args = vec![pos("2"), pos("10")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Arange, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8"])));
+    }
+
+    #[test]
+    fn test_eye_square() {
+        let args = vec![pos("n")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Eye, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_eye_rectangular() {
+        let args = vec![pos("n"), pos("m")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Eye, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "m"])));
+    }
+
+    #[test]
+    fn test_diag_vector_to_matrix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+
+        let output = apply_known_function(&KnownFunction::Diag, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_diag_matrix_to_vector() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::Diag, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["min(m,n)"])));
+    }
+
+    #[test]
+    fn test_diagonal_batch_matrix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "m", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::Diagonal, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "min(m,n)"])));
+    }
+
+    #[test]
+    fn test_trace_batch_matrix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "m", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::Trace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_take_without_axis_uses_indices_shape() {
+        let args = vec![pos("x"), pos("idx")];
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["batch", "features"])),
+            ("idx".to_string(), shape(&["k"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Take, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["k"])));
+    }
+
+    #[test]
+    fn test_take_with_axis_inserts_indices_shape() {
+        let args = vec![pos("x"), pos("idx"), kw("axis", "1")];
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["batch", "features"])),
+            ("idx".to_string(), shape(&["k"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Take, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "k"])));
+    }
+
+    #[test]
+    fn test_broadcast_to_shape() {
+        let args = vec![pos("x"), kw("shape", "(batch, features)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["features"]))]);
+
+        let output = apply_known_function(&KnownFunction::BroadcastTo, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_broadcast_arrays_two_inputs() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["batch", "1"])),
+            ("b".to_string(), shape(&["1", "features"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::BroadcastArrays, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_broadcast_arrays_mismatch_errors() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["batch", "x"])),
+            ("b".to_string(), shape(&["batch", "y"])),
+        ]);
+
+        let error = apply_known_function(&KnownFunction::BroadcastArrays, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("cannot broadcast"));
+    }
+
+    #[test]
+    fn test_tile_repeats_dims() {
+        let args = vec![pos("x"), pos("(2, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Tile, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch*2", "features*3"])));
+    }
+
+    #[test]
+    fn test_tile_numeric_dims() {
+        let args = vec![pos("x"), pos("(2, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "5"]))]);
+
+        let output = apply_known_function(&KnownFunction::Tile, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "15"])));
+    }
+
+    #[test]
+    fn test_repeat_axis() {
+        let args = vec![pos("x"), kw("repeats", "3"), kw("axis", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Repeat, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features*3"])));
+    }
+
+    #[test]
+    fn test_repeat_without_axis_flattens() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+
+        let output = apply_known_function(&KnownFunction::Repeat, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["12"])));
+    }
+
+    #[test]
+    fn test_shape_preserving_roll() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Roll, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_where_broadcasts_three_inputs() {
+        let args = vec![pos("cond"), pos("x"), pos("y")];
+        let shapes = HashMap::from([
+            ("cond".to_string(), shape(&["batch", "1"])),
+            ("x".to_string(), shape(&["batch", "features"])),
+            ("y".to_string(), shape(&["1", "features"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Where, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_where_broadcast_mismatch_errors() {
+        let args = vec![pos("cond"), pos("x"), pos("y")];
+        let shapes = HashMap::from([
+            ("cond".to_string(), shape(&["batch", "1"])),
+            ("x".to_string(), shape(&["batch", "x"])),
+            ("y".to_string(), shape(&["batch", "y"])),
+        ]);
+
+        let error = apply_known_function(&KnownFunction::Where, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("cannot broadcast"));
+    }
+
+    #[test]
     fn test_reduction_no_axis_returns_scalar_shape() {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
@@ -6757,11 +7600,131 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
+    fn test_reshape_missing_input_returns_none() {
+        let args = vec![pos("x"), pos("(2, 6)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_reshape_missing_shape_arg_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "6"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_reshape_symbolic_minus_one_errors() {
+        let args = vec![pos("x"), pos("(batch, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("symbolic input"));
+    }
+
+    #[test]
+    fn test_flatten_scalar_shape_returns_one_dim_one() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), Vec::new())]);
+
+        let output = apply_known_function(&KnownFunction::Flatten, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1"])));
+    }
+
+    #[test]
+    fn test_reduction_invalid_dynamic_axis_returns_none() {
+        let args = vec![pos("x"), kw("axis", "axis")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Sum, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_reduction_empty_axis_tuple_preserves_shape() {
+        let args = vec![pos("x"), kw("axis", "()")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Sum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_reduction_axis_none_keepdims_all_ones() {
+        let args = vec![pos("x"), kw("axis", "None"), kw("keepdims", "True")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Sum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "1"])));
+    }
+
+    #[test]
+    fn test_transpose_missing_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Transpose, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_transpose_axis_out_of_bounds_errors() {
+        let args = vec![pos("x"), kw("axes", "(0, 1, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+
+        let error = apply_known_function(&KnownFunction::Transpose, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    #[test]
+    fn test_swapaxes_negative_axes() {
+        let args = vec![pos("x"), pos("-1"), pos("0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+
+        let output = apply_known_function(&KnownFunction::SwapAxes, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "b", "a"])));
+    }
+
+    #[test]
+    fn test_swapaxes_axis_out_of_bounds_errors() {
+        let args = vec![pos("x"), pos("0"), pos("3")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+
+        let error = apply_known_function(&KnownFunction::SwapAxes, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    #[test]
+    fn test_moveaxis_missing_destination_returns_none() {
+        let args = vec![pos("x"), pos("0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+
+        let output = apply_known_function(&KnownFunction::MoveAxis, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
     fn test_non_implemented_known_function_returns_none() {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::Tile, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }

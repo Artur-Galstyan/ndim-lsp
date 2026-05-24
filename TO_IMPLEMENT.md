@@ -33,26 +33,26 @@ Legend:
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `jnp.array` / `np.array` | ✅ | ❌ | ❌ | Infer from literal/list if possible. |
-| `jnp.asarray` / `np.asarray` | ✅ | ❌ | ❌ | Shape-preserving conversion. |
-| `jnp.zeros` / `np.zeros` | ✅ | ❌ | ❌ | Output shape from shape argument. |
-| `jnp.ones` / `np.ones` | ✅ | ❌ | ❌ | Output shape from shape argument. |
-| `jnp.full` / `np.full` | ✅ | ❌ | ❌ | Output shape from shape argument. |
+| `jnp.array` / `np.array` | ✅ | ✅ | ✅ | Shape-preserving for known input shape; literal inference later. |
+| `jnp.asarray` / `np.asarray` | ✅ | ✅ | ✅ | Shape-preserving conversion. |
+| `jnp.zeros` / `np.zeros` | ✅ | ✅ | ✅ | Output shape from shape argument. |
+| `jnp.ones` / `np.ones` | ✅ | ✅ | ✅ | Output shape from shape argument. |
+| `jnp.full` / `np.full` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.empty` / `np.empty` | ❌ | ❌ | ❌ | Output shape from shape argument. |
 | `jnp.zeros_like` / `np.zeros_like` | ❌ | ❌ | ❌ | Shape-preserving. |
 | `jnp.ones_like` / `np.ones_like` | ❌ | ❌ | ❌ | Shape-preserving. |
 | `jnp.full_like` / `np.full_like` | ❌ | ❌ | ❌ | Shape-preserving. |
 | `jnp.empty_like` / `np.empty_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `jnp.arange` / `np.arange` | ✅ | ❌ | ❌ | 1D length from args when concrete. |
+| `jnp.arange` / `np.arange` | ✅ | ✅ | ✅ | 1D length from args when concrete. |
 | `jnp.linspace` / `np.linspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
 | `jnp.logspace` / `np.logspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
-| `jnp.eye` / `np.eye` | ✅ | ❌ | ❌ | Matrix shape `(N, M?)`. |
+| `jnp.eye` / `np.eye` | ✅ | ✅ | ✅ | Matrix shape `(N, M?)`. |
 | `jnp.identity` / `np.identity` | ❌ | ❌ | ❌ | Matrix shape `(n, n)`. |
-| `jnp.diag` / `np.diag` | ✅ | ❌ | ❌ | 1D→2D or 2D→1D. |
+| `jnp.diag` / `np.diag` | ✅ | ✅ | ✅ | 1D→2D or 2D→1D. |
 | `jnp.diagflat` / `np.diagflat` | ❌ | ❌ | ❌ | Flatten then diagonal matrix. |
 | `jnp.tri` / `np.tri` | ❌ | ❌ | ❌ | Matrix shape `(N, M?)`. |
-| `jnp.tril` / `np.tril` | ✅ | ❌ | ❌ | Shape-preserving. |
-| `jnp.triu` / `np.triu` | ✅ | ❌ | ❌ | Shape-preserving. |
+| `jnp.tril` / `np.tril` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `jnp.triu` / `np.triu` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.meshgrid` / `np.meshgrid` | ✅ | ❌ | ❌ | Multiple output arrays; indexing mode matters. |
 | `jnp.indices` / `np.indices` | ❌ | ❌ | ❌ | Prepends rank dimension. |
 
@@ -66,17 +66,17 @@ Legend:
 | `jnp.transpose` / `np.transpose` | ✅ | ✅ | ✅ | Permute axes. |
 | `jnp.swapaxes` / `np.swapaxes` | ✅ | ✅ | ✅ | Swap two axes. |
 | `jnp.moveaxis` / `np.moveaxis` | ✅ | ✅ | ✅ | Move axes preserving order. |
-| `jnp.expand_dims` / `np.expand_dims` | ✅ | ❌ | ❌ | Insert size-1 axes. |
-| `jnp.squeeze` / `np.squeeze` | ✅ | ❌ | ❌ | Remove size-1 axes. |
-| `jnp.atleast_1d` / `np.atleast_1d` | ✅ | ❌ | ❌ | Promote scalar to rank 1. |
-| `jnp.atleast_2d` / `np.atleast_2d` | ✅ | ❌ | ❌ | Promote to rank 2. |
-| `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ❌ | ❌ | Promote to rank 3. |
-| `jnp.broadcast_to` / `np.broadcast_to` | ✅ | ❌ | ❌ | Output explicit target shape. |
-| `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ❌ | ❌ | Common broadcasted shape for all args. |
+| `jnp.expand_dims` / `np.expand_dims` | ✅ | ✅ | ✅ | Insert size-1 axes. |
+| `jnp.squeeze` / `np.squeeze` | ✅ | ✅ | ✅ | Remove size-1 axes. |
+| `jnp.atleast_1d` / `np.atleast_1d` | ✅ | ✅ | ✅ | Promote scalar to rank 1. |
+| `jnp.atleast_2d` / `np.atleast_2d` | ✅ | ✅ | ✅ | Promote to rank 2. |
+| `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ✅ | ✅ | Promote to rank 3. |
+| `jnp.broadcast_to` / `np.broadcast_to` | ✅ | ✅ | ✅ | Output explicit target shape. |
+| `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ✅ | ✅ | Common broadcasted shape for all args. |
 | `jnp.broadcast_shapes` / `np.broadcast_shapes` | ❌ | ❌ | ❌ | Returns shape tuple, not array. |
 | `jnp.pad` / `np.pad` | ✅ | ❌ | ❌ | Modifies dimensions by pad widths. |
-| `jnp.roll` / `np.roll` | ✅ | ❌ | ❌ | Shape-preserving. |
-| `jnp.flip` / `np.flip` | ✅ | ❌ | ❌ | Shape-preserving. |
+| `jnp.roll` / `np.roll` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `jnp.flip` / `np.flip` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.fliplr` / `np.fliplr` | ✅ | ❌ | ❌ | Shape-preserving, rank >= 2. |
 | `jnp.flipud` / `np.flipud` | ✅ | ❌ | ❌ | Shape-preserving, rank >= 1. |
 | `jnp.rot90` / `np.rot90` | ✅ | ❌ | ❌ | Usually swaps two axis lengths when odd `k`. |
@@ -101,17 +101,17 @@ Legend:
 | `jnp.hsplit` / `np.hsplit` | ❌ | ❌ | ❌ | Multiple outputs. |
 | `jnp.vsplit` / `np.vsplit` | ❌ | ❌ | ❌ | Multiple outputs. |
 | `jnp.dsplit` / `np.dsplit` | ❌ | ❌ | ❌ | Multiple outputs. |
-| `jnp.tile` / `np.tile` | ✅ | ❌ | ❌ | Repeats dimensions. |
-| `jnp.repeat` / `np.repeat` | ✅ | ❌ | ❌ | Repeats along axis or flattened. |
+| `jnp.tile` / `np.tile` | ✅ | ✅ | ✅ | Repeats dimensions. |
+| `jnp.repeat` / `np.repeat` | ✅ | ✅ | ✅ | Repeats along axis or flattened. |
 
 ## JAX NumPy / NumPy indexing and selection
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `jnp.take` / `np.take` | ✅ | ❌ | ❌ | Shape based on indices and axis. |
+| `jnp.take` / `np.take` | ✅ | ✅ | ✅ | Shape based on indices and axis. |
 | `jnp.take_along_axis` / `np.take_along_axis` | ❌ | ❌ | ❌ | Output shape matches indices. |
 | `jnp.put_along_axis` / `np.put_along_axis` | ❌ | ❌ | ❌ | Mutating-ish; shape-preserving input. |
-| `jnp.where` / `np.where` | ✅ | ❌ | ❌ | Broadcast condition/x/y. |
+| `jnp.where` / `np.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
 | `jnp.nonzero` / `np.nonzero` | ❌ | ❌ | ❌ | Tuple of index arrays. |
 | `jnp.argwhere` / `np.argwhere` | ❌ | ❌ | ❌ | Shape `(N, ndim)`. |
 | `jnp.argmax` / `np.argmax` | ❌ | ❌ | ❌ | Reduction over axis. |
@@ -142,7 +142,7 @@ Legend:
 | `jnp.percentile` / `np.percentile` | ❌ | ❌ | ❌ | Similar to quantile. |
 | `jnp.cumsum` / `np.cumsum` | ❌ | ❌ | ❌ | Shape-preserving unless axis None -> flatten. |
 | `jnp.cumprod` / `np.cumprod` | ❌ | ❌ | ❌ | Shape-preserving unless axis None -> flatten. |
-| `jnp.trace` / `np.trace` | ✅ | ❌ | ❌ | Removes two axes, optional offset. |
+| `jnp.trace` / `np.trace` | ✅ | ✅ | ✅ | Removes two axes, optional offset. |
 
 ## Linear algebra
 
@@ -171,18 +171,18 @@ Legend:
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `torch.tensor` | ✅ | ❌ | ❌ | Infer from literal/list if possible. |
-| `torch.as_tensor` | ✅ | ❌ | ❌ | Shape-preserving conversion. |
-| `torch.zeros` | ✅ | ❌ | ❌ | Output shape from args. |
-| `torch.ones` | ✅ | ❌ | ❌ | Output shape from args. |
-| `torch.full` | ✅ | ❌ | ❌ | Output shape from args. |
+| `torch.tensor` | ✅ | ✅ | ✅ | Shape-preserving for known input shape; literal inference later. |
+| `torch.as_tensor` | ✅ | ✅ | ✅ | Shape-preserving conversion. |
+| `torch.zeros` | ✅ | ✅ | ✅ | Output shape from args. |
+| `torch.ones` | ✅ | ✅ | ✅ | Output shape from args. |
+| `torch.full` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.empty` | ❌ | ❌ | ❌ | Output shape from args. |
 | `torch.zeros_like` | ❌ | ❌ | ❌ | Shape-preserving. |
 | `torch.ones_like` | ❌ | ❌ | ❌ | Shape-preserving. |
 | `torch.empty_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `torch.arange` | ✅ | ❌ | ❌ | 1D length from args if concrete. |
+| `torch.arange` | ✅ | ✅ | ✅ | 1D length from args if concrete. |
 | `torch.linspace` | ❌ | ❌ | ❌ | 1D length from steps. |
-| `torch.eye` | ✅ | ❌ | ❌ | Matrix shape. |
+| `torch.eye` | ✅ | ✅ | ✅ | Matrix shape. |
 | `torch.cat` / `torch.concat` / `torch.concatenate` | ✅ | ✅ | ✅ | Concatenate along dim. |
 | `torch.stack` | ✅ | ✅ | ✅ | Stack along new dim. |
 | `torch.reshape` | ✅ | ✅ | ✅ | Reshape semantics. |
@@ -190,18 +190,18 @@ Legend:
 | `torch.ravel` | ✅ | ✅ | ✅ | Flatten all dims. |
 | `torch.transpose` | ✅ | ✅ | ✅ | Swap two dims. |
 | `torch.permute` | ✅ | ✅ | ✅ | Permute all dims. |
-| `torch.unsqueeze` | ✅ | ❌ | ❌ | Insert size-1 dim. |
-| `torch.squeeze` | ✅ | ❌ | ❌ | Remove size-1 dims. |
-| `torch.broadcast_to` | ✅ | ❌ | ❌ | Output target shape. |
-| `torch.broadcast_tensors` | ✅ | ❌ | ❌ | Common broadcast shape. |
-| `torch.tile` | ✅ | ❌ | ❌ | Repeat dims. |
-| `torch.repeat` | ✅ | ❌ | ❌ | Tensor method and function nuance. |
-| `torch.take` | ✅ | ❌ | ❌ | Output follows indices. |
-| `torch.where` | ✅ | ❌ | ❌ | Broadcast condition/x/y. |
+| `torch.unsqueeze` | ✅ | ✅ | ✅ | Insert size-1 dim. |
+| `torch.squeeze` | ✅ | ✅ | ✅ | Remove size-1 dims. |
+| `torch.broadcast_to` | ✅ | ✅ | ✅ | Output target shape. |
+| `torch.broadcast_tensors` | ✅ | ✅ | ✅ | Common broadcast shape. |
+| `torch.tile` | ✅ | ✅ | ✅ | Repeat dims. |
+| `torch.repeat` | ✅ | ✅ | ✅ | Tensor method and function nuance. |
+| `torch.take` | ✅ | ✅ | ✅ | Output follows indices. |
+| `torch.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
 | `torch.meshgrid` | ✅ | ❌ | ❌ | Multiple outputs. |
-| `torch.diag` | ✅ | ❌ | ❌ | 1D↔2D. |
-| `torch.diagonal` | ✅ | ❌ | ❌ | Diagonal extraction. |
-| `torch.trace` | ✅ | ❌ | ❌ | 2D -> scalar. |
+| `torch.diag` | ✅ | ✅ | ✅ | 1D↔2D. |
+| `torch.diagonal` | ✅ | ✅ | ✅ | Diagonal extraction. |
+| `torch.trace` | ✅ | ✅ | ✅ | 2D -> scalar. |
 | `torch.triu` | ✅ | ❌ | ❌ | Shape-preserving. |
 | `torch.tril` | ✅ | ❌ | ❌ | Shape-preserving. |
 | `torch.nn.functional.pad` | ❌ | ❌ | ❌ | Need deeper module classification. |
