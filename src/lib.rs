@@ -75,18 +75,29 @@ pub enum LayerKind {
     },
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct LayerApplication {
     pub variable: String,
     pub layer: String,
     pub input: String,
     pub kind: LayerKind,
+    pub range: Range,
+}
+
+impl PartialEq for LayerApplication {
+    fn eq(&self, other: &Self) -> bool {
+        self.variable == other.variable
+            && self.layer == other.layer
+            && self.input == other.input
+            && self.kind == other.kind
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ShapeError {
     pub variable: String,
     pub message: String,
+    pub range: Range,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -665,6 +676,7 @@ pub fn extract_layer_applications(
             layer: call.target,
             input: value.clone(),
             kind: kind.clone(),
+            range: call.args_node_range,
         });
     }
 
@@ -721,6 +733,7 @@ pub fn apply_layer_applications(
             Err(message) => errors.push(ShapeError {
                 variable: app.variable.clone(),
                 message,
+                range: app.range,
             }),
         }
     }
@@ -1653,12 +1666,22 @@ mod apply_layer_application_tests {
         }
     }
 
+    fn dummy_range() -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 0),
+        }
+    }
+
     fn app(input: &str, kind: LayerKind) -> LayerApplication {
         LayerApplication {
             variable: "y".to_string(),
             layer: "layer".to_string(),
             input: input.to_string(),
             kind,
+            range: dummy_range(),
         }
     }
 
@@ -1804,12 +1827,22 @@ mod apply_layer_applications_tests {
         }
     }
 
+    fn dummy_range() -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 0),
+        }
+    }
+
     fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
         LayerApplication {
             variable: variable.to_string(),
             layer: layer.to_string(),
             input: input.to_string(),
             kind,
+            range: dummy_range(),
         }
     }
 
@@ -2055,6 +2088,53 @@ mod apply_layer_applications_tests {
         assert!(errors[1].message.contains("l2"));
         assert_eq!(shapes.get("good"), Some(&shape(&["batch", "9"])));
     }
+
+    #[test]
+    fn test_shape_error_preserves_application_range() {
+        let mut failed = app("y", "bad_layer", "x", linear("4", "5"));
+        failed.range = Range {
+            start_byte: 10,
+            end_byte: 13,
+            start_point: tree_sitter::Point::new(1, 2),
+            end_point: tree_sitter::Point::new(1, 5),
+        };
+        let apps = vec![failed];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].range.start_byte, 10);
+        assert_eq!(errors[0].range.end_byte, 13);
+        assert_eq!(errors[0].range.start_point, tree_sitter::Point::new(1, 2));
+        assert_eq!(errors[0].range.end_point, tree_sitter::Point::new(1, 5));
+    }
+
+    #[test]
+    fn test_multiple_shape_errors_preserve_their_own_ranges() {
+        let mut first = app("a", "l1", "x", linear("4", "5"));
+        first.range = Range {
+            start_byte: 1,
+            end_byte: 4,
+            start_point: tree_sitter::Point::new(0, 1),
+            end_point: tree_sitter::Point::new(0, 4),
+        };
+        let mut second = app("b", "l2", "x", linear("6", "7"));
+        second.range = Range {
+            start_byte: 10,
+            end_byte: 13,
+            start_point: tree_sitter::Point::new(1, 1),
+            end_point: tree_sitter::Point::new(1, 4),
+        };
+        let apps = vec![first, second];
+        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+
+        let errors = apply_layer_applications(&apps, &mut shapes);
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].range.start_byte, 1);
+        assert_eq!(errors[1].range.start_byte, 10);
+    }
 }
 
 #[cfg(test)]
@@ -2076,12 +2156,22 @@ mod extract_layer_applications_tests {
         }
     }
 
+    fn dummy_range() -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 0),
+        }
+    }
+
     fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
         LayerApplication {
             variable: variable.to_string(),
             layer: layer.to_string(),
             input: input.to_string(),
             kind,
+            range: dummy_range(),
         }
     }
 
@@ -2287,6 +2377,129 @@ mod extract_layer_applications_tests {
                 app("y", "l2", "y", linear("5", "7")),
             ]
         );
+    }
+
+    fn range_text<'a>(text: &'a str, range: &Range) -> &'a str {
+        &text[range.start_byte..range.end_byte]
+    }
+
+    #[test]
+    fn test_application_range_covers_arguments() {
+        let code = "y = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(x)");
+    }
+
+    #[test]
+    fn test_application_range_covers_expression_arguments() {
+        let code = "y = layer(x + residual)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(x + residual)");
+    }
+
+    #[test]
+    fn test_multiple_application_ranges_follow_each_call() {
+        let code = "a = l1(x)\nb = l2(a)";
+        let tree = parse(code);
+        let layers = HashMap::from([
+            ("l1".to_string(), linear("3", "5")),
+            ("l2".to_string(), linear("5", "7")),
+        ]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(x)");
+        assert_eq!(range_text(code, &applications[1].range), "(a)");
+    }
+
+    #[test]
+    fn test_application_range_covers_all_arguments() {
+        let code = "y = layer(x, other, flag=True)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(
+            range_text(code, &applications[0].range),
+            "(x, other, flag=True)"
+        );
+    }
+
+    #[test]
+    fn test_application_range_covers_nested_call_argument() {
+        let code = "y = layer(preprocess(x))";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(preprocess(x))");
+    }
+
+    #[test]
+    fn test_application_range_inside_function_includes_only_arguments() {
+        let code = "def f(x):\n    y = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(x)");
+        assert_eq!(applications[0].range.start_point.row, 1);
+    }
+
+    #[test]
+    fn test_application_range_covers_multiline_arguments() {
+        let code = "y = layer(\n    x\n)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(\n    x\n)");
+        assert_eq!(applications[0].range.start_point.row, 0);
+        assert_eq!(applications[0].range.end_point.row, 2);
+    }
+
+    #[test]
+    fn test_duplicate_output_application_ranges_are_distinct() {
+        let code = "y = l1(x)\ny = l2(y)";
+        let tree = parse(code);
+        let layers = HashMap::from([
+            ("l1".to_string(), linear("3", "5")),
+            ("l2".to_string(), linear("5", "7")),
+        ]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(range_text(code, &applications[0].range), "(x)");
+        assert_eq!(range_text(code, &applications[1].range), "(y)");
+        assert_ne!(
+            applications[0].range.start_byte,
+            applications[1].range.start_byte
+        );
+    }
+
+    #[test]
+    fn test_range_after_skipped_unknown_call_belongs_to_known_call() {
+        let code = "ignored = unknown(x)\ny = layer(x)";
+        let tree = parse(code);
+        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
+
+        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+
+        assert_eq!(applications.len(), 1);
+        assert_eq!(range_text(code, &applications[0].range), "(x)");
+        assert_eq!(applications[0].range.start_point.row, 1);
     }
 
     #[test]
@@ -2756,6 +2969,46 @@ mod analyze_layer_shapes_tests {
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
         assert_eq!(analysis.shapes.get("y"), Some(&shape(&["old", "shape"])));
+    }
+
+    #[test]
+    fn test_analysis_error_range_covers_failing_call_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    bad_layer = eqx.nn.Linear(4, 5)\n    y = bad_layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(x)");
+    }
+
+    #[test]
+    fn test_analysis_multiple_error_ranges_cover_each_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = eqx.nn.Linear(4, 5)\n    l2 = eqx.nn.Linear(6, 7)\n    a = l1(x)\n    b = l2(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 2);
+        assert_eq!(
+            &code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte],
+            "(x)"
+        );
+        assert_eq!(
+            &code[analysis.errors[1].range.start_byte..analysis.errors[1].range.end_byte],
+            "(x)"
+        );
+        assert_ne!(
+            analysis.errors[0].range.start_byte,
+            analysis.errors[1].range.start_byte
+        );
     }
 
     #[test]
@@ -4993,12 +5246,22 @@ mod additional_edge_case_tests {
         }
     }
 
+    fn dummy_range() -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 0),
+        }
+    }
+
     fn app(input: &str, kind: LayerKind) -> LayerApplication {
         LayerApplication {
             variable: "out".to_string(),
             layer: "layer".to_string(),
             input: input.to_string(),
             kind,
+            range: dummy_range(),
         }
     }
 

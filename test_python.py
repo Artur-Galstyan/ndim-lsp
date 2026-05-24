@@ -1,10 +1,20 @@
-import jax.numpy as jnp
-x = jnp.zeros((32, 64))
+import foo
+import foo.bar as baz
+from jax import random
+from equinox.nn import Linear as Lin
+from ._linear import Linear
+from . import layers
+from foo import *
 
-import equinox as eqx
-layer = eqx.nn.Linear(128, 64, key=key)
+class Linear:
+    pass
 
-from mypackage.utils import transform
-a = transform(x)
+def linear():
+    pass
 
-x = foo(bar(y))
+def outer():
+    class NestedLinear:
+        pass
+
+    def nested_fn():
+        pass
