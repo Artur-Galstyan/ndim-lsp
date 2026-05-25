@@ -159,7 +159,7 @@ Legend:
 | `jnp.inner` / `np.inner` | ✅ | ✅ | ✅ | Last-axis contraction. |
 | `jnp.cross` / `np.cross` / `torch.cross` | ❌ | ❌ | ❌ | Vector axis length 2/3. |
 | `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ❌ | ❌ | ❌ | Axis-dependent. |
-| `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ❌ | ❌ | ❌ | Square matrix -> batch shape. |
+| `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ✅ | ✅ | ✅ | Square matrix -> batch shape; validates last two dims. |
 | `jnp.linalg.inv` / `np.linalg.inv` / `torch.linalg.inv` | ✅ | ✅ | ✅ | Shape-preserving for square matrices; validates last two dims. |
 | `jnp.linalg.solve` / `np.linalg.solve` / `torch.linalg.solve` | ❌ | ❌ | ❌ | Matrix solve shape rules. |
 | `jnp.linalg.svd` / `np.linalg.svd` / `torch.linalg.svd` | ❌ | ❌ | ❌ | Multiple outputs. |

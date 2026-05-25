@@ -3710,3 +3710,87 @@ mod linalg_inv_integration_tests {
         assert!(!has_shape(&analysis, "y"));
     }
 }
+
+#[cfg(test)]
+mod linalg_det_integration_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_linalg_det_batched_square_returns_batch_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch n n\"]):\n    y = jnp.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch"]))
+        );
+    }
+
+    #[test]
+    fn test_np_linalg_det_2d_square_returns_scalar_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f(x: Float[Array, \"n n\"]):\n    y = np.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn test_torch_linalg_det_multi_batch_returns_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f(x: Float[Array, \"b t n n\"]):\n    y = torch.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["b", "t"]))
+        );
+    }
+
+    #[test]
+    fn test_linalg_det_non_square_reports_error_no_output_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f(x: Float[Array, \"m n\"]):\n    y = np.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(analysis.errors[0].message.contains("last two dimensions to match"));
+        assert!(!has_shape(&analysis, "y"));
+    }
+}

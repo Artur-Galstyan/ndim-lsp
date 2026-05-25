@@ -186,6 +186,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     if is_jax_numpy_linalg || is_numpy_linalg || is_torch_linalg {
         return match name.as_str() {
             "inv" => Some(KnownFunction::LinalgInv),
+            "det" => Some(KnownFunction::LinalgDet),
             _ => None,
         };
     }
@@ -559,6 +560,7 @@ pub fn apply_known_function(
         | KnownFunction::ArgMax
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
+        KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
         _ => Ok(None),
     }
 }
@@ -2112,8 +2114,35 @@ fn apply_known_linalg_inv(
     Ok(Some(input_shape.clone()))
 }
 
+fn apply_known_linalg_det(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
 
-#[cfg(test)]
+    if input_shape.len() < 2 {
+        return Err(format!(
+            "linalg.det requires rank >= 2, got rank {}",
+            input_shape.len()
+        ));
+    }
+
+    let last = &input_shape[input_shape.len() - 1];
+    let second_last = &input_shape[input_shape.len() - 2];
+    if last != second_last {
+        return Err(format!(
+            "linalg.det requires last two dimensions to match, got {} and {}",
+            second_last, last
+        ));
+    }
+
+    Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
+}
 mod known_function_shape_rule_tests {
     use super::*;
 
@@ -3856,6 +3885,80 @@ mod known_function_shape_rule_tests {
 
         assert_eq!(output, None);
     }
+
+    // ── linalg.det shape rule tests ──
+
+    #[test]
+    fn test_linalg_det_2d_square_returns_scalar() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_linalg_det_batched_square_returns_batch_prefix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_linalg_det_multi_batch_returns_all_prefix_dims() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["b", "t", "n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "t"])));
+    }
+
+    #[test]
+    fn test_linalg_det_symbolic_square_dims_work() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "m"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_linalg_det_non_square_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("last two dimensions to match"));
+        assert!(error.contains("m"));
+        assert!(error.contains("n"));
+    }
+
+    #[test]
+    fn test_linalg_det_rank_1_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("rank >= 2"));
+    }
+
+    #[test]
+    fn test_linalg_det_unknown_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
 }
 
 #[cfg(test)]
@@ -4564,6 +4667,29 @@ mod known_function_tests {
     known_case!(
         jax_linalg_inv_unsupported,
         ["jax", "linalg", "inv"],
+        None
+    );
+
+    // ── linalg.det classification tests ──
+
+    known_case!(
+        jnp_linalg_det,
+        ["jax", "numpy", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        np_linalg_det,
+        ["numpy", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        torch_linalg_det,
+        ["torch", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        jax_linalg_det_unsupported,
+        ["jax", "linalg", "det"],
         None
     );
 
