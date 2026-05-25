@@ -297,6 +297,34 @@ fn apply_conv_layer(
     Ok(Some(output_shape))
 }
 
+/// Returns the minimum input rank required by a shape-preserving layer,
+/// or `None` if the layer accepts any rank (e.g. `Dropout`, `ReLU`).
+///
+/// Channels-first convention (no batch dimension required, matching Conv layers):
+///   BatchNorm1d → 2  (C, L)
+///   BatchNorm2d → 3  (C, H, W)
+///   BatchNorm3d → 4  (C, D, H, W)
+///   Dropout1d   → 2  (C, L)
+///   Dropout2d   → 3  (C, H, W)
+///   Dropout3d   → 4  (C, D, H, W)
+///   GroupNorm   → 1  (needs a channel dim)
+///   LayerNorm   → 1  (needs at least one dim to normalize)
+///
+/// Equinox `BatchNorm` and activations (`ReLU`, `GELU`, etc.) accept any rank.
+fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
+    match name {
+        "BatchNorm1d" | "Dropout1d" => Some(2),
+        // Same convention as Conv layers: channels-first without requiring
+        // a batch dimension. Conv2d min_rank = 3 (C, H, W), Conv3d = 4.
+        "BatchNorm2d" | "Dropout2d" => Some(3),
+        "BatchNorm3d" | "Dropout3d" => Some(4),
+        "LayerNorm" | "GroupNorm" => Some(1),
+        // Dropout, BatchNorm (equinox), ReLU, GELU, Sigmoid, Tanh, Softmax, PReLU
+        // accept any rank including scalars.
+        _ => None,
+    }
+}
+
 pub fn apply_layer_application(
     app: &LayerApplication,
     shapes: &HashMap<String, Vec<String>>,
@@ -383,8 +411,19 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
-        // Shape-preserving layers: output shape equals input shape
-        LayerKind::ShapePreserving { .. } => Ok(Some(input_shape.clone())),
+        // Shape-preserving layers: output shape equals input shape, but some
+        // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
+        LayerKind::ShapePreserving { name } => {
+            if let Some(min_rank) = min_rank_for_shape_preserving(name)
+                && input_shape.len() < min_rank
+            {
+                return Err(format!(
+                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
+                    name, app.layer, min_rank, input_shape.len(), app.input
+                ));
+            }
+            Ok(Some(input_shape.clone()))
+        }
     }
 }
 
