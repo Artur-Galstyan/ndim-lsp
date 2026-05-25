@@ -3964,3 +3964,70 @@ mod constructor_coverage_integration_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
     }
 }
+
+/// Regression guard for venv-discovery wiring: given a site-packages
+/// directory in `search_roots`, layer-mismatch diagnostics fire through the
+/// on-disk resolution path. This complements the in-process builtin layer
+/// catalog by exercising the disk resolver against a fake equinox install
+/// laid out exactly the way a real venv would store it.
+#[cfg(test)]
+mod site_packages_resolution_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    #[test]
+    fn resolves_equinox_linear_through_fake_site_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp
+            .path()
+            .join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        fs::create_dir_all(site.join("equinox").join("nn")).unwrap();
+        fs::write(
+            site.join("equinox").join("__init__.py"),
+            "from . import nn",
+        )
+        .unwrap();
+        fs::write(
+            site.join("equinox").join("nn").join("__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            site.join("equinox").join("nn").join("_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
+        )
+        .unwrap();
+
+        let code = "from jaxtyping import Float, Array\nimport equinox as eqx\n\ndef f(x: Float[Array, \"batch 32\"]):\n    layer = eqx.nn.Linear(64, 128)\n    y = layer(x)\n    return y\n";
+        let tree = parse(code);
+        let roots = vec![site];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 8).unwrap();
+
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected exactly one ShapeError, got {:?}",
+            analysis.errors
+        );
+        let msg = &analysis.errors[0].message;
+        assert!(msg.contains("Linear"), "missing 'Linear' in {:?}", msg);
+        assert!(msg.contains("64"), "missing '64' in {:?}", msg);
+        assert!(msg.contains("32"), "missing '32' in {:?}", msg);
+    }
+}
