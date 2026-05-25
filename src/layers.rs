@@ -82,6 +82,12 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 _ => None,
             }
         }
+        // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations)
+        "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
+        | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
+        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" => Some(LayerKind::ShapePreserving {
+            name: owner.to_string(),
+        }),
         _ => None,
     }
 }
@@ -377,6 +383,8 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
+        // Shape-preserving layers: output shape equals input shape
+        LayerKind::ShapePreserving { .. } => Ok(Some(input_shape.clone())),
     }
 }
 

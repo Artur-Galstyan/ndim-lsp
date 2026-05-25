@@ -117,6 +117,9 @@ pub enum LayerKind {
         stride: String,
         padding: String,
     },
+    ShapePreserving {
+        name: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]

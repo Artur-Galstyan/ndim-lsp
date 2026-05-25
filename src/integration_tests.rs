@@ -2762,3 +2762,380 @@ mod conv_layer_tests {
         assert!(has_shape(&analysis, "y"));
     }
 }
+
+#[cfg(test)]
+mod shape_preserving_layer_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// Write fake torch.nn package with shape-preserving layers + Linear
+    fn write_fake_torch_nn(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("torch/nn")).unwrap();
+        fs::write(tmp.path().join("torch/__init__.py"), "from . import nn").unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/__init__.py"),
+            "from ._layers import Dropout, Dropout1d, Dropout2d, Dropout3d\nfrom ._layers import BatchNorm1d, BatchNorm2d, BatchNorm3d\nfrom ._layers import LayerNorm, GroupNorm\nfrom ._layers import ReLU, GELU, Sigmoid, Tanh, Softmax\nfrom ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/_layers.py"),
+            "class Dropout:\n    def __init__(self, p=0.5): pass\nclass Dropout1d:\n    def __init__(self, p=0.5): pass\nclass Dropout2d:\n    def __init__(self, p=0.5): pass\nclass Dropout3d:\n    def __init__(self, p=0.5): pass\nclass BatchNorm1d:\n    def __init__(self, num_features): pass\nclass BatchNorm2d:\n    def __init__(self, num_features): pass\nclass BatchNorm3d:\n    def __init__(self, num_features): pass\nclass LayerNorm:\n    def __init__(self, normalized_shape): pass\nclass GroupNorm:\n    def __init__(self, num_groups, num_channels): pass\nclass ReLU:\n    def __init__(self): pass\nclass GELU:\n    def __init__(self): pass\nclass Sigmoid:\n    def __init__(self): pass\nclass Tanh:\n    def __init__(self): pass\nclass Softmax:\n    def __init__(self, dim=None): pass",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, bias=True): pass",
+        )
+        .unwrap();
+    }
+
+    /// Write fake equinox.nn package with shape-preserving layers + Linear
+    fn write_fake_equinox_nn(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/__init__.py"),
+            "from . import nn",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._layers import BatchNorm, LayerNorm, GroupNorm, PReLU\nfrom ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_layers.py"),
+            "class BatchNorm:\n    def __init__(self, input_shape, axis_name): pass\nclass LayerNorm:\n    def __init__(self, normalized_shape): pass\nclass GroupNorm:\n    def __init__(self, groups, channels): pass\nclass PReLU:\n    def __init__(self): pass",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        )
+        .unwrap();
+    }
+
+    // ── torch.nn.Dropout on 2D input ──
+
+    #[test]
+    fn test_torch_dropout_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    drop = torch.nn.Dropout(0.1)\n    y = drop(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.BatchNorm2d on (batch, 16, H, W) ──
+
+    #[test]
+    fn test_torch_batchnorm2d_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 16 H W\"]):\n    bn = torch.nn.BatchNorm2d(16)\n    y = bn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
+    }
+
+    // ── torch.nn.LayerNorm on (batch, 16) ──
+
+    #[test]
+    fn test_torch_layernorm_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 16\"]):\n    ln = torch.nn.LayerNorm([16])\n    y = ln(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16"])));
+    }
+
+    // ── equinox.nn.LayerNorm ──
+
+    #[test]
+    fn test_equinox_layernorm_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch features\"]):\n    ln = eqx.nn.LayerNorm(features)\n    y = ln(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.ReLU ──
+
+    #[test]
+    fn test_torch_relu_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    relu = torch.nn.ReLU()\n    y = relu(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "3", "32", "32"])));
+    }
+
+    // ── Chained: batchnorm then relu ──
+
+    #[test]
+    fn test_chained_batchnorm_relu_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 16 H W\"]):\n    bn = torch.nn.BatchNorm2d(16)\n    relu = torch.nn.ReLU()\n    y = bn(x)\n    z = relu(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "16", "H", "W"])));
+    }
+
+    // ── Symbolic input shape ──
+
+    #[test]
+    fn test_symbolic_input_shape_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"a b c\"]):\n    drop = torch.nn.Dropout(0.5)\n    y = drop(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["a", "b", "c"])));
+    }
+
+    // ── equinox.nn.BatchNorm ──
+
+    #[test]
+    fn test_equinox_batchnorm_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch features\"]):\n    bn = eqx.nn.BatchNorm(input_shape, axis_name)\n    y = bn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── equinox.nn.GroupNorm ──
+
+    #[test]
+    fn test_equinox_groupnorm_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch channels H W\"]):\n    gn = eqx.nn.GroupNorm(4, channels)\n    y = gn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "channels", "H", "W"])));
+    }
+
+    // ── equinox.nn.PReLU ──
+
+    #[test]
+    fn test_equinox_prelu_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch features\"]):\n    prelu = eqx.nn.PReLU()\n    y = prelu(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.GELU ──
+
+    #[test]
+    fn test_torch_gelu_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    gelu = torch.nn.GELU()\n    y = gelu(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.Sigmoid ──
+
+    #[test]
+    fn test_torch_sigmoid_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    sig = torch.nn.Sigmoid()\n    y = sig(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.Tanh ──
+
+    #[test]
+    fn test_torch_tanh_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    tanh = torch.nn.Tanh()\n    y = tanh(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.Softmax ──
+
+    #[test]
+    fn test_torch_softmax_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    sm = torch.nn.Softmax(dim=1)\n    y = sm(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    // ── torch.nn.GroupNorm ──
+
+    #[test]
+    fn test_torch_groupnorm_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 16 H W\"]):\n    gn = torch.nn.GroupNorm(4, 16)\n    y = gn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
+    }
+
+    // ── Chain with Linear: shape-preserving layer after Linear ──
+
+    #[test]
+    fn test_shape_preserving_after_linear() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3\"]):\n    linear = torch.nn.Linear(3, 5)\n    relu = torch.nn.ReLU()\n    y = linear(x)\n    z = relu(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "5"])));
+    }
+
+    // ── Unit test: apply_layer_application with ShapePreserving variant ──
+
+    #[test]
+    fn test_apply_shape_preserving_variant() {
+        let app = LayerApplication {
+            variable: "y".to_string(),
+            layer: "drop".to_string(),
+            input: "x".to_string(),
+            kind: LayerKind::ShapePreserving {
+                name: "Dropout".to_string(),
+            },
+            range: Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+        };
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    // ── Unit test: ShapePreserving with missing input returns None ──
+
+    #[test]
+    fn test_apply_shape_preserving_missing_input() {
+        let app = LayerApplication {
+            variable: "y".to_string(),
+            layer: "drop".to_string(),
+            input: "x".to_string(),
+            kind: LayerKind::ShapePreserving {
+                name: "Dropout".to_string(),
+            },
+            range: Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+        };
+        let shapes = HashMap::new();
+
+        let output = apply_layer_application(&app, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+}
