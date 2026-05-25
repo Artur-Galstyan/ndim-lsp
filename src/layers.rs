@@ -13,10 +13,13 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     let is_equinox_module = call.implementation.target.module_parts.len() >= 2
         && call.implementation.target.module_parts[0] == "equinox"
         && call.implementation.target.module_parts[1] == "nn";
+    let is_torch_module = call.implementation.target.module_parts.len() >= 2
+        && call.implementation.target.module_parts[0] == "torch"
+        && call.implementation.target.module_parts[1] == "nn";
     let is_linear_init =
         call.signature.owner.as_deref() == Some("Linear") && call.signature.name == "__init__";
 
-    if !is_equinox_module || !is_linear_init {
+    if (!is_equinox_module && !is_torch_module) || !is_linear_init {
         return None;
     }
 

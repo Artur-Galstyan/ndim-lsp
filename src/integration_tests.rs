@@ -1862,3 +1862,130 @@ mod call_propagation_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["c", "a", "b"])));
     }
 }
+
+#[cfg(test)]
+mod torch_nn_linear_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn write_fake_torch_nn(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("torch/nn")).unwrap();
+        fs::write(tmp.path().join("torch/__init__.py"), "from . import nn").unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, bias=True): pass",
+        )
+        .unwrap();
+    }
+
+    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
+        vec![FunctionShapeScope {
+            function_name: None,
+            start_byte: 0,
+            end_byte: usize::MAX,
+            shapes,
+        }]
+    }
+
+    #[test]
+    fn test_single_torch_nn_linear_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = torch.nn.Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.applications.len(), 1);
+    }
+
+    #[test]
+    fn test_chained_torch_nn_linear_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3\"]):\n    l1 = torch.nn.Linear(3, 5)\n    l2 = torch.nn.Linear(5, 7)\n    y = l1(x)\n    z = l2(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "7"])));
+    }
+
+    #[test]
+    fn test_torch_nn_linear_mismatch_reports_shape_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\nlayer = torch.nn.Linear(3, 5)\ny = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "4"]))]));
+
+        let errors = apply_layer_applications(&apps, &mut scopes);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].variable, "y");
+        assert!(errors[0].message.contains("expected input last dim 3"));
+        assert!(!scopes[0].shapes.contains_key("y"));
+    }
+
+    #[test]
+    fn test_from_torch_nn_import_linear_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "from torch.nn import Linear\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = Linear(3, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert!(analysis.layers.contains_key("layer"));
+    }
+
+    #[test]
+    fn test_torch_nn_linear_keyword_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = torch.nn.Linear(in_features=3, out_features=5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+    }
+}
