@@ -3140,12 +3140,15 @@ mod shape_preserving_layer_tests {
     }
 
     // ── Rank validation: under-rank input produces ShapeError ──
+    //
+    // Convention matches Conv layers: channels-first without requiring a batch
+    // dimension. BatchNorm2d min_rank=3 (C, H, W), BatchNorm3d min_rank=4 (C, D, H, W).
 
     #[test]
     fn test_batchnorm2d_under_rank_reports_error() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // BatchNorm2d requires 4D (N, C, H, W); 2D input is under-rank
+        // BatchNorm2d requires at least 3D (C, H, W); 2D input is under-rank
         let code = "import torch\ndef f(x: Float[Array, \"batch 16\"]):\n    bn = torch.nn.BatchNorm2d(16)\n    y = bn(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
@@ -3155,7 +3158,7 @@ mod shape_preserving_layer_tests {
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
         assert!(analysis.errors[0].message.contains("BatchNorm2d"));
-        assert!(analysis.errors[0].message.contains("at least 4 dims"));
+        assert!(analysis.errors[0].message.contains("at least 3 dims"));
         assert!(analysis.errors[0].message.contains("got 2"));
     }
 
@@ -3163,8 +3166,8 @@ mod shape_preserving_layer_tests {
     fn test_batchnorm3d_under_rank_reports_error() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // BatchNorm3d requires 5D; 3D input is under-rank
-        let code = "import torch\ndef f(x: Float[Array, \"batch 8 H W\"]):\n    bn = torch.nn.BatchNorm3d(8)\n    y = bn(x)";
+        // BatchNorm3d requires at least 4D (C, D, H, W); 3D input is under-rank
+        let code = "import torch\ndef f(x: Float[Array, \"8 H W\"]):\n    bn = torch.nn.BatchNorm3d(8)\n    y = bn(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -3173,14 +3176,15 @@ mod shape_preserving_layer_tests {
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
         assert!(analysis.errors[0].message.contains("BatchNorm3d"));
-        assert!(analysis.errors[0].message.contains("at least 5 dims"));
+        assert!(analysis.errors[0].message.contains("at least 4 dims"));
+        assert!(analysis.errors[0].message.contains("got 3"));
     }
 
     #[test]
     fn test_dropout2d_under_rank_reports_error() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // Dropout2d requires 4D; 1D input is under-rank
+        // Dropout2d requires at least 3D; 1D input is under-rank
         let code = "import torch\ndef f(x: Float[Array, \"features\"]):\n    drop = torch.nn.Dropout2d(0.5)\n    y = drop(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
@@ -3189,15 +3193,14 @@ mod shape_preserving_layer_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("Dropout2d"));
-        assert!(analysis.errors[0].message.contains("at least 4 dims"));
+        assert!(analysis.errors[0].message.contains("at least 3 dims"));
     }
 
     #[test]
     fn test_dropout1d_under_rank_reports_error() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // Dropout1d requires 2D; scalar (0D) input is under-rank
-        // Use 1D input instead to test the boundary
+        // Dropout1d requires at least 2D (C, L); 1D input is under-rank
         let code = "import torch\ndef f(x: Float[Array, \"features\"]):\n    drop = torch.nn.Dropout1d(0.5)\n    y = drop(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
@@ -3213,7 +3216,7 @@ mod shape_preserving_layer_tests {
     fn test_dropout3d_under_rank_reports_error() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // Dropout3d requires 5D; 2D input is under-rank
+        // Dropout3d requires at least 4D (C, D, H, W); 2D input is under-rank
         let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    drop = torch.nn.Dropout3d(0.5)\n    y = drop(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
@@ -3222,22 +3225,99 @@ mod shape_preserving_layer_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("Dropout3d"));
-        assert!(analysis.errors[0].message.contains("at least 5 dims"));
+        assert!(analysis.errors[0].message.contains("at least 4 dims"));
     }
 
+    // ── Boundary tests: unbatched inputs accepted at min rank ──
+
     #[test]
-    fn test_batchnorm1d_accepts_2d_input() {
+    fn test_batchnorm2d_unbatched_accepts_3d() {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_torch_nn(&tmp);
-        // BatchNorm1d requires 2D (N, C) — exactly at the boundary
-        let code = "import torch\ndef f(x: Float[Array, \"batch 16\"]):\n    bn = torch.nn.BatchNorm1d(16)\n    y = bn(x)";
+        // BatchNorm2d on (C, H, W) — exactly at min rank 3, no batch dim
+        let code = "import torch\ndef f(x: Float[Array, \"16 H W\"]):\n    bn = torch.nn.BatchNorm2d(16)\n    y = bn(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "H", "W"])));
+    }
+
+    #[test]
+    fn test_batchnorm3d_unbatched_accepts_4d() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // BatchNorm3d on (C, D, H, W) — exactly at min rank 4, no batch dim
+        let code = "import torch\ndef f(x: Float[Array, \"8 D H W\"]):\n    bn = torch.nn.BatchNorm3d(8)\n    y = bn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
+    }
+
+    #[test]
+    fn test_dropout2d_unbatched_accepts_3d() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // Dropout2d on (C, H, W) — exactly at min rank 3
+        let code = "import torch\ndef f(x: Float[Array, \"16 H W\"]):\n    drop = torch.nn.Dropout2d(0.5)\n    y = drop(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "H", "W"])));
+    }
+
+    #[test]
+    fn test_dropout3d_unbatched_accepts_4d() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // Dropout3d on (C, D, H, W) — exactly at min rank 4
+        let code = "import torch\ndef f(x: Float[Array, \"8 D H W\"]):\n    drop = torch.nn.Dropout3d(0.5)\n    y = drop(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
+    }
+
+    #[test]
+    fn test_batchnorm1d_accepts_2d_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // BatchNorm1d on (C, L) — exactly at min rank 2
+        let code = "import torch\ndef f(x: Float[Array, \"16 L\"]):\n    bn = torch.nn.BatchNorm1d(16)\n    y = bn(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "L"])));
+    }
+
+    #[test]
+    fn test_dropout1d_accepts_2d_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // Dropout1d on (C, L) — exactly at min rank 2
+        let code = "import torch\ndef f(x: Float[Array, \"16 L\"]):\n    drop = torch.nn.Dropout1d(0.5)\n    y = drop(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "L"])));
     }
 
     #[test]
@@ -3290,13 +3370,39 @@ mod shape_preserving_layer_tests {
     }
 
     #[test]
-    fn test_unit_batchnorm2d_3d_input_rejected() {
+    fn test_unit_batchnorm2d_2d_input_rejected() {
         let app = sp_app("BatchNorm2d", "x");
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "16", "L"]))]);
+        let shapes = HashMap::from([("x".to_string(), shape(&["16", "L"]))]);
         let err = apply_layer_application(&app, &shapes).unwrap_err();
         assert!(err.contains("BatchNorm2d"));
+        assert!(err.contains("at least 3 dims"));
+        assert!(err.contains("got 2"));
+    }
+
+    #[test]
+    fn test_unit_batchnorm2d_3d_input_accepted() {
+        let app = sp_app("BatchNorm2d", "x");
+        let shapes = HashMap::from([("x".to_string(), shape(&["16", "H", "W"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["16", "H", "W"])));
+    }
+
+    #[test]
+    fn test_unit_batchnorm3d_3d_input_rejected() {
+        let app = sp_app("BatchNorm3d", "x");
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "H", "W"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("BatchNorm3d"));
         assert!(err.contains("at least 4 dims"));
         assert!(err.contains("got 3"));
+    }
+
+    #[test]
+    fn test_unit_batchnorm3d_4d_input_accepted() {
+        let app = sp_app("BatchNorm3d", "x");
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "D", "H", "W"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["8", "D", "H", "W"])));
     }
 
     #[test]

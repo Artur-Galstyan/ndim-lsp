@@ -314,8 +314,10 @@ fn apply_conv_layer(
 fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
     match name {
         "BatchNorm1d" | "Dropout1d" => Some(2),
-        "BatchNorm2d" | "Dropout2d" => Some(4),
-        "BatchNorm3d" | "Dropout3d" => Some(5),
+        // Same convention as Conv layers: channels-first without requiring
+        // a batch dimension. Conv2d min_rank = 3 (C, H, W), Conv3d = 4.
+        "BatchNorm2d" | "Dropout2d" => Some(3),
+        "BatchNorm3d" | "Dropout3d" => Some(4),
         "LayerNorm" | "GroupNorm" => Some(1),
         // Dropout, BatchNorm (equinox), ReLU, GELU, Sigmoid, Tanh, Softmax, PReLU
         // accept any rank including scalars.
