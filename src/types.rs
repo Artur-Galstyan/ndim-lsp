@@ -198,6 +198,7 @@ pub enum KnownFunction {
     Outer,
     Inner,
     Vdot,
+    LinalgInv,
 }
 
 #[derive(Debug, Clone)]
