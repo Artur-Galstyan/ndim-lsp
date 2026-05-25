@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use tokio::sync::RwLock;
@@ -147,8 +147,10 @@ impl Backend {
             return;
         };
 
-        // Use cached workspace roots
-        let search_roots = self.workspace_roots.read().await.clone();
+        // Use cached workspace roots, extended with discovered site-packages
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        let mut search_roots = workspace_roots.clone();
+        search_roots.extend(python_site_packages_roots(&workspace_roots));
 
         // Read-file implementation
         let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
@@ -159,7 +161,7 @@ impl Backend {
             text,
             &search_roots,
             read_file,
-            5,
+            8,
         ) {
             Ok(analysis) => analysis
                 .errors
@@ -210,11 +212,13 @@ impl Backend {
         // Compute cursor byte from the identifier node's start byte
         let cursor_byte = node.start_byte();
 
-        // Use cached workspace roots for analysis
-        let search_roots = self.workspace_roots.read().await.clone();
+        // Use cached workspace roots for analysis, extended with discovered site-packages
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        let mut search_roots = workspace_roots.clone();
+        search_roots.extend(python_site_packages_roots(&workspace_roots));
         let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
 
-        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 5) {
+        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
             Ok(a) => a,
             Err(msg) => {
                 self.client
@@ -310,6 +314,68 @@ fn ts_range_to_lsp_range(ts: tree_sitter::Range) -> Range {
             character: ts.end_point.column as u32,
         },
     }
+}
+
+/// Statically discover Python `site-packages` directories without invoking
+/// Python or shelling out. Probes (in priority order):
+///
+/// 1. `$VIRTUAL_ENV`
+/// 2. `$CONDA_PREFIX`
+/// 3. `<workspace>/.venv` and `<workspace>/venv` for each workspace root
+///
+/// For each candidate venv root, looks for `lib/python*/site-packages`
+/// (Unix/macOS) and `Lib/site-packages` (Windows). Only existing paths are
+/// returned. Duplicates are collapsed by canonical path so a symlinked
+/// `.venv` does not double-count against its target. Never panics; IO errors
+/// are silently ignored.
+fn python_site_packages_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let mut probe_venv = |venv_root: PathBuf| {
+        // Unix/macOS layout: <venv>/lib/python*/site-packages
+        let lib = venv_root.join("lib");
+        if let Ok(entries) = std::fs::read_dir(&lib) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("python") {
+                    let site = entry.path().join("site-packages");
+                    if site.exists() {
+                        candidates.push(site);
+                    }
+                }
+            }
+        }
+        // Windows layout: <venv>/Lib/site-packages
+        let win = venv_root.join("Lib").join("site-packages");
+        if win.exists() {
+            candidates.push(win);
+        }
+    };
+
+    if let Ok(v) = std::env::var("VIRTUAL_ENV")
+        && !v.is_empty()
+    {
+        probe_venv(PathBuf::from(v));
+    }
+    if let Ok(v) = std::env::var("CONDA_PREFIX")
+        && !v.is_empty()
+    {
+        probe_venv(PathBuf::from(v));
+    }
+    for root in workspace_roots {
+        probe_venv(root.join(".venv"));
+        probe_venv(root.join("venv"));
+    }
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut result: Vec<PathBuf> = Vec::new();
+    for c in candidates {
+        let key = std::fs::canonicalize(&c).unwrap_or_else(|_| c.clone());
+        if seen.insert(key) {
+            result.push(c);
+        }
+    }
+    result
 }
 
 #[tokio::main]
@@ -456,6 +522,202 @@ mod tests {
 
         let result = find_shape_for_variable(&scopes, 50, "z");
         assert_eq!(result, None);
+    }
+
+    /// Drop guard that saves an environment variable's value and restores it
+    /// on drop, so env-mutating subcases inside a single test don't leak state.
+    struct EnvGuard {
+        var: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn save_and_clear(var: &'static str) -> Self {
+            let prev = std::env::var(var).ok();
+            if prev.is_some() {
+                unsafe {
+                    std::env::remove_var(var);
+                }
+            }
+            Self { var, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.var, v),
+                    None => std::env::remove_var(self.var),
+                }
+            }
+        }
+    }
+
+    fn make_site_packages(base: &std::path::Path, py_dir: &str) -> PathBuf {
+        let site = base.join("lib").join(py_dir).join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        site
+    }
+
+    fn make_win_site_packages(base: &std::path::Path) -> PathBuf {
+        let site = base.join("Lib").join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        site
+    }
+
+    /// All discovery cases bundled into a single `#[test]` so they
+    /// run sequentially — they share global env-var state, which would
+    /// otherwise race under cargo's parallel test runner. EnvGuard restores
+    /// any prior `VIRTUAL_ENV` / `CONDA_PREFIX` even on panic.
+    #[test]
+    fn python_site_packages_discovery_cases() {
+        // Save and clear both env vars for a known baseline.
+        let _ve = EnvGuard::save_and_clear("VIRTUAL_ENV");
+        let _ce = EnvGuard::save_and_clear("CONDA_PREFIX");
+
+        // Case: empty workspace, no env vars -> empty.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let roots = vec![tmp.path().to_path_buf()];
+            assert!(python_site_packages_roots(&roots).is_empty());
+        }
+
+        // Case: workspace contains .venv/lib/python3.11/site-packages.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = make_site_packages(&tmp.path().join(".venv"), "python3.11");
+            let roots = vec![tmp.path().to_path_buf()];
+            let got = python_site_packages_roots(&roots);
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&site).unwrap()
+            );
+        }
+
+        // Case: workspace contains venv/lib/python3.12/site-packages.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = make_site_packages(&tmp.path().join("venv"), "python3.12");
+            let roots = vec![tmp.path().to_path_buf()];
+            let got = python_site_packages_roots(&roots);
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&site).unwrap()
+            );
+        }
+
+        // Case: workspace contains .venv/Lib/site-packages (Windows-style).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = make_win_site_packages(&tmp.path().join(".venv"));
+            let roots = vec![tmp.path().to_path_buf()];
+            let got = python_site_packages_roots(&roots);
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&site).unwrap()
+            );
+        }
+
+        // Case: VIRTUAL_ENV points at a tempdir with lib/python3.12/site-packages.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = make_site_packages(tmp.path(), "python3.12");
+            unsafe {
+                std::env::set_var("VIRTUAL_ENV", tmp.path());
+            }
+            let got = python_site_packages_roots(&[]);
+            unsafe {
+                std::env::remove_var("VIRTUAL_ENV");
+            }
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&site).unwrap()
+            );
+        }
+
+        // Case: CONDA_PREFIX points at a tempdir with lib/python3.10/site-packages.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = make_site_packages(tmp.path(), "python3.10");
+            unsafe {
+                std::env::set_var("CONDA_PREFIX", tmp.path());
+            }
+            let got = python_site_packages_roots(&[]);
+            unsafe {
+                std::env::remove_var("CONDA_PREFIX");
+            }
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&site).unwrap()
+            );
+        }
+
+        // Case: VIRTUAL_ENV set AND workspace has .venv (different paths) ->
+        // both returned, no duplicates.
+        {
+            let venv_tmp = tempfile::tempdir().unwrap();
+            let ws_tmp = tempfile::tempdir().unwrap();
+            let venv_site = make_site_packages(venv_tmp.path(), "python3.11");
+            let ws_site = make_site_packages(&ws_tmp.path().join(".venv"), "python3.11");
+            unsafe {
+                std::env::set_var("VIRTUAL_ENV", venv_tmp.path());
+            }
+            let got = python_site_packages_roots(&[ws_tmp.path().to_path_buf()]);
+            unsafe {
+                std::env::remove_var("VIRTUAL_ENV");
+            }
+            assert_eq!(got.len(), 2);
+            let canon: HashSet<PathBuf> = got
+                .iter()
+                .map(|p| std::fs::canonicalize(p).unwrap())
+                .collect();
+            assert!(canon.contains(&std::fs::canonicalize(&venv_site).unwrap()));
+            assert!(canon.contains(&std::fs::canonicalize(&ws_site).unwrap()));
+        }
+
+        // Case: nonexistent candidate paths are filtered (workspace has no
+        // .venv or venv -> empty).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let roots = vec![tmp.path().to_path_buf()];
+            assert!(python_site_packages_roots(&roots).is_empty());
+        }
+
+        // Case: symlinked .venv -> a real venv dir; both candidate paths
+        // would otherwise appear, but they canonicalize to the same target.
+        #[cfg(unix)]
+        {
+            let real_tmp = tempfile::tempdir().unwrap();
+            let real_site = make_site_packages(real_tmp.path(), "python3.11");
+
+            let ws_tmp = tempfile::tempdir().unwrap();
+            // Make ws/.venv a symlink to real_tmp.
+            std::os::unix::fs::symlink(real_tmp.path(), ws_tmp.path().join(".venv")).unwrap();
+
+            unsafe {
+                std::env::set_var("VIRTUAL_ENV", real_tmp.path());
+            }
+            let got = python_site_packages_roots(&[ws_tmp.path().to_path_buf()]);
+            unsafe {
+                std::env::remove_var("VIRTUAL_ENV");
+            }
+            // Both probes find real_site (once directly, once via symlink),
+            // but canonicalization should collapse them to one entry.
+            assert_eq!(
+                got.len(),
+                1,
+                "expected symlinked .venv to be deduped against VIRTUAL_ENV target, got {:?}",
+                got
+            );
+            assert_eq!(
+                std::fs::canonicalize(&got[0]).unwrap(),
+                std::fs::canonicalize(&real_site).unwrap()
+            );
+        }
     }
 
     #[test]
