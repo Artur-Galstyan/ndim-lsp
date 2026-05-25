@@ -1089,14 +1089,16 @@ mod extract_jaxtyping_shapes_tests {
         dims.iter().map(|dim| dim.to_string()).collect()
     }
 
-    fn flatten(scopes: Vec<FunctionShapeScope>) -> HashMap<String, Vec<String>> {
-        let mut out = HashMap::new();
-        for scope in scopes {
-            for (k, v) in scope.shapes {
-                out.insert(k, v);
-            }
-        }
-        out
+    fn scope_by_name<'a>(scopes: &'a [FunctionShapeScope], name: &str) -> &'a FunctionShapeScope {
+        scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no scope for function '{}'", name))
+    }
+
+    fn module_scope(scopes: &[FunctionShapeScope]) -> &FunctionShapeScope {
+        assert!(scopes[0].function_name.is_none(), "scope[0] is not module scope");
+        &scopes[0]
     }
 
     #[test]
@@ -1104,9 +1106,11 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        let f = scope_by_name(&scopes, "f");
+        assert_eq!(f.shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert!(module_scope(&scopes).shapes.is_empty());
     }
 
     #[test]
@@ -1114,9 +1118,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"batch 3\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "3"]))
+        );
     }
 
     #[test]
@@ -1124,10 +1131,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"b d\"], y: Int[Array, \"b\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
-        assert_eq!(shapes.get("y"), Some(&shape(&["b"])));
+        let f = scope_by_name(&scopes, "f");
+        assert_eq!(f.shapes.get("x"), Some(&shape(&["b", "d"])));
+        assert_eq!(f.shapes.get("y"), Some(&shape(&["b"])));
+        assert_eq!(f.shapes.len(), 2);
     }
 
     #[test]
@@ -1135,9 +1144,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"b d\"] = default): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["b", "d"]))
+        );
     }
 
     #[test]
@@ -1145,10 +1157,11 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x, y: Float[Array, \"b d\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(!shapes.contains_key("x"));
-        assert_eq!(shapes.get("y"), Some(&shape(&["b", "d"])));
+        let f = scope_by_name(&scopes, "f");
+        assert!(!f.shapes.contains_key("x"));
+        assert_eq!(f.shapes.get("y"), Some(&shape(&["b", "d"])));
     }
 
     #[test]
@@ -1156,9 +1169,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: int): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1166,9 +1179,13 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def outer():\n    def inner(x: Float[Array, \"b d\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["b", "d"])));
+        let outer = scope_by_name(&scopes, "outer");
+        let inner = scope_by_name(&scopes, "inner");
+        assert_eq!(inner.shapes.get("x"), Some(&shape(&["b", "d"])));
+        assert!(!outer.shapes.contains_key("x"));
+        assert!(outer.shapes.is_empty());
     }
 
     #[test]
@@ -1176,9 +1193,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, 'batch features']): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1186,10 +1206,11 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(\n    x: Float[Array, \"batch features\"],\n    y: Float[Array, \"batch\"],\n): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch"])));
+        let f = scope_by_name(&scopes, "f");
+        assert_eq!(f.shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(f.shapes.get("y"), Some(&shape(&["batch"])));
     }
 
     #[test]
@@ -1197,10 +1218,11 @@ mod extract_jaxtyping_shapes_tests {
         let code = "class M:\n    def __call__(self, x: Float[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(!shapes.contains_key("self"));
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        let call = scope_by_name(&scopes, "__call__");
+        assert!(!call.shapes.contains_key("self"));
+        assert_eq!(call.shapes.get("x"), Some(&shape(&["batch", "features"])));
     }
 
     #[test]
@@ -1208,9 +1230,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x) -> Float[Array, \"batch features\"]: pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1218,9 +1240,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Literal[\"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1228,9 +1250,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[NotArray, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1238,9 +1260,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[jax.Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1248,9 +1273,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[jaxtyping.Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1258,9 +1286,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Shaped[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1268,9 +1299,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Optional[Float[Array, \"batch features\"]]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1278,9 +1312,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, r\"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1288,9 +1325,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"\"\"batch features\"\"\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1298,9 +1338,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, f\"batch {features}\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1308,9 +1348,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(*xs: Float[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("xs"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("xs"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1318,9 +1361,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(**kwargs: Float[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("kwargs"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("kwargs"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1328,9 +1374,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(*, x: Float[Array, \"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1338,9 +1387,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"batch features\"], /): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1348,9 +1400,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Union[None, Float[Array, \"batch features\"]]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1358,9 +1413,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, b\"batch features\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1368,9 +1423,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(\n    x: Float[Array, \"batch features\"],  # important\n): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1378,9 +1436,9 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(shapes.is_empty());
+        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
     }
 
     #[test]
@@ -1388,9 +1446,12 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"  batch   features  \"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -1398,19 +1459,71 @@ mod extract_jaxtyping_shapes_tests {
         let code = "def f(x: Float[Array, \"batch hidden*2\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "hidden*2"])));
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&shape(&["batch", "hidden*2"]))
+        );
     }
 
     #[test]
-    fn test_later_parameter_name_wins() {
+    fn test_same_param_name_in_two_functions_kept_separate() {
         let code = "def f(x: Float[Array, \"a b\"]): pass\ndef g(x: Float[Array, \"c d\"]): pass";
         let tree = parse(code);
 
-        let shapes = flatten(extract_jaxtyping_shapes(tree.root_node(), code).unwrap());
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert_eq!(shapes.get("x"), Some(&shape(&["c", "d"])));
+        let f = scope_by_name(&scopes, "f");
+        let g = scope_by_name(&scopes, "g");
+        assert_eq!(f.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert_eq!(g.shapes.get("x"), Some(&shape(&["c", "d"])));
+    }
+
+    #[test]
+    fn test_module_scope_is_present_and_empty_for_function_only_file() {
+        let code = "def f(x: Float[Array, \"a b\"]): pass";
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        assert!(module.shapes.is_empty());
+        assert_eq!(module.start_byte, tree.root_node().start_byte());
+        assert_eq!(module.end_byte, tree.root_node().end_byte());
+    }
+
+    #[test]
+    fn test_function_scope_byte_range_covers_its_definition() {
+        let code = "x = 1\ndef f(x: Float[Array, \"a b\"]): pass\ny = 2";
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let f = scope_by_name(&scopes, "f");
+        let def_start = code.find("def f").unwrap();
+        let def_end = code.find("pass").unwrap() + "pass".len();
+        assert!(f.start_byte <= def_start);
+        assert!(f.end_byte >= def_end);
+        assert!(f.start_byte >= module_scope(&scopes).start_byte);
+        assert!(f.end_byte <= module_scope(&scopes).end_byte);
+    }
+
+    #[test]
+    fn test_nested_function_scopes_are_distinct() {
+        let code = "def outer(o: Float[Array, \"a b\"]):\n    def inner(i: Float[Array, \"c d\"]): pass";
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let outer = scope_by_name(&scopes, "outer");
+        let inner = scope_by_name(&scopes, "inner");
+        assert_eq!(outer.shapes.get("o"), Some(&shape(&["a", "b"])));
+        assert!(!outer.shapes.contains_key("i"));
+        assert_eq!(inner.shapes.get("i"), Some(&shape(&["c", "d"])));
+        assert!(!inner.shapes.contains_key("o"));
+        assert!(inner.start_byte >= outer.start_byte);
+        assert!(inner.end_byte <= outer.end_byte);
     }
 }
 
