@@ -171,6 +171,17 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         };
     }
 
+    let is_jax_numpy_linalg = module == ["jax", "numpy", "linalg"];
+    let is_numpy_linalg = module == ["numpy", "linalg"];
+    let is_torch_linalg = module == ["torch", "linalg"];
+
+    if is_jax_numpy_linalg || is_numpy_linalg || is_torch_linalg {
+        return match name.as_str() {
+            "inv" => Some(KnownFunction::LinalgInv),
+            _ => None,
+        };
+    }
+
     if is_jax_lax {
         return match name.as_str() {
             "dot" => Some(KnownFunction::Dot),
@@ -539,6 +550,7 @@ pub fn apply_known_function(
         | KnownFunction::Any
         | KnownFunction::ArgMax
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
+        KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         _ => Ok(None),
     }
 }
@@ -2060,6 +2072,36 @@ fn apply_known_reduction(
         .collect();
 
     Ok(Some(output))
+}
+
+fn apply_known_linalg_inv(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+
+    if input_shape.len() < 2 {
+        return Err(format!(
+            "linalg.inv requires rank >= 2, got rank {}",
+            input_shape.len()
+        ));
+    }
+
+    let last = &input_shape[input_shape.len() - 1];
+    let second_last = &input_shape[input_shape.len() - 2];
+    if last != second_last {
+        return Err(format!(
+            "linalg.inv requires last two dimensions to match, got {} and {}",
+            second_last, last
+        ));
+    }
+
+    Ok(Some(input_shape.clone()))
 }
 
 
@@ -3742,6 +3784,70 @@ mod known_function_shape_rule_tests {
 
         assert_eq!(output, None);
     }
+
+    // ── linalg.inv shape rule tests ──
+
+    #[test]
+    fn test_linalg_inv_square_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_linalg_inv_batched_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "n", "n"])));
+    }
+
+    #[test]
+    fn test_linalg_inv_symbolic_square_dims_preserve() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "m"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "m"])));
+    }
+
+    #[test]
+    fn test_linalg_inv_non_square_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("last two dimensions to match"));
+        assert!(error.contains("m"));
+        assert!(error.contains("n"));
+    }
+
+    #[test]
+    fn test_linalg_inv_rank_1_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("rank >= 2"));
+    }
+
+    #[test]
+    fn test_linalg_inv_unknown_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
 }
 
 #[cfg(test)]
@@ -4410,6 +4516,29 @@ mod known_function_tests {
     known_case!(
         jax_numpy_linalg_norm_rejected_for_now,
         ["jax", "numpy", "linalg", "norm"],
+        None
+    );
+
+    // ── linalg.inv classification tests ──
+
+    known_case!(
+        jnp_linalg_inv,
+        ["jax", "numpy", "linalg", "inv"],
+        Some(KnownFunction::LinalgInv)
+    );
+    known_case!(
+        np_linalg_inv,
+        ["numpy", "linalg", "inv"],
+        Some(KnownFunction::LinalgInv)
+    );
+    known_case!(
+        torch_linalg_inv,
+        ["torch", "linalg", "inv"],
+        Some(KnownFunction::LinalgInv)
+    );
+    known_case!(
+        jax_linalg_inv_unsupported,
+        ["jax", "linalg", "inv"],
         None
     );
 
