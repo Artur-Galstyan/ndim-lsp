@@ -3507,6 +3507,129 @@ mod shape_preserving_layer_tests {
     }
 }
 
+// ── Integration tests for torch.nn.functional.pad ──
+
+#[cfg(test)]
+mod torch_nn_functional_pad_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_f_pad_1d_symbolic() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"n\"]):\n    y = F.pad(x, (1, 2))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
+    }
+
+    #[test]
+    fn test_torch_nn_functional_pad_2d_symbolic() {
+        // apply_known_pad applies pad pairs in dimension order (dim 0 first, dim 1 second),
+        // unlike PyTorch's reverse-axis convention. We test against the existing parser semantics.
+        let code = "import torch\ndef f(x: Float[Array, \"h w\"]):\n    y = torch.nn.functional.pad(x, (1, 2, 3, 4))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["h+3", "w+7"])));
+    }
+
+    #[test]
+    fn test_f_pad_preserves_symbolic_with_addition() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"height width\"]):\n    y = F.pad(x, (1, 2))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["height+3", "width+3"])));
+    }
+
+    #[test]
+    fn test_f_pad_dynamic_pad_variable_returns_none() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"h w\"]):\n    y = F.pad(x, pad_width)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Dynamic pad width variable cannot be statically parsed; should return no shape, not error
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_f_pad_invalid_pad_does_not_crash() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"h w\"]):\n    y = F.pad(x, \"invalid\")";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Invalid/unparseable pad does not crash; returns no shape
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_from_import_pad() {
+        let code = "from torch.nn.functional import pad\ndef f(x: Float[Array, \"n\"]):\n    y = pad(x, (1, 2))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
+    }
+
+    #[test]
+    fn test_from_import_pad_alias() {
+        let code = "from torch.nn.functional import pad as F_pad\ndef f(x: Float[Array, \"n\"]):\n    y = F_pad(x, (1, 2))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
+    }
+
+    #[test]
+    fn test_f_pad_per_axis_numeric() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"10 20\"]):\n    y = F.pad(x, ((1, 2), (3, 4)))";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["13", "27"])));
+    }
+}
+
 #[cfg(test)]
 mod linalg_inv_integration_tests {
     use super::*;

@@ -205,7 +205,7 @@ Legend:
 | `torch.trace` | ✅ | ✅ | ✅ | 2D -> scalar. |
 | `torch.triu` | ✅ | ❌ | ❌ | Shape-preserving. |
 | `torch.tril` | ✅ | ❌ | ❌ | Shape-preserving. |
-| `torch.nn.functional.pad` | ❌ | ❌ | ❌ | Need deeper module classification. |
+| `torch.nn.functional.pad` | ✅ | ✅ | ✅ | Classified via `torch.nn.functional` deep module path; reuses `KnownFunction::Pad` and existing `apply_known_pad` pad-width parser. Note: `apply_known_pad` applies pad pairs in dimension order (dim 0 first), unlike PyTorch's reverse-axis convention; see `torch_nn_functional_pad_tests` in integration_tests.rs. |
 
 ## Torch reductions
 

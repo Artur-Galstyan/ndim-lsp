@@ -174,6 +174,14 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     let is_jax_numpy_linalg = module == ["jax", "numpy", "linalg"];
     let is_numpy_linalg = module == ["numpy", "linalg"];
     let is_torch_linalg = module == ["torch", "linalg"];
+    let is_torch_nn_functional = module == ["torch", "nn", "functional"];
+
+    if is_torch_nn_functional {
+        return match name.as_str() {
+            "pad" => Some(KnownFunction::Pad),
+            _ => None,
+        };
+    }
 
     if is_jax_numpy_linalg || is_numpy_linalg || is_torch_linalg {
         return match name.as_str() {
@@ -4477,6 +4485,23 @@ mod known_function_tests {
     known_case!(torch_pad_rejected_for_now, ["torch", "pad"], None);
     known_case!(torch_block_rejected_for_now, ["torch", "block"], None);
 
+    // torch.nn.functional.* — deep module path classification
+    known_case!(
+        torch_nn_functional_pad,
+        ["torch", "nn", "functional", "pad"],
+        Some(KnownFunction::Pad)
+    );
+    known_case!(
+        torch_nn_functional_relu_not_classified,
+        ["torch", "nn", "functional", "relu"],
+        None
+    );
+    known_case!(
+        torch_nn_functional_unknown_not_classified,
+        ["torch", "nn", "functional", "unknown_func"],
+        None
+    );
+
     known_case!(jax_vmap, ["jax", "vmap"], Some(KnownFunction::Vmap));
     known_case!(jax_lax_dot, ["jax", "lax", "dot"], Some(KnownFunction::Dot));
     known_case!(
@@ -4667,6 +4692,32 @@ mod known_function_tests {
         alias_exact_matching_rejected,
         "import numpy as np",
         "npx.concatenate",
+        None
+    );
+
+    // torch.nn.functional alias/import tests
+    alias_case!(
+        alias_torch_nn_functional_imported_as_f_pad,
+        "import torch.nn.functional as F",
+        "F.pad",
+        Some(KnownFunction::Pad)
+    );
+    alias_case!(
+        from_import_torch_nn_functional_pad,
+        "from torch.nn.functional import pad",
+        "pad",
+        Some(KnownFunction::Pad)
+    );
+    alias_case!(
+        from_import_torch_nn_functional_pad_alias,
+        "from torch.nn.functional import pad as F_pad",
+        "F_pad",
+        Some(KnownFunction::Pad)
+    );
+    alias_case!(
+        alias_torch_nn_functional_imported_as_f_relu_not_classified,
+        "import torch.nn.functional as F",
+        "F.relu",
         None
     );
 }
