@@ -186,6 +186,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     if is_jax_numpy_linalg || is_numpy_linalg || is_torch_linalg {
         return match name.as_str() {
             "inv" => Some(KnownFunction::LinalgInv),
+            "det" => Some(KnownFunction::LinalgDet),
             _ => None,
         };
     }
@@ -559,6 +560,7 @@ pub fn apply_known_function(
         | KnownFunction::ArgMax
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
+        KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
         _ => Ok(None),
     }
 }
@@ -1214,7 +1216,7 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
 fn apply_known_linspace(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
     for arg in args {
         if let CallArgument::Keyword { name, value } = arg
-            && name == "num"
+            && (name == "num" || name == "steps")
         {
             return Ok(Some(vec![value.clone()]));
         }
@@ -2112,6 +2114,35 @@ fn apply_known_linalg_inv(
     Ok(Some(input_shape.clone()))
 }
 
+fn apply_known_linalg_det(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+
+    if input_shape.len() < 2 {
+        return Err(format!(
+            "linalg.det requires rank >= 2, got rank {}",
+            input_shape.len()
+        ));
+    }
+
+    let last = &input_shape[input_shape.len() - 1];
+    let second_last = &input_shape[input_shape.len() - 2];
+    if last != second_last {
+        return Err(format!(
+            "linalg.det requires last two dimensions to match, got {} and {}",
+            second_last, last
+        ));
+    }
+
+    Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
+}
 
 #[cfg(test)]
 mod known_function_shape_rule_tests {
@@ -3793,6 +3824,161 @@ mod known_function_shape_rule_tests {
         assert_eq!(output, None);
     }
 
+    // ── Reduction shape-rule tests for All / Any / ArgMax / ArgMin ──
+
+    #[test]
+    fn test_all_axis_1_reduces_axis() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_any_axis_0_keepdims_true() {
+        let args = vec![pos("x"), kw("axis", "0"), kw("keepdims", "True")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "features"])));
+    }
+
+    #[test]
+    fn test_argmax_axis_negative_removes_last_axis() {
+        let args = vec![pos("x"), kw("axis", "-1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMax, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_argmin_no_axis_reduces_all() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMin, &args, &shapes).unwrap();
+
+        // No axis = reduce all axes → scalar shape
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_all_unknown_input_returns_none() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_any_invalid_axis_errors() {
+        let args = vec![pos("x"), kw("axis", "3")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    #[test]
+    fn test_any_negative_axis_too_negative_errors() {
+        let args = vec![pos("x"), kw("axis", "-5")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    // ── Shape-preserving tests for Argsort / Sort / Cumsum / Cumprod ──
+
+    #[test]
+    fn test_argsort_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Argsort, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_sort_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Sort, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_cumsum_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Cumsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_cumprod_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Cumprod, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_argsort_unknown_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Argsort, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_argmax_dim_keyword_torch_style() {
+        let args = vec![pos("x"), kw("dim", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMax, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_all_axis_none_reduces_all() {
+        let args = vec![pos("x"), kw("axis", "None")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_any_keepdim_keyword_torch_style() {
+        let args = vec![pos("x"), kw("dim", "1"), kw("keepdim", "True")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "1"])));
+    }
+
     // ── linalg.inv shape rule tests ──
 
     #[test]
@@ -3853,6 +4039,218 @@ mod known_function_shape_rule_tests {
         let shapes = HashMap::new();
 
         let output = apply_known_function(&KnownFunction::LinalgInv, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // ── linalg.det shape rule tests ──
+
+    #[test]
+    fn test_linalg_det_2d_square_returns_scalar() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_linalg_det_batched_square_returns_batch_prefix() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_linalg_det_multi_batch_returns_all_prefix_dims() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["b", "t", "n", "n"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "t"])));
+    }
+
+    #[test]
+    fn test_linalg_det_symbolic_square_dims_work() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "m"]))]);
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_linalg_det_non_square_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["m", "n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("last two dimensions to match"));
+        assert!(error.contains("m"));
+        assert!(error.contains("n"));
+    }
+
+    #[test]
+    fn test_linalg_det_rank_1_errors() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+
+        let error = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("rank >= 2"));
+    }
+
+    #[test]
+    fn test_linalg_det_unknown_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::LinalgDet, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // ── Constructor coverage: Empty, Linspace, Logspace, Identity shape-rule tests ──
+
+    // Empty uses apply_known_shape_constructor (same as Zeros/Ones/Full)
+
+    #[test]
+    fn test_empty_positional_tuple_shape() {
+        let args = vec![pos("(batch, features)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_empty_keyword_shape() {
+        let args = vec![kw("shape", "(2, 3)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_empty_no_args_returns_none() {
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &[], &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // Linspace uses apply_known_linspace
+
+    #[test]
+    fn test_linspace_positional_num() {
+        let args = vec![pos("0"), pos("1"), pos("100")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["100"])));
+    }
+
+    #[test]
+    fn test_linspace_keyword_num() {
+        let args = vec![pos("0"), pos("1"), kw("num", "steps")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_linspace_default_num_is_50() {
+        let args = vec![pos("0"), pos("1")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["50"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_keyword_steps() {
+        let args = vec![pos("0"), pos("1"), kw("steps", "steps")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_positional_steps() {
+        let args = vec![pos("0"), pos("1"), pos("200")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["200"])));
+    }
+
+    // Logspace uses apply_known_linspace (same helper)
+
+    #[test]
+    fn test_logspace_positional_num() {
+        let args = vec![pos("0"), pos("3"), pos("n")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n"])));
+    }
+
+    #[test]
+    fn test_logspace_keyword_num() {
+        let args = vec![pos("0"), pos("3"), kw("num", "count")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["count"])));
+    }
+
+    #[test]
+    fn test_logspace_default_num_is_50() {
+        let args = vec![pos("0"), pos("3")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["50"])));
+    }
+
+    // Identity uses apply_known_eye (same helper as Eye)
+
+    #[test]
+    fn test_identity_square() {
+        let args = vec![pos("n")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Identity, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_identity_no_args_returns_none() {
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Identity, &[], &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -4003,6 +4401,26 @@ mod known_function_tests {
         jnp_full,
         ["jax", "numpy", "full"],
         Some(KnownFunction::Full)
+    );
+    known_case!(
+        jnp_empty,
+        ["jax", "numpy", "empty"],
+        Some(KnownFunction::Empty)
+    );
+    known_case!(
+        jnp_linspace,
+        ["jax", "numpy", "linspace"],
+        Some(KnownFunction::Linspace)
+    );
+    known_case!(
+        jnp_logspace,
+        ["jax", "numpy", "logspace"],
+        Some(KnownFunction::Logspace)
+    );
+    known_case!(
+        jnp_identity,
+        ["jax", "numpy", "identity"],
+        Some(KnownFunction::Identity)
     );
     known_case!(
         jnp_arange,
@@ -4211,6 +4629,10 @@ mod known_function_tests {
     known_case!(np_zeros, ["numpy", "zeros"], Some(KnownFunction::Zeros));
     known_case!(np_ones, ["numpy", "ones"], Some(KnownFunction::Ones));
     known_case!(np_full, ["numpy", "full"], Some(KnownFunction::Full));
+    known_case!(np_empty, ["numpy", "empty"], Some(KnownFunction::Empty));
+    known_case!(np_linspace, ["numpy", "linspace"], Some(KnownFunction::Linspace));
+    known_case!(np_logspace, ["numpy", "logspace"], Some(KnownFunction::Logspace));
+    known_case!(np_identity, ["numpy", "identity"], Some(KnownFunction::Identity));
     known_case!(np_arange, ["numpy", "arange"], Some(KnownFunction::Arange));
     known_case!(np_eye, ["numpy", "eye"], Some(KnownFunction::Eye));
     known_case!(
@@ -4371,6 +4793,8 @@ mod known_function_tests {
     known_case!(torch_zeros, ["torch", "zeros"], Some(KnownFunction::Zeros));
     known_case!(torch_ones, ["torch", "ones"], Some(KnownFunction::Ones));
     known_case!(torch_full, ["torch", "full"], Some(KnownFunction::Full));
+    known_case!(torch_empty, ["torch", "empty"], Some(KnownFunction::Empty));
+    known_case!(torch_linspace, ["torch", "linspace"], Some(KnownFunction::Linspace));
     known_case!(
         torch_zeros_like,
         ["torch", "zeros_like"],
@@ -4529,6 +4953,40 @@ mod known_function_tests {
         None
     );
     known_case!(method_like_known_function_rejected, ["x", "reshape"], None);
+    // ── Classification tests for all/any/argmax/argmin/argsort/sort/cumsum/cumprod ──
+
+    known_case!(jnp_all, ["jax", "numpy", "all"], Some(KnownFunction::All));
+    known_case!(np_all, ["numpy", "all"], Some(KnownFunction::All));
+    known_case!(torch_all, ["torch", "all"], Some(KnownFunction::All));
+
+    known_case!(jnp_any, ["jax", "numpy", "any"], Some(KnownFunction::Any));
+    known_case!(np_any, ["numpy", "any"], Some(KnownFunction::Any));
+    known_case!(torch_any, ["torch", "any"], Some(KnownFunction::Any));
+
+    known_case!(jnp_argmax, ["jax", "numpy", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(np_argmax, ["numpy", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(torch_argmax, ["torch", "argmax"], Some(KnownFunction::ArgMax));
+
+    known_case!(jnp_argmin, ["jax", "numpy", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(np_argmin, ["numpy", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(torch_argmin, ["torch", "argmin"], Some(KnownFunction::ArgMin));
+
+    known_case!(jnp_argsort, ["jax", "numpy", "argsort"], Some(KnownFunction::Argsort));
+    known_case!(np_argsort, ["numpy", "argsort"], Some(KnownFunction::Argsort));
+    known_case!(torch_argsort, ["torch", "argsort"], Some(KnownFunction::Argsort));
+
+    known_case!(jnp_sort, ["jax", "numpy", "sort"], Some(KnownFunction::Sort));
+    known_case!(np_sort, ["numpy", "sort"], Some(KnownFunction::Sort));
+    known_case!(torch_sort, ["torch", "sort"], Some(KnownFunction::Sort));
+
+    known_case!(jnp_cumsum, ["jax", "numpy", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(np_cumsum, ["numpy", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(torch_cumsum, ["torch", "cumsum"], Some(KnownFunction::Cumsum));
+
+    known_case!(jnp_cumprod, ["jax", "numpy", "cumprod"], Some(KnownFunction::Cumprod));
+    known_case!(np_cumprod, ["numpy", "cumprod"], Some(KnownFunction::Cumprod));
+    known_case!(torch_cumprod, ["torch", "cumprod"], Some(KnownFunction::Cumprod));
+
     known_case!(jax_numpy_vmap_rejected, ["jax", "numpy", "vmap"], None);
     known_case!(numpy_vmap_rejected, ["numpy", "vmap"], None);
     known_case!(torch_vmap_rejected_for_now, ["torch", "vmap"], None);
@@ -4564,6 +5022,29 @@ mod known_function_tests {
     known_case!(
         jax_linalg_inv_unsupported,
         ["jax", "linalg", "inv"],
+        None
+    );
+
+    // ── linalg.det classification tests ──
+
+    known_case!(
+        jnp_linalg_det,
+        ["jax", "numpy", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        np_linalg_det,
+        ["numpy", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        torch_linalg_det,
+        ["torch", "linalg", "det"],
+        Some(KnownFunction::LinalgDet)
+    );
+    known_case!(
+        jax_linalg_det_unsupported,
+        ["jax", "linalg", "det"],
         None
     );
 

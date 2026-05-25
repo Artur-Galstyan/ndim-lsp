@@ -3632,6 +3632,90 @@ mod torch_nn_functional_pad_tests {
     }
 }
 
+// ── Integration tests for free-function reductions & shape-preserving functions ──
+
+#[cfg(test)]
+mod free_reduction_shape_preserving_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_all_axis_1_gives_batch() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    y = jnp.all(x, axis=1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_np_argmax_axis_0_gives_features() {
+        let code = "import numpy as np\ndef f(x: Float[Array, \"batch features\"]):\n    y = np.argmax(x, axis=0)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+    }
+
+    #[test]
+    fn test_torch_argsort_preserves_batch_features() {
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.argsort(x)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_torch_cumsum_dim_1_preserves_batch_features() {
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.cumsum(x, dim=1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_chained_np_sort_then_any_propagates() {
+        let code = "import numpy as np\ndef f(x: Float[Array, \"batch features\"]):\n    y = np.sort(x)\n    z = np.any(y, axis=-1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch"])));
+    }
+}
+
 #[cfg(test)]
 mod linalg_inv_integration_tests {
     use super::*;
@@ -3885,5 +3969,175 @@ mod builtin_layer_catalog_end_to_end_tests {
         let conv_errs: Vec<_> = messages.iter().filter(|m| m.contains("Conv2d")).collect();
         assert_eq!(linear_errs.len(), 2);
         assert_eq!(conv_errs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod linalg_det_integration_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_linalg_det_batched_square_returns_batch_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch n n\"]):\n    y = jnp.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch"]))
+        );
+    }
+
+    #[test]
+    fn test_np_linalg_det_2d_square_returns_scalar_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f(x: Float[Array, \"n n\"]):\n    y = np.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn test_torch_linalg_det_multi_batch_returns_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f(x: Float[Array, \"b t n n\"]):\n    y = torch.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["b", "t"]))
+        );
+    }
+
+    #[test]
+    fn test_linalg_det_non_square_reports_error_no_output_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f(x: Float[Array, \"m n\"]):\n    y = np.linalg.det(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(analysis.errors[0].message.contains("last two dimensions to match"));
+        assert!(!has_shape(&analysis, "y"));
+    }
+}
+
+#[cfg(test)]
+mod constructor_coverage_integration_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_empty_tuple_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f():\n    y = jnp.empty((batch, features))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_np_identity_square() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f():\n    y = np.identity(n)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_jnp_linspace_keyword_num() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f():\n    y = jnp.linspace(0, 1, num=steps)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_keyword_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f():\n    y = torch.linspace(0, 1, steps=steps)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_np_logspace_keyword_num() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f():\n    y = np.logspace(0, 3, num=n)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
     }
 }
