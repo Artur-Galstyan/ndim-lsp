@@ -3856,6 +3856,16 @@ mod known_function_shape_rule_tests {
         assert!(error.contains("out of bounds"));
     }
 
+    #[test]
+    fn test_any_negative_axis_too_negative_errors() {
+        let args = vec![pos("x"), kw("axis", "-5")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
     // ── Shape-preserving tests for Argsort / Sort / Cumsum / Cumprod ──
 
     #[test]
