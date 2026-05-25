@@ -38,16 +38,16 @@ Legend:
 | `jnp.zeros` / `np.zeros` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.ones` / `np.ones` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.full` / `np.full` | ✅ | ✅ | ✅ | Output shape from shape argument. |
-| `jnp.empty` / `np.empty` | ❌ | ❌ | ❌ | Output shape from shape argument. |
+| `jnp.empty` / `np.empty` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.zeros_like` / `np.zeros_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.ones_like` / `np.ones_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.full_like` / `np.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.empty_like` / `np.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.arange` / `np.arange` | ✅ | ✅ | ✅ | 1D length from args when concrete. |
-| `jnp.linspace` / `np.linspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
-| `jnp.logspace` / `np.logspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
+| `jnp.linspace` / `np.linspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
+| `jnp.logspace` / `np.logspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
 | `jnp.eye` / `np.eye` | ✅ | ✅ | ✅ | Matrix shape `(N, M?)`. |
-| `jnp.identity` / `np.identity` | ❌ | ❌ | ❌ | Matrix shape `(n, n)`. |
+| `jnp.identity` / `np.identity` | ✅ | ✅ | ✅ | Matrix shape `(n, n)`. |
 | `jnp.diag` / `np.diag` | ✅ | ✅ | ✅ | 1D→2D or 2D→1D. |
 | `jnp.diagflat` / `np.diagflat` | ❌ | ❌ | ❌ | Flatten then diagonal matrix. |
 | `jnp.tri` / `np.tri` | ❌ | ❌ | ❌ | Matrix shape `(N, M?)`. |
@@ -176,13 +176,13 @@ Legend:
 | `torch.zeros` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.ones` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.full` | ✅ | ✅ | ✅ | Output shape from args. |
-| `torch.empty` | ❌ | ❌ | ❌ | Output shape from args. |
+| `torch.empty` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.zeros_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.ones_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.arange` | ✅ | ✅ | ✅ | 1D length from args if concrete. |
-| `torch.linspace` | ❌ | ❌ | ❌ | 1D length from steps. |
+| `torch.linspace` | ✅ | ✅ | ✅ | 1D length from `steps`. |
 | `torch.eye` | ✅ | ✅ | ✅ | Matrix shape. |
 | `torch.cat` / `torch.concat` / `torch.concatenate` | ✅ | ✅ | ✅ | Concatenate along dim. |
 | `torch.stack` | ✅ | ✅ | ✅ | Stack along new dim. |

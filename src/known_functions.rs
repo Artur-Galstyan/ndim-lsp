@@ -1214,7 +1214,7 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
 fn apply_known_linspace(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
     for arg in args {
         if let CallArgument::Keyword { name, value } = arg
-            && name == "num"
+            && (name == "num" || name == "steps")
         {
             return Ok(Some(vec![value.clone()]));
         }
@@ -4011,6 +4011,144 @@ mod known_function_shape_rule_tests {
 
         assert_eq!(output, None);
     }
+
+    // ── Constructor coverage: Empty, Linspace, Logspace, Identity shape-rule tests ──
+
+    // Empty uses apply_known_shape_constructor (same as Zeros/Ones/Full)
+
+    #[test]
+    fn test_empty_positional_tuple_shape() {
+        let args = vec![pos("(batch, features)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_empty_keyword_shape() {
+        let args = vec![kw("shape", "(2, 3)")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_empty_no_args_returns_none() {
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Empty, &[], &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // Linspace uses apply_known_linspace
+
+    #[test]
+    fn test_linspace_positional_num() {
+        let args = vec![pos("0"), pos("1"), pos("100")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["100"])));
+    }
+
+    #[test]
+    fn test_linspace_keyword_num() {
+        let args = vec![pos("0"), pos("1"), kw("num", "steps")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_linspace_default_num_is_50() {
+        let args = vec![pos("0"), pos("1")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["50"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_keyword_steps() {
+        let args = vec![pos("0"), pos("1"), kw("steps", "steps")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_positional_steps() {
+        let args = vec![pos("0"), pos("1"), pos("200")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Linspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["200"])));
+    }
+
+    // Logspace uses apply_known_linspace (same helper)
+
+    #[test]
+    fn test_logspace_positional_num() {
+        let args = vec![pos("0"), pos("3"), pos("n")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n"])));
+    }
+
+    #[test]
+    fn test_logspace_keyword_num() {
+        let args = vec![pos("0"), pos("3"), kw("num", "count")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["count"])));
+    }
+
+    #[test]
+    fn test_logspace_default_num_is_50() {
+        let args = vec![pos("0"), pos("3")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Logspace, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["50"])));
+    }
+
+    // Identity uses apply_known_eye (same helper as Eye)
+
+    #[test]
+    fn test_identity_square() {
+        let args = vec![pos("n")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Identity, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_identity_no_args_returns_none() {
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Identity, &[], &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
 }
 
 #[cfg(test)]
@@ -4158,6 +4296,26 @@ mod known_function_tests {
         jnp_full,
         ["jax", "numpy", "full"],
         Some(KnownFunction::Full)
+    );
+    known_case!(
+        jnp_empty,
+        ["jax", "numpy", "empty"],
+        Some(KnownFunction::Empty)
+    );
+    known_case!(
+        jnp_linspace,
+        ["jax", "numpy", "linspace"],
+        Some(KnownFunction::Linspace)
+    );
+    known_case!(
+        jnp_logspace,
+        ["jax", "numpy", "logspace"],
+        Some(KnownFunction::Logspace)
+    );
+    known_case!(
+        jnp_identity,
+        ["jax", "numpy", "identity"],
+        Some(KnownFunction::Identity)
     );
     known_case!(
         jnp_arange,
@@ -4366,6 +4524,10 @@ mod known_function_tests {
     known_case!(np_zeros, ["numpy", "zeros"], Some(KnownFunction::Zeros));
     known_case!(np_ones, ["numpy", "ones"], Some(KnownFunction::Ones));
     known_case!(np_full, ["numpy", "full"], Some(KnownFunction::Full));
+    known_case!(np_empty, ["numpy", "empty"], Some(KnownFunction::Empty));
+    known_case!(np_linspace, ["numpy", "linspace"], Some(KnownFunction::Linspace));
+    known_case!(np_logspace, ["numpy", "logspace"], Some(KnownFunction::Logspace));
+    known_case!(np_identity, ["numpy", "identity"], Some(KnownFunction::Identity));
     known_case!(np_arange, ["numpy", "arange"], Some(KnownFunction::Arange));
     known_case!(np_eye, ["numpy", "eye"], Some(KnownFunction::Eye));
     known_case!(
@@ -4526,6 +4688,8 @@ mod known_function_tests {
     known_case!(torch_zeros, ["torch", "zeros"], Some(KnownFunction::Zeros));
     known_case!(torch_ones, ["torch", "ones"], Some(KnownFunction::Ones));
     known_case!(torch_full, ["torch", "full"], Some(KnownFunction::Full));
+    known_case!(torch_empty, ["torch", "empty"], Some(KnownFunction::Empty));
+    known_case!(torch_linspace, ["torch", "linspace"], Some(KnownFunction::Linspace));
     known_case!(
         torch_zeros_like,
         ["torch", "zeros_like"],
