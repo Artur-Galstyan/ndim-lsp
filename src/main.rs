@@ -533,8 +533,10 @@ mod tests {
     impl EnvGuard {
         fn save_and_clear(var: &'static str) -> Self {
             let prev = std::env::var(var).ok();
-            unsafe {
-                std::env::remove_var(var);
+            if prev.is_some() {
+                unsafe {
+                    std::env::remove_var(var);
+                }
             }
             Self { var, prev }
         }
