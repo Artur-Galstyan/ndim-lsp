@@ -44,7 +44,7 @@ Legend:
 | `jnp.full_like` / `np.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.empty_like` / `np.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.arange` / `np.arange` | ✅ | ✅ | ✅ | 1D length from args when concrete. |
-| `jnp.linspace` / `np.linspace` | ✅ | ✅ | ✅ | 1D length from `num`/`steps`. |
+| `jnp.linspace` / `np.linspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
 | `jnp.logspace` / `np.logspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
 | `jnp.eye` / `np.eye` | ✅ | ✅ | ✅ | Matrix shape `(N, M?)`. |
 | `jnp.identity` / `np.identity` | ✅ | ✅ | ✅ | Matrix shape `(n, n)`. |
