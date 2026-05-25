@@ -159,8 +159,10 @@ mod analyze_layer_shapes_tests {
 
     #[test]
     fn test_missing_layer_implementation_keeps_only_annotation_shapes() {
+        // Uses a user-defined module path (not in the built-in catalog) so
+        // missing disk implementation still yields an empty layer map.
         let tmp = tempfile::tempdir().unwrap();
-        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)";
+        let code = "import my_layers\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = my_layers.Linear(3, 5)\n    y = layer(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -3792,6 +3794,181 @@ mod linalg_inv_integration_tests {
         assert_eq!(analysis.errors[0].variable, "y");
         assert!(analysis.errors[0].message.contains("last two dimensions to match"));
         assert!(!has_shape(&analysis, "y"));
+    }
+}
+
+#[cfg(test)]
+mod builtin_layer_catalog_end_to_end_tests {
+    //! End-to-end tests that mirror the layer-mismatch lines in
+    //! `test_python.py`, exercising `analyze_layer_shapes` with empty
+    //! `search_roots` and a `read_file` that always returns `None`. These
+    //! verify the built-in layer catalog short-circuits disk resolution so
+    //! the analyzer still reports `ShapeError`s for equinox.nn / torch.nn
+    //! layer mismatches even when the frameworks aren't reachable on disk.
+
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn no_read(_: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn empty_roots() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    #[test]
+    fn test_equinox_linear_mismatch_without_disk_reports_error() {
+        let code = "import equinox as eqx\nfrom jaxtyping import Float, Array\n\
+                    def f(x: Float[Array, \"batch 32\"]):\n\
+                    \x20   layer = eqx.nn.Linear(64, 128)\n\
+                    \x20   y = layer(x)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.errors.len(), 1);
+        let err = &analysis.errors[0];
+        assert_eq!(err.variable, "y");
+        assert!(err.message.contains("Linear"));
+        assert!(err.message.contains("layer"));
+        assert!(err.message.contains("expected input last dim"));
+        assert!(err.message.contains("64"));
+        assert!(err.message.contains("32"));
+    }
+
+    #[test]
+    fn test_torch_linear_mismatch_without_disk_reports_error() {
+        let code = "import torch\nfrom jaxtyping import Float, Array\n\
+                    def f(x: Float[Array, \"batch 64\"]):\n\
+                    \x20   layer = torch.nn.Linear(128, 256)\n\
+                    \x20   y = layer(x)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.errors.len(), 1);
+        let err = &analysis.errors[0];
+        assert_eq!(err.variable, "y");
+        assert!(err.message.contains("Linear"));
+        assert!(err.message.contains("layer"));
+        assert!(err.message.contains("expected input last dim"));
+        assert!(err.message.contains("128"));
+        assert!(err.message.contains("64"));
+    }
+
+    #[test]
+    fn test_equinox_conv2d_channels_mismatch_without_disk_reports_error() {
+        let code = "import equinox as eqx\nfrom jaxtyping import Float, Array\n\
+                    def f(x: Float[Array, \"batch 1 32 32\"]):\n\
+                    \x20   layer = eqx.nn.Conv2d(3, 16, 3)\n\
+                    \x20   y = layer(x)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.errors.len(), 1);
+        let err = &analysis.errors[0];
+        assert_eq!(err.variable, "y");
+        assert!(err.message.contains("Conv2d"));
+        assert!(err.message.contains("expected"));
+        assert!(err.message.contains("input channels"));
+        assert!(err.message.contains("1"));
+    }
+
+    #[test]
+    fn test_torch_conv2d_channels_mismatch_without_disk_reports_error() {
+        let code = "import torch\nfrom jaxtyping import Float, Array\n\
+                    def f(x: Float[Array, \"batch 8 32 32\"]):\n\
+                    \x20   layer = torch.nn.Conv2d(3, 16, 3)\n\
+                    \x20   y = layer(x)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert!(analysis.layers.contains_key("layer"));
+        assert_eq!(analysis.errors.len(), 1);
+        let err = &analysis.errors[0];
+        assert_eq!(err.variable, "y");
+        assert!(err.message.contains("Conv2d"));
+        assert!(err.message.contains("expected"));
+        assert!(err.message.contains("input channels"));
+        assert!(err.message.contains("8"));
+    }
+
+    #[test]
+    fn test_equinox_linear_success_without_disk_propagates_output_shape() {
+        let code = "import equinox as eqx\nfrom jaxtyping import Float, Array\n\
+                    def f(x: Float[Array, \"batch 64\"]):\n\
+                    \x20   layer = eqx.nn.Linear(64, 128)\n\
+                    \x20   y = layer(x)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&vec!["batch".to_string(), "128".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_combined_test_python_mismatches_without_disk_match_expected_count() {
+        // Mirror of the four layer-mismatch lines in test_python.py
+        // (Linear in-dim mismatch L44/L58, Conv2d channel mismatch L72/L92).
+        // Layer names are distinct because the layer map is flat across
+        // functions — same-named locals would collide last-wins.
+        let code = "import equinox as eqx\nimport torch\n\
+                    from jaxtyping import Float, Array\n\
+                    \n\
+                    def eqx_linear_mismatch(x: Float[Array, \"batch 32\"]):\n\
+                    \x20   eqx_lin = eqx.nn.Linear(64, 128)\n\
+                    \x20   y = eqx_lin(x)\n\
+                    \n\
+                    def torch_linear_mismatch(x: Float[Array, \"batch 64\"]):\n\
+                    \x20   torch_lin = torch.nn.Linear(128, 256)\n\
+                    \x20   y = torch_lin(x)\n\
+                    \n\
+                    def eqx_conv2d_channels_mismatch(x: Float[Array, \"batch 1 32 32\"]):\n\
+                    \x20   eqx_conv = eqx.nn.Conv2d(3, 16, 3)\n\
+                    \x20   y = eqx_conv(x)\n\
+                    \n\
+                    def torch_conv2d_channels_mismatch(x: Float[Array, \"batch 8 32 32\"]):\n\
+                    \x20   torch_conv = torch.nn.Conv2d(3, 16, 3)\n\
+                    \x20   y = torch_conv(x)\n";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+
+        assert_eq!(
+            analysis.errors.len(),
+            4,
+            "expected one ShapeError per mismatch line, got {:?}",
+            analysis.errors
+        );
+
+        let messages: Vec<&str> = analysis.errors.iter().map(|e| e.message.as_str()).collect();
+        let linear_errs: Vec<_> = messages.iter().filter(|m| m.contains("Linear")).collect();
+        let conv_errs: Vec<_> = messages.iter().filter(|m| m.contains("Conv2d")).collect();
+        assert_eq!(linear_errs.len(), 2);
+        assert_eq!(conv_errs.len(), 2);
     }
 }
 

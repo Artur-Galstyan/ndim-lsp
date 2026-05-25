@@ -6,7 +6,7 @@ use tree_sitter::Node;
 use tree_sitter::Range;
 
 use crate::python_ast::{build_import_map, extract_call_arguments, extract_calls};
-use crate::resolution::resolve_call_signature;
+use crate::resolution::{bind_call_arguments, resolve_call_signature, resolve_call_target};
 use crate::types::*;
 
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
@@ -92,6 +92,113 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     }
 }
 
+/// Built-in catalog of framework layer constructors.
+///
+/// Returns a `PythonCallableSignature` for `equinox.nn.<X>` and `torch.nn.<X>`
+/// layers whose constructor params are well-known. This short-circuits disk
+/// resolution for the common case so the analyzer still classifies layers when
+/// the framework's source isn't on `search_roots`.
+///
+/// `parts` is the import-resolved call path, e.g. `["equinox", "nn", "Linear"]`
+/// or `["torch", "nn", "Conv2d"]`. Only the last element is used as the class
+/// name; `parts[..parts.len()-1]` becomes `module_parts` when the caller
+/// synthesizes a `ResolvedCallSignature`.
+///
+/// NOTE: The `params` lists below are an **analyzer-internal binding contract**,
+/// not a faithful reproduction of the upstream constructor signatures. They
+/// exist only so `bind_call_arguments` can map positional/keyword arguments to
+/// the names that `classify_layer_call` reads (`in_features`, `out_features`,
+/// `in_channels`, `out_channels`, `kernel_size`, `stride`, `padding`). Extra
+/// trailing params (e.g. `dilation`, `groups`, `use_bias`) are present only to
+/// absorb additional positional args without binding them to the wrong name —
+/// they intentionally diverge from `torch.nn.Conv2d` (which has `padding_mode`
+/// between `groups` and `bias`) and from `equinox.nn.Conv` (which has `key`
+/// and other extras). Do not "fix" these to match the upstream signatures
+/// unless `classify_layer_call` starts reading those fields.
+fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
+    if parts.len() < 3 {
+        return None;
+    }
+    let framework = parts[0].as_str();
+    let module = parts[1].as_str();
+    if module != "nn" {
+        return None;
+    }
+    if framework != "equinox" && framework != "torch" {
+        return None;
+    }
+    let class_name = parts.last()?.as_str();
+    let params: &[&str] = match class_name {
+        "Linear" => &["self", "in_features", "out_features", "use_bias"],
+        "Conv1d" | "Conv2d" | "Conv3d" => &[
+            "self",
+            "in_channels",
+            "out_channels",
+            "kernel_size",
+            "stride",
+            "padding",
+            "dilation",
+            "groups",
+            "use_bias",
+        ],
+        "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
+        | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
+        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" => &["self"],
+        _ => return None,
+    };
+
+    Some(PythonCallableSignature {
+        owner: Some(class_name.to_string()),
+        name: "__init__".to_string(),
+        params: params.iter().map(|s| s.to_string()).collect(),
+    })
+}
+
+/// Try the built-in layer catalog for a given call. Returns a synthesized
+/// `ResolvedCallSignature` whose module_parts/owner/__init__ match what
+/// `classify_layer_call` expects, with no filesystem I/O.
+fn try_catalog_signature(
+    call: &CallInfo,
+    node: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+) -> Result<Option<ResolvedCallSignature>, String> {
+    let target = resolve_call_target(&call.target, import_map);
+    if target.dots > 0 {
+        return Ok(None);
+    }
+    let Some(signature) = known_layer_signature(&target.parts) else {
+        return Ok(None);
+    };
+
+    let Some(args_node) = node.descendant_for_byte_range(
+        call.args_node_range.start_byte,
+        call.args_node_range.end_byte,
+    ) else {
+        return Ok(None);
+    };
+    let arguments = extract_call_arguments(args_node, text)?;
+    let bindings = bind_call_arguments(&signature, &arguments);
+
+    let class_name = signature.owner.clone().unwrap_or_default();
+    let module_parts: Vec<String> = target.parts[..target.parts.len() - 1].to_vec();
+
+    Ok(Some(ResolvedCallSignature {
+        implementation: ResolvedImplementation {
+            target: ResolvedModuleTarget {
+                dots: 0,
+                module_parts,
+                file_path: PathBuf::new(),
+                symbol_parts: vec![class_name.clone()],
+            },
+            symbol: Some(PythonSymbol::Class { name: class_name }),
+        },
+        signature,
+        arguments,
+        bindings,
+    }))
+}
+
 pub fn extract_layer_assignments<F>(
     node: Node,
     text: &str,
@@ -107,15 +214,21 @@ where
     let mut layers = HashMap::new();
 
     for call in calls {
-        let Some(resolved_call) = resolve_call_signature(
-            &call,
-            text,
-            &import_map,
-            search_roots,
-            &read_file,
-            max_depth,
-        )?
-        else {
+        // Catalog-first: hardcoded equinox.nn.* / torch.nn.* signatures
+        // bypass disk resolution. Falls through to resolve_call_signature for
+        // user-defined layers and frameworks not in the catalog.
+        let resolved_call = match try_catalog_signature(&call, node, text, &import_map)? {
+            Some(c) => Some(c),
+            None => resolve_call_signature(
+                &call,
+                text,
+                &import_map,
+                search_roots,
+                &read_file,
+                max_depth,
+            )?,
+        };
+        let Some(resolved_call) = resolved_call else {
             continue;
         };
         let Some(layer) = classify_layer_call(&resolved_call) else {
@@ -1440,8 +1553,10 @@ mod extract_layer_assignments_tests {
 
     #[test]
     fn test_skips_missing_implementation() {
+        // User-defined module not in the built-in catalog: must still fall
+        // through to disk resolution, which fails for missing impl.
         let tmp = tempfile::tempdir().unwrap();
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
+        let code = "import my_layers\nlayer = my_layers.Linear(3, 5)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -1726,5 +1841,268 @@ mod classify_layer_call_tests {
         let call = call(&["jax", "numpy"], None, "concatenate", &[("arrays", "xs")]);
 
         assert_eq!(classify_layer_call(&call), None);
+    }
+}
+
+#[cfg(test)]
+mod known_layer_signature_tests {
+    use super::*;
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn test_equinox_linear_signature() {
+        let sig = known_layer_signature(&parts(&["equinox", "nn", "Linear"])).unwrap();
+        assert_eq!(sig.owner.as_deref(), Some("Linear"));
+        assert_eq!(sig.name, "__init__");
+        assert_eq!(&sig.params[..3], &["self", "in_features", "out_features"]);
+    }
+
+    #[test]
+    fn test_torch_linear_signature() {
+        let sig = known_layer_signature(&parts(&["torch", "nn", "Linear"])).unwrap();
+        assert_eq!(sig.owner.as_deref(), Some("Linear"));
+        assert_eq!(sig.name, "__init__");
+        assert_eq!(&sig.params[..3], &["self", "in_features", "out_features"]);
+    }
+
+    #[test]
+    fn test_equinox_conv_variants_signatures() {
+        for class in ["Conv1d", "Conv2d", "Conv3d"] {
+            let sig = known_layer_signature(&parts(&["equinox", "nn", class])).unwrap();
+            assert_eq!(sig.owner.as_deref(), Some(class));
+            assert_eq!(sig.name, "__init__");
+            assert_eq!(
+                &sig.params[..4],
+                &["self", "in_channels", "out_channels", "kernel_size"]
+            );
+            assert!(sig.params.iter().any(|p| p == "stride"));
+            assert!(sig.params.iter().any(|p| p == "padding"));
+        }
+    }
+
+    #[test]
+    fn test_torch_conv_variants_signatures() {
+        for class in ["Conv1d", "Conv2d", "Conv3d"] {
+            let sig = known_layer_signature(&parts(&["torch", "nn", class])).unwrap();
+            assert_eq!(sig.owner.as_deref(), Some(class));
+            assert_eq!(
+                &sig.params[..4],
+                &["self", "in_channels", "out_channels", "kernel_size"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_shape_preserving_layer_signatures() {
+        let names = [
+            "Dropout",
+            "Dropout1d",
+            "Dropout2d",
+            "Dropout3d",
+            "BatchNorm",
+            "BatchNorm1d",
+            "BatchNorm2d",
+            "BatchNorm3d",
+            "LayerNorm",
+            "GroupNorm",
+            "ReLU",
+            "GELU",
+            "Sigmoid",
+            "Tanh",
+            "Softmax",
+            "PReLU",
+        ];
+        for framework in ["equinox", "torch"] {
+            for name in names {
+                let sig = known_layer_signature(&parts(&[framework, "nn", name]))
+                    .unwrap_or_else(|| panic!("no signature for {}.nn.{}", framework, name));
+                assert_eq!(sig.owner.as_deref(), Some(name));
+                assert_eq!(sig.name, "__init__");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_framework_returns_none() {
+        assert!(known_layer_signature(&parts(&["jax", "nn", "Linear"])).is_none());
+        assert!(known_layer_signature(&parts(&["flax", "linen", "Dense"])).is_none());
+    }
+
+    #[test]
+    fn test_unknown_class_returns_none() {
+        assert!(known_layer_signature(&parts(&["equinox", "nn", "Mystery"])).is_none());
+        assert!(known_layer_signature(&parts(&["torch", "nn", "Mystery"])).is_none());
+    }
+
+    #[test]
+    fn test_short_path_returns_none() {
+        assert!(known_layer_signature(&parts(&["Linear"])).is_none());
+        assert!(known_layer_signature(&parts(&["torch", "nn"])).is_none());
+    }
+
+    #[test]
+    fn test_wrong_subpackage_returns_none() {
+        // equinox.experimental.Linear should not match
+        assert!(known_layer_signature(&parts(&["equinox", "experimental", "Linear"])).is_none());
+        assert!(known_layer_signature(&parts(&["torch", "functional", "Linear"])).is_none());
+    }
+}
+
+#[cfg(test)]
+mod catalog_first_extract_layer_assignments_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn no_read(_: &PathBuf) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn test_catalog_resolves_equinox_linear_without_disk() {
+        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(64, 128)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "64".to_string(),
+                out_features: "128".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_linear_without_disk() {
+        let code = "import torch\nlayer = torch.nn.Linear(128, 256)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "128".to_string(),
+                out_features: "256".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_equinox_conv2d_without_disk() {
+        let code = "import equinox as eqx\nlayer = eqx.nn.Conv2d(3, 16, 3)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Conv2d {
+                in_channels: "3".to_string(),
+                out_channels: "16".to_string(),
+                kernel_size: "3".to_string(),
+                stride: "1".to_string(),
+                padding: "0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_conv2d_with_stride_padding_without_disk() {
+        let code = "import torch\nlayer = torch.nn.Conv2d(3, 16, 3, stride=2, padding=1)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Conv2d {
+                in_channels: "3".to_string(),
+                out_channels: "16".to_string(),
+                kernel_size: "3".to_string(),
+                stride: "2".to_string(),
+                padding: "1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_dropout_shape_preserving() {
+        let code = "import torch\nlayer = torch.nn.Dropout()";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::ShapePreserving {
+                name: "Dropout".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_supports_from_import_alias_without_disk() {
+        let code = "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "3".to_string(),
+                out_features: "5".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_non_layer_call_is_not_added_to_layer_map() {
+        let code = "import jax.numpy as jnp\ny = jnp.sum(x)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn test_user_layer_without_catalog_or_disk_is_skipped() {
+        // `my_module.Linear` is neither equinox.nn.Linear nor torch.nn.Linear,
+        // and there's no read_file backing — so it should be silently skipped.
+        let code = "import my_module\nlayer = my_module.Linear(3, 5)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers =
+            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert!(layers.is_empty());
     }
 }
