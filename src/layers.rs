@@ -103,6 +103,18 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
 /// or `["torch", "nn", "Conv2d"]`. Only the last element is used as the class
 /// name; `parts[..parts.len()-1]` becomes `module_parts` when the caller
 /// synthesizes a `ResolvedCallSignature`.
+///
+/// NOTE: The `params` lists below are an **analyzer-internal binding contract**,
+/// not a faithful reproduction of the upstream constructor signatures. They
+/// exist only so `bind_call_arguments` can map positional/keyword arguments to
+/// the names that `classify_layer_call` reads (`in_features`, `out_features`,
+/// `in_channels`, `out_channels`, `kernel_size`, `stride`, `padding`). Extra
+/// trailing params (e.g. `dilation`, `groups`, `use_bias`) are present only to
+/// absorb additional positional args without binding them to the wrong name —
+/// they intentionally diverge from `torch.nn.Conv2d` (which has `padding_mode`
+/// between `groups` and `bias`) and from `equinox.nn.Conv` (which has `key`
+/// and other extras). Do not "fix" these to match the upstream signatures
+/// unless `classify_layer_call` starts reading those fields.
 fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     if parts.len() < 3 {
         return None;
