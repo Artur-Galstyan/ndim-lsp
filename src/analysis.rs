@@ -8,8 +8,8 @@ use crate::known_functions::{
 };
 use crate::layers::{apply_layer_application, extract_layer_assignments};
 use crate::python_ast::{
-    build_import_map, extract_call_arguments, extract_calls, extract_jaxtyping_shapes,
-    extract_method_calls,
+    build_import_map, extract_binary_ops, extract_call_arguments, extract_calls,
+    extract_jaxtyping_shapes, extract_method_calls,
 };
 use crate::resolution::resolve_call_target;
 
@@ -42,6 +42,7 @@ where
 enum CallEntry {
     Free(CallInfo),
     Method(MethodCallInfo),
+    BinaryOp(BinaryOpInfo),
 }
 
 fn propagate_calls(
@@ -53,6 +54,7 @@ fn propagate_calls(
 ) -> Result<(Vec<LayerApplication>, Vec<ShapeError>), String> {
     let free_calls = extract_calls(node, text)?;
     let method_calls = extract_method_calls(node, text)?;
+    let binary_ops = extract_binary_ops(node, text)?;
 
     let mut entries: Vec<(usize, CallEntry)> = Vec::new();
     for call in free_calls {
@@ -66,6 +68,9 @@ fn propagate_calls(
             method_call.args_node_range.start_byte,
             CallEntry::Method(method_call),
         ));
+    }
+    for binary_op in binary_ops {
+        entries.push((binary_op.range.start_byte, CallEntry::BinaryOp(binary_op)));
     }
     entries.sort_by_key(|(position, _)| *position);
 
@@ -156,8 +161,104 @@ fn propagate_calls(
                     }),
                 }
             }
+            CallEntry::BinaryOp(binop) => {
+                let scope_shapes = &mut scopes[scope_idx].shapes;
+                match apply_binary_op(&binop, scope_shapes) {
+                    Ok(Some(output)) => {
+                        scope_shapes.insert(binop.variable.clone(), output);
+                    }
+                    Ok(None) => {}
+                    Err(message) => errors.push(ShapeError {
+                        variable: binop.variable.clone(),
+                        message,
+                        range: binop.range,
+                    }),
+                }
+            }
         }
     }
 
     Ok((applications, errors))
+}
+
+fn apply_binary_op(
+    binop: &BinaryOpInfo,
+    shapes: &mut HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(left_shape) = shapes.get(&binop.left).cloned() else {
+        return Ok(None);
+    };
+    let Some(right_shape) = shapes.get(&binop.right).cloned() else {
+        return Ok(None);
+    };
+
+    match binop.op {
+        BinaryOp::MatMul => apply_matmul_shape(
+            &left_shape,
+            &right_shape,
+            &binop.left,
+            &binop.right,
+        ),
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            apply_elementwise_shape(&left_shape, &right_shape, &binop.op)
+        }
+    }
+}
+
+fn apply_matmul_shape(
+    left: &[String],
+    right: &[String],
+    left_name: &str,
+    right_name: &str,
+) -> Result<Option<Vec<String>>, String> {
+    // Rank < 2: return Ok(None) for v1
+    if left.len() < 2 || right.len() < 2 {
+        return Ok(None);
+    }
+
+    // Batch matmul: output = LHS[:-1] ++ [RHS[-1]]
+    // Last dim of LHS must equal second-to-last dim of RHS
+    let lhs_last = left.last().unwrap();
+    let rhs_second_last = &right[right.len() - 2];
+
+    if lhs_last != rhs_second_last {
+        return Err(format!(
+            "matmul dimension mismatch: {} last dim {} != {} second-to-last dim {}",
+            left_name, lhs_last, right_name, rhs_second_last
+        ));
+    }
+
+    let mut output = left[..left.len() - 1].to_vec();
+    output.push(right.last().unwrap().clone());
+    Ok(Some(output))
+}
+
+fn apply_elementwise_shape(
+    left: &[String],
+    right: &[String],
+    op: &BinaryOp,
+) -> Result<Option<Vec<String>>, String> {
+    // Scalar / rank-0: Ok(None) for now
+    if left.is_empty() || right.is_empty() {
+        return Ok(None);
+    }
+
+    let op_symbol = match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::MatMul => unreachable!(),
+    };
+
+    if left != right {
+        return Err(format!(
+            "elementwise {} expected equal shapes, got [{}] and [{}]",
+            op_symbol,
+            left.join(", "),
+            right.join(", ")
+        ));
+    }
+
+    Ok(Some(left.to_vec()))
 }

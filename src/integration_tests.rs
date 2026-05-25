@@ -1989,3 +1989,126 @@ mod torch_nn_linear_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
     }
 }
+
+#[cfg(test)]
+mod binary_op_propagation_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_matmul_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(a: Float[Array, \"batch k\"], b: Float[Array, \"k n\"]):\n    y = a @ b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "n"])));
+    }
+
+    #[test]
+    fn test_matmul_inner_dim_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(a: Float[Array, \"batch 3\"], b: Float[Array, \"5 n\"]):\n    y = a @ b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
+    }
+
+    #[test]
+    fn test_elementwise_add_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(a: Float[Array, \"batch features\"], b: Float[Array, \"batch features\"]):\n    y = a + b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
+    }
+
+    #[test]
+    fn test_elementwise_mul_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(a: Float[Array, \"a b\"], b: Float[Array, \"a c\"]):\n    y = a * b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(analysis.errors[0].message.contains("elementwise *"));
+        assert!(analysis.errors[0].message.contains("a, b"));
+        assert!(analysis.errors[0].message.contains("a, c"));
+    }
+
+    #[test]
+    fn test_binary_op_interleaved_with_method_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(a: Float[Array, \"batch k\"], b: Float[Array, \"k n\"]):\n    y = a @ b\n    z = y.sum(axis=0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "n"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn test_binary_op_inside_function_uses_own_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(a: Float[Array, \"b k\"], b: Float[Array, \"k n\"]):\n    y = a @ b\ndef g(a: Float[Array, \"x y\"], b: Float[Array, \"y z\"]):\n    y = a @ b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        let f_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("f"))
+            .expect("f scope");
+        let g_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("g"))
+            .expect("g scope");
+        assert_eq!(f_scope.shapes.get("y"), Some(&shape(&["b", "n"])));
+        assert_eq!(g_scope.shapes.get("y"), Some(&shape(&["x", "z"])));
+    }
+}

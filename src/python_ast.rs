@@ -2198,6 +2198,225 @@ y = relu(x)
     }
 }
 
+pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, String> {
+    let mut result: Vec<BinaryOpInfo> = Vec::new();
+    let query_string = r#"
+        (assignment
+          left: (identifier) @var
+          right: (binary_operator
+            left: (identifier) @left_operand
+            operator: _ @op
+            right: (identifier) @right_operand
+          )
+        ) @assignment
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
+        .map_err(|e| e.to_string())?;
+
+    let Some(var_idx) = query.capture_index_for_name("var") else {
+        return Err("var not found".to_string());
+    };
+    let Some(left_idx) = query.capture_index_for_name("left_operand") else {
+        return Err("left_operand not found".to_string());
+    };
+    let Some(right_idx) = query.capture_index_for_name("right_operand") else {
+        return Err("right_operand not found".to_string());
+    };
+    let Some(op_idx) = query.capture_index_for_name("op") else {
+        return Err("op not found".to_string());
+    };
+    let Some(assignment_idx) = query.capture_index_for_name("assignment") else {
+        return Err("assignment not found".to_string());
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        let mut variable = String::new();
+        let mut left = String::new();
+        let mut right = String::new();
+        let mut op_text = String::new();
+        let mut range: Option<Range> = None;
+
+        for capture in match_.captures {
+            if capture.index == var_idx {
+                variable = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == left_idx {
+                left = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == right_idx {
+                right = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == op_idx {
+                op_text = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == assignment_idx {
+                let right_child = capture.node.child_by_field_name("right");
+                if let Some(binop) = right_child {
+                    range = Some(binop.range());
+                }
+            }
+        }
+
+        let op = match op_text.as_str() {
+            "@" => BinaryOp::MatMul,
+            "+" => BinaryOp::Add,
+            "-" => BinaryOp::Sub,
+            "*" => BinaryOp::Mul,
+            "/" => BinaryOp::Div,
+            _ => continue,
+        };
+
+        let range = range.ok_or("range not found".to_string())?;
+        result.push(BinaryOpInfo {
+            variable,
+            left,
+            right,
+            op,
+            range,
+        });
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod extract_binary_ops_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    #[test]
+    fn test_matmul_operator() {
+        let code = "y = a @ b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].variable, "y");
+        assert_eq!(ops[0].left, "a");
+        assert_eq!(ops[0].right, "b");
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+    }
+
+    #[test]
+    fn test_add_operator() {
+        let code = "y = a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Add);
+    }
+
+    #[test]
+    fn test_sub_operator() {
+        let code = "y = a - b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Sub);
+    }
+
+    #[test]
+    fn test_mul_operator() {
+        let code = "y = a * b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Mul);
+    }
+
+    #[test]
+    fn test_div_operator() {
+        let code = "y = a / b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Div);
+    }
+
+    #[test]
+    fn test_range_covers_binary_operator_node() {
+        let code = "y = a @ b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "a @ b");
+    }
+
+    #[test]
+    fn test_skip_tuple_unpacking_lhs() {
+        let code = "x, y = a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_skip_chained_addition() {
+        let code = "y = a + b + c";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        // The outermost binary_operator has left = (a + b), which is not an identifier
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_skip_non_binary_rhs() {
+        let code = "y = foo(a, b)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_skip_parenthesized_operands() {
+        let code = "y = (a + b) @ c";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        // left operand (a + b) is a parenthesized expression, not an identifier
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_binary_ops() {
+        let code = "x = a @ b\ny = c + d";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[1].op, BinaryOp::Add);
+    }
+
+    #[test]
+    fn test_skip_unsupported_operator() {
+        let code = "y = a // b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        // floor division is not in the supported set
+        assert!(ops.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod extract_method_calls_tests {
     use super::*;

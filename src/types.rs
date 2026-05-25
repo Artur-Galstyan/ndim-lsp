@@ -25,6 +25,24 @@ pub struct MethodCallInfo {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct BinaryOpInfo {
+    pub variable: String,
+    pub left: String,
+    pub right: String,
+    pub op: BinaryOp,
+    pub range: tree_sitter::Range,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum BinaryOp {
+    MatMul,
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct ResolvedTarget {
     pub dots: usize,
     pub parts: Vec<String>,
