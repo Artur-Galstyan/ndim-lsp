@@ -198,17 +198,92 @@ impl Backend {
             return Ok(None);
         };
 
-        let Ok(name) = node.utf8_text(text.as_bytes()) else {
+        // Only hover on identifiers (skip keywords, whitespace, etc.)
+        if node.kind() != "identifier" {
+            return Ok(None);
+        }
+
+        let Ok(var_name) = node.utf8_text(text.as_bytes()) else {
             return Ok(None);
         };
 
-        // TODO: use `name` for real hover content
-        let _ = name;
+        // Compute cursor byte from the identifier node's start byte
+        let cursor_byte = node.start_byte();
+
+        // Use cached workspace roots for analysis
+        let search_roots = self.workspace_roots.read().await.clone();
+        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+
+        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 5) {
+            Ok(a) => a,
+            Err(msg) => {
+                self.client
+                    .log_message(MessageType::WARNING, format!("hover analysis failed: {}", msg))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Walk from innermost scope outward, looking for the variable
+        let shape = match find_shape_for_variable(&analysis.scopes, cursor_byte, var_name) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let hover_content = format_hover(var_name, &shape);
+        let hover_range = ts_range_to_lsp_range(node.range());
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String("shape:".to_string())),
-            range: None,
+            contents: HoverContents::Scalar(MarkedString::LanguageString(
+                tower_lsp::lsp_types::LanguageString {
+                    language: "python".into(),
+                    value: hover_content,
+                },
+            )),
+            range: Some(hover_range),
         }))
+    }
+}
+
+/// Walk from the innermost scope containing `cursor_byte` outward until a
+/// shape entry for `var_name` is found, then return a clone of it.
+fn find_shape_for_variable(
+    scopes: &[ndim_lsp::FunctionShapeScope],
+    cursor_byte: usize,
+    var_name: &str,
+) -> Option<Vec<String>> {
+    // Collect all enclosing scope indices, ordered innermost-first.
+    let mut enclosing: Vec<usize> = Vec::new();
+    for (i, scope) in scopes.iter().enumerate() {
+        if scope.start_byte <= cursor_byte && cursor_byte < scope.end_byte {
+            enclosing.push(i);
+        }
+    }
+    // Sort innermost-first: smallest byte span first, tie-break by later index
+    // (mirrors scope_index_for_byte logic).
+    enclosing.sort_by(|&a, &b| {
+        let size_a = scopes[a].end_byte - scopes[a].start_byte;
+        let size_b = scopes[b].end_byte - scopes[b].start_byte;
+        size_a.cmp(&size_b).then_with(|| b.cmp(&a))
+    });
+
+    for idx in enclosing {
+        if let Some(shape) = scopes[idx].shapes.get(var_name) {
+            return Some(shape.clone());
+        }
+    }
+    None
+}
+
+/// Format the variable name and shape into a Python-annotated string.
+/// Example: `x: Float[Array, "batch features"]`
+/// Scalar (zero-rank) shapes render as `x: Scalar`.
+fn format_hover(var_name: &str, shape: &[String]) -> String {
+    if shape.is_empty() {
+        format!("{}: Scalar", var_name)
+    } else {
+        let dims = shape.join(" ");
+        format!("{}: Float[Array, \"{}\"]", var_name, dims)
     }
 }
 
@@ -283,5 +358,122 @@ mod tests {
         assert_eq!(lsp.start.character, 0);
         assert_eq!(lsp.end.line, 0);
         assert_eq!(lsp.end.character, 1);
+    }
+
+    #[test]
+    fn format_hover_basic() {
+        assert_eq!(
+            format_hover("x", &["batch".into(), "features".into()]),
+            "x: Float[Array, \"batch features\"]"
+        );
+    }
+
+    #[test]
+    fn format_hover_single_dim() {
+        assert_eq!(
+            format_hover("vec", &["n".into()]),
+            "vec: Float[Array, \"n\"]"
+        );
+    }
+
+    #[test]
+    fn format_hover_scalar() {
+        assert_eq!(format_hover("s", &[]), "s: Scalar");
+    }
+
+    #[test]
+    fn find_shape_innermost_scope_wins() {
+        use ndim_lsp::FunctionShapeScope;
+        use std::collections::HashMap;
+
+        let mut outer_shapes: HashMap<String, Vec<String>> = HashMap::new();
+        outer_shapes.insert("x".into(), vec!["outer_dim".into()]);
+
+        let mut inner_shapes: HashMap<String, Vec<String>> = HashMap::new();
+        inner_shapes.insert("x".into(), vec!["inner_dim".into()]);
+
+        let scopes = vec![
+            FunctionShapeScope {
+                function_name: None,
+                start_byte: 0,
+                end_byte: 200,
+                shapes: outer_shapes,
+            },
+            FunctionShapeScope {
+                function_name: Some("foo".into()),
+                start_byte: 20,
+                end_byte: 180,
+                shapes: inner_shapes,
+            },
+        ];
+
+        // Cursor at byte 50 falls in both scopes; inner should win
+        let result = find_shape_for_variable(&scopes, 50, "x");
+        assert_eq!(result, Some(vec!["inner_dim".into()]));
+    }
+
+    #[test]
+    fn find_shape_falls_back_to_outer() {
+        use ndim_lsp::FunctionShapeScope;
+        use std::collections::HashMap;
+
+        let mut outer_shapes: HashMap<String, Vec<String>> = HashMap::new();
+        outer_shapes.insert("y".into(), vec!["outer".into()]);
+
+        let inner_shapes: HashMap<String, Vec<String>> = HashMap::new();
+
+        let scopes = vec![
+            FunctionShapeScope {
+                function_name: None,
+                start_byte: 0,
+                end_byte: 200,
+                shapes: outer_shapes,
+            },
+            FunctionShapeScope {
+                function_name: Some("foo".into()),
+                start_byte: 20,
+                end_byte: 180,
+                shapes: inner_shapes,
+            },
+        ];
+
+        // "y" is only in the outer scope
+        let result = find_shape_for_variable(&scopes, 50, "y");
+        assert_eq!(result, Some(vec!["outer".into()]));
+    }
+
+    #[test]
+    fn find_shape_not_found() {
+        use ndim_lsp::FunctionShapeScope;
+        use std::collections::HashMap;
+
+        let scopes = vec![FunctionShapeScope {
+            function_name: None,
+            start_byte: 0,
+            end_byte: 100,
+            shapes: HashMap::new(),
+        }];
+
+        let result = find_shape_for_variable(&scopes, 50, "z");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn position_to_byte_via_tree_sitter() {
+        // Verify that converting an LSP Position through tree-sitter's
+        // descendant_for_point_range gives the correct byte offset.
+        let text = "hello\nworld\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Point at line 1, column 0 should land on 'w' which is byte 6
+        let point = tree_sitter::Point::new(1, 0);
+        let node = root.descendant_for_point_range(point, point).unwrap();
+        // The node should start at byte 6 (after "hello\n")
+        assert_eq!(node.start_byte(), 6);
     }
 }
