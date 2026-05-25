@@ -200,7 +200,7 @@ Known limitations / important caveats
   - etc.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
-- Layer assignments (`extract_layer_assignments`) and the `layers` map remain flat. Two functions that reuse the same local layer name still collide. Only the shape map is function-scoped at this point.
+- Layer assignments are tracked with their defining byte position via `extract_layer_assignments_scoped` (returns `Vec<LayerAssignment>`). At call time, `analyze_layer_shapes` picks the innermost function-scoped layer whose enclosing scope contains the call site. The flat `LayerShapeAnalysis.layers` HashMap is preserved (last-wins) for backward compatibility with existing tests, but resolution no longer uses it.
 - Current `ShapeError` has `variable`, `message`, and tree-sitter `Range`; LSP conversion is not yet implemented.
 
 How to continue

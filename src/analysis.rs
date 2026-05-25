@@ -6,7 +6,7 @@ use tree_sitter::Node;
 use crate::known_functions::{
     apply_known_function, apply_method_call, classify_known_function, classify_method_call,
 };
-use crate::layers::{apply_layer_application, extract_layer_assignments};
+use crate::layers::{apply_layer_application, extract_layer_assignments_scoped};
 use crate::python_ast::{
     build_import_map, extract_binary_ops, extract_call_arguments, extract_calls,
     extract_jaxtyping_shapes, extract_method_calls,
@@ -27,9 +27,16 @@ where
 {
     let mut scopes = extract_jaxtyping_shapes(node, text)?;
     let import_map = build_import_map(node, text)?;
-    let layers = extract_layer_assignments(node, text, search_roots, read_file, max_depth)?;
+    let layer_records =
+        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth)?;
 
-    let (applications, errors) = propagate_calls(node, text, &import_map, &layers, &mut scopes)?;
+    let (applications, errors) =
+        propagate_calls(node, text, &import_map, &layer_records, &mut scopes)?;
+
+    let mut layers = HashMap::new();
+    for rec in &layer_records {
+        layers.insert(rec.name.clone(), rec.kind.clone());
+    }
 
     Ok(LayerShapeAnalysis {
         scopes,
@@ -37,6 +44,33 @@ where
         applications,
         errors,
     })
+}
+
+fn find_scoped_layer<'a>(
+    records: &'a [LayerAssignment],
+    scopes: &[FunctionShapeScope],
+    call_byte: usize,
+    target: &str,
+) -> Option<&'a LayerKind> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, rec) in records.iter().enumerate() {
+        if rec.name != target {
+            continue;
+        }
+        let Some(rec_scope_idx) = scope_index_for_byte(scopes, rec.byte_position) else {
+            continue;
+        };
+        let rec_scope = &scopes[rec_scope_idx];
+        if rec_scope.start_byte <= call_byte && call_byte < rec_scope.end_byte {
+            let size = rec_scope.end_byte - rec_scope.start_byte;
+            match best {
+                None => best = Some((i, size)),
+                Some((_, prev)) if size <= prev => best = Some((i, size)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(i, _)| &records[i].kind)
 }
 
 enum CallEntry {
@@ -49,7 +83,7 @@ fn propagate_calls(
     node: Node,
     text: &str,
     import_map: &HashMap<String, ImportPath>,
-    layers: &HashMap<String, LayerKind>,
+    layer_records: &[LayerAssignment],
     scopes: &mut [FunctionShapeScope],
 ) -> Result<(Vec<LayerApplication>, Vec<ShapeError>), String> {
     let free_calls = extract_calls(node, text)?;
@@ -92,7 +126,9 @@ fn propagate_calls(
                 };
                 let args = extract_call_arguments(args_node, text)?;
 
-                if let Some(kind) = layers.get(&call.target) {
+                if let Some(kind) =
+                    find_scoped_layer(layer_records, scopes, position, &call.target)
+                {
                     let Some(CallArgument::Positional { value: input }) = args.first().cloned()
                     else {
                         continue;

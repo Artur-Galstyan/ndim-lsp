@@ -209,9 +209,27 @@ pub fn extract_layer_assignments<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    let records = extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth)?;
+    let mut layers = HashMap::new();
+    for rec in records {
+        layers.insert(rec.name, rec.kind);
+    }
+    Ok(layers)
+}
+
+pub fn extract_layer_assignments_scoped<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+) -> Result<Vec<LayerAssignment>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
     let import_map = build_import_map(node, text)?;
     let calls = extract_calls(node, text)?;
-    let mut layers = HashMap::new();
+    let mut records = Vec::new();
 
     for call in calls {
         // Catalog-first: hardcoded equinox.nn.* / torch.nn.* signatures
@@ -234,10 +252,14 @@ where
         let Some(layer) = classify_layer_call(&resolved_call) else {
             continue;
         };
-        layers.insert(call.variable, layer);
+        records.push(LayerAssignment {
+            name: call.variable,
+            kind: layer,
+            byte_position: call.args_node_range.start_byte,
+        });
     }
 
-    Ok(layers)
+    Ok(records)
 }
 
 pub fn extract_layer_applications(

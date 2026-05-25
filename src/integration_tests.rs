@@ -457,6 +457,94 @@ mod analyze_layer_shapes_tests {
         assert_eq!(f_scope.shapes.get("y"), Some(&shape(&["batch", "5"])));
         assert_eq!(g_scope.shapes.get("y"), Some(&shape(&["batch", "9"])));
     }
+
+    #[test]
+    fn test_layer_name_collision_across_functions_is_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        // Both functions define a local `layer`, but with different
+        // in_features. The second function's `layer(x)` must use *its* layer,
+        // not the one from the first function.
+        let code = "\
+import equinox as eqx
+def f(x: Float[Array, \"batch 64\"]):
+    layer = eqx.nn.Linear(64, 128)
+    y = layer(x)
+def g(x: Float[Array, \"batch 128\"]):
+    layer = eqx.nn.Linear(128, 256)
+    y = layer(x)
+";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+        let f_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("f"))
+            .expect("f scope");
+        let g_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("g"))
+            .expect("g scope");
+        assert_eq!(f_scope.shapes.get("y"), Some(&shape(&["batch", "128"])));
+        assert_eq!(g_scope.shapes.get("y"), Some(&shape(&["batch", "256"])));
+    }
+
+    #[test]
+    fn test_layer_name_collision_different_layer_kinds_is_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear\nfrom ._conv import Conv2d",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_conv.py"),
+            "class Conv2d:\n    def __init__(self, in_channels, out_channels, kernel_size): pass",
+        )
+        .unwrap();
+        // First function uses `layer` as a Linear, second uses `layer` as a
+        // Conv2d. Without scoping the Linear definition leaks into g and
+        // causes a spurious last-dim mismatch.
+        let code = "\
+import equinox as eqx
+def f(x: Float[Array, \"batch 64\"]):
+    layer = eqx.nn.Linear(64, 128)
+    y = layer(x)
+def g(x: Float[Array, \"batch 3 32 32\"]):
+    layer = eqx.nn.Conv2d(3, 16, 3)
+    y = layer(x)
+";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+        let g_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("g"))
+            .expect("g scope");
+        assert_eq!(
+            g_scope.shapes.get("y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
+    }
 }
 
 #[cfg(test)]

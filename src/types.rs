@@ -221,6 +221,13 @@ impl PartialEq for LayerApplication {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct LayerAssignment {
+    pub name: String,
+    pub kind: LayerKind,
+    pub byte_position: usize,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct ShapeError {
     pub variable: String,
     pub message: String,
