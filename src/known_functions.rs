@@ -2143,6 +2143,8 @@ fn apply_known_linalg_det(
 
     Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
 }
+
+#[cfg(test)]
 mod known_function_shape_rule_tests {
     use super::*;
 
