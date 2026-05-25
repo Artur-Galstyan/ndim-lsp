@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with 723 tests.
+- `cargo test --quiet` passes with 740 tests.
 - `cargo clippy --all-targets --all-features` has no library warnings.
 - Clippy still reports existing placeholder warnings in `src/main.rs` only.
 
@@ -25,6 +25,7 @@ Current file layout
   - Important types:
     - `ImportPath`
     - `CallInfo`
+    - `MethodCallInfo`
     - `ResolvedTarget`
     - `ResolvedModuleTarget`
     - `PythonSymbol`
@@ -36,7 +37,9 @@ Current file layout
     - `KnownFunction`
     - `LayerApplication`
     - `ShapeError`
-    - `LayerShapeAnalysis`
+    - `FunctionShapeScope` (function-scoped shape map)
+    - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`)
+  - Public helpers: `scope_for_byte`, `scope_index_for_byte`.
 
 - `src/python_ast.rs`
   - Pure tree-sitter Python extraction helpers.
@@ -83,8 +86,12 @@ Current file layout
 
 - `src/analysis.rs`
   - High-level orchestration.
-  - Currently mostly:
-    - `analyze_layer_shapes`
+  - Important functions:
+    - `analyze_layer_shapes` — full pipeline:
+      1. seed shapes from jaxtyping annotations
+      2. build import map
+      3. extract layer assignments
+      4. walk free calls + method calls in source order, dispatching each to layer apps, known-function rules, or method-call rules; update shapes; collect `ShapeError`s
 
 - `src/integration_tests.rs`
   - Cross-module/end-to-end tests.
@@ -137,7 +144,7 @@ What works now
      - `x: Float[Array, "batch features"]`
    - Handles common wrappers and qualified `Array` forms.
    - Rejects f-strings/bytes strings and non-array string annotations.
-   - Current output is a flat `HashMap<String, Vec<String>>`, not scoped by function.
+   - Returns `Vec<FunctionShapeScope>`: index 0 is a module scope spanning the whole file, followed by one scope per `function_definition` (DFS order). Each scope carries `function_name`, `start_byte`, `end_byte`, and the per-function `shapes` map. Same-named params in different functions no longer collide.
 
 8. Equinox Linear layer flow
    - Resolves and classifies `equinox.nn.Linear` through imports/re-exports.
@@ -177,8 +184,9 @@ Known limitations / important caveats
 -------------------------------------
 
 - `src/main.rs` is still not wired to the analysis pipeline. LSP diagnostics/hover/inlay are placeholders.
-- Shape maps are not properly scoped by function yet. Several tests document current behavior, but real function-level scoping remains future work.
-- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)` have classification + shape rules (via `classify_method_call`/`apply_method_call`) but are not yet wired into `analyze_layer_shapes`. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)`, `x.to(...)` are not yet covered.
+- Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
+- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)` are wired end-to-end through `analyze_layer_shapes`. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)`, `x.to(...)` are not yet covered.
+- Free function calls (e.g. `jnp.sum(x)`, `np.reshape(x, (3, 4))`) are now propagated by the pipeline as well, in source order. Chained/nested calls inside a single expression (`jnp.sum(jnp.flatten(x))`) are still ignored because `extract_calls` only captures the outer assignment-level call.
 - Multi-output functions need a richer return type than `Option<Vec<String>>`:
   - `split`
   - `meshgrid`
@@ -192,7 +200,7 @@ Known limitations / important caveats
   - etc.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
-- Current `extract_jaxtyping_shapes` flattens all function parameter annotations into one map. Future function scoping should replace this.
+- Layer assignments (`extract_layer_assignments`) and the `layers` map remain flat. Two functions that reuse the same local layer name still collide. Only the shape map is function-scoped at this point.
 - Current `ShapeError` has `variable`, `message`, and tree-sitter `Range`; LSP conversion is not yet implemented.
 
 How to continue

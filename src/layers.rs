@@ -132,14 +132,19 @@ pub fn apply_layer_application(
 
 pub fn apply_layer_applications(
     apps: &[LayerApplication],
-    shapes: &mut HashMap<String, Vec<String>>,
+    scopes: &mut [FunctionShapeScope],
 ) -> Vec<ShapeError> {
     let mut errors = Vec::new();
 
     for app in apps {
-        match apply_layer_application(app, shapes) {
+        let Some(scope_idx) = scope_index_for_byte(scopes, app.range.start_byte) else {
+            continue;
+        };
+        match apply_layer_application(app, &scopes[scope_idx].shapes) {
             Ok(Some(output_shape)) => {
-                shapes.insert(app.variable.clone(), output_shape);
+                scopes[scope_idx]
+                    .shapes
+                    .insert(app.variable.clone(), output_shape);
             }
             Ok(None) => {}
             Err(message) => errors.push(ShapeError {
@@ -349,16 +354,25 @@ mod apply_layer_applications_tests {
         dims.iter().map(|dim| dim.to_string()).collect()
     }
 
+    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
+        vec![FunctionShapeScope {
+            function_name: None,
+            start_byte: 0,
+            end_byte: usize::MAX,
+            shapes,
+        }]
+    }
+
     #[test]
     fn test_applies_single_application_into_shape_map() {
         let apps = vec![app("y", "layer", "x", linear("3", "5"))];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
     }
 
     #[test]
@@ -367,24 +381,24 @@ mod apply_layer_applications_tests {
             app("y", "l1", "x", linear("3", "5")),
             app("z", "l2", "y", linear("5", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert_eq!(shapes.get("z"), Some(&shape(&["batch", "7"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("z"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
     fn test_missing_input_is_skipped_without_error() {
         let apps = vec![app("y", "layer", "missing", linear("3", "5"))];
-        let mut shapes = HashMap::new();
+        let mut scopes = scopes_from(HashMap::new());
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert!(!shapes.contains_key("y"));
+        assert!(!scopes[0].shapes.contains_key("y"));
     }
 
     #[test]
@@ -393,15 +407,15 @@ mod apply_layer_applications_tests {
             app("bad", "bad_layer", "x", linear("4", "5")),
             app("good", "good_layer", "x", linear("3", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "bad");
         assert!(errors[0].message.contains("bad_layer"));
-        assert!(!shapes.contains_key("bad"));
-        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+        assert!(!scopes[0].shapes.contains_key("bad"));
+        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
@@ -410,27 +424,27 @@ mod apply_layer_applications_tests {
             app("z", "l2", "y", linear("5", "7")),
             app("y", "l1", "x", linear("3", "5")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert!(!shapes.contains_key("z"));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(!scopes[0].shapes.contains_key("z"));
     }
 
     #[test]
     fn test_later_assignment_overwrites_existing_output_shape() {
         let apps = vec![app("y", "layer", "x", linear("3", "5"))];
-        let mut shapes = HashMap::from([
+        let mut scopes = scopes_from(HashMap::from([
             ("x".to_string(), shape(&["batch", "3"])),
             ("y".to_string(), shape(&["old"])),
-        ]);
+        ]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
     }
 
     #[test]
@@ -439,17 +453,17 @@ mod apply_layer_applications_tests {
             app("a", "l1", "x", linear("4", "5")),
             app("b", "l2", "x", linear("6", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].variable, "a");
         assert!(errors[0].message.contains("l1"));
         assert_eq!(errors[1].variable, "b");
         assert!(errors[1].message.contains("l2"));
-        assert!(!shapes.contains_key("a"));
-        assert!(!shapes.contains_key("b"));
+        assert!(!scopes[0].shapes.contains_key("a"));
+        assert!(!scopes[0].shapes.contains_key("b"));
     }
 
     #[test]
@@ -458,25 +472,25 @@ mod apply_layer_applications_tests {
             app("bad", "l1", "scalar", linear("3", "5")),
             app("good", "l2", "x", linear("3", "7")),
         ];
-        let mut shapes = HashMap::from([
+        let mut scopes = scopes_from(HashMap::from([
             ("scalar".to_string(), Vec::new()),
             ("x".to_string(), shape(&["batch", "3"])),
-        ]);
+        ]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "bad");
         assert!(errors[0].message.contains("scalar input"));
-        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
     fn test_shape_error_points_to_output_variable_not_input_variable() {
         let apps = vec![app("projected", "projection", "x", linear("4", "5"))];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "projected");
@@ -487,9 +501,9 @@ mod apply_layer_applications_tests {
     #[test]
     fn test_missing_input_does_not_create_shape_error() {
         let apps = vec![app("y", "layer", "unknown", linear("3", "5"))];
-        let mut shapes = HashMap::new();
+        let mut scopes = scopes_from(HashMap::new());
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
     }
@@ -497,27 +511,27 @@ mod apply_layer_applications_tests {
     #[test]
     fn test_empty_applications_preserve_existing_shapes() {
         let apps = Vec::new();
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "3"])));
     }
 
     #[test]
     fn test_failed_application_does_not_overwrite_existing_output_shape() {
         let apps = vec![app("y", "bad_layer", "x", linear("4", "5"))];
-        let mut shapes = HashMap::from([
+        let mut scopes = scopes_from(HashMap::from([
             ("x".to_string(), shape(&["batch", "3"])),
             ("y".to_string(), shape(&["old", "shape"])),
-        ]);
+        ]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "y");
-        assert_eq!(shapes.get("y"), Some(&shape(&["old", "shape"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["old", "shape"])));
     }
 
     #[test]
@@ -526,14 +540,14 @@ mod apply_layer_applications_tests {
             app("bad", "bad_layer", "x", linear("4", "5")),
             app("z", "next_layer", "bad", linear("5", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "bad");
-        assert!(!shapes.contains_key("bad"));
-        assert!(!shapes.contains_key("z"));
+        assert!(!scopes[0].shapes.contains_key("bad"));
+        assert!(!scopes[0].shapes.contains_key("z"));
     }
 
     #[test]
@@ -542,13 +556,13 @@ mod apply_layer_applications_tests {
             app("bad", "bad_layer", "x", linear("4", "5")),
             app("good", "good_layer", "x", linear("3", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "bad");
-        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "7"])));
+        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
@@ -557,16 +571,16 @@ mod apply_layer_applications_tests {
             app("y", "l1", "x", linear("4", "5")),
             app("y", "l2", "x", linear("6", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].variable, "y");
         assert!(errors[0].message.contains("l1"));
         assert_eq!(errors[1].variable, "y");
         assert!(errors[1].message.contains("l2"));
-        assert!(!shapes.contains_key("y"));
+        assert!(!scopes[0].shapes.contains_key("y"));
     }
 
     #[test]
@@ -576,16 +590,16 @@ mod apply_layer_applications_tests {
             app("good", "good_layer", "x", linear("3", "9")),
             app("b", "l2", "x", linear("6", "7")),
         ];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].variable, "a");
         assert!(errors[0].message.contains("l1"));
         assert_eq!(errors[1].variable, "b");
         assert!(errors[1].message.contains("l2"));
-        assert_eq!(shapes.get("good"), Some(&shape(&["batch", "9"])));
+        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "9"])));
     }
 
     #[test]
@@ -598,9 +612,9 @@ mod apply_layer_applications_tests {
             end_point: tree_sitter::Point::new(1, 5),
         };
         let apps = vec![failed];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].range.start_byte, 10);
@@ -626,9 +640,9 @@ mod apply_layer_applications_tests {
             end_point: tree_sitter::Point::new(1, 4),
         };
         let apps = vec![first, second];
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].range.start_byte, 1);

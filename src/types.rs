@@ -180,9 +180,42 @@ pub struct ShapeError {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct LayerShapeAnalysis {
+pub struct FunctionShapeScope {
+    pub function_name: Option<String>,
+    pub start_byte: usize,
+    pub end_byte: usize,
     pub shapes: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct LayerShapeAnalysis {
+    pub scopes: Vec<FunctionShapeScope>,
     pub layers: HashMap<String, LayerKind>,
     pub applications: Vec<LayerApplication>,
     pub errors: Vec<ShapeError>,
+}
+
+impl LayerShapeAnalysis {
+    pub fn scope_for_byte(&self, byte: usize) -> Option<&FunctionShapeScope> {
+        scope_for_byte(&self.scopes, byte)
+    }
+}
+
+pub fn scope_for_byte(scopes: &[FunctionShapeScope], byte: usize) -> Option<&FunctionShapeScope> {
+    scope_index_for_byte(scopes, byte).map(|i| &scopes[i])
+}
+
+pub fn scope_index_for_byte(scopes: &[FunctionShapeScope], byte: usize) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, scope) in scopes.iter().enumerate() {
+        if scope.start_byte <= byte && byte < scope.end_byte {
+            let size = scope.end_byte - scope.start_byte;
+            match best {
+                None => best = Some((i, size)),
+                Some((_, prev_size)) if size <= prev_size => best = Some((i, size)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(i, _)| i)
 }

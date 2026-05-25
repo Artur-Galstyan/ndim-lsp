@@ -5,6 +5,21 @@ use tree_sitter::Range;
 use crate::*;
 
 #[cfg(test)]
+fn find_shape<'a>(analysis: &'a LayerShapeAnalysis, var: &str) -> Option<&'a Vec<String>> {
+    analysis.scopes.iter().find_map(|s| s.shapes.get(var))
+}
+
+#[cfg(test)]
+fn has_shape(analysis: &LayerShapeAnalysis, var: &str) -> bool {
+    analysis.scopes.iter().any(|s| s.shapes.contains_key(var))
+}
+
+#[cfg(test)]
+fn shapes_empty(analysis: &LayerShapeAnalysis) -> bool {
+    analysis.scopes.iter().all(|s| s.shapes.is_empty())
+}
+
+#[cfg(test)]
 mod analyze_layer_shapes_tests {
     use super::*;
     use std::fs;
@@ -50,8 +65,8 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "3"])));
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
         assert!(analysis.layers.contains_key("layer"));
         assert_eq!(analysis.applications.len(), 1);
     }
@@ -67,8 +82,8 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert_eq!(analysis.shapes.get("z"), Some(&shape(&["batch", "7"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
@@ -88,8 +103,8 @@ mod analyze_layer_shapes_tests {
                 .message
                 .contains("expected input last dim 3")
         );
-        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "4"])));
-        assert!(!analysis.shapes.contains_key("y"));
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "4"])));
+        assert!(!has_shape(&analysis, "y"));
     }
 
     #[test]
@@ -104,7 +119,7 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert!(analysis.shapes.is_empty());
+        assert!(shapes_empty(&analysis));
         assert_eq!(analysis.layers.len(), 1);
         assert_eq!(analysis.applications.len(), 1);
     }
@@ -120,7 +135,7 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
         assert!(analysis.layers.contains_key("layer"));
     }
 
@@ -138,8 +153,8 @@ mod analyze_layer_shapes_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(analysis.layers.len(), 1);
         assert_eq!(analysis.applications.len(), 1);
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert!(!analysis.shapes.contains_key("a"));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert!(!has_shape(&analysis, "a"));
     }
 
     #[test]
@@ -154,8 +169,8 @@ mod analyze_layer_shapes_tests {
         assert!(analysis.errors.is_empty());
         assert!(analysis.layers.is_empty());
         assert!(analysis.applications.is_empty());
-        assert_eq!(analysis.shapes.get("x"), Some(&shape(&["batch", "3"])));
-        assert!(!analysis.shapes.contains_key("y"));
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
+        assert!(!has_shape(&analysis, "y"));
     }
 
     #[test]
@@ -171,8 +186,8 @@ mod analyze_layer_shapes_tests {
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "bad");
         assert!(analysis.errors[0].message.contains("bad_layer"));
-        assert!(!analysis.shapes.contains_key("bad"));
-        assert_eq!(analysis.shapes.get("good"), Some(&shape(&["batch", "6"])));
+        assert!(!has_shape(&analysis, "bad"));
+        assert_eq!(find_shape(&analysis, "good"), Some(&shape(&["batch", "6"])));
     }
 
     #[test]
@@ -190,8 +205,8 @@ mod analyze_layer_shapes_tests {
         assert!(analysis.errors[0].message.contains("l1"));
         assert_eq!(analysis.errors[1].variable, "b");
         assert!(analysis.errors[1].message.contains("l2"));
-        assert!(!analysis.shapes.contains_key("a"));
-        assert!(!analysis.shapes.contains_key("b"));
+        assert!(!has_shape(&analysis, "a"));
+        assert!(!has_shape(&analysis, "b"));
     }
 
     #[test]
@@ -207,7 +222,7 @@ mod analyze_layer_shapes_tests {
         assert_eq!(analysis.errors.len(), 2);
         assert_eq!(analysis.errors[0].variable, "a");
         assert_eq!(analysis.errors[1].variable, "b");
-        assert_eq!(analysis.shapes.get("good"), Some(&shape(&["batch", "9"])));
+        assert_eq!(find_shape(&analysis, "good"), Some(&shape(&["batch", "9"])));
     }
 
     #[test]
@@ -222,7 +237,7 @@ mod analyze_layer_shapes_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["old", "shape"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["old", "shape"])));
     }
 
     #[test]
@@ -276,8 +291,8 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert!(!analysis.shapes.contains_key("x"));
-        assert!(!analysis.shapes.contains_key("y"));
+        assert!(!has_shape(&analysis, "x"));
+        assert!(!has_shape(&analysis, "y"));
     }
 
     #[test]
@@ -291,7 +306,10 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "hidden"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "hidden"]))
+        );
     }
 
     #[test]
@@ -305,7 +323,7 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "11"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "11"])));
     }
 
     #[test]
@@ -319,7 +337,10 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "hidden"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "hidden"]))
+        );
     }
 
     #[test]
@@ -333,8 +354,8 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert!(!analysis.shapes.contains_key("z"));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert!(!has_shape(&analysis, "z"));
     }
 
     #[test]
@@ -348,8 +369,8 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert!(!analysis.shapes.contains_key("missing_out"));
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert!(!has_shape(&analysis, "missing_out"));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
     }
 
     #[test]
@@ -363,7 +384,7 @@ mod analyze_layer_shapes_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch", "7"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
@@ -380,10 +401,59 @@ mod analyze_layer_shapes_tests {
         assert!(analysis.layers.is_empty());
         assert!(analysis.applications.is_empty());
         assert_eq!(
-            analysis.shapes.get("x"),
+            find_shape(&analysis, "x"),
             Some(&shape(&["batch", "features"]))
         );
-        assert_eq!(analysis.shapes.get("y"), Some(&shape(&["batch"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_same_param_name_in_two_functions_does_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"a b\"]):\n    pass\ndef g(x: Float[Array, \"c d\"]):\n    pass";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        let f_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("f"))
+            .expect("f scope");
+        let g_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("g"))
+            .expect("g scope");
+
+        assert_eq!(f_scope.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert_eq!(g_scope.shapes.get("x"), Some(&shape(&["c", "d"])));
+    }
+
+    #[test]
+    fn test_layer_in_one_function_uses_its_own_x() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    l_f = eqx.nn.Linear(3, 5)\n    y = l_f(x)\ndef g(x: Float[Array, \"batch 7\"]):\n    l_g = eqx.nn.Linear(7, 9)\n    y = l_g(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        let f_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("f"))
+            .expect("f scope");
+        let g_scope = analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some("g"))
+            .expect("g scope");
+        assert_eq!(f_scope.shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(g_scope.shapes.get("y"), Some(&shape(&["batch", "9"])));
     }
 }
 
@@ -422,6 +492,15 @@ mod end_to_end_layer_shape_tests {
         .unwrap();
     }
 
+    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
+        vec![FunctionShapeScope {
+            function_name: None,
+            start_byte: 0,
+            end_byte: usize::MAX,
+            shapes,
+        }]
+    }
+
     #[test]
     fn test_extracts_layers_and_propagates_single_application() {
         let tmp = tempfile::tempdir().unwrap();
@@ -432,12 +511,12 @@ mod end_to_end_layer_shape_tests {
 
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
         let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
     }
 
     #[test]
@@ -450,13 +529,13 @@ mod end_to_end_layer_shape_tests {
 
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
         let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert_eq!(shapes.get("z"), Some(&shape(&["batch", "7"])));
+        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("z"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]
@@ -469,14 +548,14 @@ mod end_to_end_layer_shape_tests {
 
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
         let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "4"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "4"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].variable, "y");
         assert!(errors[0].message.contains("expected input last dim 3"));
-        assert!(!shapes.contains_key("y"));
+        assert!(!scopes[0].shapes.contains_key("y"));
     }
 
     #[test]
@@ -489,12 +568,12 @@ mod end_to_end_layer_shape_tests {
 
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
         let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut shapes = HashMap::new();
+        let mut scopes = scopes_from(HashMap::new());
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert!(!shapes.contains_key("y"));
+        assert!(!scopes[0].shapes.contains_key("y"));
     }
 
     #[test]
@@ -507,12 +586,12 @@ mod end_to_end_layer_shape_tests {
 
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
         let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
+        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
 
-        let errors = apply_layer_applications(&apps, &mut shapes);
+        let errors = apply_layer_applications(&apps, &mut scopes);
 
         assert!(errors.is_empty());
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "5"])));
+        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "5"])));
     }
 }
 
@@ -1272,7 +1351,13 @@ mod additional_edge_case_tests {
             #[test]
             fn $name() {
                 let tree = parse($code);
-                let shapes = extract_jaxtyping_shapes(tree.root_node(), $code).unwrap();
+                let scopes = extract_jaxtyping_shapes(tree.root_node(), $code).unwrap();
+                let mut shapes: HashMap<String, Vec<String>> = HashMap::new();
+                for scope in scopes {
+                    for (k, v) in scope.shapes {
+                        shapes.insert(k, v);
+                    }
+                }
                 let expected = HashMap::from([
                     $(($param.to_string(), vec![$($dim.to_string()),*]),)*
                 ]);
@@ -1531,4 +1616,249 @@ mod additional_edge_case_tests {
         [("in_features", "1"), ("out_features", "2")],
         None
     );
+}
+
+#[cfg(test)]
+mod call_propagation_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn write_equinox_linear(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_propagates_free_jnp_sum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    y = jnp.sum(x, axis=0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+    }
+
+    #[test]
+    fn test_propagates_free_np_reshape_tuple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "import numpy as np\ndef f(x: Float[Array, \"6 4\"]):\n    y = np.reshape(x, (3, 8))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "8"])));
+    }
+
+    #[test]
+    fn test_free_call_reshape_size_mismatch_reports_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "import numpy as np\ndef f(x: Float[Array, \"6 4\"]):\n    y = np.reshape(x, (3, 9))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_propagates_method_flatten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"2 3 4\"]):\n    y = x.flatten()";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
+    }
+
+    #[test]
+    fn test_propagates_method_sum_axis_kwarg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"batch features\"]):\n    y = x.sum(axis=0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+    }
+
+    #[test]
+    fn test_propagates_method_reshape_multi_positional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"6 4\"]):\n    y = x.reshape(3, 8)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "8"])));
+    }
+
+    #[test]
+    fn test_chained_method_calls_in_source_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"2 3 4\"]):\n    y = x.flatten()\n    z = y.sum(axis=0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&Vec::<String>::new()));
+    }
+
+    #[test]
+    fn test_method_call_on_layer_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    layer = eqx.nn.Linear(3, 5)\n    y = layer(x)\n    z = y.sum(axis=0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["5"])));
+    }
+
+    #[test]
+    fn test_free_and_method_call_same_function_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    y = jnp.sum(x, axis=0)\n    z = x.sum(axis=1)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_unknown_method_silently_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"batch features\"]):\n    y = x.frobnicate()";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_free_call_unknown_module_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"batch features\"]):\n    y = helpers.transform(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_method_call_error_range_covers_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"6 4\"]):\n    y = x.reshape(3, 9)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(3, 9)");
+    }
+
+    #[test]
+    fn test_method_squeeze_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"1 batch features\"]):\n    y = x.squeeze(0)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
+    }
+
+    #[test]
+    fn test_method_unsqueeze_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"batch features\"]):\n    y = x.unsqueeze(1)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "1", "features"]))
+        );
+    }
+
+    #[test]
+    fn test_method_permute_multi_positional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.permute(2, 0, 1)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["c", "a", "b"])));
+    }
 }
