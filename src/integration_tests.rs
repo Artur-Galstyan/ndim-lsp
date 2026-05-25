@@ -3710,3 +3710,89 @@ mod linalg_inv_integration_tests {
         assert!(!has_shape(&analysis, "y"));
     }
 }
+
+#[cfg(test)]
+mod constructor_coverage_integration_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_empty_tuple_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f():\n    y = jnp.empty((batch, features))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_np_identity_square() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f():\n    y = np.identity(n)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_jnp_linspace_keyword_num() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f():\n    y = jnp.linspace(0, 1, num=steps)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_torch_linspace_keyword_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f():\n    y = torch.linspace(0, 1, steps=steps)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
+    }
+
+    #[test]
+    fn test_np_logspace_keyword_num() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f():\n    y = np.logspace(0, 3, num=n)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
+    }
+}
