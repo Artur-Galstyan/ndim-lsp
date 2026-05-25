@@ -280,6 +280,7 @@ pub fn extract_jaxtyping_shapes(
         node: Node,
         text: &str,
         scopes: &mut Vec<FunctionShapeScope>,
+        current_scope_idx: usize,
     ) -> Result<(), String> {
         if node.kind() == "function_definition" {
             let function_name = node
@@ -311,19 +312,43 @@ pub fn extract_jaxtyping_shapes(
                     function_shapes.insert(name, dims);
                 }
             }
+            let new_scope_idx = scopes.len();
             scopes.push(FunctionShapeScope {
                 function_name,
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 shapes: function_shapes,
             });
+            for i in 0..node.named_child_count() {
+                let Some(child) = node.named_child(i as u32) else {
+                    continue;
+                };
+                visit(child, text, scopes, new_scope_idx)?;
+            }
+            return Ok(());
+        }
+
+        // Handle annotated assignments: x: Float[Array, "dims"] = value
+        // or forward declarations: x: Float[Array, "dims"]
+        if node.kind() == "assignment"
+            && let Some(type_node) = node.child_by_field_name("type")
+            && let Some(left_node) = node.child_by_field_name("left")
+            && left_node.kind() == "identifier"
+            && contains_array_type(type_node, text)?
+            && let Some(raw_shape) = find_string_literal(type_node, text)?
+        {
+            let dims = shape_dims(&raw_shape);
+            if !dims.is_empty() {
+                let name = node_text(left_node, text)?;
+                scopes[current_scope_idx].shapes.insert(name, dims);
+            }
         }
 
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i as u32) else {
                 continue;
             };
-            visit(child, text, scopes)?;
+            visit(child, text, scopes, current_scope_idx)?;
         }
 
         Ok(())
@@ -335,7 +360,7 @@ pub fn extract_jaxtyping_shapes(
         end_byte: node.end_byte(),
         shapes: HashMap::new(),
     }];
-    visit(node, text, &mut scopes)?;
+    visit(node, text, &mut scopes, 0)?;
     Ok(scopes)
 }
 
@@ -1524,6 +1549,143 @@ mod extract_jaxtyping_shapes_tests {
         assert!(!inner.shapes.contains_key("o"));
         assert!(inner.start_byte >= outer.start_byte);
         assert!(inner.end_byte <= outer.end_byte);
+    }
+
+    // --- Annotated assignment tests ---
+
+    #[test]
+    fn test_annotated_assignment_node_structure() {
+        // Verify tree-sitter structure: assignment with type field and left identifier
+        let code = r#"x: Float[Array, "a b"] = None"#;
+        let tree = parse(code);
+
+        let root = tree.root_node();
+        // module > expression_statement > assignment
+        let expr_stmt = root.named_child(0).unwrap();
+        assert_eq!(expr_stmt.kind(), "expression_statement");
+        let assignment = expr_stmt.named_child(0).unwrap();
+        assert_eq!(assignment.kind(), "assignment");
+        // assignment has "left" and "type" fields
+        let left = assignment.child_by_field_name("left").unwrap();
+        assert_eq!(left.kind(), "identifier");
+        assert_eq!(left.utf8_text(code.as_bytes()).unwrap(), "x");
+        let type_node = assignment.child_by_field_name("type").unwrap();
+        assert!(type_node.kind() == "type");
+        // right field exists when there's a value
+        let right = assignment.child_by_field_name("right").unwrap();
+        assert_eq!(right.kind(), "none");
+    }
+
+    #[test]
+    fn test_forward_decl_annotated_assignment_node_structure() {
+        // x: Float[Array, "n"] without a value
+        let code = r#"x: Float[Array, "n"]"#;
+        let tree = parse(code);
+
+        let root = tree.root_node();
+        let expr_stmt = root.named_child(0).unwrap();
+        let assignment = expr_stmt.named_child(0).unwrap();
+        assert_eq!(assignment.kind(), "assignment");
+        let left = assignment.child_by_field_name("left").unwrap();
+        assert_eq!(left.kind(), "identifier");
+        let type_node = assignment.child_by_field_name("type").unwrap();
+        assert!(type_node.kind() == "type");
+        // No right field for forward declaration
+        assert!(assignment.child_by_field_name("right").is_none());
+    }
+
+    #[test]
+    fn test_module_level_annotated_assignment() {
+        let code = r#"x: Float[Array, "a b"] = None"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        assert_eq!(module.shapes.get("x"), Some(&shape(&["a", "b"])));
+    }
+
+    #[test]
+    fn test_multiple_module_level_annotated_assignments() {
+        let code = r#"x: Float[Array, "a b"] = None
+y: Int[Array, "c"] = 0"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        assert_eq!(module.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert_eq!(module.shapes.get("y"), Some(&shape(&["c"])));
+        assert_eq!(module.shapes.len(), 2);
+    }
+
+    #[test]
+    fn test_annotated_assignment_inside_function() {
+        let code = r#"def f():
+    x: Float[Array, "a b"] = None"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let f = scope_by_name(&scopes, "f");
+        assert_eq!(f.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert!(module_scope(&scopes).shapes.is_empty());
+    }
+
+    #[test]
+    fn test_annotated_assignment_non_array_type_ignored() {
+        let code = r#"x: int = 5"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        assert!(module_scope(&scopes).shapes.is_empty());
+    }
+
+    #[test]
+    fn test_annotated_assignment_without_value() {
+        let code = r#"x: Float[Array, "n"]"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        assert_eq!(module.shapes.get("x"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn test_annotated_assignment_in_nested_function_goes_to_inner_scope() {
+        let code = r#"def outer():
+    x: Float[Array, "a b"] = None
+    def inner():
+        y: Float[Array, "c d"] = None"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let outer = scope_by_name(&scopes, "outer");
+        let inner = scope_by_name(&scopes, "inner");
+        assert_eq!(outer.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert!(!outer.shapes.contains_key("y"));
+        assert_eq!(inner.shapes.get("y"), Some(&shape(&["c", "d"])));
+        assert!(!inner.shapes.contains_key("x"));
+        assert!(module_scope(&scopes).shapes.is_empty());
+    }
+
+    #[test]
+    fn test_module_level_assignment_coexists_with_function_params() {
+        let code = r#"x: Float[Array, "a b"] = None
+def f(y: Float[Array, "c d"]): pass"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        let f = scope_by_name(&scopes, "f");
+        assert_eq!(module.shapes.get("x"), Some(&shape(&["a", "b"])));
+        assert_eq!(f.shapes.get("y"), Some(&shape(&["c", "d"])));
+        assert!(!module.shapes.contains_key("y"));
+        assert!(!f.shapes.contains_key("x"));
     }
 }
 
