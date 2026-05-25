@@ -39,10 +39,10 @@ Legend:
 | `jnp.ones` / `np.ones` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.full` / `np.full` | ✅ | ✅ | ✅ | Output shape from shape argument. |
 | `jnp.empty` / `np.empty` | ❌ | ❌ | ❌ | Output shape from shape argument. |
-| `jnp.zeros_like` / `np.zeros_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `jnp.ones_like` / `np.ones_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `jnp.full_like` / `np.full_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `jnp.empty_like` / `np.empty_like` | ❌ | ❌ | ❌ | Shape-preserving. |
+| `jnp.zeros_like` / `np.zeros_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `jnp.ones_like` / `np.ones_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `jnp.full_like` / `np.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `jnp.empty_like` / `np.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.arange` / `np.arange` | ✅ | ✅ | ✅ | 1D length from args when concrete. |
 | `jnp.linspace` / `np.linspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
 | `jnp.logspace` / `np.logspace` | ❌ | ❌ | ❌ | 1D length from `num`. |
@@ -177,9 +177,10 @@ Legend:
 | `torch.ones` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.full` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.empty` | ❌ | ❌ | ❌ | Output shape from args. |
-| `torch.zeros_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `torch.ones_like` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `torch.empty_like` | ❌ | ❌ | ❌ | Shape-preserving. |
+| `torch.zeros_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `torch.ones_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `torch.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `torch.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.arange` | ✅ | ✅ | ✅ | 1D length from args if concrete. |
 | `torch.linspace` | ❌ | ❌ | ❌ | 1D length from steps. |
 | `torch.eye` | ✅ | ✅ | ✅ | Matrix shape. |

@@ -1991,6 +1991,80 @@ mod torch_nn_linear_tests {
 }
 
 #[cfg(test)]
+mod like_constructors_propagation_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_zeros_like_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    y = jnp.zeros_like(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_np_ones_like_preserves_symbolic_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import numpy as np\ndef f(x: Float[Array, \"batch features\"]):\n    y = np.ones_like(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_torch_empty_like_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.empty_like(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_torch_chained_zeros_like_ones_like() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.zeros_like(x)\n    z = torch.ones_like(y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "features"])));
+    }
+}
+
 mod binary_op_propagation_tests {
     use super::*;
     use std::fs;
