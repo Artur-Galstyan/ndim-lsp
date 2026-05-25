@@ -3793,6 +3793,161 @@ mod known_function_shape_rule_tests {
         assert_eq!(output, None);
     }
 
+    // ── Reduction shape-rule tests for All / Any / ArgMax / ArgMin ──
+
+    #[test]
+    fn test_all_axis_1_reduces_axis() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_any_axis_0_keepdims_true() {
+        let args = vec![pos("x"), kw("axis", "0"), kw("keepdims", "True")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["1", "features"])));
+    }
+
+    #[test]
+    fn test_argmax_axis_negative_removes_last_axis() {
+        let args = vec![pos("x"), kw("axis", "-1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMax, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_argmin_no_axis_reduces_all() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMin, &args, &shapes).unwrap();
+
+        // No axis = reduce all axes → scalar shape
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_all_unknown_input_returns_none() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_any_invalid_axis_errors() {
+        let args = vec![pos("x"), kw("axis", "3")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    #[test]
+    fn test_any_negative_axis_too_negative_errors() {
+        let args = vec![pos("x"), kw("axis", "-5")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let error = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("out of bounds"));
+    }
+
+    // ── Shape-preserving tests for Argsort / Sort / Cumsum / Cumprod ──
+
+    #[test]
+    fn test_argsort_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Argsort, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_sort_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Sort, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_cumsum_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Cumsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_cumprod_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Cumprod, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_argsort_unknown_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output = apply_known_function(&KnownFunction::Argsort, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_argmax_dim_keyword_torch_style() {
+        let args = vec![pos("x"), kw("dim", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::ArgMax, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_all_axis_none_reduces_all() {
+        let args = vec![pos("x"), kw("axis", "None")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::All, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_any_keepdim_keyword_torch_style() {
+        let args = vec![pos("x"), kw("dim", "1"), kw("keepdim", "True")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Any, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "1"])));
+    }
+
     // ── linalg.inv shape rule tests ──
 
     #[test]
@@ -4529,6 +4684,40 @@ mod known_function_tests {
         None
     );
     known_case!(method_like_known_function_rejected, ["x", "reshape"], None);
+    // ── Classification tests for all/any/argmax/argmin/argsort/sort/cumsum/cumprod ──
+
+    known_case!(jnp_all, ["jax", "numpy", "all"], Some(KnownFunction::All));
+    known_case!(np_all, ["numpy", "all"], Some(KnownFunction::All));
+    known_case!(torch_all, ["torch", "all"], Some(KnownFunction::All));
+
+    known_case!(jnp_any, ["jax", "numpy", "any"], Some(KnownFunction::Any));
+    known_case!(np_any, ["numpy", "any"], Some(KnownFunction::Any));
+    known_case!(torch_any, ["torch", "any"], Some(KnownFunction::Any));
+
+    known_case!(jnp_argmax, ["jax", "numpy", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(np_argmax, ["numpy", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(torch_argmax, ["torch", "argmax"], Some(KnownFunction::ArgMax));
+
+    known_case!(jnp_argmin, ["jax", "numpy", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(np_argmin, ["numpy", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(torch_argmin, ["torch", "argmin"], Some(KnownFunction::ArgMin));
+
+    known_case!(jnp_argsort, ["jax", "numpy", "argsort"], Some(KnownFunction::Argsort));
+    known_case!(np_argsort, ["numpy", "argsort"], Some(KnownFunction::Argsort));
+    known_case!(torch_argsort, ["torch", "argsort"], Some(KnownFunction::Argsort));
+
+    known_case!(jnp_sort, ["jax", "numpy", "sort"], Some(KnownFunction::Sort));
+    known_case!(np_sort, ["numpy", "sort"], Some(KnownFunction::Sort));
+    known_case!(torch_sort, ["torch", "sort"], Some(KnownFunction::Sort));
+
+    known_case!(jnp_cumsum, ["jax", "numpy", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(np_cumsum, ["numpy", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(torch_cumsum, ["torch", "cumsum"], Some(KnownFunction::Cumsum));
+
+    known_case!(jnp_cumprod, ["jax", "numpy", "cumprod"], Some(KnownFunction::Cumprod));
+    known_case!(np_cumprod, ["numpy", "cumprod"], Some(KnownFunction::Cumprod));
+    known_case!(torch_cumprod, ["torch", "cumprod"], Some(KnownFunction::Cumprod));
+
     known_case!(jax_numpy_vmap_rejected, ["jax", "numpy", "vmap"], None);
     known_case!(numpy_vmap_rejected, ["numpy", "vmap"], None);
     known_case!(torch_vmap_rejected_for_now, ["torch", "vmap"], None);

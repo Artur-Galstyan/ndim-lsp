@@ -3630,6 +3630,90 @@ mod torch_nn_functional_pad_tests {
     }
 }
 
+// ── Integration tests for free-function reductions & shape-preserving functions ──
+
+#[cfg(test)]
+mod free_reduction_shape_preserving_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_jnp_all_axis_1_gives_batch() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    y = jnp.all(x, axis=1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_np_argmax_axis_0_gives_features() {
+        let code = "import numpy as np\ndef f(x: Float[Array, \"batch features\"]):\n    y = np.argmax(x, axis=0)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+    }
+
+    #[test]
+    fn test_torch_argsort_preserves_batch_features() {
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.argsort(x)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_torch_cumsum_dim_1_preserves_batch_features() {
+        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.cumsum(x, dim=1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_chained_np_sort_then_any_propagates() {
+        let code = "import numpy as np\ndef f(x: Float[Array, \"batch features\"]):\n    y = np.sort(x)\n    z = np.any(y, axis=-1)";
+        let tree = parse(code);
+        let roots = vec![];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch"])));
+    }
+}
+
 #[cfg(test)]
 mod linalg_inv_integration_tests {
     use super::*;

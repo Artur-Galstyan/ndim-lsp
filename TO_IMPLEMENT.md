@@ -114,10 +114,10 @@ Legend:
 | `jnp.where` / `np.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
 | `jnp.nonzero` / `np.nonzero` | ❌ | ❌ | ❌ | Tuple of index arrays. |
 | `jnp.argwhere` / `np.argwhere` | ❌ | ❌ | ❌ | Shape `(N, ndim)`. |
-| `jnp.argmax` / `np.argmax` | ❌ | ❌ | ❌ | Reduction over axis. |
-| `jnp.argmin` / `np.argmin` | ❌ | ❌ | ❌ | Reduction over axis. |
-| `jnp.argsort` / `np.argsort` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `jnp.sort` / `np.sort` | ❌ | ❌ | ❌ | Shape-preserving. |
+| `jnp.argmax` / `np.argmax` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `jnp.argmin` / `np.argmin` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `jnp.argsort` / `np.argsort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `jnp.sort` / `np.sort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.searchsorted` / `np.searchsorted` | ❌ | ❌ | ❌ | Shape follows values. |
 | `jnp.extract` / `np.extract` | ❌ | ❌ | ❌ | 1D unknown length. |
 | `jnp.compress` / `np.compress` | ❌ | ❌ | ❌ | Axis length unknown unless condition concrete. |
@@ -135,13 +135,13 @@ Legend:
 | `jnp.prod` / `np.prod` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.std` / `np.std` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.var` / `np.var` | ✅ | ✅ | ✅ | Same axis semantics. |
-| `jnp.all` / `np.all` | ❌ | ❌ | ❌ | Same axis semantics. |
-| `jnp.any` / `np.any` | ❌ | ❌ | ❌ | Same axis semantics. |
+| `jnp.all` / `np.all` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `jnp.any` / `np.any` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.median` / `np.median` | ❌ | ❌ | ❌ | Same axis semantics. |
 | `jnp.quantile` / `np.quantile` | ❌ | ❌ | ❌ | Adds quantile dims maybe. |
 | `jnp.percentile` / `np.percentile` | ❌ | ❌ | ❌ | Similar to quantile. |
-| `jnp.cumsum` / `np.cumsum` | ❌ | ❌ | ❌ | Shape-preserving unless axis None -> flatten. |
-| `jnp.cumprod` / `np.cumprod` | ❌ | ❌ | ❌ | Shape-preserving unless axis None -> flatten. |
+| `jnp.cumsum` / `np.cumsum` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
+| `jnp.cumprod` / `np.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
 | `jnp.trace` / `np.trace` | ✅ | ✅ | ✅ | Removes two axes, optional offset. |
 
 ## Linear algebra
@@ -218,12 +218,12 @@ Legend:
 | `torch.prod` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
 | `torch.std` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
 | `torch.var` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
-| `torch.all` | ❌ | ❌ | ❌ | `dim`, `keepdim`. |
-| `torch.any` | ❌ | ❌ | ❌ | `dim`, `keepdim`. |
-| `torch.argmax` | ❌ | ❌ | ❌ | `dim`, `keepdim`. |
-| `torch.argmin` | ❌ | ❌ | ❌ | `dim`, `keepdim`. |
-| `torch.cumsum` | ❌ | ❌ | ❌ | Shape-preserving. |
-| `torch.cumprod` | ❌ | ❌ | ❌ | Shape-preserving. |
+| `torch.all` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `torch.any` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `torch.argmax` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `torch.argmin` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
+| `torch.cumsum` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `dim=None` flattening; always preserves input shape. |
+| `torch.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `dim=None` flattening; always preserves input shape. |
 
 ## Neural-network layers / modules
 
