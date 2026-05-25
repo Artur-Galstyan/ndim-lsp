@@ -3309,6 +3309,162 @@ mod known_function_shape_rule_tests {
         assert_eq!(output, Some(shape(&["batch", "features"])));
     }
 
+    // ── *_like shape-preserving tests ──
+
+    #[test]
+    fn test_zeros_like_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_ones_like_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_full_like_preserves_shape() {
+        let args = vec![pos("x"), pos("0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_empty_like_preserves_shape() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_zeros_like_missing_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output =
+            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_ones_like_missing_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output =
+            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_full_like_missing_input_returns_none() {
+        let args = vec![pos("x"), pos("0")];
+        let shapes = HashMap::new();
+
+        let output =
+            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_empty_like_missing_input_returns_none() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+
+        let output =
+            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_zeros_like_keyword_x() {
+        let args = vec![kw("x", "arr")];
+        let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_ones_like_keyword_input() {
+        let args = vec![kw("input", "arr")];
+        let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_full_like_keyword_x() {
+        let args = vec![kw("x", "arr"), pos("0")];
+        let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_empty_like_keyword_input() {
+        let args = vec![kw("input", "arr")];
+        let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_zeros_like_no_args_returns_none() {
+        let shapes = HashMap::new();
+
+        let output =
+            apply_known_function(&KnownFunction::ZerosLike, &[], &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_full_like_unrecognized_keyword_returns_none() {
+        let args = vec![kw("template", "arr")];
+        let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
+
+        let output =
+            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+
+        // 'template' is not a recognized keyword for first_array_arg
+        assert_eq!(output, None);
+    }
+
     #[test]
     fn test_where_broadcasts_three_inputs() {
         let args = vec![pos("cond"), pos("x"), pos("y")];
@@ -3857,6 +4013,26 @@ mod known_function_tests {
         Some(KnownFunction::Block)
     );
     known_case!(
+        jnp_zeros_like,
+        ["jax", "numpy", "zeros_like"],
+        Some(KnownFunction::ZerosLike)
+    );
+    known_case!(
+        jnp_ones_like,
+        ["jax", "numpy", "ones_like"],
+        Some(KnownFunction::OnesLike)
+    );
+    known_case!(
+        jnp_full_like,
+        ["jax", "numpy", "full_like"],
+        Some(KnownFunction::FullLike)
+    );
+    known_case!(
+        jnp_empty_like,
+        ["jax", "numpy", "empty_like"],
+        Some(KnownFunction::EmptyLike)
+    );
+    known_case!(
         jnp_array,
         ["jax", "numpy", "array"],
         Some(KnownFunction::Array)
@@ -3983,6 +4159,26 @@ mod known_function_tests {
         Some(KnownFunction::ColumnStack)
     );
     known_case!(np_block, ["numpy", "block"], Some(KnownFunction::Block));
+    known_case!(
+        np_zeros_like,
+        ["numpy", "zeros_like"],
+        Some(KnownFunction::ZerosLike)
+    );
+    known_case!(
+        np_ones_like,
+        ["numpy", "ones_like"],
+        Some(KnownFunction::OnesLike)
+    );
+    known_case!(
+        np_full_like,
+        ["numpy", "full_like"],
+        Some(KnownFunction::FullLike)
+    );
+    known_case!(
+        np_empty_like,
+        ["numpy", "empty_like"],
+        Some(KnownFunction::EmptyLike)
+    );
     known_case!(np_array, ["numpy", "array"], Some(KnownFunction::Array));
     known_case!(
         np_asarray,
@@ -4061,6 +4257,26 @@ mod known_function_tests {
     known_case!(torch_zeros, ["torch", "zeros"], Some(KnownFunction::Zeros));
     known_case!(torch_ones, ["torch", "ones"], Some(KnownFunction::Ones));
     known_case!(torch_full, ["torch", "full"], Some(KnownFunction::Full));
+    known_case!(
+        torch_zeros_like,
+        ["torch", "zeros_like"],
+        Some(KnownFunction::ZerosLike)
+    );
+    known_case!(
+        torch_ones_like,
+        ["torch", "ones_like"],
+        Some(KnownFunction::OnesLike)
+    );
+    known_case!(
+        torch_full_like,
+        ["torch", "full_like"],
+        Some(KnownFunction::FullLike)
+    );
+    known_case!(
+        torch_empty_like,
+        ["torch", "empty_like"],
+        Some(KnownFunction::EmptyLike)
+    );
     known_case!(
         torch_arange,
         ["torch", "arange"],
