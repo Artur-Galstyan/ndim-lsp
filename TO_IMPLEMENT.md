@@ -74,12 +74,12 @@ Legend:
 | `jnp.broadcast_to` / `np.broadcast_to` | ✅ | ✅ | ✅ | Output explicit target shape. |
 | `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ✅ | ✅ | Common broadcasted shape for all args. |
 | `jnp.broadcast_shapes` / `np.broadcast_shapes` | ❌ | ❌ | ❌ | Returns shape tuple, not array. |
-| `jnp.pad` / `np.pad` | ✅ | ❌ | ❌ | Modifies dimensions by pad widths. |
+| `jnp.pad` / `np.pad` | ✅ | ✅ | ✅ | Modifies dimensions by pad widths. |
 | `jnp.roll` / `np.roll` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.flip` / `np.flip` | ✅ | ✅ | ✅ | Shape-preserving. |
-| `jnp.fliplr` / `np.fliplr` | ✅ | ❌ | ❌ | Shape-preserving, rank >= 2. |
-| `jnp.flipud` / `np.flipud` | ✅ | ❌ | ❌ | Shape-preserving, rank >= 1. |
-| `jnp.rot90` / `np.rot90` | ✅ | ❌ | ❌ | Usually swaps two axis lengths when odd `k`. |
+| `jnp.fliplr` / `np.fliplr` | ✅ | ✅ | ✅ | Shape-preserving, rank >= 2. |
+| `jnp.flipud` / `np.flipud` | ✅ | ✅ | ✅ | Shape-preserving, rank >= 1. |
+| `jnp.rot90` / `np.rot90` | ✅ | ✅ | ✅ | Usually swaps two axis lengths when odd `k`. |
 | `jnp.rollaxis` / `np.rollaxis` | ❌ | ❌ | ❌ | Axis movement. |
 | `jnp.resize` / `np.resize` | ❌ | ❌ | ❌ | Output explicit shape. |
 
@@ -90,11 +90,11 @@ Legend:
 | `jnp.concatenate` / `np.concatenate` | ✅ | ✅ | ✅ | Check all dims except concat axis; sum concat axis. |
 | `jnp.concat` / `np.concat` | ✅ | ✅ | ✅ | Alias of concatenate in newer APIs. |
 | `jnp.stack` / `np.stack` | ✅ | ✅ | ✅ | Check equal shapes; insert new axis. |
-| `jnp.vstack` / `np.vstack` | ✅ | ❌ | ❌ | Stack along first axis after at least 2D. |
-| `jnp.hstack` / `np.hstack` | ✅ | ❌ | ❌ | Concatenate along axis depending rank. |
-| `jnp.dstack` / `np.dstack` | ✅ | ❌ | ❌ | Stack along depth axis. |
-| `jnp.column_stack` / `np.column_stack` | ✅ | ❌ | ❌ | Stack 1D as columns. |
-| `jnp.row_stack` / `np.row_stack` | ✅ | ❌ | ❌ | Alias-ish for vstack. |
+| `jnp.vstack` / `np.vstack` | ✅ | ✅ | ✅ | Stack along first axis after at least 2D. |
+| `jnp.hstack` / `np.hstack` | ✅ | ✅ | ✅ | Concatenate along axis depending rank. |
+| `jnp.dstack` / `np.dstack` | ✅ | ✅ | ✅ | Stack along depth axis. |
+| `jnp.column_stack` / `np.column_stack` | ✅ | ✅ | ✅ | Stack 1D as columns. |
+| `jnp.row_stack` / `np.row_stack` | ✅ | ✅ | ✅ | Alias-ish for vstack. |
 | `jnp.block` / `np.block` | ✅ | ❌ | ❌ | Nested block assembly. |
 | `jnp.split` / `np.split` | ✅ | ❌ | ❌ | Multiple outputs. |
 | `jnp.array_split` / `np.array_split` | ❌ | ❌ | ❌ | Multiple outputs, uneven sizes. |
@@ -148,11 +148,11 @@ Legend:
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `jnp.matmul` / `np.matmul` / `torch.matmul` | ✅ | ❌ | ❌ | Batch matmul broadcasting + inner dim check. |
-| `jnp.dot` / `np.dot` / `torch.dot` | ✅ | ❌ | ❌ | Rank-dependent dot semantics. |
+| `jnp.matmul` / `np.matmul` / `torch.matmul` | ✅ | ✅ | ✅ | Batch matmul broadcasting + inner dim check. |
+| `jnp.dot` / `np.dot` / `torch.dot` | ✅ | ✅ | ✅ | Rank-dependent dot semantics. |
 | `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ❌ | ❌ | Equation parser needed. |
-| `jax.lax.dot` | ✅ | ❌ | ❌ | Dot semantics. |
-| `jax.lax.dot_general` | ✅ | ❌ | ❌ | General contraction dims. |
+| `jax.lax.dot` | ✅ | ✅ | ✅ | Dot semantics. |
+| `jax.lax.dot_general` | ✅ | ✅ | ✅ | Currently approximated as matmul. |
 | `jnp.vdot` / `np.vdot` | ❌ | ❌ | ❌ | Flattened dot. |
 | `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ❌ | ❌ | ❌ | Contract axes. |
 | `jnp.outer` / `np.outer` / `torch.outer` | ❌ | ❌ | ❌ | Output `(a, b)`. |
@@ -246,26 +246,41 @@ Legend:
 | pooling layers | ❌ | ❌ | ❌ | Spatial formula. |
 | attention layers | ❌ | ❌ | ❌ | Query/key/value shape rules. |
 
-## Method calls to support later
+## Method calls
 
-These are not covered well by function-path classification because the target is often a value, e.g. `x.reshape(...)`.
+`extract_method_calls` captures `var = receiver.method(args)`. `classify_method_call` maps the method name to a `KnownFunction`. `apply_method_call` synthesises the receiver as positional[0] and dispatches into `apply_known_function`, collapsing multiple positionals into a tuple-string for `Reshape`/`Permute`/`Transpose`.
 
 | Method | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `x.reshape(...)` | ❌ | ❌ | ❌ | Same as reshape. |
-| `x.transpose(...)` | ❌ | ❌ | ❌ | Axis swap/permutation. |
-| `x.permute(...)` | ❌ | ❌ | ❌ | Torch dim permutation. |
-| `x.flatten(...)` | ❌ | ❌ | ❌ | Flatten dim range. |
-| `x.squeeze(...)` | ❌ | ❌ | ❌ | Remove size-1 dims. |
-| `x.unsqueeze(...)` | ❌ | ❌ | ❌ | Torch insert dim. |
-| `x.repeat(...)` | ❌ | ❌ | ❌ | Repeat dims. |
+| `x.reshape(...)` | ✅ | ✅ | ✅ | Multi-positional args collapsed to tuple. |
+| `x.view(...)` | ✅ | ✅ | ✅ | Torch reshape alias. |
+| `x.transpose(...)` | ✅ | ✅ | ✅ | No-args reverses; numpy-style full perm works; torch `transpose(i, j)` only correct for rank 2. |
+| `x.permute(...)` | ✅ | ✅ | ✅ | Multi-positional dims collapsed. |
+| `x.swapaxes(...)` | ✅ | ✅ | ✅ | Swap two axes. |
+| `x.moveaxis(...)` | ✅ | ✅ | ✅ | Move axis preserving order. |
+| `x.flatten(...)` | ✅ | ✅ | ✅ | Flatten all dims. |
+| `x.ravel(...)` | ✅ | ✅ | ✅ | Flatten all dims. |
+| `x.squeeze(...)` | ✅ | ✅ | ✅ | Remove size-1 dims. |
+| `x.unsqueeze(...)` | ✅ | ✅ | ✅ | Insert size-1 dim (maps to `ExpandDims`). |
+| `x.expand_dims(...)` | ✅ | ✅ | ✅ | Same as `unsqueeze`. |
+| `x.sum(...)` | ✅ | ✅ | ✅ | Reduction; supports `axis`/`dim`/`keepdims`/`keepdim`. |
+| `x.mean(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.max(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.min(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.prod(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.std(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.var(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.all(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.any(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.argmax(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.argmin(...)` | ✅ | ✅ | ✅ | Reduction. |
+| `x.argsort(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `x.sort(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `x.cumsum(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `x.cumprod(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `x.repeat(...)` | ❌ | ❌ | ❌ | Torch/Numpy semantics differ; out of scope for first method-call pass. |
 | `x.expand(...)` | ❌ | ❌ | ❌ | Broadcast view. |
-| `x.view(...)` | ❌ | ❌ | ❌ | Torch reshape alias. |
-| `x.sum(...)` | ❌ | ❌ | ❌ | Reduction. |
-| `x.mean(...)` | ❌ | ❌ | ❌ | Reduction. |
-| `x.max(...)` | ❌ | ❌ | ❌ | Reduction. |
-| `x.min(...)` | ❌ | ❌ | ❌ | Reduction. |
-| `x.to(...)` | ❌ | ❌ | ❌ | Shape-preserving conversion. |
+| `x.to(...)` | ❌ | ❌ | ❌ | Shape-preserving conversion; deferred. |
 
 ## Suggested implementation order
 

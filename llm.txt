@@ -1,0 +1,248 @@
+ndim-lsp LLM handoff
+====================
+
+Purpose
+-------
+ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shape analysis in Python code. The current actively developed implementation is in the Rust library modules under src/. The LSP server in src/main.rs is still mostly a placeholder/skeleton.
+
+Current validation baseline
+---------------------------
+As of this checkpoint:
+
+- `cargo test --quiet` passes with 723 tests.
+- `cargo clippy --all-targets --all-features` has no library warnings.
+- Clippy still reports existing placeholder warnings in `src/main.rs` only.
+
+Current file layout
+-------------------
+
+- `src/lib.rs`
+  - Small public facade.
+  - Re-exports all public APIs from the internal modules.
+
+- `src/types.rs`
+  - Shared public data types/enums.
+  - Important types:
+    - `ImportPath`
+    - `CallInfo`
+    - `ResolvedTarget`
+    - `ResolvedModuleTarget`
+    - `PythonSymbol`
+    - `ResolvedImplementation`
+    - `PythonCallableSignature`
+    - `CallArgument`
+    - `ResolvedCallSignature`
+    - `LayerKind`
+    - `KnownFunction`
+    - `LayerApplication`
+    - `ShapeError`
+    - `LayerShapeAnalysis`
+
+- `src/python_ast.rs`
+  - Pure tree-sitter Python extraction helpers.
+  - Important functions:
+    - `build_import_map`
+    - `extract_calls`
+    - `extract_call_arguments`
+    - `extract_jaxtyping_shapes`
+    - `find_top_level_symbol`
+    - `extract_callable_signature`
+    - `extract_method_calls`
+
+- `src/resolution.rs`
+  - Import/module/call/implementation resolution.
+  - Important functions:
+    - `resolve_python_module_on_disk`
+    - `resolve_call_target`
+    - `resolve_target_on_disk`
+    - `resolve_import_path_from_package`
+    - `follow_import_symbol_once`
+    - `resolve_reexport_once`
+    - `resolve_terminal_symbol_once`
+    - `resolve_implementation`
+    - `resolve_call_signature`
+    - `bind_call_arguments`
+
+- `src/known_functions.rs`
+  - Known built-in function classifier and shape rules.
+  - Important functions:
+    - `classify_known_function`
+    - `apply_known_function`
+    - `classify_method_call`
+    - `apply_method_call`
+  - This module contains the largest built-in function test matrix.
+
+- `src/layers.rs`
+  - Deep-learning layer handling.
+  - Important functions:
+    - `classify_layer_call`
+    - `extract_layer_assignments`
+    - `extract_layer_applications`
+    - `apply_layer_application`
+    - `apply_layer_applications`
+
+- `src/analysis.rs`
+  - High-level orchestration.
+  - Currently mostly:
+    - `analyze_layer_shapes`
+
+- `src/integration_tests.rs`
+  - Cross-module/end-to-end tests.
+
+- `TO_IMPLEMENT.md`
+  - Tracker for built-in functions/classes and whether they are classified, have shape rules, and have tests.
+
+- `README.md`
+  - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
+
+What works now
+--------------
+
+1. Python import parsing
+   - Supports plain imports, aliases, dotted imports, from-imports, relative imports, parenthesized/multiline imports, duplicate import last-wins.
+   - Star imports are skipped.
+
+2. Assigned call extraction
+   - Finds simple assignment-call patterns like:
+     - `layer = eqx.nn.Linear(...)`
+     - `y = layer(x)`
+   - Skips tuple unpacking, attribute assignment, bare calls, non-call assignments.
+
+3. Import/call target resolution
+   - `resolve_call_target` combines call target text with import map.
+   - Example:
+     - `import equinox as eqx`
+     - `eqx.nn.Linear` -> `ResolvedTarget { parts: ["equinox", "nn", "Linear"] }`
+   - Relative import dot count is preserved in `ResolvedTarget` when needed.
+
+4. Module resolution on disk
+   - `resolve_python_module_on_disk(module, search_roots)` checks:
+     - `root/foo/bar.py`
+     - `root/foo/bar/__init__.py`
+   - No filesystem crawling. Deterministic path lookup.
+
+5. Symbol/re-export following
+   - `find_top_level_symbol` detects top-level class/function/import.
+   - `resolve_implementation` follows import re-exports until class/function found, with max depth and cycle detection.
+
+6. Callable signatures and call bindings
+   - `extract_callable_signature` extracts:
+     - top-level function params
+     - class `__init__` params
+   - `extract_call_arguments` gets positional/keyword call args.
+   - `bind_call_arguments` maps args to param names and skips `self`/`cls` for class constructors.
+
+7. Jaxtyping shape annotation extraction
+   - `extract_jaxtyping_shapes` extracts function parameter shape strings like:
+     - `x: Float[Array, "batch features"]`
+   - Handles common wrappers and qualified `Array` forms.
+   - Rejects f-strings/bytes strings and non-array string annotations.
+   - Current output is a flat `HashMap<String, Vec<String>>`, not scoped by function.
+
+8. Equinox Linear layer flow
+   - Resolves and classifies `equinox.nn.Linear` through imports/re-exports.
+   - Extracts layer assignments:
+     - `layer = eqx.nn.Linear(3, 5)` -> `layer -> LayerKind::Linear { in_features: "3", out_features: "5" }`
+   - Extracts layer applications:
+     - `y = layer(x)` -> `LayerApplication`
+   - Applies layer shape rules:
+     - input last dim must match `in_features`
+     - output last dim becomes `out_features`
+   - `analyze_layer_shapes` orchestrates annotation extraction + layer extraction + propagation.
+
+9. Known built-in function classification
+   - `classify_known_function` recognizes many JAX NumPy, NumPy, Torch, and selected JAX LAX functions.
+   - See `KnownFunction` enum and `TO_IMPLEMENT.md`.
+
+10. Known built-in shape rules already implemented
+   - `concatenate` / `cat`
+   - `stack`
+   - reductions: `sum`, `mean`, `max`, `min`, `prod`, `std`, `var`, plus `all`, `any`, `argmax`, `argmin`
+   - `reshape`
+   - `flatten`, `ravel`
+   - `transpose`, `swapaxes`, `moveaxis`, `permute`
+   - `expand_dims`, `squeeze`, `atleast_1d`, `atleast_2d`, `atleast_3d`
+   - `broadcast_to`, `broadcast_arrays` / `broadcast_tensors`
+   - `tile`, `repeat`
+   - shape-preserving: `roll`, `flip`, `triu`, `tril`, `argsort`, `sort`, `cumsum`, `cumprod`, `array`, `asarray`, `*_like`
+   - `where`
+   - constructors: `zeros`, `ones`, `full`, `empty`, `arange`, `linspace`, `logspace`, `eye`, `identity`
+   - diagonal/indexing basics: `diag`, `diagonal`, `trace`, `take`
+   - linear algebra basics: `matmul`, `dot`, `jax.lax.dot`, `jax.lax.dot_general` approximated as matmul
+   - stacking family: `vstack`, `hstack`, `dstack`, `column_stack`, `row_stack`
+   - `pad`
+   - `rot90`
+
+Known limitations / important caveats
+-------------------------------------
+
+- `src/main.rs` is still not wired to the analysis pipeline. LSP diagnostics/hover/inlay are placeholders.
+- Shape maps are not properly scoped by function yet. Several tests document current behavior, but real function-level scoping remains future work.
+- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)` have classification + shape rules (via `classify_method_call`/`apply_method_call`) but are not yet wired into `analyze_layer_shapes`. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)`, `x.to(...)` are not yet covered.
+- Multi-output functions need a richer return type than `Option<Vec<String>>`:
+  - `split`
+  - `meshgrid`
+  - `svd`
+  - `eig`
+  - etc.
+- Higher-order functions need separate modeling:
+  - `vmap`
+  - `grad`
+  - `scan`
+  - etc.
+- Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
+- Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
+- Current `extract_jaxtyping_shapes` flattens all function parameter annotations into one map. Future function scoping should replace this.
+- Current `ShapeError` has `variable`, `message`, and tree-sitter `Range`; LSP conversion is not yet implemented.
+
+How to continue
+---------------
+
+Always validate with:
+
+```sh
+cargo test --quiet
+cargo clippy --all-targets --all-features
+```
+
+Expected remaining clippy warnings are only from `src/main.rs` placeholders unless that file is cleaned up.
+
+Recommended next implementation steps
+-------------------------------------
+
+1. Add LSP-ready diagnostic conversion
+   - Add simple `TextRange` / `ShapeDiagnostic` structs or convert directly in `main.rs`.
+   - Convert `ShapeError.range` from tree-sitter points to LSP ranges.
+
+2. Wire `analyze_layer_shapes` into `src/main.rs`
+   - On document open/change parse Python file.
+   - Determine workspace/search roots.
+   - Run analysis.
+   - Publish diagnostics for `ShapeError`s.
+
+3. Add method-call support
+   - Recognize `x.reshape(...)`, `x.sum(...)`, etc.
+   - This likely needs new extraction beyond current `extract_calls`, because target `x.reshape` is an attribute and the receiver `x` is semantically the first arg.
+
+4. Add multi-output shape API
+   - Current `apply_known_function` returns one optional shape.
+   - Functions like `split`, `meshgrid`, `svd` need multiple output shapes or tuple destructuring support.
+
+5. Add function-scoped shape maps
+   - Replace flat `HashMap<String, Vec<String>>` from `extract_jaxtyping_shapes` with per-function scope data.
+   - Avoid collisions between parameters named the same in different functions.
+
+6. Keep `TO_IMPLEMENT.md` updated
+   - When a function is classified, mark Classified ✅.
+   - When a real shape rule exists, mark Shape rule ✅.
+   - When tests exist for that shape rule, mark Tests ✅.
+
+Coding conventions used so far
+------------------------------
+
+- Prefer pure helpers in `lib.rs` modules and heavy unit tests.
+- Do not wire into LSP until pure behavior is well tested.
+- Favor simple string dimensions over a symbolic algebra engine for now.
+- Unknown/dynamic information usually returns `Ok(None)` instead of error.
+- Actual contradiction/mismatch returns `Err(String)` or `ShapeError` at higher orchestration levels.
+- Tests are intentionally extensive and mostly table/macro driven for known-function coverage.
