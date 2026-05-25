@@ -300,13 +300,13 @@ fn apply_conv_layer(
 /// Returns the minimum input rank required by a shape-preserving layer,
 /// or `None` if the layer accepts any rank (e.g. `Dropout`, `ReLU`).
 ///
-/// PyTorch conventions (including batch dimension):
-///   BatchNorm1d → 2  (N, C)
-///   BatchNorm2d → 4  (N, C, H, W)
-///   BatchNorm3d → 5  (N, C, D, H, W)
-///   Dropout1d   → 2  (N, C)
-///   Dropout2d   → 4  (N, C, H, W)
-///   Dropout3d   → 5  (N, C, D, H, W)
+/// Channels-first convention (no batch dimension required, matching Conv layers):
+///   BatchNorm1d → 2  (C, L)
+///   BatchNorm2d → 3  (C, H, W)
+///   BatchNorm3d → 4  (C, D, H, W)
+///   Dropout1d   → 2  (C, L)
+///   Dropout2d   → 3  (C, H, W)
+///   Dropout3d   → 4  (C, D, H, W)
 ///   GroupNorm   → 1  (needs a channel dim)
 ///   LayerNorm   → 1  (needs at least one dim to normalize)
 ///
@@ -412,7 +412,7 @@ pub fn apply_layer_application(
             padding,
         ),
         // Shape-preserving layers: output shape equals input shape, but some
-        // layers have minimum-rank expectations (e.g. BatchNorm2d needs 4D).
+        // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
         LayerKind::ShapePreserving { name } => {
             if let Some(min_rank) = min_rank_for_shape_preserving(name)
                 && input_shape.len() < min_rank
