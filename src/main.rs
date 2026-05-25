@@ -1,33 +1,22 @@
-use tower_lsp::{LspService, Server};
-
-use core::str;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
-use tokio::sync::RwLock;
 
+use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintParams,
-    MarkedString, MessageType, OneOf, Position, ServerCapabilities, SignatureInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InlayHint, InlayHintParams, MarkedString, MessageType, OneOf, Position,
+    Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
-use tower_lsp::{Client, LanguageServer};
-use tree_sitter::{Parser, Tree};
+use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tree_sitter::Parser;
+
+use ndim_lsp::{analyze_layer_shapes, ShapeError};
 
 pub struct Backend {
     pub client: Client,
     pub document_text: RwLock<HashMap<Url, String>>,
-    pub site_packages_path: RwLock<String>,
-    pub global_state: GlobalState,
-}
-
-#[derive(Default)]
-pub struct GlobalState {
-    trees: HashMap<Url, Tree>,
-    module_resolution: HashMap<String, Url>,
-    signatures: HashMap<Url, HashMap<String, SignatureInformation>>,
 }
 
 #[tower_lsp::async_trait]
@@ -55,47 +44,14 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "File opened")
             .await;
 
-        let mut py_path = PathBuf::from(".venv/bin/python");
-
-        if !py_path.exists() {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    "No virtual env found, using system python",
-                )
-                .await;
-            py_path = PathBuf::from("python3");
-        }
-
-        let site_packages_res = Command::new(&py_path)
-            .args(["-c", "import site; print(site.getsitepackages())"])
-            .output()
-            .ok();
-
-        if let Some(output) = site_packages_res
-            && let Ok(site_packages) = std::str::from_utf8(&output.stdout)
-        {
-            let trimmed = site_packages.trim().to_string();
-            {
-                let mut site_packages_lock = self.site_packages_path.write().await;
-                *site_packages_lock = trimmed.clone();
-            }
-
-            self.client
-                .log_message(MessageType::INFO, self.site_packages_path.read().await)
-                .await;
-        }
-
-        self.on_change(&params.text_document.uri, &params.text_document.text)
-            .await
+        self.republish_diagnostics(&params.text_document.uri, &params.text_document.text)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.on_change(&params.text_document.uri, &change.text)
+            self.republish_diagnostics(&params.text_document.uri, &change.text)
                 .await;
-            let mut doc_lock = self.document_text.write().await;
-            doc_lock.insert(params.text_document.uri, change.text);
         }
     }
 
@@ -110,24 +66,67 @@ impl LanguageServer for Backend {
     }
 
     async fn inlay_hint(&self, _params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let mut hints = Vec::new();
-
+        let hints = Vec::new();
         Ok(Some(hints))
     }
 }
 
 impl Backend {
-    async fn on_change(&self, uri: &Url, text: &str) {
+    async fn republish_diagnostics(&self, uri: &Url, text: &str) {
+        // Store the document text
+        {
+            let mut doc_lock = self.document_text.write().await;
+            doc_lock.insert(uri.clone(), text.to_string());
+        }
+
+        // Parse with tree-sitter-python
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Failed to set language");
+        let Some(tree) = parser.parse(text, None) else {
+            self.client
+                .publish_diagnostics(uri.clone(), Vec::new(), None)
+                .await;
+            return;
+        };
+
+        // Determine search roots from workspace folders
+        let search_roots = self.workspace_roots().await;
+
+        // Read-file implementation
+        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+
+        // Run analysis
+        let diagnostics = match analyze_layer_shapes(tree.root_node(), text, &search_roots, read_file, 5) {
+            Ok(analysis) => analysis.errors.into_iter().map(shape_error_to_diagnostic).collect(),
+            Err(_) => Vec::new(),
+        };
+
         self.client
-            .log_message(MessageType::INFO, format!("changed uri {}", uri))
+            .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    async fn workspace_roots(&self) -> Vec<PathBuf> {
+        self.client
+            .workspace_folders()
+            .await
+            .ok()
+            .flatten()
+            .map(|folders| {
+                folders
+                    .into_iter()
+                    .filter_map(|f| f.uri.to_file_path().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
         let mut parser = Parser::new();
-        let language = tree_sitter_python::LANGUAGE;
         parser
-            .set_language(&language.into())
+            .set_language(&tree_sitter_python::LANGUAGE.into())
             .expect("Failed to set language");
         let Some(tree) = parser.parse(text, None) else {
             return Ok(None);
@@ -140,14 +139,37 @@ impl Backend {
             return Ok(None);
         };
 
-        let Ok(name) = node.utf8_text(text.as_bytes()) else {
-            return Ok(None);
-        };
+        let _name = node.utf8_text(text.as_bytes());
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(format!("shape:",))),
+            contents: HoverContents::Scalar(MarkedString::String("shape:".to_string())),
             range: None,
         }))
+    }
+}
+
+fn shape_error_to_diagnostic(error: ShapeError) -> Diagnostic {
+    Diagnostic {
+        range: ts_range_to_lsp_range(error.range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("ndim-lsp".to_string()),
+        message: format!("{}: {}", error.variable, error.message),
+        code: None,
+        related_information: None,
+        ..Default::default()
+    }
+}
+
+fn ts_range_to_lsp_range(ts: tree_sitter::Range) -> Range {
+    Range {
+        start: Position {
+            line: ts.start_point.row as u32,
+            character: ts.start_point.column as u32,
+        },
+        end: Position {
+            line: ts.end_point.row as u32,
+            character: ts.end_point.column as u32,
+        },
     }
 }
 
@@ -159,9 +181,42 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         document_text: Default::default(),
-        site_packages_path: Default::default(),
-        global_state: Default::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ts_range_to_lsp_range_converts_correctly() {
+        let ts = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(0, 5),
+            end_point: tree_sitter::Point::new(2, 10),
+            start_byte: 0,
+            end_byte: 0,
+        };
+        let lsp = ts_range_to_lsp_range(ts);
+        assert_eq!(lsp.start.line, 0);
+        assert_eq!(lsp.start.character, 5);
+        assert_eq!(lsp.end.line, 2);
+        assert_eq!(lsp.end.character, 10);
+    }
+
+    #[test]
+    fn ts_range_to_lsp_range_zero_based() {
+        let ts = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 1),
+            start_byte: 0,
+            end_byte: 0,
+        };
+        let lsp = ts_range_to_lsp_range(ts);
+        assert_eq!(lsp.start.line, 0);
+        assert_eq!(lsp.start.character, 0);
+        assert_eq!(lsp.end.line, 0);
+        assert_eq!(lsp.end.character, 1);
+    }
 }
