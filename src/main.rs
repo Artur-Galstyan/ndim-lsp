@@ -277,9 +277,14 @@ fn find_shape_for_variable(
 
 /// Format the variable name and shape into a Python-annotated string.
 /// Example: `x: Float[Array, "batch features"]`
+/// Scalar (zero-rank) shapes render as `x: Scalar`.
 fn format_hover(var_name: &str, shape: &[String]) -> String {
-    let dims = shape.join(" ");
-    format!("{}: Float[Array, \"{}\"]", var_name, dims)
+    if shape.is_empty() {
+        format!("{}: Scalar", var_name)
+    } else {
+        let dims = shape.join(" ");
+        format!("{}: Float[Array, \"{}\"]", var_name, dims)
+    }
 }
 
 fn shape_error_to_diagnostic(error: ShapeError) -> Diagnostic {
@@ -369,6 +374,11 @@ mod tests {
             format_hover("vec", &["n".into()]),
             "vec: Float[Array, \"n\"]"
         );
+    }
+
+    #[test]
+    fn format_hover_scalar() {
+        assert_eq!(format_hover("s", &[]), "s: Scalar");
     }
 
     #[test]
