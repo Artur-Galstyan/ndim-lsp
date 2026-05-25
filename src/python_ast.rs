@@ -282,7 +282,9 @@ pub fn extract_jaxtyping_shapes(
         scopes: &mut Vec<FunctionShapeScope>,
         current_scope_idx: usize,
     ) -> Result<(), String> {
-        if node.kind() == "function_definition" {
+        // Determine the scope index children should use.
+        // For function_definition we push a new scope; otherwise inherit.
+        let child_scope_idx = if node.kind() == "function_definition" {
             let function_name = node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(text.as_bytes()).ok())
@@ -312,24 +314,27 @@ pub fn extract_jaxtyping_shapes(
                     function_shapes.insert(name, dims);
                 }
             }
-            let new_scope_idx = scopes.len();
+            let new_idx = scopes.len();
             scopes.push(FunctionShapeScope {
                 function_name,
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 shapes: function_shapes,
             });
-            for i in 0..node.named_child_count() {
-                let Some(child) = node.named_child(i as u32) else {
-                    continue;
-                };
-                visit(child, text, scopes, new_scope_idx)?;
-            }
-            return Ok(());
-        }
+            new_idx
+        } else {
+            current_scope_idx
+        };
 
         // Handle annotated assignments: x: Float[Array, "dims"] = value
         // or forward declarations: x: Float[Array, "dims"]
+        //
+        // Note: class-body annotations (e.g. equinox.Module fields like
+        // `weight: Float[Array, "in out"]`) also match here. Since we
+        // don't push a scope for class_definition, they land in the
+        // enclosing scope (usually module scope). This is the current
+        // intended behavior — a future increment can add class scoping
+        // once `self.x` lookups are wired.
         if node.kind() == "assignment"
             && let Some(type_node) = node.child_by_field_name("type")
             && let Some(left_node) = node.child_by_field_name("left")
@@ -340,7 +345,7 @@ pub fn extract_jaxtyping_shapes(
             let dims = shape_dims(&raw_shape);
             if !dims.is_empty() {
                 let name = node_text(left_node, text)?;
-                scopes[current_scope_idx].shapes.insert(name, dims);
+                scopes[child_scope_idx].shapes.insert(name, dims);
             }
         }
 
@@ -348,7 +353,7 @@ pub fn extract_jaxtyping_shapes(
             let Some(child) = node.named_child(i as u32) else {
                 continue;
             };
-            visit(child, text, scopes, current_scope_idx)?;
+            visit(child, text, scopes, child_scope_idx)?;
         }
 
         Ok(())
@@ -1686,6 +1691,22 @@ def f(y: Float[Array, "c d"]): pass"#;
         assert_eq!(f.shapes.get("y"), Some(&shape(&["c", "d"])));
         assert!(!module.shapes.contains_key("y"));
         assert!(!f.shapes.contains_key("x"));
+    }
+
+    #[test]
+    fn test_annotated_assignment_in_class_body_lands_in_module_scope() {
+        // Documents current behavior: class bodies don't push a scope,
+        // so annotated fields land in the enclosing (module) scope.
+        // A future increment can add class scoping once self.x lookups
+        // are wired.
+        let code = r#"class M:
+    w: Float[Array, "in out"]"#;
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let module = module_scope(&scopes);
+        assert_eq!(module.shapes.get("w"), Some(&shape(&["in", "out"])));
     }
 }
 
