@@ -2199,3 +2199,566 @@ mod binary_op_propagation_tests {
         assert_eq!(g_scope.shapes.get("y"), Some(&shape(&["x", "z"])));
     }
 }
+mod conv_layer_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// Write fake equinox.nn package with Conv1d, Conv2d, Conv3d, Linear
+    fn write_fake_equinox_nn(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(
+            tmp.path().join("equinox/__init__.py"),
+            "from . import nn",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/__init__.py"),
+            "from ._conv import Conv1d, Conv2d, Conv3d\nfrom ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_conv.py"),
+            "class Conv1d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0): pass\nclass Conv2d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0): pass\nclass Conv3d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0): pass",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features): pass",
+        )
+        .unwrap();
+    }
+
+    /// Write fake torch.nn package with Conv1d, Conv2d, Conv3d, Linear
+    fn write_fake_torch_nn(tmp: &tempfile::TempDir) {
+        fs::create_dir_all(tmp.path().join("torch/nn")).unwrap();
+        fs::write(tmp.path().join("torch/__init__.py"), "from . import nn").unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/__init__.py"),
+            "from ._conv import Conv1d, Conv2d, Conv3d\nfrom ._linear import Linear",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/_conv.py"),
+            "class Conv1d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0): pass\nclass Conv2d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1): pass\nclass Conv3d:\n    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0): pass",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("torch/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, bias=True): pass",
+        )
+        .unwrap();
+    }
+
+    // ── Equinox Conv2d concrete dims ──
+
+    #[test]
+    fn test_equinox_conv2d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = eqx.nn.Conv2d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+    }
+
+    // ── Torch Conv2d same ──
+
+    #[test]
+    fn test_torch_conv2d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = torch.nn.Conv2d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+    }
+
+    // ── in_channels mismatch -> ShapeError ──
+
+    #[test]
+    fn test_equinox_conv2d_channels_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 4 32 32\"]):\n    layer = eqx.nn.Conv2d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(analysis.errors[0].message.contains("expected 3 input channels"));
+        assert!(analysis.errors[0].message.contains("got 4"));
+    }
+
+    #[test]
+    fn test_torch_conv2d_channels_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 5 32 32\"]):\n    layer = torch.nn.Conv2d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert!(analysis.errors[0].message.contains("expected 3 input channels"));
+        assert!(analysis.errors[0].message.contains("got 5"));
+    }
+
+    // ── Conv1d ──
+
+    #[test]
+    fn test_equinox_conv1d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 64\"]):\n    layer = eqx.nn.Conv1d(3, 16, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        // L_out = floor((64 + 2*0 - 5)/1) + 1 = 60
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "60"])));
+    }
+
+    #[test]
+    fn test_torch_conv1d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 64\"]):\n    layer = torch.nn.Conv1d(3, 16, 5)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "60"])));
+    }
+
+    // ── Conv3d ──
+
+    #[test]
+    fn test_equinox_conv3d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 32 32 32\"]):\n    layer = eqx.nn.Conv3d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
+    }
+
+    #[test]
+    fn test_torch_conv3d_concrete_dims() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32 32\"]):\n    layer = torch.nn.Conv3d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
+    }
+
+    // ── Conv2d with stride=2, padding=1 ──
+
+    #[test]
+    fn test_equinox_conv2d_stride2_padding1() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = eqx.nn.Conv2d(3, 16, 3, stride=2, padding=1)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        // H_out = floor((32 + 2*1 - 3)/2) + 1 = floor(31/2) + 1 = 15 + 1 = 16
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "16", "16"])));
+    }
+
+    #[test]
+    fn test_torch_conv2d_stride2_padding1() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = torch.nn.Conv2d(3, 16, 3, stride=2, padding=1)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "16", "16"])));
+    }
+
+    // ── Symbolic input: in_channels matches as symbol ──
+
+    #[test]
+    fn test_equinox_conv2d_symbolic_in_channels() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch in_c H W\"]):\n    layer = eqx.nn.Conv2d(in_c, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        let y_shape = find_shape(&analysis, "y").unwrap();
+        assert_eq!(y_shape[0], "batch");
+        assert_eq!(y_shape[1], "16");
+        // H and W are symbolic: (H+0-3)/1+1 and (W+0-3)/1+1
+        // Since padding=0, stride=1 the formula simplifies:
+        // inner = H, subtract 3 => H-3, divide by 1 => (H-3), add 1 => (H-3)+1
+        assert_eq!(y_shape[2], "H-2");
+        assert_eq!(y_shape[3], "W-2");
+    }
+
+    #[test]
+    fn test_equinox_conv2d_symbolic_spatial_with_stride_padding() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 H W\"]):\n    layer = eqx.nn.Conv2d(3, 16, 3, stride=2, padding=1)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        let y_shape = find_shape(&analysis, "y").unwrap();
+        assert_eq!(y_shape[0], "batch");
+        assert_eq!(y_shape[1], "16");
+        // (H-1)/2+1
+        assert_eq!(y_shape[2], "(H-1)/2+1");
+        assert_eq!(y_shape[3], "(W-1)/2+1");
+    }
+
+    // ── Keyword constructor form ──
+
+    #[test]
+    fn test_torch_conv2d_keyword_constructor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = torch.nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+    }
+
+    #[test]
+    fn test_equinox_conv2d_keyword_constructor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_equinox_nn(&tmp);
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = eqx.nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+    }
+
+    // ── from-import alias form ──
+
+    #[test]
+    fn test_from_torch_nn_import_conv2d() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "from torch.nn import Conv2d\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = Conv2d(3, 16, 3)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+    }
+
+    // ── Direct apply_layer_application unit tests ──
+
+    fn conv1d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::Conv1d {
+            in_channels: in_channels.to_string(),
+            out_channels: out_channels.to_string(),
+            kernel_size: kernel_size.to_string(),
+            stride: stride.to_string(),
+            padding: padding.to_string(),
+        }
+    }
+
+    fn conv2d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::Conv2d {
+            in_channels: in_channels.to_string(),
+            out_channels: out_channels.to_string(),
+            kernel_size: kernel_size.to_string(),
+            stride: stride.to_string(),
+            padding: padding.to_string(),
+        }
+    }
+
+    fn conv3d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::Conv3d {
+            in_channels: in_channels.to_string(),
+            out_channels: out_channels.to_string(),
+            kernel_size: kernel_size.to_string(),
+            stride: stride.to_string(),
+            padding: padding.to_string(),
+        }
+    }
+
+    fn dummy_range() -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 0),
+        }
+    }
+
+    fn layer_app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: "y".to_string(),
+            layer: "conv".to_string(),
+            input: input.to_string(),
+            kind,
+            range: dummy_range(),
+        }
+    }
+
+    #[test]
+    fn test_conv1d_concrete_apply() {
+        let app = layer_app("x", conv1d("3", "16", "5", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "64"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "16", "60"])));
+    }
+
+    #[test]
+    fn test_conv2d_concrete_apply() {
+        let app = layer_app("x", conv2d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "32", "32"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "16", "30", "30"])));
+    }
+
+    #[test]
+    fn test_conv3d_concrete_apply() {
+        let app = layer_app("x", conv3d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "32", "32", "32"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "16", "30", "30", "30"])));
+    }
+
+    #[test]
+    fn test_conv2d_stride2_padding1_apply() {
+        let app = layer_app("x", conv2d("3", "16", "3", "2", "1"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "32", "32"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        // (32 + 2*1 - 3)/2 + 1 = 16
+        assert_eq!(output, Some(shape(&["batch", "16", "16", "16"])));
+    }
+
+    #[test]
+    fn test_conv2d_channels_mismatch_error() {
+        let app = layer_app("x", conv2d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "5", "32", "32"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("expected 3 input channels"));
+        assert!(err.contains("got 5"));
+    }
+
+    #[test]
+    fn test_conv1d_too_few_dims_error() {
+        let app = layer_app("x", conv1d("3", "16", "5", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["3"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("at least 2 dims"));
+    }
+
+    #[test]
+    fn test_conv2d_too_few_dims_error() {
+        let app = layer_app("x", conv2d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["3", "32"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("at least 3 dims"));
+    }
+
+    #[test]
+    fn test_conv3d_too_few_dims_error() {
+        let app = layer_app("x", conv3d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["3", "32", "32"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("at least 4 dims"));
+    }
+
+    #[test]
+    fn test_conv2d_symbolic_spatial_dims() {
+        let app = layer_app("x", conv2d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "H", "W"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        let out = output.unwrap();
+        assert_eq!(out[0], "batch");
+        assert_eq!(out[1], "16");
+        assert_eq!(out[2], "H-2");
+        assert_eq!(out[3], "W-2");
+    }
+
+    #[test]
+    fn test_conv2d_symbolic_channels_match() {
+        let app = layer_app("x", conv2d("in_c", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "in_c", "H", "W"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        let out = output.unwrap();
+        assert_eq!(out[1], "16");
+    }
+
+    #[test]
+    fn test_conv2d_symbolic_channels_mismatch_error() {
+        let app = layer_app("x", conv2d("in_c", "16", "3", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "other", "H", "W"]))]);
+        let err = apply_layer_application(&app, &shapes).unwrap_err();
+        assert!(err.contains("expected in_c input channels"));
+        assert!(err.contains("got other"));
+    }
+
+    #[test]
+    fn test_conv1d_symbolic_spatial_dim() {
+        let app = layer_app("x", conv1d("3", "16", "5", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "L"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        let out = output.unwrap();
+        assert_eq!(out[2], "L-4");
+    }
+
+    #[test]
+    fn test_conv1d_stride2_padding1_concrete() {
+        let app = layer_app("x", conv1d("3", "16", "3", "2", "1"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "32"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        // (32 + 2*1 - 3)/2 + 1 = 16
+        assert_eq!(output, Some(shape(&["batch", "16", "16"])));
+    }
+
+    #[test]
+    fn test_conv2d_missing_input_returns_none() {
+        let app = layer_app("x", conv2d("3", "16", "3", "1", "0"));
+        let shapes = HashMap::new();
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    // ── Tuple kernel_size not yet supported — must not classify ──
+
+    #[test]
+    fn test_torch_conv2d_tuple_kernel_size_not_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\nlayer = torch.nn.Conv2d(3, 16, (3, 5))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Tuple kernel_size should not be classified — avoids garbage symbolic output
+        assert!(!layers.contains_key("layer"));
+    }
+
+    #[test]
+    fn test_torch_conv2d_tuple_stride_not_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\nlayer = torch.nn.Conv2d(3, 16, 3, stride=(2, 1))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(!layers.contains_key("layer"));
+    }
+
+    // ── Fully symbolic kernel_size ──
+
+    #[test]
+    fn test_conv2d_symbolic_kernel_size() {
+        let app = layer_app("x", conv2d("3", "16", "k", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "H", "W"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        let out = output.unwrap();
+        assert_eq!(out[0], "batch");
+        assert_eq!(out[1], "16");
+        // symbolic: H - k + 1  (stride=1, padding=0, symbolic k)
+        assert!(out[2].contains('H'));
+        assert!(out[2].contains('k'));
+        assert!(out[2].contains('+'));
+        assert!(out[3].contains('W'));
+        assert!(out[3].contains('k'));
+    }
+
+    #[test]
+    fn test_conv1d_symbolic_kernel_size_stride1() {
+        let app = layer_app("x", conv1d("3", "16", "k", "1", "0"));
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3", "L"]))]);
+        let output = apply_layer_application(&app, &shapes).unwrap();
+        let out = output.unwrap();
+        // symbolic: L - k + 1
+        assert!(out[2].contains('L'));
+        assert!(out[2].contains('k'));
+    }
+
+    // ── Extra kwargs (dilation, groups) silently ignored — must not crash ──
+
+    #[test]
+    fn test_torch_conv2d_with_extra_kwargs_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        // dilation is not modeled; shape rule is approximate (dilation≠1 is wrong)
+        // but the layer should still be classified without crashing
+        let code = "import torch\ndef f(x: Float[Array, \"batch 3 32 32\"]):\n    layer = torch.nn.Conv2d(3, 16, 3, dilation=2, groups=1)\n    y = layer(x)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // dilation=2 gives wrong spatial output, but no crash and no false error
+        assert!(analysis.layers.contains_key("layer"));
+        assert!(analysis.errors.is_empty());
+        // Output shape is computed (though incorrect for dilation=2 — v1 limitation)
+        assert!(has_shape(&analysis, "y"));
+    }
+}

@@ -229,14 +229,14 @@ Legend:
 | Function/Class | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
 | `equinox.nn.Linear` | ✅ | ✅ | ✅ | Implemented as `LayerKind::Linear`. |
-| `torch.nn.Linear` | ❌ | ❌ | ❌ | Same last-dim transform. |
+| `torch.nn.Linear` | ✅ | ✅ | ✅ | Same last-dim transform. |
 | `flax.linen.Dense` | ❌ | ❌ | ❌ | Last-dim transform. |
-| `equinox.nn.Conv1d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `equinox.nn.Conv2d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `equinox.nn.Conv3d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv1d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv2d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv3d` | ❌ | ❌ | ❌ | Spatial formula. |
+| `equinox.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
+| `equinox.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
+| `equinox.nn.Conv3d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
+| `torch.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
+| `torch.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
+| `torch.nn.Conv3d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
 | `flax.linen.Conv` | ❌ | ❌ | ❌ | Spatial formula. |
 | `Dropout` variants | ❌ | ❌ | ❌ | Shape-preserving. |
 | `BatchNorm` variants | ❌ | ❌ | ❌ | Shape-preserving. |
