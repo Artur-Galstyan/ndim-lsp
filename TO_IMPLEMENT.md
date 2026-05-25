@@ -229,14 +229,14 @@ Legend:
 | Function/Class | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
 | `equinox.nn.Linear` | ✅ | ✅ | ✅ | Implemented as `LayerKind::Linear`. |
-| `torch.nn.Linear` | ❌ | ❌ | ❌ | Same last-dim transform. |
+| `torch.nn.Linear` | ✅ | ✅ | ✅ | Same last-dim transform. |
 | `flax.linen.Dense` | ❌ | ❌ | ❌ | Last-dim transform. |
-| `equinox.nn.Conv1d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `equinox.nn.Conv2d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `equinox.nn.Conv3d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv1d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv2d` | ❌ | ❌ | ❌ | Spatial formula. |
-| `torch.nn.Conv3d` | ❌ | ❌ | ❌ | Spatial formula. |
+| `equinox.nn.Conv1d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
+| `equinox.nn.Conv2d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
+| `equinox.nn.Conv3d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
+| `torch.nn.Conv1d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
+| `torch.nn.Conv2d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
+| `torch.nn.Conv3d` | ✅ | ✅ | ✅ | Spatial formula; stride/padding defaults. |
 | `flax.linen.Conv` | ❌ | ❌ | ❌ | Spatial formula. |
 | `Dropout` variants | ❌ | ❌ | ❌ | Shape-preserving. |
 | `BatchNorm` variants | ❌ | ❌ | ❌ | Shape-preserving. |

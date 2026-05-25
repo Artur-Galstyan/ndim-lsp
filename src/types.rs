@@ -96,6 +96,27 @@ pub enum LayerKind {
         in_features: String,
         out_features: String,
     },
+    Conv1d {
+        in_channels: String,
+        out_channels: String,
+        kernel_size: String,
+        stride: String,
+        padding: String,
+    },
+    Conv2d {
+        in_channels: String,
+        out_channels: String,
+        kernel_size: String,
+        stride: String,
+        padding: String,
+    },
+    Conv3d {
+        in_channels: String,
+        out_channels: String,
+        kernel_size: String,
+        stride: String,
+        padding: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]

@@ -16,17 +16,68 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     let is_torch_module = call.implementation.target.module_parts.len() >= 2
         && call.implementation.target.module_parts[0] == "torch"
         && call.implementation.target.module_parts[1] == "nn";
-    let is_linear_init =
-        call.signature.owner.as_deref() == Some("Linear") && call.signature.name == "__init__";
 
-    if (!is_equinox_module && !is_torch_module) || !is_linear_init {
+    if !is_equinox_module && !is_torch_module {
         return None;
     }
 
-    Some(LayerKind::Linear {
-        in_features: call.bindings.get("in_features")?.clone(),
-        out_features: call.bindings.get("out_features")?.clone(),
-    })
+    let owner = call.signature.owner.as_deref()?;
+    if call.signature.name != "__init__" {
+        return None;
+    }
+
+    match owner {
+        "Linear" => Some(LayerKind::Linear {
+            in_features: call.bindings.get("in_features")?.clone(),
+            out_features: call.bindings.get("out_features")?.clone(),
+        }),
+        "Conv1d" => Some(LayerKind::Conv1d {
+            in_channels: call.bindings.get("in_channels")?.clone(),
+            out_channels: call.bindings.get("out_channels")?.clone(),
+            kernel_size: call.bindings.get("kernel_size")?.clone(),
+            stride: call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+            padding: call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+        }),
+        "Conv2d" => Some(LayerKind::Conv2d {
+            in_channels: call.bindings.get("in_channels")?.clone(),
+            out_channels: call.bindings.get("out_channels")?.clone(),
+            kernel_size: call.bindings.get("kernel_size")?.clone(),
+            stride: call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+            padding: call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+        }),
+        "Conv3d" => Some(LayerKind::Conv3d {
+            in_channels: call.bindings.get("in_channels")?.clone(),
+            out_channels: call.bindings.get("out_channels")?.clone(),
+            kernel_size: call.bindings.get("kernel_size")?.clone(),
+            stride: call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+            padding: call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+        }),
+        _ => None,
+    }
 }
 
 pub fn extract_layer_assignments<F>(
@@ -98,6 +149,70 @@ pub fn extract_layer_applications(
     Ok(applications)
 }
 
+/// Compute the output spatial dimension for a convolution.
+/// Formula: floor((L + 2*padding - kernel_size) / stride) + 1
+///
+/// If all values and the spatial dim are integers, compute concretely.
+/// Otherwise build a symbolic string.
+fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding: &str) -> String {
+    // Try fully concrete computation
+    if let (Ok(l), Ok(k), Ok(s), Ok(p)) = (
+        spatial_dim.parse::<isize>(),
+        kernel_size.parse::<isize>(),
+        stride.parse::<isize>(),
+        padding.parse::<isize>(),
+    ) && s > 0
+    {
+        let l_out = (l + 2 * p - k) / s + 1;
+        return l_out.to_string();
+    }
+
+    // Symbolic: (L + 2*p - k) / s + 1
+    // Simplify piece by piece
+    let mut inner = spatial_dim.to_string();
+
+    // Add 2*padding
+    if let Ok(p) = padding.parse::<isize>() {
+        let twice_p = 2 * p;
+        if twice_p != 0 {
+            if twice_p > 0 {
+                inner = format!("{}+{}", inner, twice_p);
+            } else {
+                inner = format!("{}{}", inner, twice_p);
+            }
+        }
+    } else if padding == "0" {
+        // nothing
+    } else {
+        inner = format!("{}+2*{}", inner, padding);
+    }
+
+    // Subtract kernel_size
+    if let Ok(k) = kernel_size.parse::<isize>() {
+        if k != 0 {
+            if k > 0 {
+                inner = format!("{}-{}", inner, k);
+            } else {
+                inner = format!("{}+{}", inner, -k);
+            }
+        }
+    } else {
+        inner = format!("{}-{}", inner, kernel_size);
+    }
+
+    // Divide by stride
+    let divided = if stride == "1" {
+        inner.clone()
+    } else if let Ok(s) = stride.parse::<isize>() {
+        format!("({})/{}", inner, s)
+    } else {
+        format!("({})/{}", inner, stride)
+    };
+
+    // Add 1
+    format!("{}+1", divided)
+}
+
 pub fn apply_layer_application(
     app: &LayerApplication,
     shapes: &HashMap<String, Vec<String>>,
@@ -128,6 +243,108 @@ pub fn apply_layer_application(
             let mut output_shape = input_shape.clone();
             let last = output_shape.len() - 1;
             output_shape[last] = out_features.clone();
+            Ok(Some(output_shape))
+        }
+        LayerKind::Conv1d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => {
+            // Input: [..., in_channels, L]  =>  Output: [..., out_channels, L_out]
+            if input_shape.len() < 2 {
+                return Err(format!(
+                    "Conv1d layer '{}' requires input with at least 2 dims, got {} for '{}'",
+                    app.layer,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            let channels_dim = &input_shape[input_shape.len() - 2];
+            if channels_dim != in_channels {
+                return Err(format!(
+                    "Conv1d layer '{}' expected {} input channels, got {} for '{}'",
+                    app.layer, in_channels, channels_dim, app.input
+                ));
+            }
+            let spatial_dim = &input_shape[input_shape.len() - 1];
+            let l_out = conv_spatial_dim(spatial_dim, kernel_size, stride, padding);
+            let mut output_shape = input_shape.clone();
+            let n = output_shape.len();
+            output_shape[n - 2] = out_channels.clone();
+            output_shape[n - 1] = l_out;
+            Ok(Some(output_shape))
+        }
+        LayerKind::Conv2d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => {
+            // Input: [..., in_channels, H, W]  =>  Output: [..., out_channels, H_out, W_out]
+            if input_shape.len() < 3 {
+                return Err(format!(
+                    "Conv2d layer '{}' requires input with at least 3 dims, got {} for '{}'",
+                    app.layer,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            let channels_dim = &input_shape[input_shape.len() - 3];
+            if channels_dim != in_channels {
+                return Err(format!(
+                    "Conv2d layer '{}' expected {} input channels, got {} for '{}'",
+                    app.layer, in_channels, channels_dim, app.input
+                ));
+            }
+            let h_dim = &input_shape[input_shape.len() - 2];
+            let w_dim = &input_shape[input_shape.len() - 1];
+            let h_out = conv_spatial_dim(h_dim, kernel_size, stride, padding);
+            let w_out = conv_spatial_dim(w_dim, kernel_size, stride, padding);
+            let mut output_shape = input_shape.clone();
+            let n = output_shape.len();
+            output_shape[n - 3] = out_channels.clone();
+            output_shape[n - 2] = h_out;
+            output_shape[n - 1] = w_out;
+            Ok(Some(output_shape))
+        }
+        LayerKind::Conv3d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => {
+            // Input: [..., in_channels, D, H, W]  =>  Output: [..., out_channels, D_out, H_out, W_out]
+            if input_shape.len() < 4 {
+                return Err(format!(
+                    "Conv3d layer '{}' requires input with at least 4 dims, got {} for '{}'",
+                    app.layer,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            let channels_dim = &input_shape[input_shape.len() - 4];
+            if channels_dim != in_channels {
+                return Err(format!(
+                    "Conv3d layer '{}' expected {} input channels, got {} for '{}'",
+                    app.layer, in_channels, channels_dim, app.input
+                ));
+            }
+            let d_dim = &input_shape[input_shape.len() - 3];
+            let h_dim = &input_shape[input_shape.len() - 2];
+            let w_dim = &input_shape[input_shape.len() - 1];
+            let d_out = conv_spatial_dim(d_dim, kernel_size, stride, padding);
+            let h_out = conv_spatial_dim(h_dim, kernel_size, stride, padding);
+            let w_out = conv_spatial_dim(w_dim, kernel_size, stride, padding);
+            let mut output_shape = input_shape.clone();
+            let n = output_shape.len();
+            output_shape[n - 4] = out_channels.clone();
+            output_shape[n - 3] = d_out;
+            output_shape[n - 2] = h_out;
+            output_shape[n - 1] = w_out;
             Ok(Some(output_shape))
         }
     }
