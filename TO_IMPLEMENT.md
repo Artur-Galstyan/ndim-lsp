@@ -238,11 +238,11 @@ Legend:
 | `torch.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
 | `torch.nn.Conv3d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
 | `flax.linen.Conv` | ❌ | ❌ | ❌ | Spatial formula. |
-| `Dropout` variants | ❌ | ❌ | ❌ | Shape-preserving. |
-| `BatchNorm` variants | ❌ | ❌ | ❌ | Shape-preserving. |
-| `LayerNorm` variants | ❌ | ❌ | ❌ | Shape-preserving. |
-| `GroupNorm` variants | ❌ | ❌ | ❌ | Shape-preserving. |
-| activation functions/modules | ❌ | ❌ | ❌ | Shape-preserving. |
+| `Dropout` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`. |
+| `BatchNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`. |
+| `LayerNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`. |
+| `GroupNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`. |
+| activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`. |
 | pooling layers | ❌ | ❌ | ❌ | Spatial formula. |
 | attention layers | ❌ | ❌ | ❌ | Query/key/value shape rules. |
 
