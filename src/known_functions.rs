@@ -46,6 +46,10 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "cumprod" => Some(KnownFunction::Cumprod),
             "matmul" => Some(KnownFunction::Matmul),
             "dot" => Some(KnownFunction::Dot),
+            "tensordot" => Some(KnownFunction::TensorDot),
+            "outer" => Some(KnownFunction::Outer),
+            "inner" => Some(KnownFunction::Inner),
+            "vdot" => Some(KnownFunction::Vdot),
             "einsum" => Some(KnownFunction::Einsum),
             "split" => Some(KnownFunction::Split),
             "tile" => Some(KnownFunction::Tile),
@@ -112,6 +116,9 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "var" => Some(KnownFunction::Var),
             "matmul" => Some(KnownFunction::Matmul),
             "dot" => Some(KnownFunction::Dot),
+            "tensordot" => Some(KnownFunction::TensorDot),
+            "outer" => Some(KnownFunction::Outer),
+            "inner" => Some(KnownFunction::Inner),
             "einsum" => Some(KnownFunction::Einsum),
             "split" => Some(KnownFunction::Split),
             "tile" => Some(KnownFunction::Tile),
@@ -499,6 +506,10 @@ pub fn apply_known_function(
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
         KnownFunction::Dot => apply_known_dot(args, shapes),
+        KnownFunction::TensorDot => apply_known_tensordot(args, shapes),
+        KnownFunction::Outer => apply_known_outer(args, shapes),
+        KnownFunction::Inner => apply_known_inner(args, shapes),
+        KnownFunction::Vdot => apply_known_vdot(args, shapes),
         KnownFunction::Diag => apply_known_diag(args, shapes),
         KnownFunction::Diagonal => apply_known_diagonal(args, shapes),
         KnownFunction::Trace => apply_known_trace(args, shapes),
@@ -1297,6 +1308,141 @@ fn apply_known_dot(
     output.extend(right[..right.len() - 2].to_vec());
     output.push(right[right.len() - 1].clone());
     Ok(Some(output))
+}
+
+fn apply_known_tensordot(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((left_name, right_name)) = first_two_positional_values(args) else {
+        return Ok(None);
+    };
+    let Some(left) = shapes.get(&left_name) else {
+        return Ok(None);
+    };
+    let Some(right) = shapes.get(&right_name) else {
+        return Ok(None);
+    };
+
+    let axes_keyword = args.iter().find_map(|arg| match arg {
+        CallArgument::Keyword { name, value } if name == "axes" || name == "dims" => {
+            Some(value.as_str())
+        }
+        _ => None,
+    });
+    let third_positional = positional_arg_values(args).get(2).cloned();
+    let axes_value = axes_keyword
+        .map(str::to_string)
+        .or(third_positional)
+        .unwrap_or_else(|| "2".to_string());
+
+    let n = match parse_axis(&axes_value) {
+        Some(n) if n >= 0 => n as usize,
+        Some(_) => return Err("tensordot axes must be non-negative".to_string()),
+        None => return Ok(None),
+    };
+
+    if n > left.len() {
+        return Err(format!(
+            "tensordot axes {} exceeds left rank {}",
+            n,
+            left.len()
+        ));
+    }
+    if n > right.len() {
+        return Err(format!(
+            "tensordot axes {} exceeds right rank {}",
+            n,
+            right.len()
+        ));
+    }
+
+    let left_keep = &left[..left.len() - n];
+    let left_contract = &left[left.len() - n..];
+    let right_contract = &right[..n];
+    let right_keep = &right[n..];
+
+    for (l, r) in left_contract.iter().zip(right_contract.iter()) {
+        check_dim_match(l, r, "tensordot")?;
+    }
+
+    let mut output = left_keep.to_vec();
+    output.extend(right_keep.iter().cloned());
+    Ok(Some(output))
+}
+
+fn apply_known_outer(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((left_name, right_name)) = first_two_positional_values(args) else {
+        return Ok(None);
+    };
+    let Some(left) = shapes.get(&left_name) else {
+        return Ok(None);
+    };
+    let Some(right) = shapes.get(&right_name) else {
+        return Ok(None);
+    };
+
+    if left.is_empty() || right.is_empty() {
+        return Err("outer does not support scalar inputs".to_string());
+    }
+
+    let left_dim = if left.len() == 1 {
+        left[0].clone()
+    } else {
+        flattened_dim(left)
+    };
+    let right_dim = if right.len() == 1 {
+        right[0].clone()
+    } else {
+        flattened_dim(right)
+    };
+
+    Ok(Some(vec![left_dim, right_dim]))
+}
+
+fn apply_known_inner(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((left_name, right_name)) = first_two_positional_values(args) else {
+        return Ok(None);
+    };
+    let Some(left) = shapes.get(&left_name) else {
+        return Ok(None);
+    };
+    let Some(right) = shapes.get(&right_name) else {
+        return Ok(None);
+    };
+
+    if left.is_empty() || right.is_empty() {
+        return Err("inner does not support scalar inputs".to_string());
+    }
+
+    check_dim_match(left.last().unwrap(), right.last().unwrap(), "inner")?;
+
+    let mut output = left[..left.len() - 1].to_vec();
+    output.extend(right[..right.len() - 1].iter().cloned());
+    Ok(Some(output))
+}
+
+fn apply_known_vdot(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((left_name, right_name)) = first_two_positional_values(args) else {
+        return Ok(None);
+    };
+    let Some(_left) = shapes.get(&left_name) else {
+        return Ok(None);
+    };
+    let Some(_right) = shapes.get(&right_name) else {
+        return Ok(None);
+    };
+
+    Ok(Some(Vec::new()))
 }
 
 fn apply_known_diag(
@@ -2673,6 +2819,123 @@ mod known_function_shape_rule_tests {
         let output = apply_known_function(&KnownFunction::Dot, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["b1", "m", "b2", "n"])));
+    }
+
+    #[test]
+    fn test_tensordot_default_axes_two() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n", "k1", "k2"])),
+            ("b".to_string(), shape(&["k1", "k2", "p", "q"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::TensorDot, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n", "p", "q"])));
+    }
+
+    #[test]
+    fn test_tensordot_int_axes_one() {
+        let args = vec![pos("a"), pos("b"), pos("1")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "k"])),
+            ("b".to_string(), shape(&["k", "n"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::TensorDot, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_tensordot_axes_keyword() {
+        let args = vec![pos("a"), pos("b"), kw("axes", "1")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["batch", "features"])),
+            ("b".to_string(), shape(&["features", "out"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::TensorDot, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "out"])));
+    }
+
+    #[test]
+    fn test_tensordot_contraction_mismatch_errors() {
+        let args = vec![pos("a"), pos("b"), pos("1")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "k"])),
+            ("b".to_string(), shape(&["other", "n"])),
+        ]);
+
+        let error = apply_known_function(&KnownFunction::TensorDot, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_outer_1d_1d() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m"])),
+            ("b".to_string(), shape(&["n"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Outer, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_outer_higher_rank_flattens() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["4", "5"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Outer, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["6", "20"])));
+    }
+
+    #[test]
+    fn test_inner_2d_2d_match() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "k"])),
+            ("b".to_string(), shape(&["n", "k"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Inner, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_inner_last_dim_mismatch_errors() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "k"])),
+            ("b".to_string(), shape(&["n", "other"])),
+        ]);
+
+        let error = apply_known_function(&KnownFunction::Inner, &args, &shapes).unwrap_err();
+
+        assert!(error.contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_vdot_returns_scalar() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["6"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Vdot, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
     }
 
     #[test]

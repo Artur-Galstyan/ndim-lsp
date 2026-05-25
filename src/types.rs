@@ -152,6 +152,10 @@ pub enum KnownFunction {
     Sort,
     Cumsum,
     Cumprod,
+    TensorDot,
+    Outer,
+    Inner,
+    Vdot,
 }
 
 #[derive(Debug, Clone)]

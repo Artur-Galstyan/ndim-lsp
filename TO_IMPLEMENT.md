@@ -153,10 +153,10 @@ Legend:
 | `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ❌ | ❌ | Equation parser needed. |
 | `jax.lax.dot` | ✅ | ✅ | ✅ | Dot semantics. |
 | `jax.lax.dot_general` | ✅ | ✅ | ✅ | Currently approximated as matmul. |
-| `jnp.vdot` / `np.vdot` | ❌ | ❌ | ❌ | Flattened dot. |
-| `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ❌ | ❌ | ❌ | Contract axes. |
-| `jnp.outer` / `np.outer` / `torch.outer` | ❌ | ❌ | ❌ | Output `(a, b)`. |
-| `jnp.inner` / `np.inner` | ❌ | ❌ | ❌ | Last-axis contraction. |
+| `jnp.vdot` / `np.vdot` | ✅ | ✅ | ✅ | Flattened dot — scalar output. |
+| `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ✅ | ✅ | ✅ | Contract axes. Only int-axes form supported; tuple-of-lists form is a follow-up. |
+| `jnp.outer` / `np.outer` / `torch.outer` | ✅ | ✅ | ✅ | Output `(a, b)`. |
+| `jnp.inner` / `np.inner` | ✅ | ✅ | ✅ | Last-axis contraction. |
 | `jnp.cross` / `np.cross` / `torch.cross` | ❌ | ❌ | ❌ | Vector axis length 2/3. |
 | `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ❌ | ❌ | ❌ | Axis-dependent. |
 | `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ❌ | ❌ | ❌ | Square matrix -> batch shape. |
