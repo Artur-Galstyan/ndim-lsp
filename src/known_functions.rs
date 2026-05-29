@@ -1277,9 +1277,15 @@ fn apply_known_matmul(
             } else {
                 Some(left[left.len() - 2].clone())
             };
-            let left_k = left.last().unwrap();
+            // Invariant: the `match` arms above handle (0, _), (_, 0), (1, 1), (1, 2),
+            // and (2, 1). In the `_` arm both left.len() and right.len() are >= 1.
+            let left_k = left
+                .last()
+                .expect("invariant: left.len() >= 1 in the `_` arm of matmul");
             let right_k = if right.len() == 1 {
-                right.last().unwrap()
+                right
+                    .last()
+                    .expect("invariant: right.len() >= 1 in the `_` arm of matmul")
             } else {
                 &right[right.len() - 2]
             };
@@ -1321,11 +1327,19 @@ fn apply_known_dot(
     }
 
     if right.len() == 1 {
-        check_dim_match(left.last().unwrap(), &right[0], "dot")?;
+        // Invariant: `left.is_empty()` guard above ensures left.last() is Some.
+        let left_last = left
+            .last()
+            .expect("invariant: left non-empty checked above");
+        check_dim_match(left_last, &right[0], "dot")?;
         return Ok(Some(left[..left.len() - 1].to_vec()));
     }
 
-    check_dim_match(left.last().unwrap(), &right[right.len() - 2], "dot")?;
+    // Invariant: `left.is_empty()` guard above ensures left.last() is Some.
+    let left_last = left
+        .last()
+        .expect("invariant: left non-empty checked above");
+    check_dim_match(left_last, &right[right.len() - 2], "dot")?;
     let mut output = left[..left.len() - 1].to_vec();
     output.extend(right[..right.len() - 2].to_vec());
     output.push(right[right.len() - 1].clone());
@@ -1443,7 +1457,14 @@ fn apply_known_inner(
         return Err("inner does not support scalar inputs".to_string());
     }
 
-    check_dim_match(left.last().unwrap(), right.last().unwrap(), "inner")?;
+    // Invariant: `left.is_empty() || right.is_empty()` guard above ensures both are non-empty.
+    let left_last = left
+        .last()
+        .expect("invariant: left non-empty checked above");
+    let right_last = right
+        .last()
+        .expect("invariant: right non-empty checked above");
+    check_dim_match(left_last, right_last, "inner")?;
 
     let mut output = left[..left.len() - 1].to_vec();
     output.extend(right[..right.len() - 1].iter().cloned());

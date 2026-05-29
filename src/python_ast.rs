@@ -259,7 +259,12 @@ pub fn extract_jaxtyping_shapes(
         }
 
         let quoted = &trimmed[quote_start..];
-        let quote = quoted.chars().next().unwrap();
+        // Invariant: `quote_start` comes from `trimmed.find(['"', '\''])` above,
+        // so `trimmed[quote_start..]` begins with a quote character.
+        let quote = quoted
+            .chars()
+            .next()
+            .expect("invariant: quote_start points to a quote char");
         let triple = quote.to_string().repeat(3);
         let unquoted = if quoted.starts_with(&triple) && quoted.ends_with(&triple) {
             &quoted[3..quoted.len() - 3]
