@@ -273,10 +273,9 @@ fn apply_matmul_shape(
         ));
     }
 
-    // Last dim of LHS must equal second-to-last dim of RHS
-    let lhs_last = left
-        .last()
-        .ok_or_else(|| format!("matmul on {} requires at least one dimension", left_name))?;
+    // Last dim of LHS must equal second-to-last dim of RHS.
+    // Invariant: left.len() >= 2 and right.len() >= 2 (guard above).
+    let lhs_last = left.last().expect("invariant: left.len() >= 2 checked above");
     let rhs_second_last = &right[right.len() - 2];
 
     if lhs_last != rhs_second_last {
@@ -290,7 +289,7 @@ fn apply_matmul_shape(
     output.push(
         right
             .last()
-            .ok_or_else(|| format!("matmul on {} requires at least one dimension", right_name))?
+            .expect("invariant: right.len() >= 2 checked above")
             .clone(),
     );
     Ok(Some(output))

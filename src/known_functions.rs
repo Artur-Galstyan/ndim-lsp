@@ -1277,13 +1277,15 @@ fn apply_known_matmul(
             } else {
                 Some(left[left.len() - 2].clone())
             };
+            // Invariant: the `match` arms above handle (0, _), (_, 0), (1, 1), (1, 2),
+            // and (2, 1). In the `_` arm both left.len() and right.len() are >= 1.
             let left_k = left
                 .last()
-                .ok_or_else(|| "matmul: left tensor has no dimensions".to_string())?;
+                .expect("invariant: left.len() >= 1 in the `_` arm of matmul");
             let right_k = if right.len() == 1 {
                 right
                     .last()
-                    .ok_or_else(|| "matmul: right tensor has no dimensions".to_string())?
+                    .expect("invariant: right.len() >= 1 in the `_` arm of matmul")
             } else {
                 &right[right.len() - 2]
             };
@@ -1325,16 +1327,18 @@ fn apply_known_dot(
     }
 
     if right.len() == 1 {
+        // Invariant: `left.is_empty()` guard above ensures left.last() is Some.
         let left_last = left
             .last()
-            .ok_or_else(|| "dot: left tensor has no dimensions".to_string())?;
+            .expect("invariant: left non-empty checked above");
         check_dim_match(left_last, &right[0], "dot")?;
         return Ok(Some(left[..left.len() - 1].to_vec()));
     }
 
+    // Invariant: `left.is_empty()` guard above ensures left.last() is Some.
     let left_last = left
         .last()
-        .ok_or_else(|| "dot: left tensor has no dimensions".to_string())?;
+        .expect("invariant: left non-empty checked above");
     check_dim_match(left_last, &right[right.len() - 2], "dot")?;
     let mut output = left[..left.len() - 1].to_vec();
     output.extend(right[..right.len() - 2].to_vec());
@@ -1453,12 +1457,13 @@ fn apply_known_inner(
         return Err("inner does not support scalar inputs".to_string());
     }
 
+    // Invariant: `left.is_empty() || right.is_empty()` guard above ensures both are non-empty.
     let left_last = left
         .last()
-        .ok_or_else(|| "inner: left tensor has no dimensions".to_string())?;
+        .expect("invariant: left non-empty checked above");
     let right_last = right
         .last()
-        .ok_or_else(|| "inner: right tensor has no dimensions".to_string())?;
+        .expect("invariant: right non-empty checked above");
     check_dim_match(left_last, right_last, "inner")?;
 
     let mut output = left[..left.len() - 1].to_vec();
