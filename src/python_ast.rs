@@ -259,7 +259,9 @@ pub fn extract_jaxtyping_shapes(
         }
 
         let quoted = &trimmed[quote_start..];
-        let quote = quoted.chars().next().unwrap();
+        let Some(quote) = quoted.chars().next() else {
+            return Vec::new();
+        };
         let triple = quote.to_string().repeat(3);
         let unquoted = if quoted.starts_with(&triple) && quoted.ends_with(&triple) {
             &quoted[3..quoted.len() - 3]
