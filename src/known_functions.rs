@@ -2570,6 +2570,63 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
+    fn test_reshape_numeric_dims_ok() {
+        let args = vec![pos("x"), pos("(2, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_reshape_symbolic_dims_ok() {
+        let args = vec![pos("x"), pos("(batch, features)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_reshape_minus_one_numeric() {
+        let args = vec![pos("x"), pos("(3, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["12"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_reshape_product_mismatch_errors() {
+        let args = vec![pos("x"), pos("(2, 4)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+
+        let error = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap_err();
+
+        assert!(
+            error.contains("reshape"),
+            "error should mention 'reshape': {error}"
+        );
+        assert!(
+            error.contains("6") || error.contains("8"),
+            "error should mention mismatched product info: {error}"
+        );
+    }
+
+    #[test]
+    fn test_reshape_method_call_form() {
+        let args = vec![pos("2"), pos("3")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+
+        let output = apply_method_call(&KnownFunction::Reshape, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
     fn test_flatten_numeric_shape() {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["2", "3", "4"]))]);
