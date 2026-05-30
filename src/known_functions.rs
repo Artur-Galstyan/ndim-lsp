@@ -51,7 +51,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "inner" => Some(KnownFunction::Inner),
             "vdot" => Some(KnownFunction::Vdot),
             "einsum" => Some(KnownFunction::Einsum),
-            "split" => Some(KnownFunction::Split),
+            "split" | "array_split" => Some(KnownFunction::Split),
             "tile" => Some(KnownFunction::Tile),
             "repeat" => Some(KnownFunction::Repeat),
             "flatten" => Some(KnownFunction::Flatten),
@@ -120,7 +120,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "outer" => Some(KnownFunction::Outer),
             "inner" => Some(KnownFunction::Inner),
             "einsum" => Some(KnownFunction::Einsum),
-            "split" => Some(KnownFunction::Split),
+            "split" | "tensor_split" => Some(KnownFunction::Split),
             "tile" => Some(KnownFunction::Tile),
             "repeat" => Some(KnownFunction::Repeat),
             "flatten" => Some(KnownFunction::Flatten),
@@ -561,6 +561,7 @@ pub fn apply_known_function(
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
+        KnownFunction::Split => apply_known_split(args, shapes),
         _ => Ok(None),
     }
 }
@@ -2163,6 +2164,224 @@ fn apply_known_linalg_det(
     }
 
     Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
+}
+
+/// Apply shape inference for `jnp.split`, `np.split`, `np.array_split`,
+/// `torch.split`, and `torch.tensor_split`.
+///
+/// # Blocker — tuple return type
+///
+/// The current return type `Result<Option<Vec<String>>, String>` represents a
+/// **single** output shape. `split` returns a *tuple* of N arrays. Until the
+/// inference framework can express tuple-valued returns, this function:
+///
+/// * validates the call (axis in range, divisibility, etc.);
+/// * delegates the real shape math to the public [`compute_split_shapes`]
+///   helper; and
+/// * returns `Ok(None)` to signal "recognised but no single shape to store".
+///
+/// When tuple unpacking lands on the analysis side, switch the dispatch to
+/// use `compute_split_shapes` directly and store the per-element shapes on
+/// the unpacked targets.
+fn apply_known_split(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    // Validate — surface errors to the user but don’t store a shape.
+    let _ = compute_split_shapes(args, shapes)?;
+    Ok(None)
+}
+
+/// Compute the per-element output shapes for a `split`-family call.
+///
+/// Returns `Ok(Some(shapes))` where `shapes` is a `Vec` of length `N`, one
+/// element per output array. Returns `Ok(None)` when the split specification
+/// is not a recognised literal (CASE 3: out of scope — a variable or
+/// non-literal expression).
+///
+/// ## Semantics
+///
+/// ### CASE 1 — integer literal `N`
+///
+/// `split(x, N, axis=k)` divides axis `k` into `N` equal parts.
+///
+/// * If the axis dimension is **numeric** and divisible by `N`: each output
+///   gets `axis_dim / N` along the split axis.
+/// * If the axis dimension is **symbolic**: each output gets a synthetic
+///   dimension named `"split(<axis_dim>, <N>)"`.
+/// * If the axis dimension is numeric but **not** divisible by `N`: error.
+///
+/// ### CASE 2 — list literal `[i₁, i₂, …, iₖ]`
+///
+/// Numpy-style index-based split. The list marks split *points* (indices
+/// after which to cut), producing `k + 1` output arrays with axis sizes:
+///
+/// ```text
+/// i₁,  i₂ − i₁,  i₃ − i₂,  …,  total − iₖ
+/// ```
+///
+/// When all indices and the total are numeric, the arithmetic is resolved
+/// directly. When any value is symbolic, the dimension is emitted as a
+/// synthetic expression like `"5-i1"` or `"n-5"`.
+///
+/// ### CASE 3 — non-literal (out of scope)
+///
+/// Returns `Ok(None)`.
+pub fn compute_split_shapes(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<Vec<String>>>, String> {
+    // ── input array ──────────────────────────────────────────────────
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.get(input_name) else {
+        return Ok(None);
+    };
+    if input_shape.is_empty() {
+        return Err("split requires rank >= 1 input".to_string());
+    }
+    let rank = input_shape.len();
+
+    // ── axis ─────────────────────────────────────────────────────────
+    let axis = normalize_axis(axis_arg(args, 0), rank, "split")?;
+
+    // ── split specification (second positional or keyword) ───────────
+    let mut split_spec: Option<&str> = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue; // this was the input array
+                }
+                split_spec = Some(value.as_str());
+            }
+            CallArgument::Keyword { name, value }
+                if name == "indices_or_sections" || name == "sections" =>
+            {
+                split_spec = Some(value.as_str());
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(split_spec) = split_spec else {
+        return Ok(None);
+    };
+    let trimmed_spec = split_spec.trim();
+
+    // ── CASE 1: integer literal N ────────────────────────────────────
+    if let Ok(n) = trimmed_spec.parse::<usize>() {
+        if n == 0 {
+            return Err("split requires N > 0".to_string());
+        }
+        let axis_dim = &input_shape[axis];
+
+        if let Ok(axis_size) = axis_dim.parse::<usize>()
+            && axis_size % n != 0
+        {
+            return Err(format!(
+                "split cannot divide axis size {} evenly into {} parts",
+                axis_size, n
+            ));
+        }
+
+        // Synthetic dimension naming convention:
+        //   numeric  → axis_size / N  (e.g. "2")
+        //   symbolic → "split(<dim>, <N>)"  (e.g. "split(n, 2)")
+        let chunk_dim = if let Ok(axis_size) = axis_dim.parse::<usize>() {
+            (axis_size / n).to_string()
+        } else {
+            format!("split({}, {})", axis_dim, n)
+        };
+
+        let mut output_shapes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut out = input_shape.clone();
+            out[axis] = chunk_dim.clone();
+            output_shapes.push(out);
+        }
+        return Ok(Some(output_shapes));
+    }
+
+    // ── CASE 2: list literal of indices ──────────────────────────────
+    if let Some(index_names) = parse_simple_sequence_names(trimmed_spec) {
+        if index_names.is_empty() {
+            // Empty list → single output identical to input.
+            return Ok(Some(vec![input_shape.clone()]));
+        }
+
+        let axis_dim = &input_shape[axis];
+        let total: Option<usize> = axis_dim.parse().ok();
+
+        // Try to parse each index as a usize.
+        let indices: Vec<Option<usize>> = index_names
+            .iter()
+            .map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+
+        let num_sections = indices.len() + 1;
+        let mut output_shapes = Vec::with_capacity(num_sections);
+
+        // Build section sizes.
+        // prev_str tracks the *expression* for the previous split point;
+        // prev_val tracks the *numeric value* when available.
+        let mut prev_str = "0".to_string();
+        let mut prev_val: Option<usize> = Some(0);
+
+        for (i, idx_opt) in indices.iter().enumerate() {
+            let mut out = input_shape.clone();
+            let curr_str = index_names[i].trim().to_string();
+
+            match (prev_val, *idx_opt, total) {
+                _ if prev_val.is_none() && idx_opt.is_none() => {
+                    // Both boundaries symbolic — emit "curr-prev".
+                    out[axis] = format!("{}-{}", curr_str, prev_str);
+                }
+                (_, Some(curr), Some(_total)) if prev_val.is_some() => {
+                    // Both boundaries numeric — resolve.
+                    if curr < prev_val.unwrap() {
+                        return Err(format!(
+                            "split indices must be non-decreasing, got {} after {}",
+                            curr,
+                            prev_val.unwrap()
+                        ));
+                    }
+                    out[axis] = (curr - prev_val.unwrap()).to_string();
+                }
+                (_, Some(curr), _) if prev_val.is_none() => {
+                    // Prev symbolic, curr numeric.
+                    out[axis] = format!("{}-{}", curr, prev_str);
+                }
+                _ => {
+                    // Curr symbolic, prev may or may not be numeric.
+                    out[axis] = format!("{}-{}", curr_str, prev_str);
+                }
+            }
+
+            prev_str = curr_str;
+            prev_val = *idx_opt;
+            output_shapes.push(out);
+        }
+
+        // Final section: from last index to end of axis.
+        let mut out = input_shape.clone();
+        match (prev_val, total) {
+            (Some(prev), Some(total)) => {
+                out[axis] = (total - prev).to_string();
+            }
+            _ => {
+                out[axis] = format!("{}-{}", axis_dim, prev_str);
+            }
+        }
+        output_shapes.push(out);
+
+        return Ok(Some(output_shapes));
+    }
+
+    // ── CASE 3: non-literal → out of scope ───────────────────────────
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -5436,6 +5655,86 @@ mod method_call_tests {
         let args: Vec<CallArgument> = vec![];
 
         let output = apply_method_call(&KnownFunction::Sum, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // ── split shape rule tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_split_int_numeric_axis() {
+        // split [6, 4] into 3 along axis 0 → each output [2, 4]
+        let shapes = HashMap::from([("x".to_string(), shape(&["6", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("axis", "0")];
+
+        let result = compute_split_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![
+                shape(&["2", "4"]),
+                shape(&["2", "4"]),
+                shape(&["2", "4"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_split_indices_list() {
+        // numpy semantics: split [10] at indices [2, 5] along axis 0
+        // → sections [0..2], [2..5], [5..10] → sizes 2, 3, 5
+        let shapes = HashMap::from([("x".to_string(), shape(&["10"]))]);
+        let args = vec![pos("x"), pos("[2, 5]"), kw("axis", "0")];
+
+        let result = compute_split_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![shape(&["2"]), shape(&["3"]), shape(&["5"]),])
+        );
+    }
+
+    #[test]
+    fn test_split_symbolic_axis() {
+        // split [batch, n] into 2 along axis 1 → each output [batch, "split(n, 2)"]
+        //
+        // Synthetic naming convention: when the axis dimension is symbolic,
+        // the chunk size is emitted as "split(<axis_dim>, <N>)".
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n"]))]);
+        let args = vec![pos("x"), pos("2"), kw("axis", "1")];
+
+        let result = compute_split_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![
+                shape(&["batch", "split(n, 2)"]),
+                shape(&["batch", "split(n, 2)"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_split_non_divisible_numeric_errors() {
+        // split [7] into 2 → Err (7 % 2 != 0)
+        let shapes = HashMap::from([("x".to_string(), shape(&["7"]))]);
+        let args = vec![pos("x"), pos("2"), kw("axis", "0")];
+
+        let result = compute_split_shapes(&args, &shapes);
+
+        assert!(result.is_err());
+    }
+
+    /// apply_known_function dispatch returns Ok(None) for Split
+    /// because the current return type cannot express a tuple of shapes.
+    /// This is a documented blocker — once tuple returns are wired through,
+    /// the dispatch should delegate to compute_split_shapes directly.
+    #[test]
+    fn test_split_dispatch_returns_none_blocker() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["6", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("axis", "0")];
+
+        let output = apply_known_function(&KnownFunction::Split, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
