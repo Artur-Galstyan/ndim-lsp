@@ -4665,3 +4665,345 @@ def caller(y: Float[Array, "batch"]) -> None:
         );
     }
 }
+
+mod vmap_shape_inference_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// Helper: find a shape for `var` in the scope named `scope_name`.
+    fn find_shape_in_scope<'a>(
+        analysis: &'a LayerShapeAnalysis,
+        scope_name: &str,
+        var: &str,
+    ) -> Option<&'a Vec<String>> {
+        analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some(scope_name))
+            .and_then(|s| s.shapes.get(var))
+    }
+
+    /// Test 1: basic jax.vmap shape inference.
+    /// vf = jax.vmap(f) applied to a batched input peels axis 0,
+    /// applies f's shape rule, then prepends the batch dim.
+    #[test]
+    fn test_vmap_basic_jax() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["B", "m"]))
+        );
+    }
+
+    /// Test 2: basic equinox.filter_vmap shape inference.
+    /// Same as test 1 but with `import equinox as eqx; eqx.filter_vmap(f)`.
+    #[test]
+    fn test_filter_vmap_basic_equinox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = eqx.filter_vmap(f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["B", "m"]))
+        );
+    }
+
+    /// Test 3: vmap with in_axes=1.
+    /// Batch dim is peeled from position 1; default out_axes=0 prepends
+    /// to front.
+    #[test]
+    fn test_vmap_in_axes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f, in_axes=1)
+
+def caller(x: Float[Array, "n B"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["B", "m"]))
+        );
+    }
+
+    /// Test 4: vmap with out_axes=1.
+    /// Default in_axes=0 peels from front; out_axes=1 inserts batch dim
+    /// at position 1.
+    #[test]
+    fn test_vmap_out_axes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f, out_axes=1)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["m", "B"]))
+        );
+    }
+
+    /// Test 5: multi-arg vmap where batch dims disagree emits an error.
+    #[test]
+    fn test_vmap_multi_arg_batch_dims_must_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"], y: Float[Array, "k"]) -> Float[Array, "n k"]:
+    pass
+
+vf = jax.vmap(f)
+
+def caller(a: Float[Array, "B n"], b: Float[Array, "C k"]) -> None:
+    z = vf(a, b)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "z");
+        assert!(
+            analysis.errors[0].message.contains("batch dims disagree"),
+            "error should mention batch dims disagree: {:?}",
+            analysis.errors[0].message
+        );
+        // No shape recorded for z when there's a mismatch.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            None
+        );
+    }
+
+    /// Test 6: wrapped function without annotations — silently skips.
+    #[test]
+    fn test_vmap_wrapped_function_without_annotations_skips_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x):
+    pass
+
+vf = jax.vmap(f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            None
+        );
+    }
+
+    /// Test 7: tuple in_axes is skipped silently (not a scalar int).
+    #[test]
+    fn test_vmap_tuple_in_axes_skipped_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f, in_axes=(0, 1))
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // vf was not recorded in vmap_targets because in_axes=(0,1) isn't
+        // a scalar int, so the call `y = vf(x)` falls through — no shape,
+        // no error.
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            None
+        );
+    }
+
+    /// Test 8: non-literal function arg (dotted name) is skipped.
+    #[test]
+    fn test_vmap_non_literal_function_arg_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pass a dotted name as the wrapped function — not a bare ident.
+        // Our parse logic rejects dotted names (contains '.').
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+# module.f is not a bare identifier
+vf = jax.vmap(module.f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // vf was not recorded because "module.f" contains a dot.
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            None
+        );
+    }
+
+    /// Test 9: arg rank insufficient for in_axes emits an error.
+    /// vmap(f) with in_axes=0 on a rank-1 input → peeled to rank 0.
+    /// Then f expects rank 1 for param 'x' but gets rank 0.
+    #[test]
+    fn test_vmap_arg_rank_insufficient_emits_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f)
+
+def caller(x: Float[Array, "scalar"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // The arg has rank 1, in_axes=0 peels axis 0, leaving rank 0.
+        // Then f expects rank 1 for param 'x' but gets rank 0.
+        // This should produce an error from bind_and_substitute.
+        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "y");
+        assert!(
+            analysis.errors[0].message.contains("f"),
+            "error should mention function 'f': {:?}",
+            analysis.errors[0].message
+        );
+        // No shape for y when there's a binding error.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            None
+        );
+    }
+
+    /// Test 10: arg variable name matches wrapped function's param name.
+    /// def f(x: ...) -> ... and caller uses `vf(x)` where the caller
+    /// also names its variable `x`. This previously tripped a
+    /// mode-detection heuristic in bind_and_substitute. Now both
+    /// callers normalize to (param_name, shape) before calling
+    /// the helper, so this case should work correctly.
+    #[test]
+    fn test_vmap_arg_var_name_matches_wrapped_param_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["B", "m"]))
+        );
+    }
+}

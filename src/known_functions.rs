@@ -12,6 +12,14 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     let is_jax_numpy = module == ["jax", "numpy"];
     let is_numpy = module == ["numpy"];
     let is_torch = module == ["torch"];
+    let is_equinox = module == ["equinox"];
+    if is_equinox {
+        return match name.as_str() {
+            "filter_vmap" => Some(KnownFunction::Vmap),
+            _ => None,
+        };
+    }
+
     let is_jax_lax = module == ["jax", "lax"];
 
     if is_jax {
@@ -5511,6 +5519,9 @@ mod known_function_tests {
     );
 
     known_case!(jax_vmap, ["jax", "vmap"], Some(KnownFunction::Vmap));
+    known_case!(equinox_filter_vmap, ["equinox", "filter_vmap"], Some(KnownFunction::Vmap));
+    // equinox.nn.filter_vmap is NOT a known function — wrong module path
+    known_case!(equinox_nn_filter_vmap_rejected, ["equinox", "nn", "filter_vmap"], None);
     known_case!(jax_lax_dot, ["jax", "lax", "dot"], Some(KnownFunction::Dot));
     known_case!(
         jax_lax_dot_general,
@@ -5690,6 +5701,25 @@ mod known_function_tests {
         from_import_jax_vmap_alias,
         "from jax import vmap as vm",
         "vm",
+        Some(KnownFunction::Vmap)
+    );
+    // equinox.filter_vmap alias tests
+    alias_case!(
+        alias_equinox_filter_vmap,
+        "import equinox",
+        "equinox.filter_vmap",
+        Some(KnownFunction::Vmap)
+    );
+    alias_case!(
+        alias_equinox_as_eqx_filter_vmap,
+        "import equinox as eqx",
+        "eqx.filter_vmap",
+        Some(KnownFunction::Vmap)
+    );
+    alias_case!(
+        from_import_equinox_filter_vmap,
+        "from equinox import filter_vmap",
+        "filter_vmap",
         Some(KnownFunction::Vmap)
     );
     alias_case!(

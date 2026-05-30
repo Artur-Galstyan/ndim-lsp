@@ -79,6 +79,135 @@ enum CallEntry {
     BinaryOp(BinaryOpInfo),
 }
 
+// ── vmap support ──────────────────────────────────────────────────────────
+//
+// v1 limitations (documented in code comments and PR description):
+// - Only scalar-integer `in_axes` / `out_axes` are supported. Tuple,
+//   PyTree, or `None` values cause `parse_vmap_call` to return None and
+//   the call is silently skipped.
+// - Nested vmap (`vmap(vmap(f))`) is not supported: the first positional
+//   arg must be a bare identifier, so a `vmap(...)` expression won't parse
+//   as a function name.
+// - Cross-file wrapped functions are not supported: if `f` is imported
+//   from another module, scope lookup will fail and we return Ok(None).
+// - `vmap_targets` is global to the analysis pass, not per-scope. Nested-
+//   scope shadowing of a vmap name is out of scope for v1.
+// - `axis_size` keyword is not supported.
+
+/// Metadata recorded when `jax.vmap(f, ...)` or `equinox.filter_vmap(f, ...)`
+/// is encountered during the walk.
+#[derive(Debug, Clone)]
+struct VmapInfo {
+    /// Name of the function being vmapped (bare identifier, e.g. "f").
+    wrapped: String,
+    /// `in_axes` value — default 0. Only scalar integers are honoured in v1.
+    in_axes: isize,
+    /// `out_axes` value — default 0. Only scalar integers are honoured in v1.
+    out_axes: isize,
+}
+
+/// Parse a vmap/filter_vmap call's arguments into a `VmapInfo`.
+///
+/// Returns `None` if:
+/// - The first positional arg is not a bare identifier (contains `.` or is
+///   not simple).
+/// - `in_axes` or `out_axes` is present but not a literal integer (tuple,
+///   variable, `None`, etc.).
+fn parse_vmap_call(args: &[CallArgument]) -> Option<VmapInfo> {
+    // First positional arg = wrapped function name.
+    let first_positional = args.iter().find_map(|arg| match arg {
+        CallArgument::Positional { value } => Some(value.clone()),
+        _ => None,
+    })?;
+
+    // Must be a bare identifier — no dots (no qualified names like
+    // `module.func`), and no expressions like `lambda x: x`.
+    if first_positional.contains('.') {
+        return None;
+    }
+
+    // Read in_axes (default 0). Only scalar literal ints are honoured.
+    let in_axes = parse_int_keyword(args, "in_axes", 0)?;
+    // Read out_axes (default 0). Same rule.
+    let out_axes = parse_int_keyword(args, "out_axes", 0)?;
+
+    Some(VmapInfo {
+        wrapped: first_positional,
+        in_axes,
+        out_axes,
+    })
+}
+
+/// Extract a keyword argument as `isize`, falling back to `default`.
+/// Returns `None` if the keyword is present but its value is not a
+/// parseable integer (e.g. tuple, variable, None).
+fn parse_int_keyword(args: &[CallArgument], name: &str, default: isize) -> Option<isize> {
+    for arg in args {
+        if let CallArgument::Keyword { name: kw_name, value } = arg
+            && kw_name == name
+        {
+            return value.parse::<isize>().ok();
+        }
+    }
+    Some(default) // keyword not present → use default
+}
+
+/// Peel the batch dim from a shape at position `axis`.
+/// Returns `Ok((peeled_shape, batch_dim))` or `Err(msg)`.
+fn peel_batch_dim(shape: &[String], axis: isize) -> Result<(Vec<String>, String), String> {
+    let len = shape.len() as isize;
+    if len == 0 {
+        return Err("cannot peel axis from scalar (rank-0)".to_string());
+    }
+    let axis = if axis < 0 { axis + len } else { axis };
+    if axis < 0 || axis >= len {
+        return Err(format!(
+            "axis {} out of bounds for rank {}",
+            axis, len
+        ));
+    }
+    let axis = axis as usize;
+    let batch_dim = shape[axis].clone();
+    let mut peeled = shape.to_vec();
+    peeled.remove(axis);
+    Ok((peeled, batch_dim))
+}
+
+/// Insert a batch dim at position `axis` in the shape.
+/// Negative axes count from the right *relative to the shape after
+/// insertion* (numpy `np.insert` semantics). For v1 we clamp the
+/// effective axis to `0..=len`.
+///
+/// The `len + axis + 1` formula for negative axes follows np.insert
+/// convention: axis = -1 means "insert before the last element of
+/// the result after insertion", which for a pre-insertion length of
+/// `len` means position `len` (i.e. append at the end).
+///
+/// Example: shape = ["m"] (post-peel rank 1), axis = -1
+///   → effective axis = 1 + (-1) + 1 = 1 → insert at position 1 (end of result)
+///   → result = ["m", "B"]
+///
+/// Example: shape = ["m"] (post-peel rank 1), axis = 1
+///   → effective axis = 1 (clamped to len=1) → insert at position 1 (end)
+///   → result = ["m", "B"]
+///
+/// Example: shape = ["m", "k"] (post-peel rank 2), axis = -1
+///   → effective axis = 2 + (-1) + 1 = 2 → insert at position 2 (end)
+///   → result = ["m", "k", "B"]
+fn prepend_batch_dim(mut shape: Vec<String>, axis: isize, dim: String) -> Vec<String> {
+    let len = shape.len() as isize;
+    // Normalise negative axis: -1 means "insert before the last element"
+    // which means position len for len elements, or position len-1+1=len.
+    // np.insert convention: axis = -1 → insert at the end.
+    let axis = if axis < 0 {
+        (len + axis + 1).max(0) as usize
+    } else {
+        (axis as usize).min(shape.len())
+    };
+    shape.insert(axis, dim);
+    shape
+}
+
 fn propagate_calls(
     node: Node,
     text: &str,
@@ -111,6 +240,10 @@ fn propagate_calls(
     let mut applications = Vec::new();
     let mut errors = Vec::new();
 
+    // vmap_targets is global to the analysis pass, not per-scope.
+    // Nested-scope shadowing of a vmap name is out of scope for v1.
+    let mut vmap_targets: HashMap<String, VmapInfo> = HashMap::new();
+
     for (position, entry) in entries {
         let Some(scope_idx) = scope_index_for_byte(scopes, position) else {
             continue;
@@ -126,6 +259,7 @@ fn propagate_calls(
                 };
                 let args = extract_call_arguments(args_node, text)?;
 
+                // 1. Layer check (existing)
                 if let Some(kind) =
                     find_scoped_layer(layer_records, scopes, position, &call.target)
                 {
@@ -156,7 +290,36 @@ fn propagate_calls(
                     continue;
                 }
 
-                // --- User-defined function propagation (Phase 2) ---
+                // 2. vmap-target check (Phase 3)
+                // If call.target is a name that was bound by a prior
+                // `vf = jax.vmap(f)` call, expand it here.
+                if let Some(info) = vmap_targets.get(&call.target).cloned() {
+                    let result = apply_vmap_call(
+                        &info,
+                        &args,
+                        &scopes[scope_idx].shapes,
+                        scopes,
+                    );
+                    match result {
+                        Ok(Some(output_shape)) => {
+                            scopes[scope_idx]
+                                .shapes
+                                .insert(call.variable.clone(), output_shape);
+                        }
+                        Ok(None) => {
+                            // Silently skipped — missing arg shape, no
+                            // annotations on wrapped function, etc.
+                        }
+                        Err(message) => errors.push(ShapeError {
+                            variable: call.variable.clone(),
+                            message,
+                            range: call.args_node_range,
+                        }),
+                    }
+                    continue;
+                }
+
+                // 3. User-defined function propagation (Phase 2)
                 // Try to resolve `call.target` as a user-defined function in the
                 // same file. Qualified names (e.g. "mod.f") are skipped — no
                 // cross-module resolution yet. Method calls are dispatched
@@ -194,7 +357,20 @@ fn propagate_calls(
                 // Qualified names (e.g. "module.func") are out of scope for
                 // user-function propagation in v1 — no cross-module resolution.
 
+                // Before known-function check: intercept vmap/filter_vmap calls
+                // that *record* a vmap binding (e.g. `vf = jax.vmap(f)`).
                 let resolved = resolve_call_target(&call.target, import_map);
+                if let Some(KnownFunction::Vmap) = classify_known_function(&resolved) {
+                    if let Some(info) = parse_vmap_call(&args) {
+                        vmap_targets.insert(call.variable.clone(), info);
+                    }
+                    // Whether or not we recorded the binding, don't fall
+                    // through to `apply_known_function` — Vmap has no shape
+                    // rule of its own.
+                    continue;
+                }
+
+                // 4. Known-function check (existing)
                 let Some(known) = classify_known_function(&resolved) else {
                     continue;
                 };
@@ -263,6 +439,221 @@ fn record_result(
     }
 }
 
+/// Expand a call to a vmap-bound name.
+///
+/// `info` describes the vmap binding (wrapped function name, in_axes, out_axes).
+/// `args` are the call's arguments (positional variable names).
+/// `caller_shapes` are the caller's known shapes.
+/// `scopes` are all function scopes (used to find the wrapped function).
+///
+/// Returns:
+/// - `Ok(Some(shape))` — output shape with batch dim prepended.
+/// - `Ok(None)` — silently skipped (missing shapes, no annotations, etc.).
+/// - `Err(msg)` — shape error (rank mismatch, batch dim disagreement, etc.).
+fn apply_vmap_call(
+    info: &VmapInfo,
+    args: &[CallArgument],
+    caller_shapes: &HashMap<String, Vec<String>>,
+    scopes: &[FunctionShapeScope],
+) -> Result<Option<Vec<String>>, String> {
+    // a. Resolve each positional arg's shape from caller_shapes.
+    //    Peel the batch dim from each.
+    let mut peeled_arg_shapes: Vec<(&str, Vec<String>)> = Vec::new(); // (arg_name, peeled_shape)
+    let mut batch_dim: Option<String> = None;
+
+    for arg in args {
+        let CallArgument::Positional { value } = arg else {
+            // Skip non-positional args silently (v1 doesn't pass kwargs through vmap).
+            continue;
+        };
+        let Some(shape) = caller_shapes.get(value.as_str()) else {
+            // Arg has no known shape — skip silently.
+            return Ok(None);
+        };
+        // b. Peel the batch dim at in_axes.
+        match peel_batch_dim(shape, info.in_axes) {
+            Ok((peeled, dim)) => {
+                // d. All peeled batch dims must match.
+                if let Some(ref existing) = batch_dim {
+                    if existing != &dim {
+                        return Err(format!(
+                            "vmap input batch dims disagree: '{}' vs '{}'",
+                            existing, dim
+                        ));
+                    }
+                } else {
+                    batch_dim = Some(dim);
+                }
+                peeled_arg_shapes.push((value.as_str(), peeled));
+            }
+            Err(msg) => {
+                return Err(format!(
+                    "vmap: argument '{}' rank insufficient for in_axes={}: {}",
+                    value, info.in_axes, msg
+                ));
+            }
+        }
+    }
+
+    // e. Find the wrapped function's FunctionShapeScope.
+    let callee = match find_callee_scope(&info.wrapped, None, scopes) {
+        Some(idx) => &scopes[idx],
+        None => return Ok(None), // wrapped function not found — skip silently
+    };
+
+    // If the callee has no jaxtyping annotations at all, skip.
+    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+        return Ok(None);
+    }
+
+    // f. Map positional arg shapes to param names (using param_order),
+    //    then bind and substitute.
+    let param_names = &callee.param_order;
+    let arg_shapes: Vec<(&str, Vec<String>)> = peeled_arg_shapes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (_, shape))| {
+            param_names.get(idx).map(|p| (p.as_str(), shape.clone()))
+        })
+        .collect();
+
+    let result = bind_and_substitute(
+        callee,
+        &info.wrapped,
+        &arg_shapes,
+    )?;
+
+    // g. If return_shape is None after substitution, no output to propagate.
+    let Some(substituted) = result else {
+        return Ok(None);
+    };
+
+    // h. Prepend the batch dim at out_axes.
+    let Some(ref dim) = batch_dim else {
+        // No positional args at all — can't determine batch dim.
+        return Ok(None);
+    };
+
+    let output = prepend_batch_dim(substituted, info.out_axes, dim.clone());
+
+    // i. Store result — done by caller.
+    Ok(Some(output))
+}
+
+/// Search for a `FunctionShapeScope` whose `function_name` matches `target`,
+/// excluding the module scope (index 0) and optionally excluding scopes
+/// whose byte range contains `call_byte`.
+///
+/// - `Some(call_byte)`: exclude scopes whose byte range contains this byte
+///   (used by user-function calls to avoid self-recursive binding).
+/// - `None`: don't exclude any scope (used by vmap where the call is not
+///   inside the wrapped function).
+///
+/// Returns the index of the best (smallest-scope) matching scope, or `None`.
+fn find_callee_scope(
+    target: &str,
+    call_byte: Option<usize>,
+    scopes: &[FunctionShapeScope],
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None; // (scope index, scope size)
+    for (i, scope) in scopes.iter().enumerate() {
+        if i == 0 {
+            continue; // skip module scope
+        }
+        if scope.function_name.as_deref() != Some(target) {
+            continue;
+        }
+        // Don't bind a call to itself (recursive call in the same function body).
+        if let Some(byte) = call_byte
+            && scope.start_byte <= byte && byte < scope.end_byte
+        {
+            continue;
+        }
+        let size = scope.end_byte - scope.start_byte;
+        match best {
+            None => best = Some((i, size)),
+            Some((_, prev_size)) if size < prev_size => best = Some((i, size)),
+            _ => {} // keep first on tie
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Bind a callee's parameter dims to provided arg shapes and substitute
+/// into the callee's return shape.
+///
+/// `positional_arg_shapes` is `[(param_name, shape)]` — callers must
+/// map argument variable names to the callee's declared parameter names
+/// before calling this function. Both the user-function path and the
+/// vmap path do this mapping upstream.
+///
+/// Returns:
+/// - `Ok(Some(substituted_return_shape))` if binding and substitution
+///   succeeded and the callee has a return annotation.
+/// - `Ok(None)` if the callee has no return annotation (or no shapes at all).
+/// - `Err(msg)` if there's a rank or dim mismatch.
+fn bind_and_substitute(
+    callee: &FunctionShapeScope,
+    target_name: &str,
+    positional_arg_shapes: &[(&str, Vec<String>)],
+) -> Result<Option<Vec<String>>, String> {
+    // If the callee has no jaxtyping annotations at all, skip.
+    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+        return Ok(None);
+    }
+
+    // Build a binding: declared dim name → resolved dim from the caller's arg.
+    let mut binding: HashMap<String, String> = HashMap::new();
+    for (param_name, arg_shape) in positional_arg_shapes {
+        let Some(param_shape) = callee.shapes.get(*param_name) else {
+            continue;
+        };
+
+        if param_shape.len() != arg_shape.len() {
+            return Err(format!(
+                "call to {}: argument '{}' expected rank {}, got rank {}",
+                target_name, param_name, param_shape.len(), arg_shape.len()
+            ));
+        }
+
+        for (dim_idx, (param_dim, arg_dim)) in
+            param_shape.iter().zip(arg_shape.iter()).enumerate()
+        {
+            let is_param_concrete = param_dim.parse::<usize>().is_ok();
+
+            if is_param_concrete {
+                if param_dim != arg_dim {
+                    return Err(format!(
+                        "call to {}: argument '{}' dim {} expected {}, got {}",
+                        target_name, param_name, dim_idx, param_dim, arg_dim
+                    ));
+                }
+            } else if let Some(existing) = binding.get(param_dim) {
+                if existing != arg_dim {
+                    return Err(format!(
+                        "call to {}: dim '{}' cannot be both '{}' and '{}'",
+                        target_name, param_dim, existing, arg_dim
+                    ));
+                }
+            } else {
+                binding.insert(param_dim.clone(), arg_dim.clone());
+            }
+        }
+    }
+
+    // Substitute into return_shape.
+    let Some(ref return_shape) = callee.return_shape else {
+        return Ok(None);
+    };
+
+    let substituted: Vec<String> = return_shape
+        .iter()
+        .map(|dim| binding.get(dim).cloned().unwrap_or_else(|| dim.clone()))
+        .collect();
+
+    Ok(Some(substituted))
+}
+
 /// Attempt to resolve `target` as a user-defined function in the same file
 /// and propagate its declared return shape to the call site.
 ///
@@ -288,31 +679,7 @@ fn apply_user_function(
     caller_shapes: &HashMap<String, Vec<String>>,
     scopes: &[FunctionShapeScope],
 ) -> Option<Result<Option<Vec<String>>, String>> {
-    // Search for a FunctionShapeScope whose function_name matches `target`,
-    // excluding the module scope (index 0) and excluding scopes whose
-    // byte range contains the call site (to avoid self-recursive binding).
-    // If multiple candidates remain, prefer the one with the smallest scope
-    // (most specific / innermost). If still tied, take the first match.
-    let mut best: Option<(usize, usize)> = None; // (scope index, scope size)
-    for (i, scope) in scopes.iter().enumerate() {
-        if i == 0 {
-            continue; // skip module scope
-        }
-        if scope.function_name.as_deref() != Some(target) {
-            continue;
-        }
-        // Don't bind a call to itself (recursive call in the same function body).
-        if scope.start_byte <= call_byte && call_byte < scope.end_byte {
-            continue;
-        }
-        let size = scope.end_byte - scope.start_byte;
-        match best {
-            None => best = Some((i, size)),
-            Some((_, prev_size)) if size < prev_size => best = Some((i, size)),
-            _ => {} // keep first on tie
-        }
-    }
-    let scope_idx = best.map(|(i, _)| i)?;
+    let scope_idx = find_callee_scope(target, Some(call_byte), scopes)?;
     let callee = &scopes[scope_idx];
 
     // If the callee has no jaxtyping annotations at all, fall through to
@@ -356,65 +723,12 @@ fn apply_user_function(
         }
     }
 
-    // Build a binding: declared dim name → resolved dim from the caller's arg.
-    // For each param, walk its dims in order against the arg's dims.
-    let mut binding: HashMap<String, String> = HashMap::new();
-    for (param_name, arg_shape) in &arg_shapes {
-        let Some(param_shape) = callee.shapes.get(*param_name) else {
-            continue;
-        };
-
-        // Rank mismatch
-        if param_shape.len() != arg_shape.len() {
-            return Some(Err(format!(
-                "call to {}: argument '{}' expected rank {}, got rank {}",
-                target, param_name, param_shape.len(), arg_shape.len()
-            )));
-        }
-
-        for (dim_idx, (param_dim, arg_dim)) in
-            param_shape.iter().zip(arg_shape.iter()).enumerate()
-        {
-            let is_param_concrete = param_dim.parse::<usize>().is_ok();
-
-            if is_param_concrete {
-                // Concrete param dim must match the arg dim exactly.
-                if param_dim != arg_dim {
-                    return Some(Err(format!(
-                        "call to {}: argument '{}' dim {} expected {}, got {}",
-                        target, param_name, dim_idx, param_dim, arg_dim
-                    )));
-                }
-            } else {
-                // Symbolic param dim: bind it.
-                if let Some(existing) = binding.get(param_dim) {
-                    if existing != arg_dim {
-                        return Some(Err(format!(
-                            "call to {}: dim '{}' cannot be both '{}' and '{}'" ,
-                            target, param_dim, existing, arg_dim
-                        )));
-                    }
-                } else {
-                    binding.insert(param_dim.clone(), arg_dim.clone());
-                }
-            }
-        }
+    // Delegate to the shared bind_and_substitute helper.
+    let result = bind_and_substitute(callee, target, &arg_shapes);
+    match result {
+        Ok(substituted) => Some(Ok(substituted)),
+        Err(msg) => Some(Err(msg)),
     }
-
-    // Substitute into return_shape using the binding.
-    // Dims not in the binding pass through unchanged (fresh output dims).
-    let Some(ref return_shape) = callee.return_shape else {
-        // No return annotation — nothing to propagate, but argument
-        // validation above succeeded without error.
-        return Some(Ok(None));
-    };
-
-    let substituted: Vec<String> = return_shape
-        .iter()
-        .map(|dim| binding.get(dim).cloned().unwrap_or_else(|| dim.clone()))
-        .collect();
-
-    Some(Ok(Some(substituted)))
 }
 
 fn apply_binary_op(
