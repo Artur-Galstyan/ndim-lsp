@@ -2,6 +2,18 @@
 
 A Rust-based Language Server Protocol (LSP) for statically detecting tensor shape mismatches in Python deep learning code (NumPy, JAX, PyTorch, Equinox, etc.) using `tree-sitter` and type annotations.
 
+## For agents working on this repo
+
+The roadmap below is best-effort and lags the codebase. **Authoritative state lives in `src/`.** Before implementing any feature, grep for it first:
+
+```sh
+grep -E "KnownFunction::|apply_known_" src/known_functions.rs   # built-in fns
+grep -E "LayerKind::|\"<ClassName>\"" src/layers.rs              # layers
+grep -n "<feature>" src/analysis.rs src/main.rs                  # analysis & LSP wiring
+```
+
+If the feature is already implemented, **stop and report** — don't invent adjacent work to justify the run. See `LLM.txt` for the full agent handoff.
+
 ## Features & Roadmap
 
 ### Type Annotations & Declarations
@@ -26,20 +38,20 @@ A Rust-based Language Server Protocol (LSP) for statically detecting tensor shap
 - [x] `jnp.expand_dims` (multiple axes insertion, bounds checking)
 - [x] `jnp.squeeze` (multiple axes removal, `size == 1` validation)
 - [x] Reduction ops (`sum`, `mean`, `max`, `min`, `prod`, `std`, `var`) with `keepdims` and multiple axes support
-- [ ] `jnp.reshape` (dimension flattening/unflattening tracking)
-- [ ] `jnp.stack`
-- [ ] `jnp.einsum`
-- [ ] Array manipulation operations (`jnp.split`, `jnp.tile`, `jnp.repeat`, `jnp.flatten`)
+- [x] `jnp.reshape` (dimension flattening/unflattening tracking)
+- [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`)
+- [x] `jnp.einsum`
+- [x] `jnp.split`, `jnp.tile`, `jnp.repeat`, `jnp.flatten` (note: `split` returns a tuple; tuple-unpacking propagation still pending)
 - [x] Dynamic `kwargs` handling in function parsing
 
 ### Deep Learning Layers
 - [x] Framework-agnostic layer struct and parsing architecture
 - [x] **Equinox:** `equinox.nn.Linear` (validates `in_features`, modifies shape to `out_features`, supports `kwargs` and positional args)
-- [ ] **PyTorch:** `torch.nn.Linear`
+- [x] **PyTorch:** `torch.nn.Linear`
 - [ ] **Flax:** `flax.linen.Dense`
-- [ ] Convolutional layers (1D, 2D, 3D) tracking spatial dimension reductions
+- [x] Convolutional layers (`Conv1d`, `Conv2d`, `Conv3d`) tracking spatial dimension reductions
 - [ ] Attention mechanisms (e.g., MultiheadAttention)
-- [ ] Shape-preserving layers (Dropout, BatchNorm, LayerNorm, Activations)
+- [x] Shape-preserving layers (`Dropout{,1d,2d,3d}`, `BatchNorm{,1d,2d,3d}`, `LayerNorm`, `GroupNorm`, `ReLU`, `GELU`, etc.)
 
 ### Static Analysis & AST Tracking
 - [x] Trace shapes through variable assignments (`z = x @ y`)
