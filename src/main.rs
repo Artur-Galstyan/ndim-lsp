@@ -6,9 +6,10 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
     DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, InlayHintParams, MarkedString, MessageType,
-    OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Url, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    InitializeParams, InitializeResult, InlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintParams, MarkedString, MessageType, OneOf, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::Parser;
@@ -112,9 +113,14 @@ impl LanguageServer for Backend {
         self.on_hover(text, &pos).await
     }
 
-    async fn inlay_hint(&self, _params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let hints = Vec::new();
-        Ok(Some(hints))
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let visible_range = params.range;
+        let doc_lock = self.document_text.read().await;
+        let Some(text) = doc_lock.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(self.compute_inlay_hints(text, &visible_range).await)
     }
 }
 
@@ -182,6 +188,82 @@ impl Backend {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(version))
             .await;
+    }
+
+    async fn compute_inlay_hints(&self, text: &str, visible_range: &Range) -> Option<Vec<InlayHint>> {
+        let mut parser = Parser::new();
+        if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+            return None;
+        }
+        let tree = parser.parse(text, None)?;
+
+        let root = tree.root_node();
+
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        let mut search_roots = workspace_roots.clone();
+        search_roots.extend(python_site_packages_roots(&workspace_roots));
+        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+
+        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+
+        let mut hints: Vec<InlayHint> = Vec::new();
+
+        // Collect all variable+shape entries across all scopes, remembering
+        // the byte position of the defining assignment so we can place hints.
+        // We deduplicate by variable name per scope (innermost scope wins via
+        // later overwrite).
+        let mut seen: HashSet<(u32, String)> = HashSet::new();
+
+        for scope in &analysis.scopes {
+            for (var_name, shape) in &scope.shapes {
+                // Skip variables that start with '_' (private/temp)
+                if var_name.starts_with('_') {
+                    continue;
+                }
+
+                let line = find_variable_line(&root, text, var_name, scope.start_byte, scope.end_byte);
+                let Some(line) = line else {
+                    continue;
+                };
+
+                // Deduplicate: same var on same line should only emit one hint
+                if !seen.insert((line, var_name.clone())) {
+                    continue;
+                }
+
+                // Only emit hints for variables within the visible range
+                if line < visible_range.start.line || line > visible_range.end.line {
+                    continue;
+                }
+
+                let label = if shape.is_empty() {
+                    ": Scalar".to_string()
+                } else {
+                    format!(": [{}]", shape.join(", "))
+                };
+
+                hints.push(InlayHint {
+                    position: Position {
+                        line,
+                        // Place at end of line (character = line length).
+                        // Client renders hint after this position.
+                        character: line_length(text, line),
+                    },
+                    label: InlayHintLabel::String(label),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: None,
+                    padding_right: Some(true),
+                    data: None,
+                });
+            }
+        }
+
+        Some(hints)
     }
 
     async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
@@ -289,6 +371,66 @@ fn format_hover(var_name: &str, shape: &[String]) -> String {
         let dims = shape.join(" ");
         format!("{}: Float[Array, \"{}\"]", var_name, dims)
     }
+}
+
+/// Find the 0-based line number of the last assignment to `var_name` within
+/// the byte range [start_byte, end_byte). Returns `None` if no assignment found.
+fn find_variable_line(
+    root: &tree_sitter::Node,
+    text: &str,
+    var_name: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<u32> {
+    let mut cursor = root.walk();
+    let mut result: Option<u32> = None;
+
+    // DFS over all nodes within the byte range
+    walk_nodes(&mut cursor, &mut |node| {
+        if node.start_byte() > end_byte || node.end_byte() < start_byte {
+            return false; // skip children outside scope
+        }
+        if node.kind() == "assignment"
+            && node.child_by_field_name("type").is_none() // skip annotated assignments (duplicate of user-written type)
+            && let Some(lhs) = node.child(0)
+            && lhs.kind() == "identifier"
+            && let Ok(name) = lhs.utf8_text(text.as_bytes())
+            && name == var_name
+        {
+            result = Some(lhs.start_position().row as u32);
+        }
+        true // continue walking
+    });
+
+    result
+}
+
+/// Walk all nodes in DFS order, calling `f` for each node.
+/// If `f` returns false, children of that node are skipped.
+fn walk_nodes(cursor: &mut tree_sitter::TreeCursor, f: &mut impl FnMut(tree_sitter::Node) -> bool) {
+    loop {
+        let descend = f(cursor.node());
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
+/// Return the UTF-16 code-unit count of the given 0-based line in `text`.
+/// LSP `Position.character` is UTF-16 code units by default.
+fn line_length(text: &str, line: u32) -> u32 {
+    text.lines()
+        .nth(line as usize)
+        .map(|l| l.encode_utf16().count() as u32)
+        .unwrap_or(0)
 }
 
 fn shape_error_to_diagnostic(error: ShapeError) -> Diagnostic {
@@ -747,5 +889,84 @@ mod tests {
         let node = root.descendant_for_point_range(point, point).unwrap();
         // The node should start at byte 6 (after "hello\n")
         assert_eq!(node.start_byte(), 6);
+    }
+
+    #[test]
+    fn line_length_basic() {
+        let text = "x = 1\ny = 2\n";
+        assert_eq!(line_length(text, 0), 5);
+        assert_eq!(line_length(text, 1), 5);
+    }
+
+    #[test]
+    fn line_length_utf16() {
+        // α is U+03B1 → 2 UTF-16 code units. "α = 1" → 2+3 = 5 code units, but 5+2=7 bytes.
+        let text = "\u{03b1} = 1\n";
+        assert_eq!(line_length(text, 0), 5); // UTF-16 code units, not bytes
+        assert_ne!(line_length(text, 0) as usize, text.lines().next().unwrap().len()); // bytes ≠ code units
+    }
+
+    #[test]
+    fn line_length_empty_line() {
+        let text = "\n\n";
+        assert_eq!(line_length(text, 0), 0);
+        assert_eq!(line_length(text, 1), 0);
+    }
+
+    #[test]
+    fn line_length_out_of_range() {
+        let text = "abc\n";
+        assert_eq!(line_length(text, 99), 0);
+    }
+
+    #[test]
+    fn find_variable_line_finds_assignment() {
+        let text = "x = 1\ny = 2\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        assert_eq!(find_variable_line(&root, text, "x", 0, text.len()), Some(0));
+        assert_eq!(find_variable_line(&root, text, "y", 0, text.len()), Some(1));
+        assert_eq!(find_variable_line(&root, text, "z", 0, text.len()), None);
+    }
+
+    #[test]
+    fn find_variable_line_respects_byte_range() {
+        let text = "x = 1\nx = 2\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Only look within the second line's byte range
+        let second_line_start = "x = 1\n".len();
+        assert_eq!(
+            find_variable_line(&root, text, "x", second_line_start, text.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_variable_line_skips_annotated_assignment() {
+        // Annotated assignments have a 'type' field; find_variable_line should skip them
+        // to avoid duplicating the user-written type annotation.
+        let text = "y: int = 1\nz = 2\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // 'y' has a type annotation — should be skipped
+        assert_eq!(find_variable_line(&root, text, "y", 0, text.len()), None);
+        // 'z' is a bare assignment — should be found
+        assert_eq!(find_variable_line(&root, text, "z", 0, text.len()), Some(1));
     }
 }
