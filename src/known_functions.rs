@@ -768,6 +768,12 @@ fn apply_known_reshape(
         return Ok(None);
     };
 
+    for dim in &mut output_shape {
+        if let Some(resolved) = resolve_shape_index(dim, shapes) {
+            *dim = resolved;
+        }
+    }
+
     let minus_one_count = output_shape
         .iter()
         .filter(|dim| dim.as_str() == "-1")
@@ -777,24 +783,28 @@ fn apply_known_reshape(
     }
 
     if minus_one_count == 1 {
-        let Some(input_product) = dim_product(input_shape) else {
-            return Err("reshape cannot infer -1 dimension for symbolic input shape".to_string());
-        };
-        let known_dims = output_shape
+        let known_dims: Vec<String> = output_shape
             .iter()
             .filter(|dim| dim.as_str() != "-1")
             .cloned()
-            .collect::<Vec<_>>();
-        let Some(known_product) = dim_product(&known_dims) else {
-            return Err("reshape cannot infer -1 dimension with symbolic target shape".to_string());
+            .collect();
+
+        let inferred = match (dim_product(input_shape), dim_product(&known_dims)) {
+            (Some(input_product), Some(known_product)) => {
+                if known_product == 0 || input_product % known_product != 0 {
+                    return Err(format!(
+                        "reshape cannot infer -1 dimension: input size {} not divisible by {}",
+                        input_product, known_product
+                    ));
+                }
+                Some((input_product / known_product).to_string())
+            }
+            _ => infer_symbolic_minus_one(input_shape, &known_dims),
         };
-        if known_product == 0 || input_product % known_product != 0 {
-            return Err(format!(
-                "reshape cannot infer -1 dimension: input size {} not divisible by {}",
-                input_product, known_product
-            ));
-        }
-        let inferred = (input_product / known_product).to_string();
+
+        let Some(inferred) = inferred else {
+            return Ok(None);
+        };
         for dim in &mut output_shape {
             if dim == "-1" {
                 *dim = inferred.clone();
@@ -814,6 +824,39 @@ fn apply_known_reshape(
     }
 
     Ok(Some(output_shape))
+}
+
+fn resolve_shape_index(dim: &str, shapes: &HashMap<String, Vec<String>>) -> Option<String> {
+    let dim = dim.trim();
+    let suffix_start = dim.find(".shape[")?;
+    let (ident, rest) = dim.split_at(suffix_start);
+    let ident = ident.trim();
+    if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let idx_part = rest.strip_prefix(".shape[")?.strip_suffix(']')?;
+    let idx: isize = idx_part.trim().parse().ok()?;
+    let shape = shapes.get(ident)?;
+    let resolved = if idx >= 0 {
+        shape.get(idx as usize)?
+    } else {
+        let from_end = (-idx) as usize;
+        shape.get(shape.len().checked_sub(from_end)?)?
+    };
+    Some(resolved.clone())
+}
+
+fn infer_symbolic_minus_one(input_shape: &[String], known_dims: &[String]) -> Option<String> {
+    let mut remaining: Vec<String> = input_shape.to_vec();
+    for known in known_dims {
+        let pos = remaining.iter().position(|d| d == known)?;
+        remaining.remove(pos);
+    }
+    if remaining.is_empty() {
+        Some("1".to_string())
+    } else {
+        Some(flattened_dim(&remaining))
+    }
 }
 
 fn apply_known_flatten(
@@ -3736,13 +3779,63 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
-    fn test_reshape_symbolic_minus_one_errors() {
+    fn test_reshape_symbolic_minus_one_cancels_known_dim() {
         let args = vec![pos("x"), pos("(batch, -1)")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let error = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap_err();
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
 
-        assert!(error.contains("symbolic input"));
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_reshape_symbolic_minus_one_flattens_remaining_dims() {
+        let args = vec![pos("x"), pos("(c, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
+    }
+
+    #[test]
+    fn test_reshape_shape_index_resolves_to_input_dim() {
+        let args = vec![pos("x"), pos("(x.shape[0], -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
+    }
+
+    #[test]
+    fn test_reshape_shape_index_negative_resolves() {
+        let args = vec![pos("x"), pos("(x.shape[-1], -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["w", "c*h"])));
+    }
+
+    #[test]
+    fn test_reshape_symbolic_minus_one_unmatched_known_dim_returns_none() {
+        let args = vec![pos("x"), pos("(z, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_reshape_method_form_with_shape_index_and_minus_one() {
+        let args = vec![pos("x.shape[0]"), pos("-1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_method_call(&KnownFunction::Reshape, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
     }
 
     #[test]
