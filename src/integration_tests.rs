@@ -4974,4 +4974,36 @@ def caller(x: Float[Array, "scalar"]) -> None:
             None
         );
     }
+
+    /// Test 10: arg variable name matches wrapped function's param name.
+    /// def f(x: ...) -> ... and caller uses `vf(x)` where the caller
+    /// also names its variable `x`. This previously tripped a
+    /// mode-detection heuristic in bind_and_substitute. Now both
+    /// callers normalize to (param_name, shape) before calling
+    /// the helper, so this case should work correctly.
+    #[test]
+    fn test_vmap_arg_var_name_matches_wrapped_param_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+vf = jax.vmap(f)
+
+def caller(x: Float[Array, "B n"]) -> None:
+    y = vf(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "y"),
+            Some(&shape(&["B", "m"]))
+        );
+    }
 }
