@@ -1,17 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, InlayHintKind, InlayHintLabel,
-    InlayHintParams, MarkedString, MessageType, OneOf, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
+    InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf, Position, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::Parser;
@@ -23,7 +24,8 @@ pub struct Backend {
     pub document_text: RwLock<HashMap<Url, String>>,
     pub workspace_roots: RwLock<Vec<PathBuf>>,
     /// Cache: URI → (version, analysis). Invalidated on text change.
-    pub analysis_cache: RwLock<HashMap<Url, (i32, LayerShapeAnalysis)>>,
+    /// Stored as `Arc` so cache hits clone a pointer, not the whole analysis.
+    pub analysis_cache: RwLock<HashMap<Url, (i32, Arc<LayerShapeAnalysis>)>>,
     /// Current version for each URI (set on did_open/did_change).
     pub document_version: RwLock<HashMap<Url, i32>>,
 }
@@ -89,6 +91,18 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = &params.text_document.uri;
+        // Evict all per-document state so long-lived sessions don't leak.
+        self.document_text.write().await.remove(uri);
+        self.document_version.write().await.remove(uri);
+        self.analysis_cache.write().await.remove(uri);
+        // Clear any diagnostics the client may still be showing.
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+    }
+
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
         let mut lock = self.workspace_roots.write().await;
 
@@ -136,22 +150,36 @@ impl LanguageServer for Backend {
 
 impl Backend {
     /// Run full analysis, or return cached result if version matches.
-    /// Populates the analysis cache on miss.
-    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<LayerShapeAnalysis> {
+    /// Populates the analysis cache on miss. Caller passes the version it
+    /// believes is current; if the document advances during analysis the
+    /// freshly-computed entry is dropped instead of poisoning a newer cached
+    /// result.
+    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<Arc<LayerShapeAnalysis>> {
         // Check cache hit first (read-only lock, cheap)
         {
             let cache = self.analysis_cache.read().await;
             if let Some((cached_ver, analysis)) = cache.get(uri)
-                && *cached_ver == version {
-                    return Some(analysis.clone());
-                }
+                && *cached_ver == version
+            {
+                return Some(Arc::clone(analysis));
+            }
         }
 
-        // Cache miss — run full analysis
+        // Cache miss — run full analysis. Read text + version together so the
+        // value we cache can't disagree with the version it's keyed on.
         let t_total = Instant::now();
-        let doc_lock = self.document_text.read().await;
-        let text = doc_lock.get(uri)?.clone();
-        drop(doc_lock);
+        let (text, snapshot_version) = {
+            let doc_lock = self.document_text.read().await;
+            let ver_lock = self.document_version.read().await;
+            let text = doc_lock.get(uri)?.clone();
+            let snapshot_version = ver_lock.get(uri).copied()?;
+            (text, snapshot_version)
+        };
+        if snapshot_version != version {
+            // Document moved while we were waiting. Let the caller re-request
+            // with the current version rather than analyzing stale text.
+            return None;
+        }
         let text_bytes = text.len();
         let text_lines = text.lines().count();
 
@@ -210,17 +238,28 @@ impl Backend {
             )
             .await;
 
-        // Store in cache
+        let analysis = Arc::new(analysis);
+        // Only publish to the cache if the document hasn't advanced past the
+        // version we analyzed. Otherwise we'd overwrite a (potentially newer)
+        // entry with stale results.
         {
-            let mut cache = self.analysis_cache.write().await;
-            cache.insert(uri.clone(), (version, analysis.clone()));
+            let ver_lock = self.document_version.read().await;
+            let current = ver_lock.get(uri).copied();
+            drop(ver_lock);
+            if current == Some(version) {
+                let mut cache = self.analysis_cache.write().await;
+                cache.insert(uri.clone(), (version, Arc::clone(&analysis)));
+            }
         }
 
         Some(analysis)
     }
 
     async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
-        // Store the document text and version
+        // Store the document text and version. LSP versions are monotonic
+        // per did_change, so any existing cache entry for this URI will be
+        // at a strictly older version — `get_analysis` misses on the version
+        // check and overwrites, no explicit invalidation needed.
         {
             let mut doc_lock = self.document_text.write().await;
             doc_lock.insert(uri.clone(), text.to_string());
@@ -228,12 +267,6 @@ impl Backend {
         {
             let mut ver_lock = self.document_version.write().await;
             ver_lock.insert(uri.clone(), version);
-        }
-
-        // Invalidate stale cache entry for this URI
-        {
-            let mut cache = self.analysis_cache.write().await;
-            cache.remove(uri);
         }
 
         // Run analysis (will populate cache)
@@ -246,7 +279,8 @@ impl Backend {
 
         let diagnostics: Vec<Diagnostic> = analysis
             .errors
-            .into_iter()
+            .iter()
+            .cloned()
             .map(shape_error_to_diagnostic)
             .collect();
 
@@ -263,17 +297,28 @@ impl Backend {
             ver_lock.get(uri).copied()?
         };
 
+        // Snapshot cache state *before* `get_analysis` populates it on miss,
+        // so the telemetry below actually distinguishes hits from misses.
+        let was_cached = {
+            let cache = self.analysis_cache.read().await;
+            cache.get(uri).is_some_and(|(v, _)| *v == version)
+        };
+
         let analysis = self.get_analysis(uri, version).await?;
 
-        // We need text + tree for find_variable_line and line_length.
-        // Parse is cheap (~5ms), analysis was cached.
-        let doc_lock = self.document_text.read().await;
-        let text = doc_lock.get(uri)?;
+        // Take an owned snapshot of the text and use it for the rest of the
+        // function. The tree we parse below indexes into THIS string; if we
+        // re-read `document_text` later we may see a newer version whose bytes
+        // no longer match the tree, producing wrong line numbers or silent
+        // `utf8_text` failures.
+        let text: String = {
+            let doc_lock = self.document_text.read().await;
+            doc_lock.get(uri)?.clone()
+        };
         let mut parser = Parser::new();
         parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
-        let tree = parser.parse(text, None)?;
+        let tree = parser.parse(&text, None)?;
         let root = tree.root_node();
-        drop(doc_lock);
 
         let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
@@ -285,11 +330,9 @@ impl Backend {
                     continue;
                 }
 
-                let doc_lock = self.document_text.read().await;
-                let text = doc_lock.get(uri)?;
-                let line = find_variable_line(&root, text, var_name, scope.start_byte, scope.end_byte);
-                drop(doc_lock);
-                let Some(line) = line else {
+                let Some(line) =
+                    find_variable_line(&root, &text, var_name, scope.start_byte, scope.end_byte)
+                else {
                     continue;
                 };
 
@@ -301,15 +344,12 @@ impl Backend {
                     continue;
                 }
 
-                let doc_lock = self.document_text.read().await;
-                let text = doc_lock.get(uri)?;
                 let label = if shape.is_empty() {
                     ": Scalar".to_string()
                 } else {
                     format!(": [{}]", shape.join(", "))
                 };
-                let char_pos = line_length(text, line);
-                drop(doc_lock);
+                let char_pos = line_length(&text, line);
 
                 hints.push(InlayHint {
                     position: Position {
@@ -329,10 +369,6 @@ impl Backend {
 
         let build_ms = t_build.elapsed().as_millis();
         let total_ms = t_total.elapsed().as_millis();
-        let was_cached = {
-            let cache = self.analysis_cache.read().await;
-            cache.get(uri).is_some_and(|(v, _)| *v == version)
-        };
         self.client
             .log_message(
                 MessageType::INFO,
@@ -366,16 +402,30 @@ impl Backend {
             return Ok(None);
         };
 
-        // We need a tree to find the identifier node under cursor.
-        let doc_lock = self.document_text.read().await;
-        let Some(text) = doc_lock.get(uri) else {
-            return Ok(None);
+        // Snapshot cache state *before* `get_analysis` may populate it on
+        // miss, so telemetry distinguishes hits from misses.
+        let was_cached = {
+            let cache = self.analysis_cache.read().await;
+            cache.get(uri).is_some_and(|(v, _)| *v == version)
+        };
+
+        // Take an owned text snapshot for tree-sitter so `cursor_byte` is
+        // computed against the same bytes we'll later index into via
+        // `analysis.scopes`. If the document advances between here and
+        // `get_analysis` returning, the version check below rejects the
+        // mismatched pair.
+        let text: String = {
+            let doc_lock = self.document_text.read().await;
+            match doc_lock.get(uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            }
         };
         let mut parser = Parser::new();
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
             return Ok(None);
         }
-        let Some(tree) = parser.parse(text, None) else {
+        let Some(tree) = parser.parse(&text, None) else {
             return Ok(None);
         };
         let root = tree.root_node();
@@ -391,7 +441,6 @@ impl Backend {
             Err(_) => return Ok(None),
         };
         let cursor_byte = node.start_byte();
-        drop(doc_lock);
 
         // Get analysis (cached or fresh)
         let analysis = match self.get_analysis(uri, version).await {
@@ -399,11 +448,17 @@ impl Backend {
             None => return Ok(None),
         };
 
+        // If the document advanced while we were waiting on `get_analysis`,
+        // `cursor_byte` points into stale text and `analysis.scopes` byte
+        // ranges may have moved. Bail; the editor will re-request.
+        {
+            let ver_lock = self.document_version.read().await;
+            if ver_lock.get(uri).copied() != Some(version) {
+                return Ok(None);
+            }
+        }
+
         let total_ms = t_total.elapsed().as_millis();
-        let was_cached = {
-            let cache = self.analysis_cache.read().await;
-            cache.get(uri).is_some_and(|(v, _)| *v == version)
-        };
         self.client
             .log_message(
                 MessageType::INFO,
