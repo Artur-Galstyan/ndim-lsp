@@ -16,12 +16,16 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::Parser;
 
-use ndim_lsp::{analyze_layer_shapes, ShapeError};
+use ndim_lsp::{analyze_layer_shapes, LayerShapeAnalysis, ShapeError};
 
 pub struct Backend {
     pub client: Client,
     pub document_text: RwLock<HashMap<Url, String>>,
     pub workspace_roots: RwLock<Vec<PathBuf>>,
+    /// Cache: URI → (version, analysis). Invalidated on text change.
+    pub analysis_cache: RwLock<HashMap<Url, (i32, LayerShapeAnalysis)>>,
+    /// Current version for each URI (set on did_open/did_change).
+    pub document_version: RwLock<HashMap<Url, i32>>,
 }
 
 #[tower_lsp::async_trait]
@@ -108,60 +112,57 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // Verify doc exists
         let doc_lock = self.document_text.read().await;
-        let Some(text) = doc_lock.get(&uri) else {
+        if !doc_lock.contains_key(&uri) {
             return Ok(None);
-        };
-        self.on_hover(text, &pos).await
+        }
+        drop(doc_lock);
+        self.on_hover(&uri, &pos).await
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let visible_range = params.range;
+        // Verify doc exists
         let doc_lock = self.document_text.read().await;
-        let Some(text) = doc_lock.get(&uri) else {
+        if !doc_lock.contains_key(&uri) {
             return Ok(None);
-        };
-        Ok(self.compute_inlay_hints(text, &visible_range).await)
+        }
+        drop(doc_lock);
+        Ok(self.compute_inlay_hints(&uri, &visible_range).await)
     }
 }
 
 impl Backend {
-    async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
+    /// Run full analysis, or return cached result if version matches.
+    /// Populates the analysis cache on miss.
+    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<LayerShapeAnalysis> {
+        // Check cache hit first (read-only lock, cheap)
+        {
+            let cache = self.analysis_cache.read().await;
+            if let Some((cached_ver, analysis)) = cache.get(uri)
+                && *cached_ver == version {
+                    return Some(analysis.clone());
+                }
+        }
+
+        // Cache miss — run full analysis
         let t_total = Instant::now();
+        let doc_lock = self.document_text.read().await;
+        let text = doc_lock.get(uri)?.clone();
+        drop(doc_lock);
         let text_bytes = text.len();
         let text_lines = text.lines().count();
 
-        // Store the document text
-        {
-            let mut doc_lock = self.document_text.write().await;
-            doc_lock.insert(uri.clone(), text.to_string());
-        }
-
-        // Parse with tree-sitter-python
         let mut parser = Parser::new();
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
-            self.client
-                .log_message(
-                    MessageType::ERROR,
-                    "failed to set tree-sitter-python language",
-                )
-                .await;
-            self.client
-                .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
-                .await;
-            return;
+            return None;
         }
         let t_parse = Instant::now();
-        let Some(tree) = parser.parse(text, None) else {
-            self.client
-                .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
-                .await;
-            return;
-        };
+        let tree = parser.parse(&text, None)?;
         let parse_ms = t_parse.elapsed().as_millis();
 
-        // Use cached workspace roots, extended with discovered site-packages
         let t_roots = Instant::now();
         let workspace_roots = self.workspace_roots.read().await.clone();
         let mut search_roots = workspace_roots.clone();
@@ -169,7 +170,6 @@ impl Backend {
         let roots_ms = t_roots.elapsed().as_millis();
         let search_roots_count = search_roots.len();
 
-        // Read-file implementation — instrumented to count invocations and bytes.
         let read_count = AtomicUsize::new(0);
         let read_bytes = AtomicUsize::new(0);
         let read_file = |path: &PathBuf| {
@@ -181,28 +181,16 @@ impl Backend {
             result
         };
 
-        // Run analysis
         let t_analyze = Instant::now();
-        let diagnostics = match analyze_layer_shapes(
-            tree.root_node(),
-            text,
-            &search_roots,
-            read_file,
-            8,
+        let analysis = match analyze_layer_shapes(
+            tree.root_node(), &text, &search_roots, read_file, 8,
         ) {
-            Ok(analysis) => analysis
-                .errors
-                .into_iter()
-                .map(shape_error_to_diagnostic)
-                .collect(),
-            Err(message) => {
+            Ok(a) => a,
+            Err(msg) => {
                 self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("analysis failed: {}", message),
-                    )
+                    .log_message(MessageType::WARNING, format!("analysis failed: {}", msg))
                     .await;
-                Vec::new()
+                return None;
             }
         };
         let analyze_ms = t_analyze.elapsed().as_millis();
@@ -212,105 +200,121 @@ impl Backend {
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "diagnostics: total={}ms parse={}ms roots={}ms analyze={}ms \
+                    "analysis: total={}ms parse={}ms roots={}ms analyze={}ms \
                      | text={}B/{}L roots={} reads={}/{}B",
-                    total_ms,
-                    parse_ms,
-                    roots_ms,
-                    analyze_ms,
-                    text_bytes,
-                    text_lines,
-                    search_roots_count,
+                    total_ms, parse_ms, roots_ms, analyze_ms,
+                    text_bytes, text_lines, search_roots_count,
                     read_count.load(Ordering::Relaxed),
                     read_bytes.load(Ordering::Relaxed),
                 ),
             )
             .await;
 
+        // Store in cache
+        {
+            let mut cache = self.analysis_cache.write().await;
+            cache.insert(uri.clone(), (version, analysis.clone()));
+        }
+
+        Some(analysis)
+    }
+
+    async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
+        // Store the document text and version
+        {
+            let mut doc_lock = self.document_text.write().await;
+            doc_lock.insert(uri.clone(), text.to_string());
+        }
+        {
+            let mut ver_lock = self.document_version.write().await;
+            ver_lock.insert(uri.clone(), version);
+        }
+
+        // Invalidate stale cache entry for this URI
+        {
+            let mut cache = self.analysis_cache.write().await;
+            cache.remove(uri);
+        }
+
+        // Run analysis (will populate cache)
+        let Some(analysis) = self.get_analysis(uri, version).await else {
+            self.client
+                .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
+                .await;
+            return;
+        };
+
+        let diagnostics: Vec<Diagnostic> = analysis
+            .errors
+            .into_iter()
+            .map(shape_error_to_diagnostic)
+            .collect();
+
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(version))
             .await;
     }
 
-    async fn compute_inlay_hints(&self, text: &str, visible_range: &Range) -> Option<Vec<InlayHint>> {
+    async fn compute_inlay_hints(&self, uri: &Url, visible_range: &Range) -> Option<Vec<InlayHint>> {
         let t_total = Instant::now();
+
+        let version = {
+            let ver_lock = self.document_version.read().await;
+            ver_lock.get(uri).copied()?
+        };
+
+        let analysis = self.get_analysis(uri, version).await?;
+
+        // We need text + tree for find_variable_line and line_length.
+        // Parse is cheap (~5ms), analysis was cached.
+        let doc_lock = self.document_text.read().await;
+        let text = doc_lock.get(uri)?;
         let mut parser = Parser::new();
-        if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
-            return None;
-        }
-        let t_parse = Instant::now();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
         let tree = parser.parse(text, None)?;
-        let parse_ms = t_parse.elapsed().as_millis();
-
         let root = tree.root_node();
-
-        let t_roots = Instant::now();
-        let workspace_roots = self.workspace_roots.read().await.clone();
-        let mut search_roots = workspace_roots.clone();
-        search_roots.extend(python_site_packages_roots(&workspace_roots));
-        let roots_ms = t_roots.elapsed().as_millis();
-
-        let read_count = AtomicUsize::new(0);
-        let read_bytes = AtomicUsize::new(0);
-        let read_file = |path: &PathBuf| {
-            let result = std::fs::read_to_string(path).ok();
-            if let Some(ref s) = result {
-                read_count.fetch_add(1, Ordering::Relaxed);
-                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
-            }
-            result
-        };
-
-        let t_analyze = Instant::now();
-        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
-        let analyze_ms = t_analyze.elapsed().as_millis();
+        drop(doc_lock);
 
         let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
-
-        // Collect all variable+shape entries across all scopes, remembering
-        // the byte position of the defining assignment so we can place hints.
-        // We deduplicate by variable name per scope (innermost scope wins via
-        // later overwrite).
         let mut seen: HashSet<(u32, String)> = HashSet::new();
 
         for scope in &analysis.scopes {
             for (var_name, shape) in &scope.shapes {
-                // Skip variables that start with '_' (private/temp)
                 if var_name.starts_with('_') {
                     continue;
                 }
 
+                let doc_lock = self.document_text.read().await;
+                let text = doc_lock.get(uri)?;
                 let line = find_variable_line(&root, text, var_name, scope.start_byte, scope.end_byte);
+                drop(doc_lock);
                 let Some(line) = line else {
                     continue;
                 };
 
-                // Deduplicate: same var on same line should only emit one hint
                 if !seen.insert((line, var_name.clone())) {
                     continue;
                 }
 
-                // Only emit hints for variables within the visible range
                 if line < visible_range.start.line || line > visible_range.end.line {
                     continue;
                 }
 
+                let doc_lock = self.document_text.read().await;
+                let text = doc_lock.get(uri)?;
                 let label = if shape.is_empty() {
                     ": Scalar".to_string()
                 } else {
                     format!(": [{}]", shape.join(", "))
                 };
+                let char_pos = line_length(text, line);
+                drop(doc_lock);
 
                 hints.push(InlayHint {
                     position: Position {
                         line,
-                        // Place at end of line (character = line length).
-                        // Client renders hint after this position.
-                        character: line_length(text, line),
+                        character: char_pos,
                     },
                     label: InlayHintLabel::String(label),
                     kind: Some(InlayHintKind::TYPE),
@@ -325,21 +329,21 @@ impl Backend {
 
         let build_ms = t_build.elapsed().as_millis();
         let total_ms = t_total.elapsed().as_millis();
+        let was_cached = {
+            let cache = self.analysis_cache.read().await;
+            cache.get(uri).is_some_and(|(v, _)| *v == version)
+        };
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "inlay_hint: total={}ms parse={}ms roots={}ms analyze={}ms build={}ms \
-                     | hints={} scopes={} reads={}/{}B visible={}..{}",
+                    "inlay_hint: total={}ms build={}ms cached={} \
+                     | hints={} scopes={} visible={}..{}",
                     total_ms,
-                    parse_ms,
-                    roots_ms,
-                    analyze_ms,
                     build_ms,
+                    was_cached,
                     hints.len(),
                     analysis.scopes.len(),
-                    read_count.load(Ordering::Relaxed),
-                    read_bytes.load(Ordering::Relaxed),
                     visible_range.start.line,
                     visible_range.end.line,
                 ),
@@ -349,90 +353,74 @@ impl Backend {
         Some(hints)
     }
 
-    async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
+    async fn on_hover(&self, uri: &Url, pos: &Position) -> Result<Option<Hover>> {
         let t_total = Instant::now();
+
+        let version = {
+            let ver_lock = self.document_version.read().await;
+            ver_lock.get(uri).copied()
+        };
+
+        // If no version tracked, doc might not be open — fall back
+        let Some(version) = version else {
+            return Ok(None);
+        };
+
+        // We need a tree to find the identifier node under cursor.
+        let doc_lock = self.document_text.read().await;
+        let Some(text) = doc_lock.get(uri) else {
+            return Ok(None);
+        };
         let mut parser = Parser::new();
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
             return Ok(None);
         }
-        let t_parse = Instant::now();
         let Some(tree) = parser.parse(text, None) else {
             return Ok(None);
         };
-        let parse_ms = t_parse.elapsed().as_millis();
-
         let root = tree.root_node();
         let point = tree_sitter::Point::new(pos.line as usize, pos.character as usize);
-
         let Some(node) = root.descendant_for_point_range(point, point) else {
             return Ok(None);
         };
-
-        // Only hover on identifiers (skip keywords, whitespace, etc.)
         if node.kind() != "identifier" {
             return Ok(None);
         }
-
-        let Ok(var_name) = node.utf8_text(text.as_bytes()) else {
-            return Ok(None);
+        let var_name = match node.utf8_text(text.as_bytes()) {
+            Ok(v) => v.to_string(),
+            Err(_) => return Ok(None),
         };
-
-        // Compute cursor byte from the identifier node's start byte
         let cursor_byte = node.start_byte();
+        drop(doc_lock);
 
-        // Use cached workspace roots for analysis, extended with discovered site-packages
-        let t_roots = Instant::now();
-        let workspace_roots = self.workspace_roots.read().await.clone();
-        let mut search_roots = workspace_roots.clone();
-        search_roots.extend(python_site_packages_roots(&workspace_roots));
-        let roots_ms = t_roots.elapsed().as_millis();
-        let read_count = AtomicUsize::new(0);
-        let read_bytes = AtomicUsize::new(0);
-        let read_file = |path: &PathBuf| {
-            let result = std::fs::read_to_string(path).ok();
-            if let Some(ref s) = result {
-                read_count.fetch_add(1, Ordering::Relaxed);
-                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
-            }
-            result
+        // Get analysis (cached or fresh)
+        let analysis = match self.get_analysis(uri, version).await {
+            Some(a) => a,
+            None => return Ok(None),
         };
 
-        let t_analyze = Instant::now();
-        let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
-            Ok(a) => a,
-            Err(msg) => {
-                self.client
-                    .log_message(MessageType::WARNING, format!("hover analysis failed: {}", msg))
-                    .await;
-                return Ok(None);
-            }
-        };
-        let analyze_ms = t_analyze.elapsed().as_millis();
         let total_ms = t_total.elapsed().as_millis();
+        let was_cached = {
+            let cache = self.analysis_cache.read().await;
+            cache.get(uri).is_some_and(|(v, _)| *v == version)
+        };
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "hover '{}': total={}ms parse={}ms roots={}ms analyze={}ms \
-                     | reads={}/{}B",
-                    var_name,
-                    total_ms,
-                    parse_ms,
-                    roots_ms,
-                    analyze_ms,
-                    read_count.load(Ordering::Relaxed),
-                    read_bytes.load(Ordering::Relaxed),
+                    "hover '{}': total={}ms cached={}",
+                    var_name, total_ms, was_cached,
                 ),
             )
             .await;
 
         // Walk from innermost scope outward, looking for the variable
-        let shape = match find_shape_for_variable(&analysis.scopes, cursor_byte, var_name) {
+        let shape = match find_shape_for_variable(&analysis.scopes, cursor_byte, &var_name) {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        let hover_content = format_hover(var_name, &shape);
+        let hover_content = format_hover(&var_name, &shape);
         let hover_range = ts_range_to_lsp_range(node.range());
 
         Ok(Some(Hover {
@@ -645,6 +633,8 @@ async fn main() {
         client,
         document_text: Default::default(),
         workspace_roots: Default::default(),
+        analysis_cache: Default::default(),
+        document_version: Default::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
