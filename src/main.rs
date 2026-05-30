@@ -464,12 +464,14 @@ mod tests {
                 start_byte: 0,
                 end_byte: 200,
                 shapes: outer_shapes,
+                return_shape: None,
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
                 start_byte: 20,
                 end_byte: 180,
                 shapes: inner_shapes,
+                return_shape: None,
             },
         ];
 
@@ -494,12 +496,14 @@ mod tests {
                 start_byte: 0,
                 end_byte: 200,
                 shapes: outer_shapes,
+                return_shape: None,
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
                 start_byte: 20,
                 end_byte: 180,
                 shapes: inner_shapes,
+                return_shape: None,
             },
         ];
 
@@ -518,6 +522,7 @@ mod tests {
             start_byte: 0,
             end_byte: 100,
             shapes: HashMap::new(),
+            return_shape: None,
         }];
 
         let result = find_shape_for_variable(&scopes, 50, "z");

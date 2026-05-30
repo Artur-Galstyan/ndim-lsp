@@ -240,6 +240,7 @@ pub struct FunctionShapeScope {
     pub start_byte: usize,
     pub end_byte: usize,
     pub shapes: HashMap<String, Vec<String>>,
+    pub return_shape: Option<Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
