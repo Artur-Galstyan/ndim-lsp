@@ -4492,11 +4492,11 @@ z = f(y)
         );
     }
 
-    /// Test 7: a user-defined function named `reshape` should be resolved
-    /// as a user function, not a known function — `classify_known_function`
-    /// only matches qualified names like `np.reshape`.
+    /// Test 7: a bare name that also exists as a known function (e.g. `reshape`)
+    /// is resolved as a user function, because `classify_known_function`
+    /// only matches module-qualified names like `np.reshape`.
     #[test]
-    fn test_user_function_known_function_takes_precedence_when_both_apply() {
+    fn test_bare_name_matching_known_function_resolves_as_user_function() {
         let tmp = tempfile::tempdir().unwrap();
         let code = r#"
 def reshape(x: Float[Array, "n"]) -> Float[Array, "m"]:
@@ -4547,6 +4547,121 @@ def caller(y: Float[Array, "a b"]) -> None:
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             None
+        );
+    }
+
+    /// Test 9: keyword argument matching a declared param name is honoured.
+    /// z = f(x=y) should resolve the same as z = f(y).
+    #[test]
+    fn test_user_function_keyword_arg_resolves_by_param_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "a b"]) -> Float[Array, "a c"]:
+    pass
+
+def caller(y: Float[Array, "batch features"]) -> None:
+    z = f(x=y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["batch", "c"]))
+        );
+    }
+
+    /// Test 10: self-recursive call is skipped (no panic, no infinite loop).
+    /// The byte-range exclusion prevents a function from resolving to itself.
+    #[test]
+    fn test_user_function_self_recursive_call_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    z = f(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Self-call is silently skipped — the user-function branch can't
+        // resolve f (its scope contains the call byte), so it falls through.
+        // No shape recorded for z, no error.
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "z"),
+            None
+        );
+    }
+
+    /// Test 11: inner-scope preference when same function name appears at
+    /// two different lexical depths. The innermost (smallest byte-range)
+    /// scope wins.
+    #[test]
+    fn test_user_function_inner_scope_preferred_on_name_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two functions named `g` at different depths.
+        // The outer `g` returns ["outer_dim"], the inner returns ["inner_dim"].
+        // Call from `caller` should pick the inner one (smaller scope),
+        // but since both are at the same nesting level as the call, the
+        // one whose scope does NOT contain the call byte wins. If both
+        // don't contain it, smallest scope wins.
+        let code = r#"
+def g(x: Float[Array, "n"]) -> Float[Array, "outer_dim"]:
+    pass
+
+def h():
+    def g(x: Float[Array, "n"]) -> Float[Array, "inner_dim"]:
+        pass
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = g(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        // The outer `g` (smaller scope among candidates whose byte range
+        // doesn't contain the call) wins.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["outer_dim"]))
+        );
+    }
+
+    /// Test 12: return dim referencing a param dim from an omitted arg.
+    /// When a function has multiple params but the call only provides one
+    /// positional arg, the unprovided param's dims are not in the binding.
+    /// A return dim referencing that param passes through unchanged.
+    #[test]
+    fn test_user_function_return_dim_from_omitted_arg_passes_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "a"], w: Float[Array, "k"]) -> Float[Array, "a k"]:
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Only the first positional arg is provided, so `a` binds to
+        // "batch" but `k` is unbound. The return shape ["a", "k"] becomes
+        // ["batch", "k"] — `k` passes through as a fresh dim.
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["batch", "k"]))
         );
     }
 }

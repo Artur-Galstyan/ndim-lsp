@@ -333,7 +333,11 @@ fn apply_user_function(
                     break; // more positional args than annotated params — ignore extras
                 };
                 let Some(shape) = caller_shapes.get(value.as_str()) else {
-                    // Arg has no known shape — can't validate, skip entirely.
+                    // Arg has no known shape (literal, untracked variable, etc.)
+                    // — skip entire function. v1 intentionally bails early
+                    // rather than partially validating some args, to avoid
+                    // noisy diagnostics on calls that mix typed and untyped
+                    // arguments.
                     return Some(Ok(None));
                 };
                 arg_shapes.push((param_name.as_str(), shape.clone()));
@@ -371,8 +375,7 @@ fn apply_user_function(
         for (dim_idx, (param_dim, arg_dim)) in
             param_shape.iter().zip(arg_shape.iter()).enumerate()
         {
-            let is_param_concrete = param_dim.parse::<usize>().is_ok()
-                || param_dim.parse::<isize>().is_ok();
+            let is_param_concrete = param_dim.parse::<usize>().is_ok();
 
             if is_param_concrete {
                 // Concrete param dim must match the arg dim exactly.
