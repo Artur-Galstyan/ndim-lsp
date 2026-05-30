@@ -561,6 +561,7 @@ pub fn apply_known_function(
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
+        KnownFunction::Einsum => apply_known_einsum(args, shapes),
         KnownFunction::Split => apply_known_split(args, shapes),
         _ => Ok(None),
     }
@@ -597,6 +598,97 @@ fn axis_arg(args: &[CallArgument], default: isize) -> isize {
         }
     }
     axis
+}
+
+fn apply_known_einsum(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let positional_values = positional_arg_values(args);
+    let Some(equation) = positional_values.first() else {
+        return Ok(None);
+    };
+
+    let equation_trimmed = equation.trim();
+
+    // Remove quotes if present
+    let equation_str = if (equation_trimmed.starts_with('"') && equation_trimmed.ends_with('"'))
+        || (equation_trimmed.starts_with('\'') && equation_trimmed.ends_with('\''))
+    {
+        &equation_trimmed[1..equation_trimmed.len() - 1]
+    } else {
+        // Not a string literal
+        return Ok(None);
+    };
+
+    // If equation contains ellipsis, return Ok(None) for v1
+    if equation_str.contains("...") {
+        return Ok(None);
+    }
+
+    // Split on "->" for explicit output
+    let Some((inputs_part, output_part)) = equation_str.split_once("->") else {
+        // Implicit-mode (no "->"), return Ok(None) for v1
+        return Ok(None);
+    };
+
+    let input_specs: Vec<&str> = inputs_part.split(',').map(str::trim).collect();
+    let output_spec = output_part.trim();
+
+    // Collect operand shapes (reuse positional_values from above)
+    let operand_names = &positional_values[1..]; // Skip equation string
+
+    if operand_names.len() != input_specs.len() {
+        return Err(format!(
+            "einsum equation has {} input specs but got {} operands",
+            input_specs.len(),
+            operand_names.len()
+        ));
+    }
+
+    // Build label→dim map
+    let mut label_map: HashMap<char, String> = HashMap::new();
+
+    for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
+        let Some(shape) = shapes.get(operand_name.as_str()) else {
+            return Ok(None);
+        };
+
+        // Note: einsum subscripts are ASCII letters in practice, so chars().count() == byte len.
+        // Using chars().count() is more correct for the rank comparison.
+        let spec_label_count = spec.chars().count();
+        if shape.len() != spec_label_count {
+            return Err(format!(
+                "einsum operand '{}' has rank {} but subscript '{}' has length {}",
+                operand_name,
+                shape.len(),
+                spec,
+                spec_label_count
+            ));
+        }
+
+        for (label_char, dim) in spec.chars().zip(shape.iter()) {
+            if let Some(existing_dim) = label_map.get(&label_char) {
+                check_dim_match(existing_dim, dim, &format!("einsum label '{}'", label_char))?;
+            } else {
+                label_map.insert(label_char, dim.clone());
+            }
+        }
+    }
+
+    // Build output shape
+    let mut output_shape = Vec::new();
+    for label_char in output_spec.chars() {
+        let Some(dim) = label_map.get(&label_char) else {
+            return Err(format!(
+                "einsum output label '{}' not found in input subscripts",
+                label_char
+            ));
+        };
+        output_shape.push(dim.clone());
+    }
+
+    Ok(Some(output_shape))
 }
 
 fn apply_known_concatenate(
@@ -769,6 +861,12 @@ fn apply_known_reshape(
         return Ok(None);
     };
 
+    for dim in &mut output_shape {
+        if let Some(resolved) = resolve_shape_index(dim, shapes) {
+            *dim = resolved;
+        }
+    }
+
     let minus_one_count = output_shape
         .iter()
         .filter(|dim| dim.as_str() == "-1")
@@ -778,24 +876,28 @@ fn apply_known_reshape(
     }
 
     if minus_one_count == 1 {
-        let Some(input_product) = dim_product(input_shape) else {
-            return Err("reshape cannot infer -1 dimension for symbolic input shape".to_string());
-        };
-        let known_dims = output_shape
+        let known_dims: Vec<String> = output_shape
             .iter()
             .filter(|dim| dim.as_str() != "-1")
             .cloned()
-            .collect::<Vec<_>>();
-        let Some(known_product) = dim_product(&known_dims) else {
-            return Err("reshape cannot infer -1 dimension with symbolic target shape".to_string());
+            .collect();
+
+        let inferred = match (dim_product(input_shape), dim_product(&known_dims)) {
+            (Some(input_product), Some(known_product)) => {
+                if known_product == 0 || input_product % known_product != 0 {
+                    return Err(format!(
+                        "reshape cannot infer -1 dimension: input size {} not divisible by {}",
+                        input_product, known_product
+                    ));
+                }
+                Some((input_product / known_product).to_string())
+            }
+            _ => infer_symbolic_minus_one(input_shape, &known_dims),
         };
-        if known_product == 0 || input_product % known_product != 0 {
-            return Err(format!(
-                "reshape cannot infer -1 dimension: input size {} not divisible by {}",
-                input_product, known_product
-            ));
-        }
-        let inferred = (input_product / known_product).to_string();
+
+        let Some(inferred) = inferred else {
+            return Ok(None);
+        };
         for dim in &mut output_shape {
             if dim == "-1" {
                 *dim = inferred.clone();
@@ -815,6 +917,39 @@ fn apply_known_reshape(
     }
 
     Ok(Some(output_shape))
+}
+
+fn resolve_shape_index(dim: &str, shapes: &HashMap<String, Vec<String>>) -> Option<String> {
+    let dim = dim.trim();
+    let suffix_start = dim.find(".shape[")?;
+    let (ident, rest) = dim.split_at(suffix_start);
+    let ident = ident.trim();
+    if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let idx_part = rest.strip_prefix(".shape[")?.strip_suffix(']')?;
+    let idx: isize = idx_part.trim().parse().ok()?;
+    let shape = shapes.get(ident)?;
+    let resolved = if idx >= 0 {
+        shape.get(idx as usize)?
+    } else {
+        let from_end = (-idx) as usize;
+        shape.get(shape.len().checked_sub(from_end)?)?
+    };
+    Some(resolved.clone())
+}
+
+fn infer_symbolic_minus_one(input_shape: &[String], known_dims: &[String]) -> Option<String> {
+    let mut remaining: Vec<String> = input_shape.to_vec();
+    for known in known_dims {
+        let pos = remaining.iter().position(|d| d == known)?;
+        remaining.remove(pos);
+    }
+    if remaining.is_empty() {
+        Some("1".to_string())
+    } else {
+        Some(flattened_dim(&remaining))
+    }
 }
 
 fn apply_known_flatten(
@@ -2335,28 +2470,65 @@ pub fn compute_split_shapes(
             let curr_str = index_names[i].trim().to_string();
 
             match (prev_val, *idx_opt, total) {
-                _ if prev_val.is_none() && idx_opt.is_none() => {
-                    // Both boundaries symbolic — emit "curr-prev".
-                    out[axis] = format!("{}-{}", curr_str, prev_str);
-                }
-                (_, Some(curr), Some(_total)) if prev_val.is_some() => {
+                (Some(prev), Some(curr), Some(t)) => {
                     // Both boundaries numeric — resolve.
-                    if curr < prev_val.unwrap() {
+                    if curr < prev {
                         return Err(format!(
                             "split indices must be non-decreasing, got {} after {}",
-                            curr,
-                            prev_val.unwrap()
+                            curr, prev
                         ));
                     }
-                    out[axis] = (curr - prev_val.unwrap()).to_string();
+                    if curr > t {
+                        return Err(format!(
+                            "split index {} exceeds axis size {}",
+                            curr, t
+                        ));
+                    }
+                    out[axis] = (curr - prev).to_string();
                 }
-                (_, Some(curr), _) if prev_val.is_none() => {
-                    // Prev symbolic, curr numeric.
+                (None, Some(curr), Some(t)) => {
+                    // Prev symbolic, curr numeric — validate bound.
+                    if curr > t {
+                        return Err(format!(
+                            "split index {} exceeds axis size {}",
+                            curr, t
+                        ));
+                    }
                     out[axis] = format!("{}-{}", curr, prev_str);
                 }
-                _ => {
-                    // Curr symbolic, prev may or may not be numeric.
-                    out[axis] = format!("{}-{}", curr_str, prev_str);
+                (_, Some(curr), _) => {
+                    // Curr numeric, total unknown — validate non-decreasing only.
+                    if let Some(prev) = prev_val
+                        && curr < prev
+                    {
+                        return Err(format!(
+                            "split indices must be non-decreasing, got {} after {}",
+                            curr, prev
+                        ));
+                    }
+                    out[axis] = (curr - prev_val.unwrap_or(0)).to_string();
+                }
+                (Some(prev), None, Some(t)) => {
+                    // Prev numeric, curr symbolic — validate prev ≤ total.
+                    if prev > t {
+                        return Err(format!(
+                            "split index {} exceeds axis size {}",
+                            prev, t
+                        ));
+                    }
+                    if prev_str == "0" {
+                        out[axis] = curr_str.clone();
+                    } else {
+                        out[axis] = format!("{}-{}", curr_str, prev_str);
+                    }
+                }
+                (_, None, _) => {
+                    // Curr symbolic, prev symbolic or zero — simplify "x-0" → "x".
+                    if prev_str == "0" {
+                        out[axis] = curr_str.clone();
+                    } else {
+                        out[axis] = format!("{}-{}", curr_str, prev_str);
+                    }
                 }
             }
 
@@ -2368,11 +2540,22 @@ pub fn compute_split_shapes(
         // Final section: from last index to end of axis.
         let mut out = input_shape.clone();
         match (prev_val, total) {
-            (Some(prev), Some(total)) => {
-                out[axis] = (total - prev).to_string();
+            (Some(prev), Some(t)) => {
+                if prev > t {
+                    return Err(format!(
+                        "split index {} exceeds axis size {}",
+                        prev, t
+                    ));
+                }
+                out[axis] = (t - prev).to_string();
             }
             _ => {
-                out[axis] = format!("{}-{}", axis_dim, prev_str);
+                // Simplify "dim-0" → "dim" for the final section too.
+                if prev_str == "0" {
+                    out[axis] = axis_dim.clone();
+                } else {
+                    out[axis] = format!("{}-{}", axis_dim, prev_str);
+                }
             }
         }
         output_shapes.push(out);
@@ -3955,13 +4138,63 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
-    fn test_reshape_symbolic_minus_one_errors() {
+    fn test_reshape_symbolic_minus_one_cancels_known_dim() {
         let args = vec![pos("x"), pos("(batch, -1)")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let error = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap_err();
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
 
-        assert!(error.contains("symbolic input"));
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_reshape_symbolic_minus_one_flattens_remaining_dims() {
+        let args = vec![pos("x"), pos("(c, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
+    }
+
+    #[test]
+    fn test_reshape_shape_index_resolves_to_input_dim() {
+        let args = vec![pos("x"), pos("(x.shape[0], -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
+    }
+
+    #[test]
+    fn test_reshape_shape_index_negative_resolves() {
+        let args = vec![pos("x"), pos("(x.shape[-1], -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["w", "c*h"])));
+    }
+
+    #[test]
+    fn test_reshape_symbolic_minus_one_unmatched_known_dim_returns_none() {
+        let args = vec![pos("x"), pos("(z, -1)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Reshape, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_reshape_method_form_with_shape_index_and_minus_one() {
+        let args = vec![pos("x.shape[0]"), pos("-1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+
+        let output = apply_method_call(&KnownFunction::Reshape, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h*w"])));
     }
 
     #[test]
@@ -4493,6 +4726,117 @@ mod known_function_shape_rule_tests {
         let output = apply_known_function(&KnownFunction::Identity, &[], &shapes).unwrap();
 
         assert_eq!(output, None);
+    }
+
+    // ── einsum shape rule tests ──
+
+    #[test]
+    fn test_einsum_matmul_2d() {
+        let args = vec![pos("\"ij,jk->ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "p"])));
+    }
+
+    #[test]
+    fn test_einsum_batched_matmul() {
+        let args = vec![pos("\"bij,bjk->bik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["b", "m", "n"])),
+            ("b".to_string(), shape(&["b", "n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "m", "p"])));
+    }
+
+    #[test]
+    fn test_einsum_transpose() {
+        let args = vec![pos("\"ij->ji\""), pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "a"])));
+    }
+
+    #[test]
+    fn test_einsum_sum_over_axis() {
+        let args = vec![pos("\"ij->i\""), pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["a"])));
+    }
+
+    #[test]
+    fn test_einsum_dim_mismatch_errors() {
+        let args = vec![pos("\"ij,jk->ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["x", "p"])),
+        ]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_einsum_non_literal_equation_returns_none() {
+        let args = vec![pos("equation"), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_einsum_ellipsis_returns_none() {
+        let args = vec![pos("\"...ij,...jk->...ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["b", "m", "n"])),
+            ("b".to_string(), shape(&["b", "n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_einsum_output_label_not_in_inputs_errors() {
+        // "z" appears in output but not in any input subscript
+        let args = vec![pos("\"ij->z\""), pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["m", "n"]))]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("output label 'z' not found"));
+    }
+
+    #[test]
+    fn test_einsum_rank_mismatch_errors() {
+        // "ijk" has 3 labels but operand has rank 2
+        let args = vec![pos("\"ijk->ij\""), pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["m", "n"]))]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("rank 2 but subscript 'ijk' has length 3"));
     }
 }
 
@@ -5725,6 +6069,17 @@ mod method_call_tests {
         assert!(result.is_err());
     }
 
+    /// Regression: split index exceeding axis size must error, not panic.
+    /// Input [5] with indices [2, 7] — 7 > axis size 5.
+    #[test]
+    fn test_split_index_exceeds_axis_size_errors() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["5"]))]);
+        let args = vec![pos("x"), pos("[2, 7]"), kw("axis", "0")];
+
+        let result = compute_split_shapes(&args, &shapes);
+        assert!(result.is_err());
+    }
+
     /// apply_known_function dispatch returns Ok(None) for Split
     /// because the current return type cannot express a tuple of shapes.
     /// This is a documented blocker — once tuple returns are wired through,
@@ -5737,5 +6092,18 @@ mod method_call_tests {
         let output = apply_known_function(&KnownFunction::Split, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
+    }
+
+    /// Validation errors from compute_split_shapes must propagate through
+    /// apply_known_function dispatch. This is the only reason the PR delivers
+    /// user value before tuple-returns land.
+    #[test]
+    fn test_split_dispatch_surfaces_validation_errors() {
+        // [7] split into 2 → non-divisible → Err
+        let shapes = HashMap::from([("x".to_string(), shape(&["7"]))]);
+        let args = vec![pos("x"), pos("2"), kw("axis", "0")];
+
+        let result = apply_known_function(&KnownFunction::Split, &args, &shapes);
+        assert!(result.is_err());
     }
 }
