@@ -588,6 +588,7 @@ mod end_to_end_layer_shape_tests {
             start_byte: 0,
             end_byte: usize::MAX,
             shapes,
+            return_shape: None,
         }]
     }
 
@@ -1995,6 +1996,7 @@ mod torch_nn_linear_tests {
             start_byte: 0,
             end_byte: usize::MAX,
             shapes,
+            return_shape: None,
         }]
     }
 

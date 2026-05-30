@@ -319,12 +319,32 @@ pub fn extract_jaxtyping_shapes(
                     function_shapes.insert(name, dims);
                 }
             }
+            let return_shape = if let Some(ret_type) = node.child_by_field_name("return_type") {
+                if contains_array_type(ret_type, text)? {
+                    if let Some(raw_shape) = find_string_literal(ret_type, text)? {
+                        let dims = shape_dims(&raw_shape);
+                        if dims.is_empty() {
+                            None
+                        } else {
+                            Some(dims)
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let new_idx = scopes.len();
             scopes.push(FunctionShapeScope {
                 function_name,
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 shapes: function_shapes,
+                return_shape,
             });
             new_idx
         } else {
@@ -369,6 +389,7 @@ pub fn extract_jaxtyping_shapes(
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         shapes: HashMap::new(),
+        return_shape: None,
     }];
     visit(node, text, &mut scopes, 0)?;
     Ok(scopes)
@@ -1261,13 +1282,80 @@ mod extract_jaxtyping_shapes_tests {
     }
 
     #[test]
-    fn test_return_annotation_is_ignored() {
+    fn test_return_annotation_is_captured() {
         let code = "def f(x) -> Float[Array, \"batch features\"]: pass";
         let tree = parse(code);
 
         let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
+        assert_eq!(
+            scope_by_name(&scopes, "f").return_shape,
+            Some(vec!["batch".into(), "features".into()])
+        );
+    }
+
+    #[test]
+    fn test_return_annotation_non_array_returns_none() {
+        let code = "def f(x) -> int: pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(scope_by_name(&scopes, "f").return_shape, None);
+
+        let code = "def f(x) -> str: pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(scope_by_name(&scopes, "f").return_shape, None);
+
+        let code = "def f(x) -> Literal[\"x\"]: pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(scope_by_name(&scopes, "f").return_shape, None);
+    }
+
+    #[test]
+    fn test_return_annotation_array_with_concrete_dims() {
+        let code = "def f(x) -> Float[Array, \"3 4\"]: pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(
+            scope_by_name(&scopes, "f").return_shape,
+            Some(vec!["3".into(), "4".into()])
+        );
+    }
+
+    #[test]
+    fn test_return_annotation_missing() {
+        let code = "def f(x): pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(scope_by_name(&scopes, "f").return_shape, None);
+    }
+
+    #[test]
+    fn test_return_annotation_inside_nested_function() {
+        let code = "\
+def f(x) -> Float[Array, \"batch\"]:
+    def g(y) -> Float[Array, \"features\"]:
+        pass
+";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(
+            scope_by_name(&scopes, "f").return_shape,
+            Some(vec!["batch".into()])
+        );
+        assert_eq!(
+            scope_by_name(&scopes, "g").return_shape,
+            Some(vec!["features".into()])
+        );
+    }
+
+    #[test]
+    fn test_module_scope_has_no_return_shape() {
+        let code = "x = 1";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        assert_eq!(module_scope(&scopes).return_shape, None);
     }
 
     #[test]

@@ -792,6 +792,7 @@ mod apply_layer_applications_tests {
             start_byte: 0,
             end_byte: usize::MAX,
             shapes,
+            return_shape: None,
         }]
     }
 
