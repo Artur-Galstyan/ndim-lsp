@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
@@ -126,6 +128,10 @@ impl LanguageServer for Backend {
 
 impl Backend {
     async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
+        let t_total = Instant::now();
+        let text_bytes = text.len();
+        let text_lines = text.lines().count();
+
         // Store the document text
         {
             let mut doc_lock = self.document_text.write().await;
@@ -146,22 +152,37 @@ impl Backend {
                 .await;
             return;
         }
+        let t_parse = Instant::now();
         let Some(tree) = parser.parse(text, None) else {
             self.client
                 .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
                 .await;
             return;
         };
+        let parse_ms = t_parse.elapsed().as_millis();
 
         // Use cached workspace roots, extended with discovered site-packages
+        let t_roots = Instant::now();
         let workspace_roots = self.workspace_roots.read().await.clone();
         let mut search_roots = workspace_roots.clone();
         search_roots.extend(python_site_packages_roots(&workspace_roots));
+        let roots_ms = t_roots.elapsed().as_millis();
+        let search_roots_count = search_roots.len();
 
-        // Read-file implementation
-        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+        // Read-file implementation — instrumented to count invocations and bytes.
+        let read_count = AtomicUsize::new(0);
+        let read_bytes = AtomicUsize::new(0);
+        let read_file = |path: &PathBuf| {
+            let result = std::fs::read_to_string(path).ok();
+            if let Some(ref s) = result {
+                read_count.fetch_add(1, Ordering::Relaxed);
+                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
+            }
+            result
+        };
 
         // Run analysis
+        let t_analyze = Instant::now();
         let diagnostics = match analyze_layer_shapes(
             tree.root_node(),
             text,
@@ -184,6 +205,27 @@ impl Backend {
                 Vec::new()
             }
         };
+        let analyze_ms = t_analyze.elapsed().as_millis();
+        let total_ms = t_total.elapsed().as_millis();
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "diagnostics: total={}ms parse={}ms roots={}ms analyze={}ms \
+                     | text={}B/{}L roots={} reads={}/{}B",
+                    total_ms,
+                    parse_ms,
+                    roots_ms,
+                    analyze_ms,
+                    text_bytes,
+                    text_lines,
+                    search_roots_count,
+                    read_count.load(Ordering::Relaxed),
+                    read_bytes.load(Ordering::Relaxed),
+                ),
+            )
+            .await;
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(version))
@@ -191,24 +233,42 @@ impl Backend {
     }
 
     async fn compute_inlay_hints(&self, text: &str, visible_range: &Range) -> Option<Vec<InlayHint>> {
+        let t_total = Instant::now();
         let mut parser = Parser::new();
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
             return None;
         }
+        let t_parse = Instant::now();
         let tree = parser.parse(text, None)?;
+        let parse_ms = t_parse.elapsed().as_millis();
 
         let root = tree.root_node();
 
+        let t_roots = Instant::now();
         let workspace_roots = self.workspace_roots.read().await.clone();
         let mut search_roots = workspace_roots.clone();
         search_roots.extend(python_site_packages_roots(&workspace_roots));
-        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+        let roots_ms = t_roots.elapsed().as_millis();
 
+        let read_count = AtomicUsize::new(0);
+        let read_bytes = AtomicUsize::new(0);
+        let read_file = |path: &PathBuf| {
+            let result = std::fs::read_to_string(path).ok();
+            if let Some(ref s) = result {
+                read_count.fetch_add(1, Ordering::Relaxed);
+                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
+            }
+            result
+        };
+
+        let t_analyze = Instant::now();
         let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
             Ok(a) => a,
             Err(_) => return None,
         };
+        let analyze_ms = t_analyze.elapsed().as_millis();
 
+        let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
 
         // Collect all variable+shape entries across all scopes, remembering
@@ -263,17 +323,43 @@ impl Backend {
             }
         }
 
+        let build_ms = t_build.elapsed().as_millis();
+        let total_ms = t_total.elapsed().as_millis();
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "inlay_hint: total={}ms parse={}ms roots={}ms analyze={}ms build={}ms \
+                     | hints={} scopes={} reads={}/{}B visible={}..{}",
+                    total_ms,
+                    parse_ms,
+                    roots_ms,
+                    analyze_ms,
+                    build_ms,
+                    hints.len(),
+                    analysis.scopes.len(),
+                    read_count.load(Ordering::Relaxed),
+                    read_bytes.load(Ordering::Relaxed),
+                    visible_range.start.line,
+                    visible_range.end.line,
+                ),
+            )
+            .await;
+
         Some(hints)
     }
 
     async fn on_hover(&self, text: &str, pos: &Position) -> Result<Option<Hover>> {
+        let t_total = Instant::now();
         let mut parser = Parser::new();
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
             return Ok(None);
         }
+        let t_parse = Instant::now();
         let Some(tree) = parser.parse(text, None) else {
             return Ok(None);
         };
+        let parse_ms = t_parse.elapsed().as_millis();
 
         let root = tree.root_node();
         let point = tree_sitter::Point::new(pos.line as usize, pos.character as usize);
@@ -295,11 +381,23 @@ impl Backend {
         let cursor_byte = node.start_byte();
 
         // Use cached workspace roots for analysis, extended with discovered site-packages
+        let t_roots = Instant::now();
         let workspace_roots = self.workspace_roots.read().await.clone();
         let mut search_roots = workspace_roots.clone();
         search_roots.extend(python_site_packages_roots(&workspace_roots));
-        let read_file = |path: &PathBuf| std::fs::read_to_string(path).ok();
+        let roots_ms = t_roots.elapsed().as_millis();
+        let read_count = AtomicUsize::new(0);
+        let read_bytes = AtomicUsize::new(0);
+        let read_file = |path: &PathBuf| {
+            let result = std::fs::read_to_string(path).ok();
+            if let Some(ref s) = result {
+                read_count.fetch_add(1, Ordering::Relaxed);
+                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
+            }
+            result
+        };
 
+        let t_analyze = Instant::now();
         let analysis = match analyze_layer_shapes(root, text, &search_roots, read_file, 8) {
             Ok(a) => a,
             Err(msg) => {
@@ -309,6 +407,24 @@ impl Backend {
                 return Ok(None);
             }
         };
+        let analyze_ms = t_analyze.elapsed().as_millis();
+        let total_ms = t_total.elapsed().as_millis();
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "hover '{}': total={}ms parse={}ms roots={}ms analyze={}ms \
+                     | reads={}/{}B",
+                    var_name,
+                    total_ms,
+                    parse_ms,
+                    roots_ms,
+                    analyze_ms,
+                    read_count.load(Ordering::Relaxed),
+                    read_bytes.load(Ordering::Relaxed),
+                ),
+            )
+            .await;
 
         // Walk from innermost scope outward, looking for the variable
         let shape = match find_shape_for_variable(&analysis.scopes, cursor_byte, var_name) {
