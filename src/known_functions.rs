@@ -634,9 +634,8 @@ fn apply_known_einsum(
     let input_specs: Vec<&str> = inputs_part.split(',').map(str::trim).collect();
     let output_spec = output_part.trim();
 
-    // Collect operand shapes
-    let operand_values = positional_arg_values(args);
-    let operand_names = &operand_values[1..]; // Skip equation string
+    // Collect operand shapes (reuse positional_values from above)
+    let operand_names = &positional_values[1..]; // Skip equation string
 
     if operand_names.len() != input_specs.len() {
         return Err(format!(
@@ -654,13 +653,16 @@ fn apply_known_einsum(
             return Ok(None);
         };
 
-        if shape.len() != spec.len() {
+        // Note: einsum subscripts are ASCII letters in practice, so chars().count() == byte len.
+        // Using chars().count() is more correct for the rank comparison.
+        let spec_label_count = spec.chars().count();
+        if shape.len() != spec_label_count {
             return Err(format!(
                 "einsum operand '{}' has rank {} but subscript '{}' has length {}",
                 operand_name,
                 shape.len(),
                 spec,
-                spec.len()
+                spec_label_count
             ));
         }
 
@@ -4451,6 +4453,30 @@ mod known_function_shape_rule_tests {
         let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_einsum_output_label_not_in_inputs_errors() {
+        // "z" appears in output but not in any input subscript
+        let args = vec![pos("\"ij->z\""), pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["m", "n"]))]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("output label 'z' not found"));
+    }
+
+    #[test]
+    fn test_einsum_rank_mismatch_errors() {
+        // "ijk" has 3 labels but operand has rank 2
+        let args = vec![pos("\"ijk->ij\""), pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["m", "n"]))]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("rank 2 but subscript 'ijk' has length 3"));
     }
 }
 
