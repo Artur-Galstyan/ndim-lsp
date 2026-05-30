@@ -561,6 +561,7 @@ pub fn apply_known_function(
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
+        KnownFunction::Einsum => apply_known_einsum(args, shapes),
         _ => Ok(None),
     }
 }
@@ -596,6 +597,95 @@ fn axis_arg(args: &[CallArgument], default: isize) -> isize {
         }
     }
     axis
+}
+
+fn apply_known_einsum(
+    args: &[CallArgument],
+    shapes: &HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let positional_values = positional_arg_values(args);
+    let Some(equation) = positional_values.first() else {
+        return Ok(None);
+    };
+
+    let equation_trimmed = equation.trim();
+
+    // Remove quotes if present
+    let equation_str = if (equation_trimmed.starts_with('"') && equation_trimmed.ends_with('"'))
+        || (equation_trimmed.starts_with('\'') && equation_trimmed.ends_with('\''))
+    {
+        &equation_trimmed[1..equation_trimmed.len() - 1]
+    } else {
+        // Not a string literal
+        return Ok(None);
+    };
+
+    // If equation contains ellipsis, return Ok(None) for v1
+    if equation_str.contains("...") {
+        return Ok(None);
+    }
+
+    // Split on "->" for explicit output
+    let Some((inputs_part, output_part)) = equation_str.split_once("->") else {
+        // Implicit-mode (no "->"), return Ok(None) for v1
+        return Ok(None);
+    };
+
+    let input_specs: Vec<&str> = inputs_part.split(',').map(str::trim).collect();
+    let output_spec = output_part.trim();
+
+    // Collect operand shapes
+    let operand_values = positional_arg_values(args);
+    let operand_names = &operand_values[1..]; // Skip equation string
+
+    if operand_names.len() != input_specs.len() {
+        return Err(format!(
+            "einsum equation has {} input specs but got {} operands",
+            input_specs.len(),
+            operand_names.len()
+        ));
+    }
+
+    // Build label→dim map
+    let mut label_map: HashMap<char, String> = HashMap::new();
+
+    for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
+        let Some(shape) = shapes.get(operand_name.as_str()) else {
+            return Ok(None);
+        };
+
+        if shape.len() != spec.len() {
+            return Err(format!(
+                "einsum operand '{}' has rank {} but subscript '{}' has length {}",
+                operand_name,
+                shape.len(),
+                spec,
+                spec.len()
+            ));
+        }
+
+        for (label_char, dim) in spec.chars().zip(shape.iter()) {
+            if let Some(existing_dim) = label_map.get(&label_char) {
+                check_dim_match(existing_dim, dim, &format!("einsum label '{}'", label_char))?;
+            } else {
+                label_map.insert(label_char, dim.clone());
+            }
+        }
+    }
+
+    // Build output shape
+    let mut output_shape = Vec::new();
+    for label_char in output_spec.chars() {
+        let Some(dim) = label_map.get(&label_char) else {
+            return Err(format!(
+                "einsum output label '{}' not found in input subscripts",
+                label_char
+            ));
+        };
+        output_shape.push(dim.clone());
+    }
+
+    Ok(Some(output_shape))
 }
 
 fn apply_known_concatenate(
@@ -4272,6 +4362,93 @@ mod known_function_shape_rule_tests {
         let shapes = HashMap::new();
 
         let output = apply_known_function(&KnownFunction::Identity, &[], &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    // ── einsum shape rule tests ──
+
+    #[test]
+    fn test_einsum_matmul_2d() {
+        let args = vec![pos("\"ij,jk->ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "p"])));
+    }
+
+    #[test]
+    fn test_einsum_batched_matmul() {
+        let args = vec![pos("\"bij,bjk->bik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["b", "m", "n"])),
+            ("b".to_string(), shape(&["b", "n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "m", "p"])));
+    }
+
+    #[test]
+    fn test_einsum_transpose() {
+        let args = vec![pos("\"ij->ji\""), pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b", "a"])));
+    }
+
+    #[test]
+    fn test_einsum_sum_over_axis() {
+        let args = vec![pos("\"ij->i\""), pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b"]))]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["a"])));
+    }
+
+    #[test]
+    fn test_einsum_dim_mismatch_errors() {
+        let args = vec![pos("\"ij,jk->ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["x", "p"])),
+        ]);
+
+        let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_einsum_non_literal_equation_returns_none() {
+        let args = vec![pos("equation"), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_einsum_ellipsis_returns_none() {
+        let args = vec![pos("\"...ij,...jk->...ik\""), pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["b", "m", "n"])),
+            ("b".to_string(), shape(&["b", "n", "p"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Einsum, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
