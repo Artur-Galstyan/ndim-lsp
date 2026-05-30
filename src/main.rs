@@ -195,9 +195,7 @@ impl Backend {
         if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
             return None;
         }
-        let Some(tree) = parser.parse(text, None) else {
-            return None;
-        };
+        let tree = parser.parse(text, None)?;
 
         let root = tree.root_node();
 
@@ -393,6 +391,7 @@ fn find_variable_line(
             return false; // skip children outside scope
         }
         if node.kind() == "assignment"
+            && node.child_by_field_name("type").is_none() // skip annotated assignments (duplicate of user-written type)
             && let Some(lhs) = node.child(0)
             && lhs.kind() == "identifier"
             && let Ok(name) = lhs.utf8_text(text.as_bytes())
@@ -410,28 +409,27 @@ fn find_variable_line(
 /// If `f` returns false, children of that node are skipped.
 fn walk_nodes(cursor: &mut tree_sitter::TreeCursor, f: &mut impl FnMut(tree_sitter::Node) -> bool) {
     loop {
-        let node = cursor.node();
-        let descend = f(node);
+        let descend = f(cursor.node());
         if descend && cursor.goto_first_child() {
-            loop {
-                walk_nodes(cursor, f);
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-            cursor.goto_parent();
+            continue;
         }
-        if !cursor.goto_next_sibling() {
-            break;
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
         }
     }
 }
 
-/// Return the character count of the given 0-based line in `text`.
+/// Return the UTF-16 code-unit count of the given 0-based line in `text`.
+/// LSP `Position.character` is UTF-16 code units by default.
 fn line_length(text: &str, line: u32) -> u32 {
     text.lines()
         .nth(line as usize)
-        .map(|l| l.len() as u32)
+        .map(|l| l.encode_utf16().count() as u32)
         .unwrap_or(0)
 }
 
@@ -901,6 +899,14 @@ mod tests {
     }
 
     #[test]
+    fn line_length_utf16() {
+        // α is U+03B1 → 2 UTF-16 code units. "α = 1" → 2+3 = 5 code units, but 5+2=7 bytes.
+        let text = "\u{03b1} = 1\n";
+        assert_eq!(line_length(text, 0), 5); // UTF-16 code units, not bytes
+        assert_ne!(line_length(text, 0) as usize, text.lines().next().unwrap().len()); // bytes ≠ code units
+    }
+
+    #[test]
     fn line_length_empty_line() {
         let text = "\n\n";
         assert_eq!(line_length(text, 0), 0);
@@ -944,5 +950,23 @@ mod tests {
             find_variable_line(&root, text, "x", second_line_start, text.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn find_variable_line_skips_annotated_assignment() {
+        // Annotated assignments have a 'type' field; find_variable_line should skip them
+        // to avoid duplicating the user-written type annotation.
+        let text = "y: int = 1\nz = 2\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // 'y' has a type annotation — should be skipped
+        assert_eq!(find_variable_line(&root, text, "y", 0, text.len()), None);
+        // 'z' is a bare assignment — should be found
+        assert_eq!(find_variable_line(&root, text, "z", 0, text.len()), Some(1));
     }
 }
