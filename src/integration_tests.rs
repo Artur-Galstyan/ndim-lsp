@@ -589,6 +589,7 @@ mod end_to_end_layer_shape_tests {
             end_byte: usize::MAX,
             shapes,
             return_shape: None,
+            param_order: Vec::new(),
         }]
     }
 
@@ -1997,6 +1998,7 @@ mod torch_nn_linear_tests {
             end_byte: usize::MAX,
             shapes,
             return_shape: None,
+            param_order: Vec::new(),
         }]
     }
 
@@ -4296,5 +4298,255 @@ mod site_packages_resolution_tests {
         assert!(msg.contains("Linear"), "missing 'Linear' in {:?}", msg);
         assert!(msg.contains("64"), "missing '64' in {:?}", msg);
         assert!(msg.contains("32"), "missing '32' in {:?}", msg);
+    }
+}
+
+/// Phase 2: Cross-function shape propagation tests.
+/// When a user-defined function has jaxtyping annotations, calls to it
+/// propagate the return shape (with dim binding) to the assignment target.
+#[cfg(test)]
+mod user_function_propagation_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// Helper: find a shape for `var` in the scope named `scope_name`.
+    fn find_shape_in_scope<'a>(
+        analysis: &'a LayerShapeAnalysis,
+        scope_name: &str,
+        var: &str,
+    ) -> Option<&'a Vec<String>> {
+        analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some(scope_name))
+            .and_then(|s| s.shapes.get(var))
+    }
+
+    /// Test 1: basic return-shape propagation with symbolic dims.
+    /// `z = f(y)` where f returns Float[Array, "m"] — z gets ["m"].
+    #[test]
+    fn test_user_function_return_shape_propagates_to_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["m"]))
+        );
+    }
+
+    /// Test 2: param dims bind into the return shape.
+    /// f(x: Float[Array, "a b"]) -> Float[Array, "a c"]
+    /// caller passes x: Float[Array, "batch features"]
+    /// z = f(x) → z has shape ["batch", "c"] (a→batch, c is fresh)
+    #[test]
+    fn test_user_function_param_dim_binds_into_return_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "a b"]) -> Float[Array, "a c"]:
+    pass
+
+def caller(x: Float[Array, "batch features"]) -> None:
+    z = f(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["batch", "c"]))
+        );
+    }
+
+    /// Test 3: rank mismatch between param and arg emits a diagnostic.
+    /// f expects rank 2, caller passes rank 1.
+    #[test]
+    fn test_user_function_arg_rank_mismatch_emits_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n m"]) -> Float[Array, "n"]:
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "z");
+        assert!(
+            analysis.errors[0].message.contains("rank"),
+            "error should mention rank: {:?}",
+            analysis.errors[0].message
+        );
+        // No shape recorded for z when there's a mismatch.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            None
+        );
+    }
+
+    /// Test 4: concrete dim mismatch emits a diagnostic.
+    /// f expects dim 3, caller passes dim 5.
+    #[test]
+    fn test_user_function_concrete_dim_mismatch_emits_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "3 features"]) -> Float[Array, "features"]:
+    pass
+
+def caller(y: Float[Array, "5 features"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "z");
+        assert!(
+            analysis.errors[0].message.contains('3') && analysis.errors[0].message.contains('5'),
+            "error should mention 3 vs 5: {:?}",
+            analysis.errors[0].message
+        );
+    }
+
+    /// Test 5: function without return annotation — no propagation, no error.
+    #[test]
+    fn test_user_function_without_return_annotation_skips_propagation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n"]):
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            None
+        );
+    }
+
+    /// Test 6: user function call at module scope.
+    #[test]
+    fn test_user_function_call_in_module_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+y: Float[Array, "batch"] = 0
+z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        // Module scope (index 0) should have z → ["m"]
+        assert_eq!(
+            analysis.scopes[0].shapes.get("z"),
+            Some(&shape(&["m"]))
+        );
+    }
+
+    /// Test 7: a user-defined function named `reshape` should be resolved
+    /// as a user function, not a known function — `classify_known_function`
+    /// only matches qualified names like `np.reshape`.
+    #[test]
+    fn test_user_function_known_function_takes_precedence_when_both_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def reshape(x: Float[Array, "n"]) -> Float[Array, "m"]:
+    pass
+
+def caller(y: Float[Array, "batch"]) -> None:
+    z = reshape(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        // Bare `reshape` is not classified by `classify_known_function`, so the
+        // user-function branch handles it: z gets ["m"].
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            Some(&shape(&["m"]))
+        );
+    }
+
+    /// Test 8: repeated dim name in param must bind consistently.
+    /// f(x: Float[Array, "n n"]) — passing ["a", "b"] where a ≠ b is an error.
+    #[test]
+    fn test_user_function_repeated_dim_name_must_bind_consistently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "n n"]) -> Float[Array, "n"]:
+    pass
+
+def caller(y: Float[Array, "a b"]) -> None:
+    z = f(y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "z");
+        assert!(
+            analysis.errors[0].message.contains("cannot be both"),
+            "error should mention conflicting binding: {:?}",
+            analysis.errors[0].message
+        );
+        // No shape for z when binding is inconsistent.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "caller", "z"),
+            None
+        );
     }
 }

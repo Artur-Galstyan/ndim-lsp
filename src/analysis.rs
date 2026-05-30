@@ -156,6 +156,44 @@ fn propagate_calls(
                     continue;
                 }
 
+                // --- User-defined function propagation (Phase 2) ---
+                // Try to resolve `call.target` as a user-defined function in the
+                // same file. Qualified names (e.g. "mod.f") are skipped — no
+                // cross-module resolution yet. Method calls are dispatched
+                // separately above via CallEntry::Method.
+                if !call.target.contains('.')
+                    && let Some(result) = apply_user_function(
+                        &call.target,
+                        position,
+                        &args,
+                        &scopes[scope_idx].shapes,
+                        scopes,
+                    )
+                {
+                    match result {
+                        Ok(Some(output_shape)) => {
+                            scopes[scope_idx]
+                                .shapes
+                                .insert(call.variable.clone(), output_shape);
+                        }
+                        Ok(None) => {
+                            // No return annotation — nothing to propagate,
+                            // but any ShapeErrors from argument validation
+                            // were already handled below (they'd be Err).
+                        }
+                        Err(message) => errors.push(ShapeError {
+                            variable: call.variable.clone(),
+                            message,
+                            range: call.args_node_range,
+                        }),
+                    }
+                    continue;
+                    // If no matching user-function scope was found, fall through
+                    // to the known-function branch below.
+                }
+                // Qualified names (e.g. "module.func") are out of scope for
+                // user-function propagation in v1 — no cross-module resolution.
+
                 let resolved = resolve_call_target(&call.target, import_map);
                 let Some(known) = classify_known_function(&resolved) else {
                     continue;
@@ -223,6 +261,157 @@ fn record_result(
             range,
         }),
     }
+}
+
+/// Attempt to resolve `target` as a user-defined function in the same file
+/// and propagate its declared return shape to the call site.
+///
+/// Returns:
+/// - `Some(Ok(Some(shape)))` if a matching function was found and its
+///   return shape could be computed after binding param dims to arg dims.
+/// - `Some(Ok(None))` if a matching function was found but has no return
+///   annotation — argument validation still ran but nothing to propagate.
+/// - `Some(Err(msg))` if argument shapes don't unify with declared param shapes.
+/// - `None` if no matching user-defined function was found (fall through to
+///   the known-function branch).
+///
+/// v1 limitations (documented in PR):
+/// - Only positional arguments are matched. Keyword args that match a param
+///   name are honoured; otherwise the call is skipped with Ok(None).
+/// - No cross-file resolution.
+/// - Qualified names ("module.func") are excluded at the call site.
+/// - Fresh output dims (not in the binding) pass through unchanged.
+fn apply_user_function(
+    target: &str,
+    call_byte: usize,
+    args: &[CallArgument],
+    caller_shapes: &HashMap<String, Vec<String>>,
+    scopes: &[FunctionShapeScope],
+) -> Option<Result<Option<Vec<String>>, String>> {
+    // Search for a FunctionShapeScope whose function_name matches `target`,
+    // excluding the module scope (index 0) and excluding scopes whose
+    // byte range contains the call site (to avoid self-recursive binding).
+    // If multiple candidates remain, prefer the one with the smallest scope
+    // (most specific / innermost). If still tied, take the first match.
+    let mut best: Option<(usize, usize)> = None; // (scope index, scope size)
+    for (i, scope) in scopes.iter().enumerate() {
+        if i == 0 {
+            continue; // skip module scope
+        }
+        if scope.function_name.as_deref() != Some(target) {
+            continue;
+        }
+        // Don't bind a call to itself (recursive call in the same function body).
+        if scope.start_byte <= call_byte && call_byte < scope.end_byte {
+            continue;
+        }
+        let size = scope.end_byte - scope.start_byte;
+        match best {
+            None => best = Some((i, size)),
+            Some((_, prev_size)) if size < prev_size => best = Some((i, size)),
+            _ => {} // keep first on tie
+        }
+    }
+    let scope_idx = best.map(|(i, _)| i)?;
+    let callee = &scopes[scope_idx];
+
+    // If the callee has no jaxtyping annotations at all, fall through to
+    // the known-function branch.
+    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+        return None;
+    }
+
+    // Resolve each positional arg to a shape from the caller's scope.
+    // We match positional args to declared params in declaration order.
+    let param_names = &callee.param_order;
+    let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new(); // (param_name, arg_shape)
+    let mut positional_idx = 0usize;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                let Some(param_name) = param_names.get(positional_idx) else {
+                    break; // more positional args than annotated params — ignore extras
+                };
+                let Some(shape) = caller_shapes.get(value.as_str()) else {
+                    // Arg has no known shape — can't validate, skip entirely.
+                    return Some(Ok(None));
+                };
+                arg_shapes.push((param_name.as_str(), shape.clone()));
+                positional_idx += 1;
+            }
+            CallArgument::Keyword { name, value } => {
+                // v1: honour keyword args whose name matches a declared param.
+                if callee.shapes.contains_key(name) {
+                    let Some(shape) = caller_shapes.get(value.as_str()) else {
+                        return Some(Ok(None));
+                    };
+                    arg_shapes.push((name.as_str(), shape.clone()));
+                }
+                // Non-matching keyword args are silently ignored in v1.
+            }
+        }
+    }
+
+    // Build a binding: declared dim name → resolved dim from the caller's arg.
+    // For each param, walk its dims in order against the arg's dims.
+    let mut binding: HashMap<String, String> = HashMap::new();
+    for (param_name, arg_shape) in &arg_shapes {
+        let Some(param_shape) = callee.shapes.get(*param_name) else {
+            continue;
+        };
+
+        // Rank mismatch
+        if param_shape.len() != arg_shape.len() {
+            return Some(Err(format!(
+                "call to {}: argument '{}' expected rank {}, got rank {}",
+                target, param_name, param_shape.len(), arg_shape.len()
+            )));
+        }
+
+        for (dim_idx, (param_dim, arg_dim)) in
+            param_shape.iter().zip(arg_shape.iter()).enumerate()
+        {
+            let is_param_concrete = param_dim.parse::<usize>().is_ok()
+                || param_dim.parse::<isize>().is_ok();
+
+            if is_param_concrete {
+                // Concrete param dim must match the arg dim exactly.
+                if param_dim != arg_dim {
+                    return Some(Err(format!(
+                        "call to {}: argument '{}' dim {} expected {}, got {}",
+                        target, param_name, dim_idx, param_dim, arg_dim
+                    )));
+                }
+            } else {
+                // Symbolic param dim: bind it.
+                if let Some(existing) = binding.get(param_dim) {
+                    if existing != arg_dim {
+                        return Some(Err(format!(
+                            "call to {}: dim '{}' cannot be both '{}' and '{}'" ,
+                            target, param_dim, existing, arg_dim
+                        )));
+                    }
+                } else {
+                    binding.insert(param_dim.clone(), arg_dim.clone());
+                }
+            }
+        }
+    }
+
+    // Substitute into return_shape using the binding.
+    // Dims not in the binding pass through unchanged (fresh output dims).
+    let Some(ref return_shape) = callee.return_shape else {
+        // No return annotation — nothing to propagate, but argument
+        // validation above succeeded without error.
+        return Some(Ok(None));
+    };
+
+    let substituted: Vec<String> = return_shape
+        .iter()
+        .map(|dim| binding.get(dim).cloned().unwrap_or_else(|| dim.clone()))
+        .collect();
+
+    Some(Ok(Some(substituted)))
 }
 
 fn apply_binary_op(

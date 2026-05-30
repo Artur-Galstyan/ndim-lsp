@@ -241,6 +241,10 @@ pub struct FunctionShapeScope {
     pub end_byte: usize,
     pub shapes: HashMap<String, Vec<String>>,
     pub return_shape: Option<Vec<String>>,
+    /// Parameter names with jaxtyping annotations, in declaration order.
+    /// Used by cross-function shape propagation to match positional call
+    /// arguments to declared parameter shapes.
+    pub param_order: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]

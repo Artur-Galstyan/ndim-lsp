@@ -793,6 +793,7 @@ mod apply_layer_applications_tests {
             end_byte: usize::MAX,
             shapes,
             return_shape: None,
+            param_order: Vec::new(),
         }]
     }
 

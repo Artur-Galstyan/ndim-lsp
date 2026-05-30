@@ -295,6 +295,7 @@ pub fn extract_jaxtyping_shapes(
                 .and_then(|n| n.utf8_text(text.as_bytes()).ok())
                 .map(|s| s.to_string());
             let mut function_shapes = HashMap::new();
+            let mut param_order = Vec::new();
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 for i in 0..parameters.named_child_count() {
                     let Some(parameter) = parameters.named_child(i as u32) else {
@@ -316,7 +317,8 @@ pub fn extract_jaxtyping_shapes(
                     let Some(name) = first_identifier(parameter, text)? else {
                         continue;
                     };
-                    function_shapes.insert(name, dims);
+                    function_shapes.insert(name.clone(), dims);
+                    param_order.push(name);
                 }
             }
             let return_shape = if let Some(ret_type) = node.child_by_field_name("return_type") {
@@ -345,6 +347,7 @@ pub fn extract_jaxtyping_shapes(
                 end_byte: node.end_byte(),
                 shapes: function_shapes,
                 return_shape,
+                param_order,
             });
             new_idx
         } else {
@@ -390,6 +393,7 @@ pub fn extract_jaxtyping_shapes(
         end_byte: node.end_byte(),
         shapes: HashMap::new(),
         return_shape: None,
+        param_order: Vec::new(),
     }];
     visit(node, text, &mut scopes, 0)?;
     Ok(scopes)
