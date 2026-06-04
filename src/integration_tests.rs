@@ -62,7 +62,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
@@ -79,7 +79,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -94,7 +94,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -116,7 +116,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(shapes_empty(&analysis));
@@ -132,7 +132,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -148,7 +148,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(analysis.layers.len(), 1);
@@ -166,7 +166,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(analysis.layers.is_empty());
@@ -183,7 +183,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "bad");
@@ -200,7 +200,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 2);
         assert_eq!(analysis.errors[0].variable, "a");
@@ -219,7 +219,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 2);
         assert_eq!(analysis.errors[0].variable, "a");
@@ -235,7 +235,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -250,7 +250,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         let range = &analysis.errors[0].range;
@@ -265,7 +265,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 2);
         assert_eq!(
@@ -290,7 +290,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(!has_shape(&analysis, "x"));
@@ -305,7 +305,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -322,7 +322,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "11"])));
@@ -336,7 +336,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -353,7 +353,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -368,7 +368,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(!has_shape(&analysis, "missing_out"));
@@ -383,7 +383,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "7"])));
@@ -397,7 +397,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(analysis.layers.is_empty());
@@ -416,7 +416,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         let f_scope = analysis
             .scopes
@@ -441,7 +441,7 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         let f_scope = analysis
@@ -477,7 +477,7 @@ def g(x: Float[Array, \"batch 128\"]):
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(
             analysis.errors.is_empty(),
@@ -528,7 +528,7 @@ def g(x: Float[Array, \"batch 3 32 32\"]):
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(
             analysis.errors.is_empty(),
@@ -728,7 +728,7 @@ mod resolve_call_signature_tests {
         let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
             .unwrap()
             .unwrap();
 
@@ -753,7 +753,7 @@ mod resolve_call_signature_tests {
         let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
             .unwrap()
             .unwrap();
 
@@ -780,7 +780,7 @@ mod resolve_call_signature_tests {
         let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
             .unwrap()
             .unwrap();
 
@@ -809,7 +809,7 @@ mod resolve_call_signature_tests {
         let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
             .unwrap()
             .unwrap();
 
@@ -834,7 +834,7 @@ mod resolve_call_signature_tests {
         let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5)
+        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
             .unwrap()
             .unwrap();
 
@@ -854,7 +854,7 @@ mod resolve_call_signature_tests {
         let roots = vec![tmp.path().to_path_buf()];
 
         let found =
-            resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5).unwrap();
+            resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -1752,7 +1752,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -1766,7 +1766,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "8"])));
@@ -1780,7 +1780,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -1794,7 +1794,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
@@ -1807,7 +1807,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -1820,7 +1820,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "8"])));
@@ -1833,7 +1833,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
@@ -1848,7 +1848,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -1862,7 +1862,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -1876,7 +1876,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(!has_shape(&analysis, "y"));
@@ -1889,7 +1889,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert!(!has_shape(&analysis, "y"));
@@ -1902,7 +1902,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         let range = &analysis.errors[0].range;
@@ -1916,7 +1916,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -1932,7 +1932,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -1948,7 +1948,7 @@ mod call_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["c", "a", "b"])));
@@ -2010,7 +2010,7 @@ mod torch_nn_linear_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
@@ -2027,7 +2027,7 @@ mod torch_nn_linear_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -2062,7 +2062,7 @@ mod torch_nn_linear_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -2077,7 +2077,7 @@ mod torch_nn_linear_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -2112,7 +2112,7 @@ mod like_constructors_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -2125,7 +2125,7 @@ mod like_constructors_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -2138,7 +2138,7 @@ mod like_constructors_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -2151,7 +2151,7 @@ mod like_constructors_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -2187,7 +2187,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "n"])));
@@ -2201,7 +2201,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2216,7 +2216,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2231,7 +2231,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "m", "n"])));
@@ -2245,7 +2245,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -2262,7 +2262,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2279,7 +2279,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "d"])));
@@ -2293,7 +2293,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2308,7 +2308,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "d"])));
@@ -2322,7 +2322,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2336,7 +2336,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "n"])));
@@ -2350,7 +2350,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         let f_scope = analysis
@@ -2443,7 +2443,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
@@ -2459,7 +2459,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
@@ -2475,7 +2475,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -2491,7 +2491,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("expected 3 input channels"));
@@ -2508,7 +2508,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         // L_out = floor((64 + 2*0 - 5)/1) + 1 = 60
@@ -2523,7 +2523,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "60"])));
@@ -2539,7 +2539,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
@@ -2553,7 +2553,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
@@ -2569,7 +2569,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         // H_out = floor((32 + 2*1 - 3)/2) + 1 = floor(31/2) + 1 = 15 + 1 = 16
@@ -2584,7 +2584,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "16", "16"])));
@@ -2600,7 +2600,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         let y_shape = find_shape(&analysis, "y").unwrap();
@@ -2621,7 +2621,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         let y_shape = find_shape(&analysis, "y").unwrap();
@@ -2642,7 +2642,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
@@ -2656,7 +2656,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
@@ -2672,7 +2672,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
@@ -2921,7 +2921,7 @@ mod conv_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // dilation=2 gives wrong spatial output, but no crash and no false error
         assert!(analysis.layers.contains_key("layer"));
@@ -3008,7 +3008,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "features"])));
@@ -3025,7 +3025,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
@@ -3041,7 +3041,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16"])));
@@ -3057,7 +3057,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3073,7 +3073,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "3", "32", "32"])));
@@ -3089,7 +3089,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
@@ -3106,7 +3106,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["a", "b", "c"])));
@@ -3122,7 +3122,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3138,7 +3138,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "channels", "H", "W"])));
@@ -3154,7 +3154,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3170,7 +3170,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3186,7 +3186,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3202,7 +3202,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3218,7 +3218,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3234,7 +3234,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
@@ -3250,7 +3250,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -3321,7 +3321,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -3339,7 +3339,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -3357,7 +3357,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("Dropout2d"));
@@ -3373,7 +3373,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("Dropout1d"));
@@ -3389,7 +3389,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("Dropout3d"));
@@ -3407,7 +3407,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "H", "W"])));
@@ -3422,7 +3422,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
@@ -3437,7 +3437,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "H", "W"])));
@@ -3452,7 +3452,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
@@ -3467,7 +3467,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "L"])));
@@ -3482,7 +3482,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["16", "L"])));
@@ -3497,7 +3497,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -3512,7 +3512,7 @@ mod shape_preserving_layer_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -3629,7 +3629,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
@@ -3643,7 +3643,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["h+3", "w+7"])));
@@ -3655,7 +3655,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["height+3", "width+3"])));
@@ -3667,7 +3667,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // Dynamic pad width variable cannot be statically parsed; should return no shape, not error
         assert!(analysis.errors.is_empty());
@@ -3680,7 +3680,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // Invalid/unparseable pad does not crash; returns no shape
         assert!(analysis.errors.is_empty());
@@ -3693,7 +3693,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
@@ -3705,7 +3705,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n+3"])));
@@ -3717,7 +3717,7 @@ mod torch_nn_functional_pad_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["13", "27"])));
@@ -3752,7 +3752,7 @@ mod free_reduction_shape_preserving_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch"])));
@@ -3764,7 +3764,7 @@ mod free_reduction_shape_preserving_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
@@ -3776,7 +3776,7 @@ mod free_reduction_shape_preserving_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3788,7 +3788,7 @@ mod free_reduction_shape_preserving_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3800,7 +3800,7 @@ mod free_reduction_shape_preserving_tests {
         let tree = parse(code);
         let roots = vec![];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -3835,7 +3835,7 @@ mod linalg_inv_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -3851,7 +3851,7 @@ mod linalg_inv_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "n"])));
@@ -3864,7 +3864,7 @@ mod linalg_inv_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -3880,7 +3880,7 @@ mod linalg_inv_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -3925,7 +3925,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert!(analysis.layers.contains_key("layer"));
         assert_eq!(analysis.errors.len(), 1);
@@ -3947,7 +3947,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert!(analysis.layers.contains_key("layer"));
         assert_eq!(analysis.errors.len(), 1);
@@ -3969,7 +3969,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert!(analysis.layers.contains_key("layer"));
         assert_eq!(analysis.errors.len(), 1);
@@ -3990,7 +3990,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert!(analysis.layers.contains_key("layer"));
         assert_eq!(analysis.errors.len(), 1);
@@ -4011,7 +4011,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -4047,7 +4047,7 @@ mod builtin_layer_catalog_end_to_end_tests {
         let tree = parse(code);
 
         let analysis =
-            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5).unwrap();
+            analyze_layer_shapes(tree.root_node(), code, &empty_roots(), no_read, 5, None).unwrap();
 
         assert_eq!(
             analysis.errors.len(),
@@ -4091,7 +4091,7 @@ mod linalg_det_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -4107,7 +4107,7 @@ mod linalg_det_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -4123,7 +4123,7 @@ mod linalg_det_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(
@@ -4139,7 +4139,7 @@ mod linalg_det_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
@@ -4175,7 +4175,7 @@ mod constructor_coverage_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
@@ -4188,7 +4188,7 @@ mod constructor_coverage_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "n"])));
@@ -4201,7 +4201,7 @@ mod constructor_coverage_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
@@ -4214,7 +4214,7 @@ mod constructor_coverage_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["steps"])));
@@ -4227,7 +4227,7 @@ mod constructor_coverage_integration_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
@@ -4286,7 +4286,7 @@ mod site_packages_resolution_tests {
         let tree = parse(code);
         let roots = vec![site];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 8).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 8, None).unwrap();
 
         assert_eq!(
             analysis.errors.len(),
@@ -4353,7 +4353,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4379,7 +4379,7 @@ def caller(x: Float[Array, "batch features"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4403,7 +4403,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
         assert_eq!(analysis.errors[0].variable, "z");
@@ -4434,7 +4434,7 @@ def caller(y: Float[Array, "5 features"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
         assert_eq!(analysis.errors[0].variable, "z");
@@ -4459,7 +4459,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4482,7 +4482,7 @@ z = f(y)
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         // Module scope (index 0) should have z → ["m"]
@@ -4508,7 +4508,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // Bare `reshape` is not classified by `classify_known_function`, so the
         // user-function branch handles it: z gets ["m"].
@@ -4534,7 +4534,7 @@ def caller(y: Float[Array, "a b"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
         assert_eq!(analysis.errors[0].variable, "z");
@@ -4565,7 +4565,7 @@ def caller(y: Float[Array, "batch features"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4586,7 +4586,7 @@ def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // Self-call is silently skipped — the user-function branch can't
         // resolve f (its scope contains the call byte), so it falls through.
@@ -4625,7 +4625,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         // The outer `g` (smaller scope among candidates whose byte range
@@ -4653,7 +4653,7 @@ def caller(y: Float[Array, "batch"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // Only the first positional arg is provided, so `a` binds to
         // "batch" but `k` is unbound. The return shape ["a", "k"] becomes
@@ -4719,7 +4719,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4747,7 +4747,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4776,7 +4776,7 @@ def caller(x: Float[Array, "n B"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4805,7 +4805,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4832,7 +4832,7 @@ def caller(a: Float[Array, "B n"], b: Float[Array, "C k"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
         assert_eq!(analysis.errors[0].variable, "z");
@@ -4866,7 +4866,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(
@@ -4893,7 +4893,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // vf was not recorded in vmap_targets because in_axes=(0,1) isn't
         // a scalar int, so the call `y = vf(x)` falls through — no shape,
@@ -4926,7 +4926,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // vf was not recorded because "module.f" contains a dot.
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
@@ -4956,7 +4956,7 @@ def caller(x: Float[Array, "scalar"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // The arg has rank 1, in_axes=0 peels axis 0, leaving rank 0.
         // Then f expects rank 1 for param 'x' but gets rank 0.
@@ -4998,7 +4998,7 @@ def caller(x: Float[Array, "B n"]) -> None:
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
         assert_eq!(

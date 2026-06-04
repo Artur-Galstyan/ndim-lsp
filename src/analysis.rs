@@ -11,7 +11,7 @@ use crate::python_ast::{
     build_import_map, extract_binary_ops, extract_call_arguments, extract_calls,
     extract_jaxtyping_shapes, extract_method_calls,
 };
-use crate::resolution::resolve_call_target;
+use crate::resolution::{resolve_call_target, ResolutionCache};
 
 use crate::types::*;
 
@@ -21,6 +21,7 @@ pub fn analyze_layer_shapes<F>(
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
+    cache: Option<&ResolutionCache>,
 ) -> Result<LayerShapeAnalysis, String>
 where
     F: Fn(&PathBuf) -> Option<String>,
@@ -28,7 +29,7 @@ where
     let mut scopes = extract_jaxtyping_shapes(node, text)?;
     let import_map = build_import_map(node, text)?;
     let layer_records =
-        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth)?;
+        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, cache)?;
 
     let (applications, errors) =
         propagate_calls(node, text, &import_map, &layer_records, &mut scopes)?;

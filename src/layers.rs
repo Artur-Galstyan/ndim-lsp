@@ -6,7 +6,7 @@ use tree_sitter::Node;
 use tree_sitter::Range;
 
 use crate::python_ast::{build_import_map, extract_call_arguments, extract_calls};
-use crate::resolution::{bind_call_arguments, resolve_call_signature, resolve_call_target};
+use crate::resolution::{bind_call_arguments, resolve_call_signature, resolve_call_target, ResolutionCache};
 use crate::types::*;
 
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
@@ -209,7 +209,7 @@ pub fn extract_layer_assignments<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let records = extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth)?;
+    let records = extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, None)?;
     let mut layers = HashMap::new();
     for rec in records {
         layers.insert(rec.name, rec.kind);
@@ -223,6 +223,7 @@ pub fn extract_layer_assignments_scoped<F>(
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
+    cache: Option<&ResolutionCache>,
 ) -> Result<Vec<LayerAssignment>, String>
 where
     F: Fn(&PathBuf) -> Option<String>,
@@ -244,6 +245,7 @@ where
                 search_roots,
                 &read_file,
                 max_depth,
+                cache,
             )?,
         };
         let Some(resolved_call) = resolved_call else {

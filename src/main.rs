@@ -17,7 +17,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::Parser;
 
-use ndim_lsp::{analyze_layer_shapes, LayerShapeAnalysis, ShapeError};
+use ndim_lsp::{analyze_layer_shapes, LayerShapeAnalysis, ShapeError, new_resolution_cache, clear_resolution_cache, ResolutionCache};
 
 pub struct Backend {
     pub client: Client,
@@ -28,6 +28,10 @@ pub struct Backend {
     pub analysis_cache: RwLock<HashMap<Url, (i32, Arc<LayerShapeAnalysis>)>>,
     /// Current version for each URI (set on did_open/did_change).
     pub document_version: RwLock<HashMap<Url, i32>>,
+    /// Session-lifetime cache for resolved import targets.
+    /// Keyed on (import-path-segments, search-roots-fingerprint).
+    /// Invalidated when workspace folders change.
+    pub resolution_cache: ResolutionCache,
 }
 
 #[tower_lsp::async_trait]
@@ -121,6 +125,10 @@ impl LanguageServer for Backend {
                 lock.push(path);
             }
         }
+
+        // Workspace roots changed → site-packages may have shifted.
+        // Clear the resolution cache so stale entries don't survive.
+        clear_resolution_cache(&self.resolution_cache);
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -211,7 +219,7 @@ impl Backend {
 
         let t_analyze = Instant::now();
         let analysis = match analyze_layer_shapes(
-            tree.root_node(), &text, &search_roots, read_file, 8,
+            tree.root_node(), &text, &search_roots, read_file, 8, Some(&self.resolution_cache),
         ) {
             Ok(a) => a,
             Err(msg) => {
@@ -229,11 +237,12 @@ impl Backend {
                 MessageType::INFO,
                 format!(
                     "analysis: total={}ms parse={}ms roots={}ms analyze={}ms \
-                     | text={}B/{}L roots={} reads={}/{}B",
+                     | text={}B/{}L roots={} reads={}/{}B res_cache_entries={}",
                     total_ms, parse_ms, roots_ms, analyze_ms,
                     text_bytes, text_lines, search_roots_count,
                     read_count.load(Ordering::Relaxed),
                     read_bytes.load(Ordering::Relaxed),
+                    self.resolution_cache.read().unwrap().len(),
                 ),
             )
             .await;
@@ -690,6 +699,7 @@ async fn main() {
         workspace_roots: Default::default(),
         analysis_cache: Default::default(),
         document_version: Default::default(),
+        resolution_cache: new_resolution_cache(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
