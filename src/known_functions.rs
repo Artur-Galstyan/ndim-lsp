@@ -442,6 +442,11 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "sort" => Some(KnownFunction::Sort),
         "cumsum" => Some(KnownFunction::Cumsum),
         "cumprod" => Some(KnownFunction::Cumprod),
+        "astype" => Some(KnownFunction::Astype),
+        "copy" => Some(KnownFunction::Copy),
+        "detach" => Some(KnownFunction::Detach),
+        "contiguous" => Some(KnownFunction::Contiguous),
+        "to" => Some(KnownFunction::To),
         _ => None,
     }
 }
@@ -546,7 +551,9 @@ pub fn apply_known_function(
         KnownFunction::BroadcastArrays => apply_known_broadcast_arrays(args, shapes),
         KnownFunction::Tile => apply_known_tile(args, shapes),
         KnownFunction::Repeat => apply_known_repeat(args, shapes),
-        KnownFunction::Roll | KnownFunction::Flip | KnownFunction::Triu | KnownFunction::Tril => {
+        KnownFunction::Roll | KnownFunction::Flip | KnownFunction::Triu | KnownFunction::Tril
+        | KnownFunction::Astype | KnownFunction::Copy | KnownFunction::Detach
+        | KnownFunction::Contiguous | KnownFunction::To => {
             apply_known_shape_preserving(args, shapes)
         }
         KnownFunction::Pad => apply_known_pad(args, shapes),
@@ -5869,7 +5876,6 @@ mod method_call_tests {
     #[test]
     fn test_classify_unknown_returns_none() {
         assert_eq!(classify_method_call("frobnicate"), None);
-        assert_eq!(classify_method_call("to"), None);
         assert_eq!(classify_method_call("clone"), None);
     }
 
@@ -6135,5 +6141,136 @@ mod method_call_tests {
 
         let result = apply_known_function(&KnownFunction::Split, &args, &shapes);
         assert!(result.is_err());
+    }
+
+    // ── shape passthrough method tests (astype/copy/detach/contiguous/to) ──
+
+    #[test]
+    fn test_classify_astype() {
+        assert_eq!(classify_method_call("astype"), Some(KnownFunction::Astype));
+    }
+
+    #[test]
+    fn test_classify_copy() {
+        assert_eq!(classify_method_call("copy"), Some(KnownFunction::Copy));
+    }
+
+    #[test]
+    fn test_classify_detach() {
+        assert_eq!(classify_method_call("detach"), Some(KnownFunction::Detach));
+    }
+
+    #[test]
+    fn test_classify_contiguous() {
+        assert_eq!(classify_method_call("contiguous"), Some(KnownFunction::Contiguous));
+    }
+
+    #[test]
+    fn test_classify_to() {
+        assert_eq!(classify_method_call("to"), Some(KnownFunction::To));
+    }
+
+    #[test]
+    fn test_apply_astype_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+        let args = vec![pos("jnp.float32")];
+
+        let output = apply_method_call(&KnownFunction::Astype, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_apply_astype_with_dtype_kwarg() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "m"]))]);
+        let args = vec![kw("dtype", "jnp.float32")];
+
+        let output = apply_method_call(&KnownFunction::Astype, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["n", "m"])));
+    }
+
+    #[test]
+    fn test_apply_astype_no_args_preserves_shape() {
+        // numpy astype with no dtype arg still returns same shape
+        let shapes = HashMap::from([("x".to_string(), shape(&["3", "4"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Astype, "x", &args, &shapes).unwrap();
+
+        // shape-preserving: even without known dtype, shape passes through
+        // but first_array_arg needs a positional arg — with no args, it falls
+        // back to the receiver via synthesize_method_args
+        assert_eq!(output, Some(shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_apply_copy_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Copy, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "features"])));
+    }
+
+    #[test]
+    fn test_apply_detach_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "seq", "hidden"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Detach, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "seq", "hidden"])));
+    }
+
+    #[test]
+    fn test_apply_contiguous_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["c", "h", "w"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Contiguous, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["c", "h", "w"])));
+    }
+
+    #[test]
+    fn test_apply_to_device_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n"]))]);
+        let args = vec![pos("cuda")];
+
+        let output = apply_method_call(&KnownFunction::To, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "n"])));
+    }
+
+    #[test]
+    fn test_apply_to_dtype_kwarg_preserves_shape() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+        let args = vec![kw("dtype", "torch.float32")];
+
+        let output = apply_method_call(&KnownFunction::To, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_apply_astype_unknown_receiver_returns_none() {
+        let shapes: HashMap<String, Vec<String>> = HashMap::new();
+        let args = vec![pos("jnp.float32")];
+
+        let output = apply_method_call(&KnownFunction::Astype, "unknown", &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_apply_to_unknown_receiver_returns_none() {
+        let shapes: HashMap<String, Vec<String>> = HashMap::new();
+        let args = vec![pos("cuda")];
+
+        let output = apply_method_call(&KnownFunction::To, "unknown", &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
     }
 }

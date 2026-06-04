@@ -200,6 +200,11 @@ pub enum KnownFunction {
     Vdot,
     LinalgInv,
     LinalgDet,
+    Astype,
+    Copy,
+    Detach,
+    Contiguous,
+    To,
 }
 
 #[derive(Debug, Clone)]
