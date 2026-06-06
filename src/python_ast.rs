@@ -2478,30 +2478,6 @@ y = relu(x)
     }
 }
 
-/// Walk down through parenthesized_expression / unary_operator /
-/// expression_list wrappers to find the innermost binary_operator node.
-fn find_inner_binary_operator(node: Node) -> Option<Range> {
-    let mut current = node;
-    loop {
-        match current.kind() {
-            "binary_operator" => return Some(current.range()),
-            "parenthesized_expression" | "unary_operator" | "expression_list" | "yield" => {
-                // For unary_operator, descend into the "argument" field;
-                // otherwise take the first named child.
-                let child = if current.kind() == "unary_operator" {
-                    current.child_by_field_name("argument")
-                } else {
-                    current.named_child(0)
-                };
-                let Some(ch) = child else { break };
-                current = ch;
-            }
-            _ => break,
-        }
-    }
-    None
-}
-
 pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, String> {
     let mut result: Vec<BinaryOpInfo> = Vec::new();
     let query_string = r#"
@@ -2511,8 +2487,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
             left: (identifier) @left_operand
             operator: _ @op
             right: (identifier) @right_operand
-          )
-        ) @assignment
+          ) @binop
+        )
         (return_statement
           (binary_operator
             left: (identifier) @left_operand
@@ -2526,8 +2502,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
               left: (identifier) @left_operand
               operator: _ @op
               right: (identifier) @right_operand
-            )
-          ) @binop
+            ) @binop
+          )
         )
         (return_statement
           (parenthesized_expression
@@ -2536,9 +2512,9 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                 left: (identifier) @left_operand
                 operator: _ @op
                 right: (identifier) @right_operand
-              )
+              ) @binop
             )
-          ) @binop
+          )
         )
         (return_statement
           (expression_list
@@ -2546,8 +2522,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
               left: (identifier) @left_operand
               operator: _ @op
               right: (identifier) @right_operand
-            )
-          ) @binop
+            ) @binop
+          )
         )
         (return_statement
           (unary_operator
@@ -2556,9 +2532,9 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                 left: (identifier) @left_operand
                 operator: _ @op
                 right: (identifier) @right_operand
-              )
+              ) @binop
             )
-          ) @binop
+          )
         )
         (expression_statement
           (yield
@@ -2566,8 +2542,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
               left: (identifier) @left_operand
               operator: _ @op
               right: (identifier) @right_operand
-            )
-          ) @binop
+            ) @binop
+          )
         )
         (assert_statement
           (binary_operator
@@ -2591,7 +2567,6 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
     let Some(op_idx) = query.capture_index_for_name("op") else {
         return Err("op not found".to_string());
     };
-    let assignment_idx = query.capture_index_for_name("assignment");
     let binop_idx = query.capture_index_for_name("binop");
 
     let mut cursor = QueryCursor::new();
@@ -2629,21 +2604,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                     .utf8_text(text.as_bytes())
                     .map_err(|e| e.to_string())?
                     .to_string();
-            } else if assignment_idx.is_some_and(|idx| capture.index == idx) {
-                let right_child = capture.node.child_by_field_name("right");
-                if let Some(binop) = right_child {
-                    range = Some(binop.range());
-                }
             } else if binop_idx.is_some_and(|idx| capture.index == idx) {
-                // @binop is attached to various wrapper nodes depending on pattern.
-                // Walk down through parenthesized_expression / unary_operator /
-                // expression_list to find the inner binary_operator for the range.
-                let node = capture.node;
-                if node.kind() == "binary_operator" {
-                    range = Some(node.range());
-                } else {
-                    range = find_inner_binary_operator(node);
-                }
+                range = Some(capture.node.range());
             }
         }
 
@@ -2877,10 +2839,12 @@ mod extract_binary_ops_tests {
         assert_eq!(ops[0].left, "x");
         assert_eq!(ops[0].right, "y");
         assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
         assert_eq!(ops[1].op, BinaryOp::Add);
         assert_eq!(ops[1].left, "a");
         assert_eq!(ops[1].right, "b");
         assert_eq!(ops[1].variable, "");
+        assert_eq!(&code[ops[1].range.start_byte..ops[1].range.end_byte], "a + b");
     }
 
     #[test]
