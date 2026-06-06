@@ -2478,101 +2478,130 @@ y = relu(x)
     }
 }
 
+/// Walk the AST to find all `binary_operator` nodes that appear in a value position
+/// (assignment RHS, return, yield, assert) and whose operands are both identifiers.
+/// Handles arbitrary nesting of parenthesized_expression, expression_list, and
+/// unary_operator wrappers — no pattern enumeration needed.
 pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, String> {
     let mut result: Vec<BinaryOpInfo> = Vec::new();
-    let query_string = r#"
-        (assignment
-          left: (identifier) @var
-          right: (binary_operator
-            left: (identifier) @left_operand
-            operator: _ @op
-            right: (identifier) @right_operand
-          )
-        ) @assignment
-    "#;
+    collect_binary_ops(node, text, &mut result)?;
+    // Sort by start byte for source-order traversal.
+    result.sort_by_key(|info| info.range.start_byte);
+    Ok(result)
+}
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+fn collect_binary_ops(
+    node: Node,
+    text: &str,
+    result: &mut Vec<BinaryOpInfo>,
+) -> Result<(), String> {
+    let kind = node.kind();
 
-    let Some(var_idx) = query.capture_index_for_name("var") else {
-        return Err("var not found".to_string());
-    };
-    let Some(left_idx) = query.capture_index_for_name("left_operand") else {
-        return Err("left_operand not found".to_string());
-    };
-    let Some(right_idx) = query.capture_index_for_name("right_operand") else {
-        return Err("right_operand not found".to_string());
-    };
-    let Some(op_idx) = query.capture_index_for_name("op") else {
-        return Err("op not found".to_string());
-    };
-    let Some(assignment_idx) = query.capture_index_for_name("assignment") else {
-        return Err("assignment not found".to_string());
-    };
-
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
-
-    while let Some(match_) = matches.next() {
-        let mut variable = String::new();
-        let mut left = String::new();
-        let mut right = String::new();
-        let mut op_text = String::new();
-        let mut range: Option<Range> = None;
-
-        for capture in match_.captures {
-            if capture.index == var_idx {
-                variable = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
-            } else if capture.index == left_idx {
-                left = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
-            } else if capture.index == right_idx {
-                right = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
-            } else if capture.index == op_idx {
-                op_text = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
-            } else if capture.index == assignment_idx {
-                let right_child = capture.node.child_by_field_name("right");
-                if let Some(binop) = right_child {
-                    range = Some(binop.range());
-                }
-            }
+    // Check if this node is a binary_operator with identifier operands.
+    if kind == "binary_operator" {
+        if let Some(info) = try_extract_binary_op(node, text)? {
+            result.push(info);
         }
-
-        let op = match op_text.as_str() {
-            "@" => BinaryOp::MatMul,
-            "+" => BinaryOp::Add,
-            "-" => BinaryOp::Sub,
-            "*" => BinaryOp::Mul,
-            "/" => BinaryOp::Div,
-            _ => continue,
-        };
-
-        let range = range.ok_or("range not found".to_string())?;
-        result.push(BinaryOpInfo {
-            variable,
-            left,
-            right,
-            op,
-            range,
-        });
+        // Don't recurse into children — operands are already handled.
+    // TODO: If nested binary ops become in-scope (e.g. `(a + b) @ c`),
+    // this early return must be removed so the walker can recurse into
+    // non-identifier operands and find inner ops.
+        return Ok(());
     }
 
-    Ok(result)
+    // Recurse into children for all other node types.
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else { continue };
+        collect_binary_ops(child, text, result)?;
+    }
+    Ok(())
+}
+
+/// If `node` is a binary_operator with two identifier operands, determine
+/// whether it sits in a value position and return its info.
+fn try_extract_binary_op(node: Node, text: &str) -> Result<Option<BinaryOpInfo>, String> {
+    let left_child = node.child_by_field_name("left");
+    let right_child = node.child_by_field_name("right");
+    let Some(left_node) = left_child else { return Ok(None) };
+    let Some(right_node) = right_child else { return Ok(None) };
+
+    if left_node.kind() != "identifier" || right_node.kind() != "identifier" {
+        return Ok(None);
+    }
+
+    // Find the operator via the named field.
+    let Some(op_node) = node.child_by_field_name("operator") else {
+        return Ok(None);
+    };
+    let op_text = op_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string();
+
+    let op = match op_text.as_str() {
+        "@" => BinaryOp::MatMul,
+        "+" => BinaryOp::Add,
+        "-" => BinaryOp::Sub,
+        "*" => BinaryOp::Mul,
+        "/" => BinaryOp::Div,
+        _ => return Ok(None),
+    };
+
+    // Walk up through transparent wrappers to find the enclosing context.
+    // Returns None for contexts we don't track (e.g., tuple unpacking, call args).
+    let variable = match resolve_variable_context(node, text) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    Ok(Some(BinaryOpInfo {
+        variable,
+        left: left_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string(),
+        right: right_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string(),
+        op,
+        range: node.range(),
+    }))
+}
+
+/// Walk up from a binary_operator node through transparent wrappers
+/// (parenthesized_expression, expression_list, unary_operator) to
+/// determine the variable context.
+/// - Returns `Some(varname)` for assignments with an identifier LHS.
+/// - Returns `Some("")` for return/yield/assert contexts.
+/// - Returns `None` for untracked contexts (tuple unpacking, call args, etc.).
+fn resolve_variable_context(node: Node, text: &str) -> Option<String> {
+    let mut current = node;
+    loop {
+        let Some(parent) = current.parent() else {
+            // Reached root without hitting a value-position context.
+            return None;
+        };
+        match parent.kind() {
+            // Transparent wrappers — keep walking up.
+            "parenthesized_expression" | "expression_list" | "unary_operator" => {
+                current = parent;
+            }
+            // Value-position contexts with no LHS variable.
+            "return_statement" | "yield" | "assert_statement" => {
+                return Some(String::new());
+            }
+            // Assignment — extract LHS variable.
+            "assignment" => {
+                let left = parent.child_by_field_name("left");
+                if let Some(lhs) = left
+                    && lhs.kind() == "identifier"
+                {
+                    return Some(
+                        lhs.utf8_text(text.as_bytes())
+                            .ok()?
+                            .to_string()
+                    );
+                }
+                // Tuple unpacking or other non-identifier LHS — not tracked.
+                return None;
+            }
+            // Any other parent means the binary_operator is in a context
+            // we don't track (e.g., call argument, subscript index).
+            _ => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2693,6 +2722,186 @@ mod extract_binary_ops_tests {
         let tree = parse(code);
         let ops = extract_binary_ops(tree.root_node(), code).unwrap();
         // floor division is not in the supported set
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_matmul() {
+        let code = "return x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_add() {
+        let code = "return a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Add);
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_mixed_assignment_and_return() {
+        let code = "z = x @ y\nreturn z + w";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        // Source order: assignment first, then return
+        assert_eq!(ops[0].variable, "z");
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[1].variable, "");
+        assert_eq!(ops[1].op, BinaryOp::Add);
+    }
+
+    #[test]
+    fn test_return_no_binary_op_function_call() {
+        let code = "return f(x)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_bare_identifier() {
+        let code = "return x";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_parenthesized_matmul() {
+        let code = "return (x @ y)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_double_parenthesized_matmul() {
+        let code = "return ((x @ y))";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_expression_list_two_ops() {
+        let code = "return x @ y, a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+        assert_eq!(ops[1].op, BinaryOp::Add);
+        assert_eq!(ops[1].left, "a");
+        assert_eq!(ops[1].right, "b");
+        assert_eq!(ops[1].variable, "");
+        assert_eq!(&code[ops[1].range.start_byte..ops[1].range.end_byte], "a + b");
+    }
+
+    #[test]
+    fn test_return_unary_negated_matmul() {
+        let code = "return -(x @ y)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_yield_matmul() {
+        let code = "yield x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_assert_matmul() {
+        let code = "assert x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_triple_parenthesized_return() {
+        let code = "return (((x @ y)))";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_tuple_with_parenthesized_element() {
+        let code = "return x @ y, (a + b)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+        assert_eq!(ops[1].op, BinaryOp::Add);
+        assert_eq!(ops[1].left, "a");
+        assert_eq!(ops[1].right, "b");
+        assert_eq!(&code[ops[1].range.start_byte..ops[1].range.end_byte], "a + b");
+    }
+
+    #[test]
+    fn test_yield_from_matmul() {
+        // tree-sitter-python parses "yield from x @ y" identically to "yield x @ y"
+        let code = "yield from x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_binary_op_in_call_arg_not_extracted() {
+        let code = "print(x @ y)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
         assert!(ops.is_empty());
     }
 }

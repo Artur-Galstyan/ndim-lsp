@@ -428,7 +428,9 @@ fn record_result(
 ) {
     match result {
         Ok(Some(output)) => {
-            shapes.insert(variable.to_string(), output);
+            if !variable.is_empty() {
+                shapes.insert(variable.to_string(), output);
+            }
         }
         Ok(None) => {}
         Err(message) => errors.push(ShapeError {
