@@ -2496,6 +2496,15 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
             right: (identifier) @right_operand
           ) @binop
         )
+        (return_statement
+          (parenthesized_expression
+            (binary_operator
+              left: (identifier) @left_operand
+              operator: _ @op
+              right: (identifier) @right_operand
+            )
+          ) @binop
+        )
     "#;
 
     let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
@@ -2555,7 +2564,17 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                     range = Some(binop.range());
                 }
             } else if binop_idx.is_some_and(|idx| capture.index == idx) {
-                range = Some(capture.node.range());
+                // For direct return_statement pattern, node is binary_operator.
+                // For parenthesized pattern, node is parenthesized_expression;
+                // extract the inner binary_operator for the range.
+                let node = capture.node;
+                if node.kind() == "binary_operator" {
+                    range = Some(node.range());
+                } else if node.kind() == "parenthesized_expression"
+                    && let Some(inner) = node.named_child(0)
+                {
+                    range = Some(inner.range());
+                }
             }
         }
 
@@ -2752,6 +2771,19 @@ mod extract_binary_ops_tests {
         let tree = parse(code);
         let ops = extract_binary_ops(tree.root_node(), code).unwrap();
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_parenthesized_matmul() {
+        let code = "return (x @ y)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
     }
 }
 
