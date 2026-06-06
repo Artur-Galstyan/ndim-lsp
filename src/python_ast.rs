@@ -2503,6 +2503,9 @@ fn collect_binary_ops(
             result.push(info);
         }
         // Don't recurse into children — operands are already handled.
+    // TODO: If nested binary ops become in-scope (e.g. `(a + b) @ c`),
+    // this early return must be removed so the walker can recurse into
+    // non-identifier operands and find inner ops.
         return Ok(());
     }
 
@@ -2526,19 +2529,11 @@ fn try_extract_binary_op(node: Node, text: &str) -> Result<Option<BinaryOpInfo>,
         return Ok(None);
     }
 
-    // Find the operator node (the child that is neither left nor right).
-    let op_text = {
-        let mut op_node: Option<Node> = None;
-        for i in 0..node.child_count() {
-            let child = node.child(i as u32).unwrap();
-            if child.id() != left_node.id() && child.id() != right_node.id() {
-                op_node = Some(child);
-                break;
-            }
-        }
-        let Some(on) = op_node else { return Ok(None) };
-        on.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string()
+    // Find the operator via the named field.
+    let Some(op_node) = node.child_by_field_name("operator") else {
+        return Ok(None);
     };
+    let op_text = op_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string();
 
     let op = match op_text.as_str() {
         "@" => BinaryOp::MatMul,
@@ -2595,7 +2590,7 @@ fn resolve_variable_context(node: Node, text: &str) -> Option<String> {
                 {
                     return Some(
                         lhs.utf8_text(text.as_bytes())
-                            .unwrap_or_default()
+                            .ok()?
                             .to_string()
                     );
                 }
