@@ -2478,6 +2478,30 @@ y = relu(x)
     }
 }
 
+/// Walk down through parenthesized_expression / unary_operator /
+/// expression_list wrappers to find the innermost binary_operator node.
+fn find_inner_binary_operator(node: Node) -> Option<Range> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "binary_operator" => return Some(current.range()),
+            "parenthesized_expression" | "unary_operator" | "expression_list" | "yield" => {
+                // For unary_operator, descend into the "argument" field;
+                // otherwise take the first named child.
+                let child = if current.kind() == "unary_operator" {
+                    current.child_by_field_name("argument")
+                } else {
+                    current.named_child(0)
+                };
+                let Some(ch) = child else { break };
+                current = ch;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
 pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, String> {
     let mut result: Vec<BinaryOpInfo> = Vec::new();
     let query_string = r#"
@@ -2503,6 +2527,53 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
               operator: _ @op
               right: (identifier) @right_operand
             )
+          ) @binop
+        )
+        (return_statement
+          (parenthesized_expression
+            (parenthesized_expression
+              (binary_operator
+                left: (identifier) @left_operand
+                operator: _ @op
+                right: (identifier) @right_operand
+              )
+            )
+          ) @binop
+        )
+        (return_statement
+          (expression_list
+            (binary_operator
+              left: (identifier) @left_operand
+              operator: _ @op
+              right: (identifier) @right_operand
+            )
+          ) @binop
+        )
+        (return_statement
+          (unary_operator
+            argument: (parenthesized_expression
+              (binary_operator
+                left: (identifier) @left_operand
+                operator: _ @op
+                right: (identifier) @right_operand
+              )
+            )
+          ) @binop
+        )
+        (expression_statement
+          (yield
+            (binary_operator
+              left: (identifier) @left_operand
+              operator: _ @op
+              right: (identifier) @right_operand
+            )
+          ) @binop
+        )
+        (assert_statement
+          (binary_operator
+            left: (identifier) @left_operand
+            operator: _ @op
+            right: (identifier) @right_operand
           ) @binop
         )
     "#;
@@ -2564,16 +2635,14 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                     range = Some(binop.range());
                 }
             } else if binop_idx.is_some_and(|idx| capture.index == idx) {
-                // For direct return_statement pattern, node is binary_operator.
-                // For parenthesized pattern, node is parenthesized_expression;
-                // extract the inner binary_operator for the range.
+                // @binop is attached to various wrapper nodes depending on pattern.
+                // Walk down through parenthesized_expression / unary_operator /
+                // expression_list to find the inner binary_operator for the range.
                 let node = capture.node;
                 if node.kind() == "binary_operator" {
                     range = Some(node.range());
-                } else if node.kind() == "parenthesized_expression"
-                    && let Some(inner) = node.named_child(0)
-                {
-                    range = Some(inner.range());
+                } else {
+                    range = find_inner_binary_operator(node);
                 }
             }
         }
@@ -2784,6 +2853,70 @@ mod extract_binary_ops_tests {
         assert_eq!(ops[0].right, "y");
         assert_eq!(ops[0].variable, "");
         assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_double_parenthesized_matmul() {
+        let code = "return ((x @ y))";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_expression_list_two_ops() {
+        let code = "return x @ y, a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(ops[1].op, BinaryOp::Add);
+        assert_eq!(ops[1].left, "a");
+        assert_eq!(ops[1].right, "b");
+        assert_eq!(ops[1].variable, "");
+    }
+
+    #[test]
+    fn test_return_unary_negated_matmul() {
+        let code = "return -(x @ y)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_yield_matmul() {
+        let code = "yield x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_assert_matmul() {
+        let code = "assert x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
     }
 }
 
