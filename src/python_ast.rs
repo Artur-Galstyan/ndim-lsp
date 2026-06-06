@@ -2489,14 +2489,19 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
             right: (identifier) @right_operand
           )
         ) @assignment
+        (return_statement
+          (binary_operator
+            left: (identifier) @left_operand
+            operator: _ @op
+            right: (identifier) @right_operand
+          ) @binop
+        )
     "#;
 
     let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
         .map_err(|e| e.to_string())?;
 
-    let Some(var_idx) = query.capture_index_for_name("var") else {
-        return Err("var not found".to_string());
-    };
+    let var_idx = query.capture_index_for_name("var");
     let Some(left_idx) = query.capture_index_for_name("left_operand") else {
         return Err("left_operand not found".to_string());
     };
@@ -2506,9 +2511,8 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
     let Some(op_idx) = query.capture_index_for_name("op") else {
         return Err("op not found".to_string());
     };
-    let Some(assignment_idx) = query.capture_index_for_name("assignment") else {
-        return Err("assignment not found".to_string());
-    };
+    let assignment_idx = query.capture_index_for_name("assignment");
+    let binop_idx = query.capture_index_for_name("binop");
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, node, text.as_bytes());
@@ -2521,7 +2525,7 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
         let mut range: Option<Range> = None;
 
         for capture in match_.captures {
-            if capture.index == var_idx {
+            if var_idx.is_some_and(|idx| capture.index == idx) {
                 variable = capture
                     .node
                     .utf8_text(text.as_bytes())
@@ -2545,11 +2549,13 @@ pub fn extract_binary_ops(node: Node, text: &str) -> Result<Vec<BinaryOpInfo>, S
                     .utf8_text(text.as_bytes())
                     .map_err(|e| e.to_string())?
                     .to_string();
-            } else if capture.index == assignment_idx {
+            } else if assignment_idx.is_some_and(|idx| capture.index == idx) {
                 let right_child = capture.node.child_by_field_name("right");
                 if let Some(binop) = right_child {
                     range = Some(binop.range());
                 }
+            } else if binop_idx.is_some_and(|idx| capture.index == idx) {
+                range = Some(capture.node.range());
             }
         }
 
@@ -2693,6 +2699,58 @@ mod extract_binary_ops_tests {
         let tree = parse(code);
         let ops = extract_binary_ops(tree.root_node(), code).unwrap();
         // floor division is not in the supported set
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_matmul() {
+        let code = "return x @ y";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[0].left, "x");
+        assert_eq!(ops[0].right, "y");
+        assert_eq!(ops[0].variable, "");
+        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_add() {
+        let code = "return a + b";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BinaryOp::Add);
+        assert_eq!(ops[0].variable, "");
+    }
+
+    #[test]
+    fn test_mixed_assignment_and_return() {
+        let code = "z = x @ y\nreturn z + w";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert_eq!(ops.len(), 2);
+        // Source order: assignment first, then return
+        assert_eq!(ops[0].variable, "z");
+        assert_eq!(ops[0].op, BinaryOp::MatMul);
+        assert_eq!(ops[1].variable, "");
+        assert_eq!(ops[1].op, BinaryOp::Add);
+    }
+
+    #[test]
+    fn test_return_no_binary_op_function_call() {
+        let code = "return f(x)";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_return_bare_identifier() {
+        let code = "return x";
+        let tree = parse(code);
+        let ops = extract_binary_ops(tree.root_node(), code).unwrap();
         assert!(ops.is_empty());
     }
 }

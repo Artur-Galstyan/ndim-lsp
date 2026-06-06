@@ -2238,6 +2238,37 @@ mod binary_op_propagation_tests {
     }
 
     #[test]
+    fn test_return_matmul_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    return x @ y";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
+        assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
+        // variable is empty for return-statement ops
+        assert_eq!(analysis.errors[0].variable, "");
+        // range should cover the `x @ y` expression
+        assert_eq!(&code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte], "x @ y");
+    }
+
+    #[test]
+    fn test_return_matmul_compatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"b c\"]):\n    return x @ y";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+    }
+
+    #[test]
     fn test_elementwise_add_success() {
         let tmp = tempfile::tempdir().unwrap();
         let code =

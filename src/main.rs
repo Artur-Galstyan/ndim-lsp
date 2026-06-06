@@ -597,7 +597,11 @@ fn shape_error_to_diagnostic(error: ShapeError) -> Diagnostic {
         range: ts_range_to_lsp_range(error.range),
         severity: Some(DiagnosticSeverity::ERROR),
         source: Some("ndim-lsp".to_string()),
-        message: format!("{}: {}", error.variable, error.message),
+        message: if error.variable.is_empty() {
+            error.message
+        } else {
+            format!("{}: {}", error.variable, error.message)
+        },
         code: None,
         related_information: None,
         ..Default::default()
