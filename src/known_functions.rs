@@ -551,11 +551,15 @@ pub fn apply_known_function(
         KnownFunction::BroadcastArrays => apply_known_broadcast_arrays(args, shapes),
         KnownFunction::Tile => apply_known_tile(args, shapes),
         KnownFunction::Repeat => apply_known_repeat(args, shapes),
-        KnownFunction::Roll | KnownFunction::Flip | KnownFunction::Triu | KnownFunction::Tril
-        | KnownFunction::Astype | KnownFunction::Copy | KnownFunction::Detach
-        | KnownFunction::Contiguous | KnownFunction::To => {
-            apply_known_shape_preserving(args, shapes)
-        }
+        KnownFunction::Roll
+        | KnownFunction::Flip
+        | KnownFunction::Triu
+        | KnownFunction::Tril
+        | KnownFunction::Astype
+        | KnownFunction::Copy
+        | KnownFunction::Detach
+        | KnownFunction::Contiguous
+        | KnownFunction::To => apply_known_shape_preserving(args, shapes),
         KnownFunction::Pad => apply_known_pad(args, shapes),
         KnownFunction::Rot90 => apply_known_rot90(args, shapes),
         KnownFunction::Vstack => apply_known_stack_family(args, shapes, "vstack"),
@@ -2494,20 +2498,14 @@ pub fn compute_split_shapes(
                         ));
                     }
                     if curr > t {
-                        return Err(format!(
-                            "split index {} exceeds axis size {}",
-                            curr, t
-                        ));
+                        return Err(format!("split index {} exceeds axis size {}", curr, t));
                     }
                     out[axis] = (curr - prev).to_string();
                 }
                 (None, Some(curr), Some(t)) => {
                     // Prev symbolic, curr numeric — validate bound.
                     if curr > t {
-                        return Err(format!(
-                            "split index {} exceeds axis size {}",
-                            curr, t
-                        ));
+                        return Err(format!("split index {} exceeds axis size {}", curr, t));
                     }
                     out[axis] = format!("{}-{}", curr, prev_str);
                 }
@@ -2526,10 +2524,7 @@ pub fn compute_split_shapes(
                 (Some(prev), None, Some(t)) => {
                     // Prev numeric, curr symbolic — validate prev ≤ total.
                     if prev > t {
-                        return Err(format!(
-                            "split index {} exceeds axis size {}",
-                            prev, t
-                        ));
+                        return Err(format!("split index {} exceeds axis size {}", prev, t));
                     }
                     if prev_str == "0" {
                         out[axis] = curr_str.clone();
@@ -2557,10 +2552,7 @@ pub fn compute_split_shapes(
         match (prev_val, total) {
             (Some(prev), Some(t)) => {
                 if prev > t {
-                    return Err(format!(
-                        "split index {} exceeds axis size {}",
-                        prev, t
-                    ));
+                    return Err(format!("split index {} exceeds axis size {}", prev, t));
                 }
                 out[axis] = (t - prev).to_string();
             }
@@ -3835,8 +3827,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["batch", "features"])));
     }
@@ -3846,8 +3837,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["batch", "features"])));
     }
@@ -3857,8 +3847,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x"), pos("0")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["batch", "features"])));
     }
@@ -3868,8 +3857,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["batch", "features"])));
     }
@@ -3879,8 +3867,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::new();
 
-        let output =
-            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -3890,8 +3877,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::new();
 
-        let output =
-            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -3901,8 +3887,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x"), pos("0")];
         let shapes = HashMap::new();
 
-        let output =
-            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -3912,8 +3897,7 @@ mod known_function_shape_rule_tests {
         let args = vec![pos("x")];
         let shapes = HashMap::new();
 
-        let output =
-            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -3923,8 +3907,7 @@ mod known_function_shape_rule_tests {
         let args = vec![kw("x", "arr")];
         let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::ZerosLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["m", "n"])));
     }
@@ -3934,8 +3917,7 @@ mod known_function_shape_rule_tests {
         let args = vec![kw("input", "arr")];
         let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::OnesLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["m", "n"])));
     }
@@ -3945,8 +3927,7 @@ mod known_function_shape_rule_tests {
         let args = vec![kw("x", "arr"), pos("0")];
         let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["m", "n"])));
     }
@@ -3956,8 +3937,7 @@ mod known_function_shape_rule_tests {
         let args = vec![kw("input", "arr")];
         let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::EmptyLike, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["m", "n"])));
     }
@@ -3966,8 +3946,7 @@ mod known_function_shape_rule_tests {
     fn test_zeros_like_no_args_returns_none() {
         let shapes = HashMap::new();
 
-        let output =
-            apply_known_function(&KnownFunction::ZerosLike, &[], &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::ZerosLike, &[], &shapes).unwrap();
 
         assert_eq!(output, None);
     }
@@ -3977,8 +3956,7 @@ mod known_function_shape_rule_tests {
         let args = vec![kw("template", "arr")];
         let shapes = HashMap::from([("arr".to_string(), shape(&["m", "n"]))]);
 
-        let output =
-            apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
+        let output = apply_known_function(&KnownFunction::FullLike, &args, &shapes).unwrap();
 
         // 'template' is not a recognized keyword for first_array_arg
         assert_eq!(output, None);
@@ -4851,7 +4829,11 @@ mod known_function_shape_rule_tests {
         let result = apply_known_function(&KnownFunction::Einsum, &args, &shapes);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("rank 2 but subscript 'ijk' has length 3"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("rank 2 but subscript 'ijk' has length 3")
+        );
     }
 }
 
@@ -5229,9 +5211,21 @@ mod known_function_tests {
     known_case!(np_ones, ["numpy", "ones"], Some(KnownFunction::Ones));
     known_case!(np_full, ["numpy", "full"], Some(KnownFunction::Full));
     known_case!(np_empty, ["numpy", "empty"], Some(KnownFunction::Empty));
-    known_case!(np_linspace, ["numpy", "linspace"], Some(KnownFunction::Linspace));
-    known_case!(np_logspace, ["numpy", "logspace"], Some(KnownFunction::Logspace));
-    known_case!(np_identity, ["numpy", "identity"], Some(KnownFunction::Identity));
+    known_case!(
+        np_linspace,
+        ["numpy", "linspace"],
+        Some(KnownFunction::Linspace)
+    );
+    known_case!(
+        np_logspace,
+        ["numpy", "logspace"],
+        Some(KnownFunction::Logspace)
+    );
+    known_case!(
+        np_identity,
+        ["numpy", "identity"],
+        Some(KnownFunction::Identity)
+    );
     known_case!(np_arange, ["numpy", "arange"], Some(KnownFunction::Arange));
     known_case!(np_eye, ["numpy", "eye"], Some(KnownFunction::Eye));
     known_case!(
@@ -5393,7 +5387,11 @@ mod known_function_tests {
     known_case!(torch_ones, ["torch", "ones"], Some(KnownFunction::Ones));
     known_case!(torch_full, ["torch", "full"], Some(KnownFunction::Full));
     known_case!(torch_empty, ["torch", "empty"], Some(KnownFunction::Empty));
-    known_case!(torch_linspace, ["torch", "linspace"], Some(KnownFunction::Linspace));
+    known_case!(
+        torch_linspace,
+        ["torch", "linspace"],
+        Some(KnownFunction::Linspace)
+    );
     known_case!(
         torch_zeros_like,
         ["torch", "zeros_like"],
@@ -5526,9 +5524,17 @@ mod known_function_tests {
     );
 
     known_case!(jax_vmap, ["jax", "vmap"], Some(KnownFunction::Vmap));
-    known_case!(equinox_filter_vmap, ["equinox", "filter_vmap"], Some(KnownFunction::Vmap));
+    known_case!(
+        equinox_filter_vmap,
+        ["equinox", "filter_vmap"],
+        Some(KnownFunction::Vmap)
+    );
     // equinox.nn.filter_vmap is NOT a known function — wrong module path
-    known_case!(equinox_nn_filter_vmap_rejected, ["equinox", "nn", "filter_vmap"], None);
+    known_case!(
+        equinox_nn_filter_vmap_rejected,
+        ["equinox", "nn", "filter_vmap"],
+        None
+    );
     known_case!(jax_lax_dot, ["jax", "lax", "dot"], Some(KnownFunction::Dot));
     known_case!(
         jax_lax_dot_general,
@@ -5565,29 +5571,81 @@ mod known_function_tests {
     known_case!(np_any, ["numpy", "any"], Some(KnownFunction::Any));
     known_case!(torch_any, ["torch", "any"], Some(KnownFunction::Any));
 
-    known_case!(jnp_argmax, ["jax", "numpy", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(
+        jnp_argmax,
+        ["jax", "numpy", "argmax"],
+        Some(KnownFunction::ArgMax)
+    );
     known_case!(np_argmax, ["numpy", "argmax"], Some(KnownFunction::ArgMax));
-    known_case!(torch_argmax, ["torch", "argmax"], Some(KnownFunction::ArgMax));
+    known_case!(
+        torch_argmax,
+        ["torch", "argmax"],
+        Some(KnownFunction::ArgMax)
+    );
 
-    known_case!(jnp_argmin, ["jax", "numpy", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(
+        jnp_argmin,
+        ["jax", "numpy", "argmin"],
+        Some(KnownFunction::ArgMin)
+    );
     known_case!(np_argmin, ["numpy", "argmin"], Some(KnownFunction::ArgMin));
-    known_case!(torch_argmin, ["torch", "argmin"], Some(KnownFunction::ArgMin));
+    known_case!(
+        torch_argmin,
+        ["torch", "argmin"],
+        Some(KnownFunction::ArgMin)
+    );
 
-    known_case!(jnp_argsort, ["jax", "numpy", "argsort"], Some(KnownFunction::Argsort));
-    known_case!(np_argsort, ["numpy", "argsort"], Some(KnownFunction::Argsort));
-    known_case!(torch_argsort, ["torch", "argsort"], Some(KnownFunction::Argsort));
+    known_case!(
+        jnp_argsort,
+        ["jax", "numpy", "argsort"],
+        Some(KnownFunction::Argsort)
+    );
+    known_case!(
+        np_argsort,
+        ["numpy", "argsort"],
+        Some(KnownFunction::Argsort)
+    );
+    known_case!(
+        torch_argsort,
+        ["torch", "argsort"],
+        Some(KnownFunction::Argsort)
+    );
 
-    known_case!(jnp_sort, ["jax", "numpy", "sort"], Some(KnownFunction::Sort));
+    known_case!(
+        jnp_sort,
+        ["jax", "numpy", "sort"],
+        Some(KnownFunction::Sort)
+    );
     known_case!(np_sort, ["numpy", "sort"], Some(KnownFunction::Sort));
     known_case!(torch_sort, ["torch", "sort"], Some(KnownFunction::Sort));
 
-    known_case!(jnp_cumsum, ["jax", "numpy", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(
+        jnp_cumsum,
+        ["jax", "numpy", "cumsum"],
+        Some(KnownFunction::Cumsum)
+    );
     known_case!(np_cumsum, ["numpy", "cumsum"], Some(KnownFunction::Cumsum));
-    known_case!(torch_cumsum, ["torch", "cumsum"], Some(KnownFunction::Cumsum));
+    known_case!(
+        torch_cumsum,
+        ["torch", "cumsum"],
+        Some(KnownFunction::Cumsum)
+    );
 
-    known_case!(jnp_cumprod, ["jax", "numpy", "cumprod"], Some(KnownFunction::Cumprod));
-    known_case!(np_cumprod, ["numpy", "cumprod"], Some(KnownFunction::Cumprod));
-    known_case!(torch_cumprod, ["torch", "cumprod"], Some(KnownFunction::Cumprod));
+    known_case!(
+        jnp_cumprod,
+        ["jax", "numpy", "cumprod"],
+        Some(KnownFunction::Cumprod)
+    );
+    known_case!(
+        np_cumprod,
+        ["numpy", "cumprod"],
+        Some(KnownFunction::Cumprod)
+    );
+    known_case!(
+        torch_cumprod,
+        ["torch", "cumprod"],
+        Some(KnownFunction::Cumprod)
+    );
 
     known_case!(jax_numpy_vmap_rejected, ["jax", "numpy", "vmap"], None);
     known_case!(numpy_vmap_rejected, ["numpy", "vmap"], None);
@@ -5621,11 +5679,7 @@ mod known_function_tests {
         ["torch", "linalg", "inv"],
         Some(KnownFunction::LinalgInv)
     );
-    known_case!(
-        jax_linalg_inv_unsupported,
-        ["jax", "linalg", "inv"],
-        None
-    );
+    known_case!(jax_linalg_inv_unsupported, ["jax", "linalg", "inv"], None);
 
     // ── linalg.det classification tests ──
 
@@ -5644,11 +5698,7 @@ mod known_function_tests {
         ["torch", "linalg", "det"],
         Some(KnownFunction::LinalgDet)
     );
-    known_case!(
-        jax_linalg_det_unsupported,
-        ["jax", "linalg", "det"],
-        None
-    );
+    known_case!(jax_linalg_det_unsupported, ["jax", "linalg", "det"], None);
 
     macro_rules! alias_case {
         ($name:ident, $code:expr, $target:expr, $kind:expr) => {
@@ -6162,7 +6212,10 @@ mod method_call_tests {
 
     #[test]
     fn test_classify_contiguous() {
-        assert_eq!(classify_method_call("contiguous"), Some(KnownFunction::Contiguous));
+        assert_eq!(
+            classify_method_call("contiguous"),
+            Some(KnownFunction::Contiguous)
+        );
     }
 
     #[test]

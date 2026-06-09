@@ -1,9 +1,63 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tree_sitter::{Node, Parser};
 
-use crate::python_ast::{extract_call_arguments, extract_callable_signature, find_top_level_symbol};
+use crate::python_ast::{
+    extract_call_arguments, extract_callable_signature, find_top_level_symbol,
+};
 use crate::types::*;
+
+/// Session-lifetime cache for resolved import targets.
+///
+/// Keyed on `(import-path-segments, search-roots-fingerprint)` so that
+/// a change to workspace/site-packages roots invalidates stale entries.
+///
+/// `search_roots_fingerprint` is a stable u64 hash of the ordered
+/// search-root path list at resolution time. When roots change
+/// (workspace folder added/removed), the fingerprint shifts and old
+/// entries naturally fall out of lookup — no explicit eviction needed
+/// beyond clearing the entire map.
+///
+/// Note: only the final resolution result (start → ResolvedImplementation)
+/// is cached. Re-export chain intermediates are not cached individually,
+/// which is correct for the LSP workload (queries target first-class
+/// imports, not intermediate re-export hops).
+pub struct ResolutionCache {
+    pub map: std::sync::RwLock<HashMap<(Vec<String>, u64), ResolvedImplementation>>,
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+}
+
+/// Compute a stable u64 fingerprint for an ordered list of search-root paths.
+/// Uses `DefaultHasher` over the `PathBuf` slice, which is deterministic
+/// within a session and order-sensitive (reordering roots produces a
+/// different fingerprint).
+pub fn search_roots_fingerprint(search_roots: &[PathBuf]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    search_roots.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Create a new empty resolution cache.
+pub fn new_resolution_cache() -> Arc<ResolutionCache> {
+    Arc::new(ResolutionCache {
+        map: std::sync::RwLock::new(HashMap::new()),
+        hits: AtomicUsize::new(0),
+        misses: AtomicUsize::new(0),
+    })
+}
+
+/// Clear all entries from the resolution cache. Called when workspace
+/// folders change, since site-packages roots may shift.
+pub fn clear_resolution_cache(cache: &Arc<ResolutionCache>) {
+    cache.map.write().unwrap().clear();
+}
 
 pub fn resolve_python_module_on_disk(
     module: &[String],
@@ -171,60 +225,91 @@ pub fn resolve_implementation<F>(
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
+    cache: Option<&ResolutionCache>,
 ) -> Result<Option<ResolvedImplementation>, String>
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    // Cache lookup — only for absolute (dots==0) targets with non-empty parts.
+    if start.dots == 0
+        && !start.parts.is_empty()
+        && let Some(cache) = cache
+    {
+        let fingerprint = search_roots_fingerprint(search_roots);
+        let key = (start.parts.clone(), fingerprint);
+        let cache_map = cache.map.read().unwrap();
+        if let Some(cached) = cache_map.get(&key) {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(cached.clone()));
+        }
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .map_err(|e| e.to_string())?;
 
-    let mut current = start;
+    let mut current = start.clone();
 
     let mut visited = HashSet::new();
 
-    for _ in 0..max_depth {
-        if !visited.insert(current.parts.clone()) {
+    let result = (|| {
+        for _ in 0..max_depth {
+            if !visited.insert(current.parts.clone()) {
+                return Ok(None);
+            }
+            let Some(resolved) = resolve_target_on_disk(&current, search_roots) else {
+                return Ok(None);
+            };
+
+            if resolved.symbol_parts.is_empty() {
+                return Ok(Some(ResolvedImplementation {
+                    target: resolved,
+                    symbol: None,
+                }));
+            }
+
+            let Some(text) = read_file(&resolved.file_path) else {
+                return Ok(None);
+            };
+
+            let Some(tree) = parser.parse(&text, None) else {
+                return Err("failed to parse file".to_string());
+            };
+
+            let root = tree.root_node();
+
+            if let Some(symbol) = resolve_terminal_symbol_once(&resolved, root, &text)? {
+                return Ok(Some(ResolvedImplementation {
+                    target: resolved,
+                    symbol: Some(symbol),
+                }));
+            }
+
+            if let Some(next) = resolve_reexport_once(&resolved, root, &text)? {
+                current = next;
+                continue;
+            }
+
             return Ok(None);
         }
-        let Some(resolved) = resolve_target_on_disk(&current, search_roots) else {
-            return Ok(None);
-        };
 
-        if resolved.symbol_parts.is_empty() {
-            return Ok(Some(ResolvedImplementation {
-                target: resolved,
-                symbol: None,
-            }));
-        }
+        Ok(None)
+    })();
 
-        let Some(text) = read_file(&resolved.file_path) else {
-            return Ok(None);
-        };
-
-        let Some(tree) = parser.parse(&text, None) else {
-            return Err("failed to parse file".to_string());
-        };
-
-        let root = tree.root_node();
-
-        if let Some(symbol) = resolve_terminal_symbol_once(&resolved, root, &text)? {
-            return Ok(Some(ResolvedImplementation {
-                target: resolved,
-                symbol: Some(symbol),
-            }));
-        }
-
-        if let Some(next) = resolve_reexport_once(&resolved, root, &text)? {
-            current = next;
-            continue;
-        }
-
-        return Ok(None);
+    // Cache insert — only on successful resolution of absolute targets.
+    if start.dots == 0
+        && !start.parts.is_empty()
+        && let (Some(cache), Ok(Some(impl_result))) = (cache, &result)
+    {
+        let fingerprint = search_roots_fingerprint(search_roots);
+        let key = (start.parts.clone(), fingerprint);
+        let mut cache_map = cache.map.write().unwrap();
+        cache_map.insert(key, impl_result.clone());
     }
 
-    Ok(None)
+    result
 }
 
 pub fn resolve_call_signature<F>(
@@ -234,12 +319,14 @@ pub fn resolve_call_signature<F>(
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
+    cache: Option<&ResolutionCache>,
 ) -> Result<Option<ResolvedCallSignature>, String>
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
     let target = resolve_call_target(&call.target, import_map);
-    let Some(implementation) = resolve_implementation(target, search_roots, &read_file, max_depth)?
+    let Some(implementation) =
+        resolve_implementation(target, search_roots, &read_file, max_depth, cache)?
     else {
         return Ok(None);
     };
@@ -320,7 +407,6 @@ pub fn bind_call_arguments(
 
     bindings
 }
-
 
 #[cfg(test)]
 mod resolve_import_path_from_package_tests {
@@ -455,7 +541,8 @@ mod resolve_implementation_tests {
 
         let roots = vec![tmp.path().to_path_buf()];
         let found =
-            resolve_implementation(target(&["pkg", "linear", "Linear"]), &roots, read, 5).unwrap();
+            resolve_implementation(target(&["pkg", "linear", "Linear"]), &roots, read, 5, None)
+                .unwrap();
 
         assert_eq!(
             found,
@@ -486,6 +573,7 @@ mod resolve_implementation_tests {
             &roots,
             read,
             5,
+            None,
         )
         .unwrap();
 
@@ -509,7 +597,7 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("pkg/mod.py"), "VALUE = 1").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["pkg", "mod"]), &roots, read, 5).unwrap();
+        let found = resolve_implementation(target(&["pkg", "mod"]), &roots, read, 5, None).unwrap();
 
         assert_eq!(
             found,
@@ -539,7 +627,8 @@ mod resolve_implementation_tests {
 
         let roots = vec![tmp.path().to_path_buf()];
         let found =
-            resolve_implementation(target(&["equinox", "nn", "Linear"]), &roots, read, 5).unwrap();
+            resolve_implementation(target(&["equinox", "nn", "Linear"]), &roots, read, 5, None)
+                .unwrap();
 
         assert_eq!(
             found,
@@ -560,7 +649,7 @@ mod resolve_implementation_tests {
 
         let roots = vec![tmp.path().to_path_buf()];
         let found =
-            resolve_implementation(target(&["missing", "Linear"]), &roots, read, 5).unwrap();
+            resolve_implementation(target(&["missing", "Linear"]), &roots, read, 5, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -571,7 +660,8 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("foo.py"), "class Foo: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, |_| None, 5).unwrap();
+        let found =
+            resolve_implementation(target(&["foo", "Foo"]), &roots, |_| None, 5, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -582,7 +672,7 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("foo.py"), "class Bar: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 5).unwrap();
+        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 5, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -593,7 +683,7 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("foo.py"), "class Foo: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 0).unwrap();
+        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, read, 0, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -606,9 +696,14 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("realpkg/layers.py"), "class Linear: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found =
-            resolve_implementation(target(&["aliaspkg", "layers", "Linear"]), &roots, read, 10)
-                .unwrap();
+        let found = resolve_implementation(
+            target(&["aliaspkg", "layers", "Linear"]),
+            &roots,
+            read,
+            10,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             found,
@@ -631,7 +726,7 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("pkg/a.py"), "from . import X").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["pkg", "X"]), &roots, read, 10).unwrap();
+        let found = resolve_implementation(target(&["pkg", "X"]), &roots, read, 10, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -1256,5 +1351,251 @@ mod follow_import_symbol_once_tests {
         );
 
         assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
+mod resolution_cache_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn parts(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: self::parts(parts),
+        }
+    }
+
+    fn implementation(
+        module_parts: &[&str],
+        file_path: PathBuf,
+        symbol_parts: &[&str],
+        symbol: Option<PythonSymbol>,
+    ) -> ResolvedImplementation {
+        ResolvedImplementation {
+            target: ResolvedModuleTarget {
+                dots: 0,
+                module_parts: parts(module_parts),
+                file_path,
+                symbol_parts: parts(symbol_parts),
+            },
+            symbol,
+        }
+    }
+
+    #[test]
+    fn test_cache_hit_avoids_disk_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let read_count = AtomicUsize::new(0);
+        let read = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+
+        let cache = new_resolution_cache();
+
+        // First call — populates cache
+        let found1 = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        let reads_first = read_count.load(Ordering::Relaxed);
+        assert!(reads_first > 0, "first call should read files");
+
+        assert_eq!(
+            found1,
+            Some(implementation(
+                &["pkg", "linear"],
+                tmp.path().join("pkg/linear.py"),
+                &["Linear"],
+                Some(PythonSymbol::Class {
+                    name: "Linear".to_string(),
+                })
+            ))
+        );
+
+        // Reset counter
+        read_count.store(0, Ordering::Relaxed);
+
+        // Second call — should hit cache, no disk reads
+        let found2 = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(found2, found1, "cache hit should return same result");
+        assert_eq!(
+            read_count.load(Ordering::Relaxed),
+            0,
+            "cache hit should not read files"
+        );
+
+        // Cache should have exactly 1 entry
+        assert_eq!(cache.map.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_cache_stats_track_hits_and_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+
+        let read = |path: &PathBuf| fs::read_to_string(path).ok();
+
+        // First call — cache miss
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Second call — cache hit
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Third call — another hit
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Miss on a different target
+        let _ = resolve_implementation(target(&["pkg", "missing"]), &roots, read, 5, Some(&cache))
+            .unwrap();
+        // Failed resolution is not cached, so this counts as a miss
+        // (the miss was recorded at lookup time, before the disk walk)
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_cache_different_roots_is_separate() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp1.path().join("pkg")).unwrap();
+        fs::write(tmp1.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp2.path().join("pkg")).unwrap();
+        fs::write(tmp2.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let cache = new_resolution_cache();
+
+        let read = |path: &PathBuf| fs::read_to_string(path).ok();
+
+        // Resolve with roots1
+        let _found1 = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &[tmp1.path().to_path_buf()],
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+
+        // Resolve with roots2 — different fingerprint, should not cache-hit
+        let read_count = AtomicUsize::new(0);
+        let read_counted = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+        let _found2 = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &[tmp2.path().to_path_buf()],
+            read_counted,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert!(
+            read_count.load(Ordering::Relaxed) > 0,
+            "different roots should miss cache"
+        );
+    }
+
+    #[test]
+    fn test_clear_resolution_cache_empties() {
+        let cache = new_resolution_cache();
+        cache.map.write().unwrap().insert(
+            (parts(&["test"]), 0),
+            ResolvedImplementation {
+                target: ResolvedModuleTarget {
+                    dots: 0,
+                    module_parts: parts(&["test"]),
+                    file_path: PathBuf::from("fake.py"),
+                    symbol_parts: vec![],
+                },
+                symbol: None,
+            },
+        );
+        assert_eq!(cache.map.read().unwrap().len(), 1);
+        clear_resolution_cache(&cache);
+        assert_eq!(cache.map.read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_search_roots_fingerprint_same_roots_same_hash() {
+        let roots = vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")];
+        let h1 = search_roots_fingerprint(&roots);
+        let h2 = search_roots_fingerprint(&roots);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_search_roots_fingerprint_different_roots_different_hash() {
+        let roots1 = vec![PathBuf::from("/a/b")];
+        let roots2 = vec![PathBuf::from("/x/y")];
+        assert_ne!(
+            search_roots_fingerprint(&roots1),
+            search_roots_fingerprint(&roots2)
+        );
+    }
+
+    #[test]
+    fn test_search_roots_fingerprint_order_matters() {
+        let roots1 = vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")];
+        let roots2 = vec![PathBuf::from("/c/d"), PathBuf::from("/a/b")];
+        assert_ne!(
+            search_roots_fingerprint(&roots1),
+            search_roots_fingerprint(&roots2)
+        );
     }
 }
