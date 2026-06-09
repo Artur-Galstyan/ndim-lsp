@@ -11,7 +11,7 @@ use crate::python_ast::{
     build_import_map, extract_binary_ops, extract_call_arguments, extract_calls,
     extract_jaxtyping_shapes, extract_method_calls,
 };
-use crate::resolution::{resolve_call_target, ResolutionCache};
+use crate::resolution::{ResolutionCache, resolve_call_target};
 
 use crate::types::*;
 
@@ -144,7 +144,10 @@ fn parse_vmap_call(args: &[CallArgument]) -> Option<VmapInfo> {
 /// parseable integer (e.g. tuple, variable, None).
 fn parse_int_keyword(args: &[CallArgument], name: &str, default: isize) -> Option<isize> {
     for arg in args {
-        if let CallArgument::Keyword { name: kw_name, value } = arg
+        if let CallArgument::Keyword {
+            name: kw_name,
+            value,
+        } = arg
             && kw_name == name
         {
             return value.parse::<isize>().ok();
@@ -162,10 +165,7 @@ fn peel_batch_dim(shape: &[String], axis: isize) -> Result<(Vec<String>, String)
     }
     let axis = if axis < 0 { axis + len } else { axis };
     if axis < 0 || axis >= len {
-        return Err(format!(
-            "axis {} out of bounds for rank {}",
-            axis, len
-        ));
+        return Err(format!("axis {} out of bounds for rank {}", axis, len));
     }
     let axis = axis as usize;
     let batch_dim = shape[axis].clone();
@@ -261,8 +261,7 @@ fn propagate_calls(
                 let args = extract_call_arguments(args_node, text)?;
 
                 // 1. Layer check (existing)
-                if let Some(kind) =
-                    find_scoped_layer(layer_records, scopes, position, &call.target)
+                if let Some(kind) = find_scoped_layer(layer_records, scopes, position, &call.target)
                 {
                     let Some(CallArgument::Positional { value: input }) = args.first().cloned()
                     else {
@@ -295,12 +294,7 @@ fn propagate_calls(
                 // If call.target is a name that was bound by a prior
                 // `vf = jax.vmap(f)` call, expand it here.
                 if let Some(info) = vmap_targets.get(&call.target).cloned() {
-                    let result = apply_vmap_call(
-                        &info,
-                        &args,
-                        &scopes[scope_idx].shapes,
-                        scopes,
-                    );
+                    let result = apply_vmap_call(&info, &args, &scopes[scope_idx].shapes, scopes);
                     match result {
                         Ok(Some(output_shape)) => {
                             scopes[scope_idx]
@@ -513,16 +507,10 @@ fn apply_vmap_call(
     let arg_shapes: Vec<(&str, Vec<String>)> = peeled_arg_shapes
         .iter()
         .enumerate()
-        .filter_map(|(idx, (_, shape))| {
-            param_names.get(idx).map(|p| (p.as_str(), shape.clone()))
-        })
+        .filter_map(|(idx, (_, shape))| param_names.get(idx).map(|p| (p.as_str(), shape.clone())))
         .collect();
 
-    let result = bind_and_substitute(
-        callee,
-        &info.wrapped,
-        &arg_shapes,
-    )?;
+    let result = bind_and_substitute(callee, &info.wrapped, &arg_shapes)?;
 
     // g. If return_shape is None after substitution, no output to propagate.
     let Some(substituted) = result else {
@@ -566,7 +554,8 @@ fn find_callee_scope(
         }
         // Don't bind a call to itself (recursive call in the same function body).
         if let Some(byte) = call_byte
-            && scope.start_byte <= byte && byte < scope.end_byte
+            && scope.start_byte <= byte
+            && byte < scope.end_byte
         {
             continue;
         }
@@ -613,12 +602,14 @@ fn bind_and_substitute(
         if param_shape.len() != arg_shape.len() {
             return Err(format!(
                 "call to {}: argument '{}' expected rank {}, got rank {}",
-                target_name, param_name, param_shape.len(), arg_shape.len()
+                target_name,
+                param_name,
+                param_shape.len(),
+                arg_shape.len()
             ));
         }
 
-        for (dim_idx, (param_dim, arg_dim)) in
-            param_shape.iter().zip(arg_shape.iter()).enumerate()
+        for (dim_idx, (param_dim, arg_dim)) in param_shape.iter().zip(arg_shape.iter()).enumerate()
         {
             let is_param_concrete = param_dim.parse::<usize>().is_ok();
 
@@ -744,12 +735,7 @@ fn apply_binary_op(
     };
 
     match binop.op {
-        BinaryOp::MatMul => apply_matmul_shape(
-            left_shape,
-            right_shape,
-            &binop.left,
-            &binop.right,
-        ),
+        BinaryOp::MatMul => apply_matmul_shape(left_shape, right_shape, &binop.left, &binop.right),
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
             apply_elementwise_shape(left_shape, right_shape, binop.op)
         }
@@ -782,7 +768,9 @@ fn apply_matmul_shape(
 
     // Last dim of LHS must equal second-to-last dim of RHS.
     // Invariant: left.len() >= 2 and right.len() >= 2 (guard above).
-    let lhs_last = left.last().expect("invariant: left.len() >= 2 checked above");
+    let lhs_last = left
+        .last()
+        .expect("invariant: left.len() >= 2 checked above");
     let rhs_second_last = &right[right.len() - 2];
 
     if lhs_last != rhs_second_last {

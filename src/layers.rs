@@ -6,7 +6,9 @@ use tree_sitter::Node;
 use tree_sitter::Range;
 
 use crate::python_ast::{build_import_map, extract_call_arguments, extract_calls};
-use crate::resolution::{bind_call_arguments, resolve_call_signature, resolve_call_target, ResolutionCache};
+use crate::resolution::{
+    ResolutionCache, bind_call_arguments, resolve_call_signature, resolve_call_target,
+};
 use crate::types::*;
 
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
@@ -209,7 +211,8 @@ pub fn extract_layer_assignments<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let records = extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, None)?;
+    let records =
+        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, None)?;
     let mut layers = HashMap::new();
     for rec in records {
         layers.insert(rec.name, rec.kind);
@@ -411,7 +414,11 @@ fn apply_conv_layer(
     if input_shape.len() < min_rank {
         return Err(format!(
             "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-            layer_name, app.layer, min_rank, input_shape.len(), app.input
+            layer_name,
+            app.layer,
+            min_rank,
+            input_shape.len(),
+            app.input
         ));
     }
 
@@ -556,7 +563,11 @@ pub fn apply_layer_application(
             {
                 return Err(format!(
                     "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-                    name, app.layer, min_rank, input_shape.len(), app.input
+                    name,
+                    app.layer,
+                    min_rank,
+                    input_shape.len(),
+                    app.input
                 ));
             }
             Ok(Some(input_shape.clone()))
@@ -591,7 +602,6 @@ pub fn apply_layer_applications(
 
     errors
 }
-
 
 #[cfg(test)]
 mod apply_layer_application_tests {
@@ -1999,8 +2009,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2017,8 +2026,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2035,8 +2043,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2056,8 +2063,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2077,8 +2083,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2090,12 +2095,12 @@ mod catalog_first_extract_layer_assignments_tests {
 
     #[test]
     fn test_catalog_supports_from_import_alias_without_disk() {
-        let code = "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
+        let code =
+            "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert_eq!(
             layers.get("layer"),
@@ -2112,8 +2117,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert!(layers.is_empty());
     }
@@ -2126,8 +2130,7 @@ mod catalog_first_extract_layer_assignments_tests {
         let tree = parse(code);
         let roots: Vec<PathBuf> = Vec::new();
 
-        let layers =
-            extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert!(layers.is_empty());
     }

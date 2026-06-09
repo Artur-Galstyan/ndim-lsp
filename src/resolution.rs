@@ -1,8 +1,16 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tree_sitter::{Node, Parser};
 
-use crate::python_ast::{extract_call_arguments, extract_callable_signature, find_top_level_symbol};
+use crate::python_ast::{
+    extract_call_arguments, extract_callable_signature, find_top_level_symbol,
+};
 use crate::types::*;
 
 /// Session-lifetime cache for resolved import targets.
@@ -15,33 +23,40 @@ use crate::types::*;
 /// (workspace folder added/removed), the fingerprint shifts and old
 /// entries naturally fall out of lookup — no explicit eviction needed
 /// beyond clearing the entire map.
-pub type ResolutionCache = Arc<std::sync::RwLock<HashMap<(Vec<String>, u64), ResolvedImplementation>>>;
+///
+/// Note: only the final resolution result (start → ResolvedImplementation)
+/// is cached. Re-export chain intermediates are not cached individually,
+/// which is correct for the LSP workload (queries target first-class
+/// imports, not intermediate re-export hops).
+pub struct ResolutionCache {
+    pub map: std::sync::RwLock<HashMap<(Vec<String>, u64), ResolvedImplementation>>,
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+}
 
 /// Compute a stable u64 fingerprint for an ordered list of search-root paths.
-/// Uses a simple hash-fold so identical root lists produce the same key.
+/// Uses `DefaultHasher` over the `PathBuf` slice, which is deterministic
+/// within a session and order-sensitive (reordering roots produces a
+/// different fingerprint).
 pub fn search_roots_fingerprint(search_roots: &[PathBuf]) -> u64 {
-    let mut hash: u64 = 0;
-    for root in search_roots {
-        // Fold each path's byte representation into the running hash.
-        // XOR + rotate avoids trivial collisions for reordered roots.
-        for byte in root.as_os_str().as_encoded_bytes() {
-            hash = hash.rotate_left(7) ^ (*byte as u64);
-        }
-        // Separator between paths so /a/b + /c != /a + /b/c.
-        hash = hash.rotate_left(7) ^ 0xFF;
-    }
-    hash
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    search_roots.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Create a new empty resolution cache.
-pub fn new_resolution_cache() -> ResolutionCache {
-    Arc::new(std::sync::RwLock::new(HashMap::new()))
+pub fn new_resolution_cache() -> Arc<ResolutionCache> {
+    Arc::new(ResolutionCache {
+        map: std::sync::RwLock::new(HashMap::new()),
+        hits: AtomicUsize::new(0),
+        misses: AtomicUsize::new(0),
+    })
 }
 
 /// Clear all entries from the resolution cache. Called when workspace
 /// folders change, since site-packages roots may shift.
-pub fn clear_resolution_cache(cache: &ResolutionCache) {
-    cache.write().unwrap().clear();
+pub fn clear_resolution_cache(cache: &Arc<ResolutionCache>) {
+    cache.map.write().unwrap().clear();
 }
 
 pub fn resolve_python_module_on_disk(
@@ -216,15 +231,19 @@ where
     F: Fn(&PathBuf) -> Option<String>,
 {
     // Cache lookup — only for absolute (dots==0) targets with non-empty parts.
-    if start.dots == 0 && !start.parts.is_empty()
-        && let Some(cache) = cache {
-            let fingerprint = search_roots_fingerprint(search_roots);
-            let key = (start.parts.clone(), fingerprint);
-            let cache_map = cache.read().unwrap();
-            if let Some(cached) = cache_map.get(&key) {
-                return Ok(Some(cached.clone()));
-            }
+    if start.dots == 0
+        && !start.parts.is_empty()
+        && let Some(cache) = cache
+    {
+        let fingerprint = search_roots_fingerprint(search_roots);
+        let key = (start.parts.clone(), fingerprint);
+        let cache_map = cache.map.read().unwrap();
+        if let Some(cached) = cache_map.get(&key) {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(cached.clone()));
         }
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+    }
 
     let mut parser = Parser::new();
     parser
@@ -280,13 +299,15 @@ where
     })();
 
     // Cache insert — only on successful resolution of absolute targets.
-    if start.dots == 0 && !start.parts.is_empty()
-        && let (Some(cache), Ok(Some(impl_result))) = (cache, &result) {
-            let fingerprint = search_roots_fingerprint(search_roots);
-            let key = (start.parts.clone(), fingerprint);
-            let mut cache_map = cache.write().unwrap();
-            cache_map.insert(key, impl_result.clone());
-        }
+    if start.dots == 0
+        && !start.parts.is_empty()
+        && let (Some(cache), Ok(Some(impl_result))) = (cache, &result)
+    {
+        let fingerprint = search_roots_fingerprint(search_roots);
+        let key = (start.parts.clone(), fingerprint);
+        let mut cache_map = cache.map.write().unwrap();
+        cache_map.insert(key, impl_result.clone());
+    }
 
     result
 }
@@ -304,7 +325,8 @@ where
     F: Fn(&PathBuf) -> Option<String>,
 {
     let target = resolve_call_target(&call.target, import_map);
-    let Some(implementation) = resolve_implementation(target, search_roots, &read_file, max_depth, cache)?
+    let Some(implementation) =
+        resolve_implementation(target, search_roots, &read_file, max_depth, cache)?
     else {
         return Ok(None);
     };
@@ -385,7 +407,6 @@ pub fn bind_call_arguments(
 
     bindings
 }
-
 
 #[cfg(test)]
 mod resolve_import_path_from_package_tests {
@@ -520,7 +541,8 @@ mod resolve_implementation_tests {
 
         let roots = vec![tmp.path().to_path_buf()];
         let found =
-            resolve_implementation(target(&["pkg", "linear", "Linear"]), &roots, read, 5, None).unwrap();
+            resolve_implementation(target(&["pkg", "linear", "Linear"]), &roots, read, 5, None)
+                .unwrap();
 
         assert_eq!(
             found,
@@ -605,7 +627,8 @@ mod resolve_implementation_tests {
 
         let roots = vec![tmp.path().to_path_buf()];
         let found =
-            resolve_implementation(target(&["equinox", "nn", "Linear"]), &roots, read, 5, None).unwrap();
+            resolve_implementation(target(&["equinox", "nn", "Linear"]), &roots, read, 5, None)
+                .unwrap();
 
         assert_eq!(
             found,
@@ -637,7 +660,8 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("foo.py"), "class Foo: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found = resolve_implementation(target(&["foo", "Foo"]), &roots, |_| None, 5, None).unwrap();
+        let found =
+            resolve_implementation(target(&["foo", "Foo"]), &roots, |_| None, 5, None).unwrap();
 
         assert_eq!(found, None);
     }
@@ -672,9 +696,14 @@ mod resolve_implementation_tests {
         fs::write(tmp.path().join("realpkg/layers.py"), "class Linear: pass").unwrap();
 
         let roots = vec![tmp.path().to_path_buf()];
-        let found =
-            resolve_implementation(target(&["aliaspkg", "layers", "Linear"]), &roots, read, 10, None)
-                .unwrap();
+        let found = resolve_implementation(
+            target(&["aliaspkg", "layers", "Linear"]),
+            &roots,
+            read,
+            10,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             found,
@@ -1419,7 +1448,62 @@ mod resolution_cache_tests {
         );
 
         // Cache should have exactly 1 entry
-        assert_eq!(cache.read().unwrap().len(), 1);
+        assert_eq!(cache.map.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_cache_stats_track_hits_and_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/linear.py"), "class Linear: pass").unwrap();
+
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+
+        let read = |path: &PathBuf| fs::read_to_string(path).ok();
+
+        // First call — cache miss
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Second call — cache hit
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Third call — another hit
+        let _ = resolve_implementation(
+            target(&["pkg", "linear", "Linear"]),
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+
+        // Miss on a different target
+        let _ = resolve_implementation(target(&["pkg", "missing"]), &roots, read, 5, Some(&cache))
+            .unwrap();
+        // Failed resolution is not cached, so this counts as a miss
+        // (the miss was recorded at lookup time, before the disk walk)
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1470,24 +1554,21 @@ mod resolution_cache_tests {
     #[test]
     fn test_clear_resolution_cache_empties() {
         let cache = new_resolution_cache();
-        cache
-            .write()
-            .unwrap()
-            .insert(
-                (parts(&["test"]), 0),
-                ResolvedImplementation {
-                    target: ResolvedModuleTarget {
-                        dots: 0,
-                        module_parts: parts(&["test"]),
-                        file_path: PathBuf::from("fake.py"),
-                        symbol_parts: vec![],
-                    },
-                    symbol: None,
+        cache.map.write().unwrap().insert(
+            (parts(&["test"]), 0),
+            ResolvedImplementation {
+                target: ResolvedModuleTarget {
+                    dots: 0,
+                    module_parts: parts(&["test"]),
+                    file_path: PathBuf::from("fake.py"),
+                    symbol_parts: vec![],
                 },
-            );
-        assert_eq!(cache.read().unwrap().len(), 1);
+                symbol: None,
+            },
+        );
+        assert_eq!(cache.map.read().unwrap().len(), 1);
         clear_resolution_cache(&cache);
-        assert_eq!(cache.read().unwrap().len(), 0);
+        assert_eq!(cache.map.read().unwrap().len(), 0);
     }
 
     #[test]

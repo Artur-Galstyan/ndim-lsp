@@ -180,10 +180,7 @@ pub fn extract_call_arguments(args_node: Node, text: &str) -> Result<Vec<CallArg
     Ok(args)
 }
 
-pub fn extract_jaxtyping_shapes(
-    node: Node,
-    text: &str,
-) -> Result<Vec<FunctionShapeScope>, String> {
+pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionShapeScope>, String> {
     fn node_text(node: Node, text: &str) -> Result<String, String> {
         node.utf8_text(text.as_bytes())
             .map(|s| s.to_string())
@@ -325,11 +322,7 @@ pub fn extract_jaxtyping_shapes(
                 if contains_array_type(ret_type, text)? {
                     if let Some(raw_shape) = find_string_literal(ret_type, text)? {
                         let dims = shape_dims(&raw_shape);
-                        if dims.is_empty() {
-                            None
-                        } else {
-                            Some(dims)
-                        }
+                        if dims.is_empty() { None } else { Some(dims) }
                     } else {
                         None
                     }
@@ -1157,7 +1150,10 @@ mod extract_jaxtyping_shapes_tests {
     }
 
     fn module_scope(scopes: &[FunctionShapeScope]) -> &FunctionShapeScope {
-        assert!(scopes[0].function_name.is_none(), "scope[0] is not module scope");
+        assert!(
+            scopes[0].function_name.is_none(),
+            "scope[0] is not module scope"
+        );
         &scopes[0]
     }
 
@@ -1638,7 +1634,8 @@ def f(x) -> Float[Array, \"batch\"]:
 
     #[test]
     fn test_nested_function_scopes_are_distinct() {
-        let code = "def outer(o: Float[Array, \"a b\"]):\n    def inner(i: Float[Array, \"c d\"]): pass";
+        let code =
+            "def outer(o: Float[Array, \"a b\"]):\n    def inner(i: Float[Array, \"c d\"]): pass";
         let tree = parse(code);
 
         let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
@@ -2640,7 +2637,10 @@ mod extract_binary_ops_tests {
         let code = "y = a @ b";
         let tree = parse(code);
         let ops = extract_binary_ops(tree.root_node(), code).unwrap();
-        assert_eq!(&code[ops[0].range.start_byte..ops[0].range.end_byte], "a @ b");
+        assert_eq!(
+            &code[ops[0].range.start_byte..ops[0].range.end_byte],
+            "a @ b"
+        );
     }
 
     #[test]

@@ -2115,7 +2115,10 @@ mod like_constructors_propagation_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -2128,7 +2131,10 @@ mod like_constructors_propagation_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -2141,7 +2147,10 @@ mod like_constructors_propagation_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -2154,8 +2163,14 @@ mod like_constructors_propagation_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
-        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
+        assert_eq!(
+            find_shape(&analysis, "z"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 }
 
@@ -2182,8 +2197,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_matmul_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"batch k\"], b: Float[Array, \"k n\"]):\n    y = a @ b";
+        let code = "def f(a: Float[Array, \"batch k\"], b: Float[Array, \"k n\"]):\n    y = a @ b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2196,8 +2210,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_matmul_inner_dim_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"batch 3\"], b: Float[Array, \"5 n\"]):\n    y = a @ b";
+        let code = "def f(a: Float[Array, \"batch 3\"], b: Float[Array, \"5 n\"]):\n    y = a @ b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2205,14 +2218,17 @@ mod binary_op_propagation_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("matmul dimension mismatch")
+        );
     }
 
     #[test]
     fn test_matmul_batch_dim_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"2 3 4\"], b: Float[Array, \"5 4 6\"]):\n    y = a @ b";
+        let code = "def f(a: Float[Array, \"2 3 4\"], b: Float[Array, \"5 4 6\"]):\n    y = a @ b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2220,14 +2236,17 @@ mod binary_op_propagation_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert!(analysis.errors[0].message.contains("matmul batch dimension mismatch"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("matmul batch dimension mismatch")
+        );
     }
 
     #[test]
     fn test_matmul_matching_batch_dims() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"b m k\"], b: Float[Array, \"b k n\"]):\n    y = a @ b";
+        let code = "def f(a: Float[Array, \"b m k\"], b: Float[Array, \"b k n\"]):\n    y = a @ b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2240,8 +2259,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_add_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"batch features\"], b: Float[Array, \"batch features\"]):\n    y = a + b";
+        let code = "def f(a: Float[Array, \"batch features\"], b: Float[Array, \"batch features\"]):\n    y = a + b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2257,8 +2275,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_mul_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"a b\"], b: Float[Array, \"a c\"]):\n    y = a * b";
+        let code = "def f(a: Float[Array, \"a b\"], b: Float[Array, \"a c\"]):\n    y = a * b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2274,8 +2291,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_sub_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"b d\"], b: Float[Array, \"b d\"]):\n    y = a - b";
+        let code = "def f(a: Float[Array, \"b d\"], b: Float[Array, \"b d\"]):\n    y = a - b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2288,8 +2304,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_sub_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"x y\"], b: Float[Array, \"x z\"]):\n    y = a - b";
+        let code = "def f(a: Float[Array, \"x y\"], b: Float[Array, \"x z\"]):\n    y = a - b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2303,8 +2318,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_div_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"b d\"], b: Float[Array, \"b d\"]):\n    y = a / b";
+        let code = "def f(a: Float[Array, \"b d\"], b: Float[Array, \"b d\"]):\n    y = a / b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2317,8 +2331,7 @@ mod binary_op_propagation_tests {
     #[test]
     fn test_elementwise_div_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let code =
-            "def f(a: Float[Array, \"p q\"], b: Float[Array, \"p r\"]):\n    y = a / b";
+        let code = "def f(a: Float[Array, \"p q\"], b: Float[Array, \"p r\"]):\n    y = a / b";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
@@ -2390,11 +2403,7 @@ mod conv_layer_tests {
     /// Write fake equinox.nn package with Conv1d, Conv2d, Conv3d, Linear
     fn write_fake_equinox_nn(tmp: &tempfile::TempDir) {
         fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
-        fs::write(
-            tmp.path().join("equinox/__init__.py"),
-            "from . import nn",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("equinox/__init__.py"), "from . import nn").unwrap();
         fs::write(
             tmp.path().join("equinox/nn/__init__.py"),
             "from ._conv import Conv1d, Conv2d, Conv3d\nfrom ._linear import Linear",
@@ -2446,7 +2455,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
     }
 
     // ── Torch Conv2d same ──
@@ -2462,7 +2474,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
     }
 
     // ── in_channels mismatch -> ShapeError ──
@@ -2479,7 +2494,11 @@ mod conv_layer_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert!(analysis.errors[0].message.contains("expected 3 input channels"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("expected 3 input channels")
+        );
         assert!(analysis.errors[0].message.contains("got 4"));
     }
 
@@ -2494,7 +2513,11 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1);
-        assert!(analysis.errors[0].message.contains("expected 3 input channels"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("expected 3 input channels")
+        );
         assert!(analysis.errors[0].message.contains("got 5"));
     }
 
@@ -2512,7 +2535,10 @@ mod conv_layer_tests {
 
         assert!(analysis.errors.is_empty());
         // L_out = floor((64 + 2*0 - 5)/1) + 1 = 60
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "60"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "60"]))
+        );
     }
 
     #[test]
@@ -2526,7 +2552,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "60"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "60"]))
+        );
     }
 
     // ── Conv3d ──
@@ -2542,7 +2571,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30", "30"]))
+        );
     }
 
     #[test]
@@ -2556,7 +2588,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30", "30"]))
+        );
     }
 
     // ── Conv2d with stride=2, padding=1 ──
@@ -2573,7 +2608,10 @@ mod conv_layer_tests {
 
         assert!(analysis.errors.is_empty());
         // H_out = floor((32 + 2*1 - 3)/2) + 1 = floor(31/2) + 1 = 15 + 1 = 16
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "16", "16"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "16", "16"]))
+        );
     }
 
     #[test]
@@ -2587,7 +2625,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "16", "16"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "16", "16"]))
+        );
     }
 
     // ── Symbolic input: in_channels matches as symbol ──
@@ -2645,7 +2686,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
     }
 
     #[test]
@@ -2659,7 +2703,10 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
     }
 
     // ── from-import alias form ──
@@ -2675,12 +2722,21 @@ mod conv_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "30", "30"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "30", "30"]))
+        );
     }
 
     // ── Direct apply_layer_application unit tests ──
 
-    fn conv1d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+    fn conv1d(
+        in_channels: &str,
+        out_channels: &str,
+        kernel_size: &str,
+        stride: &str,
+        padding: &str,
+    ) -> LayerKind {
         LayerKind::Conv1d {
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
@@ -2690,7 +2746,13 @@ mod conv_layer_tests {
         }
     }
 
-    fn conv2d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+    fn conv2d(
+        in_channels: &str,
+        out_channels: &str,
+        kernel_size: &str,
+        stride: &str,
+        padding: &str,
+    ) -> LayerKind {
         LayerKind::Conv2d {
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
@@ -2700,7 +2762,13 @@ mod conv_layer_tests {
         }
     }
 
-    fn conv3d(in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+    fn conv3d(
+        in_channels: &str,
+        out_channels: &str,
+        kernel_size: &str,
+        stride: &str,
+        padding: &str,
+    ) -> LayerKind {
         LayerKind::Conv3d {
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
@@ -2976,11 +3044,7 @@ mod shape_preserving_layer_tests {
     /// Write fake equinox.nn package with shape-preserving layers + Linear
     fn write_fake_equinox_nn(tmp: &tempfile::TempDir) {
         fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
-        fs::write(
-            tmp.path().join("equinox/__init__.py"),
-            "from . import nn",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("equinox/__init__.py"), "from . import nn").unwrap();
         fs::write(
             tmp.path().join("equinox/nn/__init__.py"),
             "from ._layers import BatchNorm, LayerNorm, GroupNorm, PReLU\nfrom ._linear import Linear",
@@ -3011,8 +3075,14 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "features"])));
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "x"),
+            Some(&shape(&["batch", "features"]))
+        );
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.BatchNorm2d on (batch, 16, H, W) ──
@@ -3028,7 +3098,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "H", "W"]))
+        );
     }
 
     // ── torch.nn.LayerNorm on (batch, 16) ──
@@ -3060,7 +3133,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.ReLU ──
@@ -3076,7 +3152,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "3", "32", "32"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "3", "32", "32"]))
+        );
     }
 
     // ── Chained: batchnorm then relu ──
@@ -3092,8 +3171,14 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
-        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "16", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "H", "W"]))
+        );
+        assert_eq!(
+            find_shape(&analysis, "z"),
+            Some(&shape(&["batch", "16", "H", "W"]))
+        );
     }
 
     // ── Symbolic input shape ──
@@ -3125,7 +3210,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── equinox.nn.GroupNorm ──
@@ -3141,7 +3229,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "channels", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "channels", "H", "W"]))
+        );
     }
 
     // ── equinox.nn.PReLU ──
@@ -3157,7 +3248,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.GELU ──
@@ -3173,7 +3267,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.Sigmoid ──
@@ -3189,7 +3286,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.Tanh ──
@@ -3205,7 +3305,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.Softmax ──
@@ -3221,7 +3324,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     // ── torch.nn.GroupNorm ──
@@ -3237,7 +3343,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "16", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "16", "H", "W"]))
+        );
     }
 
     // ── Chain with Linear: shape-preserving layer after Linear ──
@@ -3425,7 +3534,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "D", "H", "W"]))
+        );
     }
 
     #[test]
@@ -3455,7 +3567,10 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "D", "H", "W"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "D", "H", "W"]))
+        );
     }
 
     #[test]
@@ -3658,7 +3773,10 @@ mod torch_nn_functional_pad_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["height+3", "width+3"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["height+3", "width+3"]))
+        );
     }
 
     #[test]
@@ -3772,14 +3890,18 @@ mod free_reduction_shape_preserving_tests {
 
     #[test]
     fn test_torch_argsort_preserves_batch_features() {
-        let code = "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.argsort(x)";
+        let code =
+            "import torch\ndef f(x: Float[Array, \"batch features\"]):\n    y = torch.argsort(x)";
         let tree = parse(code);
         let roots = vec![];
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -3791,7 +3913,10 @@ mod free_reduction_shape_preserving_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -3803,7 +3928,10 @@ mod free_reduction_shape_preserving_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
         assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch"])));
     }
 }
@@ -3867,10 +3995,7 @@ mod linalg_inv_integration_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(
-            find_shape(&analysis, "y"),
-            Some(&shape(&["b", "n", "n"]))
-        );
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "n", "n"])));
     }
 
     #[test]
@@ -3884,7 +4009,11 @@ mod linalg_inv_integration_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert!(analysis.errors[0].message.contains("last two dimensions to match"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("last two dimensions to match")
+        );
         assert!(!has_shape(&analysis, "y"));
     }
 }
@@ -4094,10 +4223,7 @@ mod linalg_det_integration_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(
-            find_shape(&analysis, "y"),
-            Some(&shape(&["batch"]))
-        );
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch"])));
     }
 
     #[test]
@@ -4110,26 +4236,21 @@ mod linalg_det_integration_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(
-            find_shape(&analysis, "y"),
-            Some(&Vec::<String>::new())
-        );
+        assert_eq!(find_shape(&analysis, "y"), Some(&Vec::<String>::new()));
     }
 
     #[test]
     fn test_torch_linalg_det_multi_batch_returns_prefix() {
         let tmp = tempfile::tempdir().unwrap();
-        let code = "import torch\ndef f(x: Float[Array, \"b t n n\"]):\n    y = torch.linalg.det(x)";
+        let code =
+            "import torch\ndef f(x: Float[Array, \"b t n n\"]):\n    y = torch.linalg.det(x)";
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(
-            find_shape(&analysis, "y"),
-            Some(&shape(&["b", "t"]))
-        );
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "t"])));
     }
 
     #[test]
@@ -4143,7 +4264,11 @@ mod linalg_det_integration_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert!(analysis.errors[0].message.contains("last two dimensions to match"));
+        assert!(
+            analysis.errors[0]
+                .message
+                .contains("last two dimensions to match")
+        );
         assert!(!has_shape(&analysis, "y"));
     }
 }
@@ -4178,7 +4303,10 @@ mod constructor_coverage_integration_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "features"])));
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 
     #[test]
@@ -4266,11 +4394,7 @@ mod site_packages_resolution_tests {
             .join("python3.11")
             .join("site-packages");
         fs::create_dir_all(site.join("equinox").join("nn")).unwrap();
-        fs::write(
-            site.join("equinox").join("__init__.py"),
-            "from . import nn",
-        )
-        .unwrap();
+        fs::write(site.join("equinox").join("__init__.py"), "from . import nn").unwrap();
         fs::write(
             site.join("equinox").join("nn").join("__init__.py"),
             "from ._linear import Linear",
@@ -4355,7 +4479,11 @@ def caller(y: Float[Array, "batch"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             Some(&shape(&["m"]))
@@ -4381,7 +4509,11 @@ def caller(x: Float[Array, "batch features"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             Some(&shape(&["batch", "c"]))
@@ -4405,7 +4537,12 @@ def caller(y: Float[Array, "batch"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected 1 error, got {:?}",
+            analysis.errors
+        );
         assert_eq!(analysis.errors[0].variable, "z");
         assert!(
             analysis.errors[0].message.contains("rank"),
@@ -4413,10 +4550,7 @@ def caller(y: Float[Array, "batch"]) -> None:
             analysis.errors[0].message
         );
         // No shape recorded for z when there's a mismatch.
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "z"),
-            None
-        );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "z"), None);
     }
 
     /// Test 4: concrete dim mismatch emits a diagnostic.
@@ -4436,7 +4570,12 @@ def caller(y: Float[Array, "5 features"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected 1 error, got {:?}",
+            analysis.errors
+        );
         assert_eq!(analysis.errors[0].variable, "z");
         assert!(
             analysis.errors[0].message.contains('3') && analysis.errors[0].message.contains('5'),
@@ -4461,11 +4600,12 @@ def caller(y: Float[Array, "batch"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "z"),
-            None
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "z"), None);
     }
 
     /// Test 6: user function call at module scope.
@@ -4484,12 +4624,13 @@ z = f(y)
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        // Module scope (index 0) should have z → ["m"]
-        assert_eq!(
-            analysis.scopes[0].shapes.get("z"),
-            Some(&shape(&["m"]))
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        // Module scope (index 0) should have z → ["m"]
+        assert_eq!(analysis.scopes[0].shapes.get("z"), Some(&shape(&["m"])));
     }
 
     /// Test 7: a bare name that also exists as a known function (e.g. `reshape`)
@@ -4512,7 +4653,11 @@ def caller(y: Float[Array, "batch"]) -> None:
 
         // Bare `reshape` is not classified by `classify_known_function`, so the
         // user-function branch handles it: z gets ["m"].
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             Some(&shape(&["m"]))
@@ -4536,7 +4681,12 @@ def caller(y: Float[Array, "a b"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected 1 error, got {:?}",
+            analysis.errors
+        );
         assert_eq!(analysis.errors[0].variable, "z");
         assert!(
             analysis.errors[0].message.contains("cannot be both"),
@@ -4544,10 +4694,7 @@ def caller(y: Float[Array, "a b"]) -> None:
             analysis.errors[0].message
         );
         // No shape for z when binding is inconsistent.
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "z"),
-            None
-        );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "z"), None);
     }
 
     /// Test 9: keyword argument matching a declared param name is honoured.
@@ -4567,7 +4714,11 @@ def caller(y: Float[Array, "batch features"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             Some(&shape(&["batch", "c"]))
@@ -4591,11 +4742,12 @@ def f(x: Float[Array, "n"]) -> Float[Array, "m"]:
         // Self-call is silently skipped — the user-function branch can't
         // resolve f (its scope contains the call byte), so it falls through.
         // No shape recorded for z, no error.
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        assert_eq!(
-            find_shape_in_scope(&analysis, "f", "z"),
-            None
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        assert_eq!(find_shape_in_scope(&analysis, "f", "z"), None);
     }
 
     /// Test 11: inner-scope preference when same function name appears at
@@ -4627,7 +4779,11 @@ def caller(y: Float[Array, "batch"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         // The outer `g` (smaller scope among candidates whose byte range
         // doesn't contain the call) wins.
         assert_eq!(
@@ -4658,7 +4814,11 @@ def caller(y: Float[Array, "batch"]) -> None:
         // Only the first positional arg is provided, so `a` binds to
         // "batch" but `k` is unbound. The return shape ["a", "k"] becomes
         // ["batch", "k"] — `k` passes through as a fresh dim.
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "z"),
             Some(&shape(&["batch", "k"]))
@@ -4721,7 +4881,11 @@ def caller(x: Float[Array, "B n"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
@@ -4749,7 +4913,11 @@ def caller(x: Float[Array, "B n"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
@@ -4778,7 +4946,11 @@ def caller(x: Float[Array, "n B"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
@@ -4807,7 +4979,11 @@ def caller(x: Float[Array, "B n"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["m", "B"]))
@@ -4834,7 +5010,12 @@ def caller(a: Float[Array, "B n"], b: Float[Array, "C k"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected 1 error, got {:?}",
+            analysis.errors
+        );
         assert_eq!(analysis.errors[0].variable, "z");
         assert!(
             analysis.errors[0].message.contains("batch dims disagree"),
@@ -4842,10 +5023,7 @@ def caller(a: Float[Array, "B n"], b: Float[Array, "C k"]) -> None:
             analysis.errors[0].message
         );
         // No shape recorded for z when there's a mismatch.
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "z"),
-            None
-        );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "z"), None);
     }
 
     /// Test 6: wrapped function without annotations — silently skips.
@@ -4868,11 +5046,12 @@ def caller(x: Float[Array, "B n"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "y"),
-            None
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "y"), None);
     }
 
     /// Test 7: tuple in_axes is skipped silently (not a scalar int).
@@ -4898,11 +5077,12 @@ def caller(x: Float[Array, "B n"]) -> None:
         // vf was not recorded in vmap_targets because in_axes=(0,1) isn't
         // a scalar int, so the call `y = vf(x)` falls through — no shape,
         // no error.
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "y"),
-            None
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "y"), None);
     }
 
     /// Test 8: non-literal function arg (dotted name) is skipped.
@@ -4929,11 +5109,12 @@ def caller(x: Float[Array, "B n"]) -> None:
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         // vf was not recorded because "module.f" contains a dot.
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "y"),
-            None
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
         );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "y"), None);
     }
 
     /// Test 9: arg rank insufficient for in_axes emits an error.
@@ -4961,7 +5142,12 @@ def caller(x: Float[Array, "scalar"]) -> None:
         // The arg has rank 1, in_axes=0 peels axis 0, leaving rank 0.
         // Then f expects rank 1 for param 'x' but gets rank 0.
         // This should produce an error from bind_and_substitute.
-        assert_eq!(analysis.errors.len(), 1, "expected 1 error, got {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected 1 error, got {:?}",
+            analysis.errors
+        );
         assert_eq!(analysis.errors[0].variable, "y");
         assert!(
             analysis.errors[0].message.contains("f"),
@@ -4969,10 +5155,7 @@ def caller(x: Float[Array, "scalar"]) -> None:
             analysis.errors[0].message
         );
         // No shape for y when there's a binding error.
-        assert_eq!(
-            find_shape_in_scope(&analysis, "caller", "y"),
-            None
-        );
+        assert_eq!(find_shape_in_scope(&analysis, "caller", "y"), None);
     }
 
     /// Test 10: arg variable name matches wrapped function's param name.
@@ -5000,7 +5183,11 @@ def caller(x: Float[Array, "B n"]) -> None:
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
