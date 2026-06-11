@@ -2264,7 +2264,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -2282,7 +2282,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
     }
@@ -2295,7 +2295,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("elementwise"));
@@ -2310,7 +2310,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -2324,7 +2324,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -2338,7 +2338,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -2352,7 +2352,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -2367,7 +2367,7 @@ mod binary_op_propagation_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5).unwrap();
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert_eq!(analysis.errors.len(), 1, "expected exactly one error, got {:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
@@ -3830,6 +3830,27 @@ mod shape_preserving_layer_tests {
         let err = apply_layer_application(&app, &shapes).unwrap_err();
         assert!(err.contains("GroupNorm"));
         assert!(err.contains("at least 1 dims"));
+    }
+
+    // ── Layer applied to a nested inline expression ──
+    // Verifies the layer pre-check now routes its input through
+    // resolve_call_args, so `y = drop(jnp.exp(x))` resolves a shape.
+    #[test]
+    fn test_layer_with_nested_call_input_resolves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_torch_nn(&tmp);
+        let code = "import torch\nimport jax.numpy as jnp\ndef f(x: Float[Array, \"batch features\"]):\n    drop = torch.nn.Dropout(0.1)\n    y = drop(jnp.exp(x))";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        // jnp.exp(x) preserves shape, Dropout preserves shape → y is [batch, features]
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "features"]))
+        );
     }
 }
 
@@ -5308,6 +5329,135 @@ def caller(x: Float[Array, "B n"]) -> None:
         assert_eq!(
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
+        );
+    }
+}
+
+mod recursive_evaluator_tests {
+    use super::*;
+
+    /// Tests routed through analyze_layer_shapes (the public API)
+    /// to catch wiring regressions and the synthetic-name-leak class of bug.
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn find_shape_in_scope<'a>(
+        analysis: &'a LayerShapeAnalysis,
+        scope_name: &str,
+        var: &str,
+    ) -> Option<&'a Vec<String>> {
+        analysis
+            .scopes
+            .iter()
+            .find(|s| s.function_name.as_deref() == Some(scope_name))
+            .and_then(|s| s.shapes.get(var))
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn test_nested_call_shape_error_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        // a @ b with mismatched inner dims should produce a matmul error
+        let code = r#"
+import jax.numpy as jnp
+def f(a: Float[Array, "3 5"], b: Float[Array, "4 2"]):
+    y = jnp.exp(a @ b)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            analysis.errors
+        );
+        assert!(
+            analysis.errors[0].message.contains("matmul dimension mismatch"),
+            "unexpected error message: {}",
+            analysis.errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_no_synth_keys_in_scopes_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(x: Float[Array, "3 5"]):
+    y = jnp.exp(jnp.reshape(x, (5, 3)))
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        for scope in &analysis.scopes {
+            for key in scope.shapes.keys() {
+                assert!(
+                    !key.starts_with("__synth_"),
+                    "__synth_* key leaked into scope.shapes: {}",
+                    key
+                );
+            }
+        }
+        // Sanity: y should have the correct shape
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["5", "3"]))
+        );
+    }
+
+    #[test]
+    fn test_chained_method_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "3 4"]):
+    y = x.reshape(3, 4).sum(axis=1)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["3"]))
+        );
+    }
+
+    #[test]
+    fn test_binary_op_in_nested_call_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        // z = jnp.exp(a @ b) — compatible matmul inside nested call
+        let code = r#"
+import jax.numpy as jnp
+def f(a: Float[Array, "3 5"], b: Float[Array, "5 2"]):
+    z = jnp.exp(a @ b)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "z"),
+            Some(&shape(&"3 2".split(' ').collect::<Vec<_>>()))
         );
     }
 }
