@@ -776,6 +776,14 @@ mod tests {
             parse_severity(&json!({"diagnostic_severity": "ERROR"})),
             DiagnosticSeverity::ERROR
         );
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "information"})),
+            DiagnosticSeverity::INFORMATION
+        );
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "hint"})),
+            DiagnosticSeverity::HINT
+        );
         assert_eq!(parse_severity(&json!({})), DiagnosticSeverity::ERROR);
         assert_eq!(
             parse_severity(&json!({"diagnostic_severity": "garbage"})),
