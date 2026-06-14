@@ -1425,16 +1425,38 @@ fn apply_elementwise_shape(
         BinaryOp::MatMul => unreachable!(),
     };
 
-    if left != right {
-        return Err(format!(
-            "elementwise {} expected equal shapes, got [{}] and [{}]",
-            op_symbol,
-            left.join(", "),
-            right.join(", ")
-        ));
+    let rank = left.len().max(right.len());
+    let mut result = Vec::with_capacity(rank);
+    for i in 0..rank {
+        // right-align: None = leading pad of the shorter operand
+        let a = (i + left.len()).checked_sub(rank).map(|j| &left[j]);
+        let b = (i + right.len()).checked_sub(rank).map(|j| &right[j]);
+        let dim = match (a, b) {
+            (Some(a), None) => a.clone(),
+            (None, Some(b)) => b.clone(),
+            (Some(a), Some(b)) => {
+                if a == b || b == "1" {
+                    a.clone()
+                } else if a == "1" {
+                    b.clone()
+                } else {
+                    // ponytail: unequal non-"1" dims are incompatible, including
+                    // distinct symbolic names ("batch" vs "seq"). Strict in v1;
+                    // upgrade to a unification step if it proves too strict.
+                    return Err(format!(
+                        "elementwise {} incompatible shapes, got [{}] and [{}]",
+                        op_symbol,
+                        left.join(", "),
+                        right.join(", ")
+                    ));
+                }
+            }
+            (None, None) => unreachable!("i < max(left.len(), right.len())"),
+        };
+        result.push(dim);
     }
 
-    Ok(Some(left.to_vec()))
+    Ok(Some(result))
 }
 
 /// Check if a resolved call target is a shape-preserving function
@@ -1742,5 +1764,61 @@ def f(x: Float[Array, "3 5"]):
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_broadcast_equal_shapes_unchanged() {
+        let l = shape(&["batch", "features"]);
+        assert_eq!(
+            apply_elementwise_shape(&l, &l, BinaryOp::Add),
+            Ok(Some(shape(&["batch", "features"])))
+        );
+    }
+
+    #[test]
+    fn test_broadcast_trailing_one_each_side() {
+        let a = shape(&["3", "1"]);
+        let b = shape(&["3", "5"]);
+        assert_eq!(
+            apply_elementwise_shape(&a, &b, BinaryOp::Mul),
+            Ok(Some(shape(&["3", "5"])))
+        );
+        assert_eq!(
+            apply_elementwise_shape(&b, &a, BinaryOp::Mul),
+            Ok(Some(shape(&["3", "5"])))
+        );
+    }
+
+    #[test]
+    fn test_broadcast_rank_mismatch_leading_dims_pass_through() {
+        let x = shape(&["batch", "f"]);
+        let bias = shape(&["f"]);
+        assert_eq!(
+            apply_elementwise_shape(&x, &bias, BinaryOp::Add),
+            Ok(Some(shape(&["batch", "f"])))
+        );
+        assert_eq!(
+            apply_elementwise_shape(&bias, &x, BinaryOp::Add),
+            Ok(Some(shape(&["batch", "f"])))
+        );
+    }
+
+    #[test]
+    fn test_broadcast_scalar_empty_returns_none() {
+        let x = shape(&["3", "5"]);
+        assert_eq!(apply_elementwise_shape(&[], &x, BinaryOp::Add), Ok(None));
+        assert_eq!(apply_elementwise_shape(&x, &[], BinaryOp::Add), Ok(None));
+    }
+
+    #[test]
+    fn test_broadcast_incompatible_concrete_dims() {
+        assert!(apply_elementwise_shape(&shape(&["3"]), &shape(&["4"]), BinaryOp::Add).is_err());
+    }
+
+    #[test]
+    fn test_broadcast_incompatible_symbolic_dims() {
+        assert!(
+            apply_elementwise_shape(&shape(&["batch"]), &shape(&["seq"]), BinaryOp::Add).is_err()
+        );
     }
 }

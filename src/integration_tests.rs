@@ -2390,6 +2390,19 @@ mod binary_op_propagation_tests {
     }
 
     #[test]
+    fn test_elementwise_add_broadcast_bias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"batch f\"], b: Float[Array, \"f\"]):\n    y = x + b";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "f"])));
+    }
+
+    #[test]
     fn test_elementwise_mul_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let code = "def f(a: Float[Array, \"a b\"], b: Float[Array, \"a c\"]):\n    y = a * b";

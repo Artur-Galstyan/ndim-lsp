@@ -238,18 +238,15 @@ Steps 1–3 and 5 from prior versions of this doc are now done (LSP wiring, meth
    - `split`, `meshgrid`, `svd`, `eig`, etc. already either return `Ok(None)` or model a single shape.
    - Extend the shape-result type to express a tuple of shapes, and teach `analyze_layer_shapes` to bind tuple-pattern LHS like `a, b = jnp.split(x, 2)`.
 
-2. Broadcasting in elementwise ops
-   - `apply_elementwise_shape` in `src/analysis.rs` is currently strict-equal. Implement numpy broadcasting (right-align, `"1"` broadcasts, leading dims pass through).
-
-3. Diagnostic severity configuration — DONE
+2. Diagnostic severity configuration — DONE
    - `parse_severity` in `src/main.rs` reads `initializationOptions.diagnostic_severity` and `republish_diagnostics` plumbs it through `shape_error_to_diagnostic`.
 
-4. Cross-function shape tracing
+3. Cross-function shape tracing
    - Return-type annotations (`-> Float[Array, "..."]`) are not yet used. Wire them in so calls to user-defined helpers propagate shapes.
 
-5. Flax (`flax.linen.Dense`) and attention layers in `src/layers.rs`.
+4. Flax (`flax.linen.Dense`) and attention layers in `src/layers.rs`.
 
-6. Keep `TO_IMPLEMENT.md` and `README.md` honest
+5. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.
    - When a real shape rule exists, mark Shape rule ✅.
    - When tests exist for that shape rule, mark Tests ✅.
