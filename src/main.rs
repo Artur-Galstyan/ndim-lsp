@@ -35,6 +35,8 @@ pub struct Backend {
     /// Keyed on (import-path-segments, search-roots-fingerprint).
     /// Invalidated when workspace folders change.
     pub resolution_cache: Arc<ResolutionCache>,
+    /// Severity for published diagnostics, set from `initializationOptions`.
+    pub diagnostic_severity: RwLock<DiagnosticSeverity>,
 }
 
 #[tower_lsp::async_trait]
@@ -48,6 +50,10 @@ impl LanguageServer for Backend {
                 .collect();
             let mut lock = self.workspace_roots.write().await;
             *lock = roots;
+        }
+
+        if let Some(opts) = params.initialization_options.as_ref() {
+            *self.diagnostic_severity.write().await = parse_severity(opts);
         }
 
         Ok(InitializeResult {
@@ -304,11 +310,12 @@ impl Backend {
             return;
         };
 
+        let severity = *self.diagnostic_severity.read().await;
         let diagnostics: Vec<Diagnostic> = analysis
             .errors
             .iter()
             .cloned()
-            .map(shape_error_to_diagnostic)
+            .map(|e| shape_error_to_diagnostic(e, severity))
             .collect();
 
         self.client
@@ -628,10 +635,27 @@ fn line_length(text: &str, line: u32) -> u32 {
         .unwrap_or(0)
 }
 
-fn shape_error_to_diagnostic(error: ShapeError) -> Diagnostic {
+/// Map an `initializationOptions` value to a diagnostic severity.
+/// Unknown / missing / malformed -> ERROR.
+fn parse_severity(opts: &serde_json::Value) -> DiagnosticSeverity {
+    match opts
+        .get("diagnostic_severity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("warning") => DiagnosticSeverity::WARNING,
+        Some("information") => DiagnosticSeverity::INFORMATION,
+        Some("hint") => DiagnosticSeverity::HINT,
+        // ponytail: unknown value falls back to ERROR (also covers "error")
+        _ => DiagnosticSeverity::ERROR,
+    }
+}
+
+fn shape_error_to_diagnostic(error: ShapeError, severity: DiagnosticSeverity) -> Diagnostic {
     Diagnostic {
         range: ts_range_to_lsp_range(error.range),
-        severity: Some(DiagnosticSeverity::ERROR),
+        severity: Some(severity),
         source: Some("ndim-lsp".to_string()),
         message: if error.variable.is_empty() {
             error.message
@@ -731,6 +755,7 @@ async fn main() {
         analysis_cache: Default::default(),
         document_version: Default::default(),
         resolution_cache: new_resolution_cache(),
+        diagnostic_severity: RwLock::new(DiagnosticSeverity::ERROR),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -739,6 +764,32 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_severity_maps_values() {
+        use serde_json::json;
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "warning"})),
+            DiagnosticSeverity::WARNING
+        );
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "ERROR"})),
+            DiagnosticSeverity::ERROR
+        );
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "information"})),
+            DiagnosticSeverity::INFORMATION
+        );
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "hint"})),
+            DiagnosticSeverity::HINT
+        );
+        assert_eq!(parse_severity(&json!({})), DiagnosticSeverity::ERROR);
+        assert_eq!(
+            parse_severity(&json!({"diagnostic_severity": "garbage"})),
+            DiagnosticSeverity::ERROR
+        );
+    }
 
     #[test]
     fn ts_range_to_lsp_range_converts_correctly() {

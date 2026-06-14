@@ -68,7 +68,7 @@ If the feature is already implemented, **stop and report** — don't invent adja
 - [x] **Inlay Hints:** Display inferred dimensions inline directly in the editor
 - [x] Show exact shapes and operators in diagnostic error messages
 - [ ] Highlight specific conflicting dimensions in error output
-- [ ] Diagnostic severity configuration (Warning vs Error)
+- [x] Diagnostic severity configuration (Warning vs Error) — set `initializationOptions.diagnostic_severity` to `error` (default), `warning`, `information`, or `hint`
 - [ ] Go-to-definition for dimension names (jump to where a dimension size was defined)
 - [ ] Code actions (e.g., "Insert `.T` to fix shape mismatch")
 
