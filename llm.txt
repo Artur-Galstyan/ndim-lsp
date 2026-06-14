@@ -246,7 +246,7 @@ Steps 1–3 and 5 from prior versions of this doc are now done (LSP wiring, meth
 
 4. Flax (`flax.linen.Dense`) and attention layers in `src/layers.rs`.
 
-6. Keep `TO_IMPLEMENT.md` and `README.md` honest
+5. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.
    - When a real shape rule exists, mark Shape rule ✅.
    - When tests exist for that shape rule, mark Tests ✅.

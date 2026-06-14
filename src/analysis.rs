@@ -1428,6 +1428,7 @@ fn apply_elementwise_shape(
     let rank = left.len().max(right.len());
     let mut result = Vec::with_capacity(rank);
     for i in 0..rank {
+        // right-align: None = leading pad of the shorter operand
         let a = (i + left.len()).checked_sub(rank).map(|j| &left[j]);
         let b = (i + right.len()).checked_sub(rank).map(|j| &right[j]);
         let dim = match (a, b) {
