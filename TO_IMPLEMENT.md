@@ -203,8 +203,8 @@ Legend:
 | `torch.diag` | ✅ | ✅ | ✅ | 1D↔2D. |
 | `torch.diagonal` | ✅ | ✅ | ✅ | Diagonal extraction. |
 | `torch.trace` | ✅ | ✅ | ✅ | 2D -> scalar. |
-| `torch.triu` | ✅ | ❌ | ❌ | Shape-preserving. |
-| `torch.tril` | ✅ | ❌ | ❌ | Shape-preserving. |
+| `torch.triu` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Triu` path with `jnp.triu`. |
+| `torch.tril` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Tril` path with `jnp.tril`. |
 | `torch.nn.functional.pad` | ✅ | ✅ | ✅ | Classified via `torch.nn.functional` deep module path; reuses `KnownFunction::Pad` and existing `apply_known_pad` pad-width parser. Note: `apply_known_pad` applies pad pairs in dimension order (dim 0 first), unlike PyTorch's reverse-axis convention; see `torch_nn_functional_pad_tests` in integration_tests.rs. |
 
 ## Torch reductions
@@ -283,17 +283,23 @@ Legend:
 | `x.expand(...)` | ❌ | ❌ | ❌ | Broadcast view. |
 | `x.to(...)` | ❌ | ❌ | ❌ | Shape-preserving conversion; deferred. |
 
-## Suggested implementation order
+## Open targets (current)
 
-1. `concatenate` / `cat`
-2. `stack`
-3. reductions: `sum`, `mean`, `max`, `min`, `prod`, `std`, `var`
-4. `reshape`, `flatten`, `ravel`
-5. `transpose`, `swapaxes`, `moveaxis`, `permute`
-6. `expand_dims` / `unsqueeze`, `squeeze`
-7. `broadcast_to`, `broadcast_arrays`
-8. `matmul`, `dot`
-9. array creation: `zeros`, `ones`, `full`, `arange`, `eye`
-10. `vmap`
-11. method-call equivalents
-12. more layer classes (`torch.nn.Linear`, `flax.linen.Dense`, convolutions)
+Earlier suggested-order items (concatenate/stack, reductions, reshape/flatten,
+transpose family, expand_dims/squeeze, broadcast_to, matmul/dot, array creation,
+method-call equivalents, Linear/Conv layers) are all done. Current open work:
+
+1. **Broadcasting in elementwise ops** — `apply_elementwise_shape` in
+   `src/analysis.rs` is strict-equal; implement numpy broadcasting
+   (right-align, `"1"` broadcasts, leading dims pass through).
+2. **Tuple-unpacking for multi-output functions** — `split`, `meshgrid`,
+   `svd`, `eig`, `qr`. Needs a richer shape-result type than
+   `Option<Vec<String>>` and `a, b = f(x)` LHS binding.
+3. **Diagnostic severity config** — `shape_error_to_diagnostic` in
+   `src/main.rs` hard-codes `ERROR`; read `initializationOptions`.
+4. **Cross-function shape tracing** — use `-> Float[Array, "..."]` return
+   annotations so calls to user helpers propagate shapes.
+5. **Flax (`flax.linen.Dense`/`Conv`) and attention layers** in `src/layers.rs`.
+6. **Remaining single-function shape rules** — see ❌ rows above
+   (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
+   `einsum`, the `*split` family, `take_along_axis`, etc.).
