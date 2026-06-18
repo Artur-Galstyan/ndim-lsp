@@ -884,6 +884,62 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
     Ok(result)
 }
 
+/// Collect `self.<attr> = <identifier>` assignments (typically the
+/// `self.dt_rank = dt_rank` lines in an `__init__`) into an alias map
+/// `{attr -> identifier}`. Used to canonicalize symbolic dims so that
+/// `self.dt_rank` and `dt_rank` (the same value) compare equal.
+///
+/// Only identifier right-hand sides are captured (the dominant
+/// "store the constructor arg" pattern); expression RHS is skipped.
+/// The map is file-global; cross-class collisions on the same attribute
+/// name resolve last-wins.
+pub fn extract_self_attr_aliases(
+    node: Node,
+    text: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut aliases = HashMap::new();
+    let query_string = r#"
+        (assignment
+          left: (attribute
+            object: (identifier) @obj
+            attribute: (identifier) @attr)
+          right: (identifier) @val)
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
+        .map_err(|e| e.to_string())?;
+    let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
+    let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
+    let val_idx = query.capture_index_for_name("val").ok_or("val not found")?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        let mut is_self = false;
+        let mut attr = String::new();
+        let mut val = String::new();
+        for capture in match_.captures {
+            let t = capture
+                .node
+                .utf8_text(text.as_bytes())
+                .map_err(|e| e.to_string())?;
+            if capture.index == obj_idx {
+                is_self = t == "self";
+            } else if capture.index == attr_idx {
+                attr = t.to_string();
+            } else if capture.index == val_idx {
+                val = t.to_string();
+            }
+        }
+        if is_self && !attr.is_empty() {
+            aliases.insert(attr, val);
+        }
+    }
+
+    Ok(aliases)
+}
+
 #[cfg(test)]
 mod call_argument_tests {
     use super::*;

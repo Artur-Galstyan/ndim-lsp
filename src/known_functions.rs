@@ -2381,6 +2381,34 @@ fn apply_known_split(
 /// ### CASE 3 — non-literal (out of scope)
 ///
 /// Returns `Ok(None)`.
+/// Simplify `dim / n` by cancelling a literal factor `n` from a flat product,
+/// e.g. `"d_model * 3" / 3 → "d_model"`, `"3 * a * b" / 3 → "a * b"`. Returns
+/// `None` when `dim` isn't a plain product or has no matching literal factor.
+/// Common for fused projections: `Linear(d, 3*d)` then `split(qkv, 3)`.
+fn cancel_product_factor(dim: &str, n: usize) -> Option<String> {
+    if dim.contains(['+', '-', '/', '(', ')']) {
+        return None;
+    }
+    let factors: Vec<&str> = dim.split('*').map(|f| f.trim()).collect();
+    if factors.len() < 2 {
+        return None;
+    }
+    let mut cancelled = false;
+    let mut remaining: Vec<&str> = Vec::new();
+    for f in factors {
+        if !cancelled && f.parse::<usize>() == Ok(n) {
+            cancelled = true;
+            continue;
+        }
+        remaining.push(f);
+    }
+    if cancelled && !remaining.is_empty() {
+        Some(remaining.join(" * "))
+    } else {
+        None
+    }
+}
+
 pub fn compute_split_shapes(
     args: &[CallArgument],
     shapes: &HashMap<String, Vec<String>>,
@@ -2442,10 +2470,13 @@ pub fn compute_split_shapes(
         }
 
         // Synthetic dimension naming convention:
-        //   numeric  → axis_size / N  (e.g. "2")
-        //   symbolic → "split(<dim>, <N>)"  (e.g. "split(n, 2)")
+        //   numeric         → axis_size / N            (e.g. "2")
+        //   symbolic "X*N"  → X via factor cancellation (e.g. "d_model*3"/3 → "d_model")
+        //   other symbolic  → "split(<dim>, <N>)"      (e.g. "split(n, 2)")
         let chunk_dim = if let Ok(axis_size) = axis_dim.parse::<usize>() {
             (axis_size / n).to_string()
+        } else if let Some(simplified) = cancel_product_factor(axis_dim, n) {
+            simplified
         } else {
             format!("split({}, {})", axis_dim, n)
         };
@@ -6140,6 +6171,37 @@ mod method_call_tests {
             Some(vec![
                 shape(&["batch", "split(n, 2)"]),
                 shape(&["batch", "split(n, 2)"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_cancel_product_factor() {
+        assert_eq!(cancel_product_factor("d_model * 3", 3).as_deref(), Some("d_model"));
+        assert_eq!(cancel_product_factor("3 * d_model", 3).as_deref(), Some("d_model"));
+        assert_eq!(cancel_product_factor("a * 3 * b", 3).as_deref(), Some("a * b"));
+        // No matching literal factor.
+        assert_eq!(cancel_product_factor("d_model * 6", 3), None);
+        assert_eq!(cancel_product_factor("d_model", 3), None);
+        // Not a flat product.
+        assert_eq!(cancel_product_factor("d_model + 3", 3), None);
+        assert_eq!(cancel_product_factor("(d_model) * 3", 3), None);
+    }
+
+    #[test]
+    fn test_split_symbolic_product_cancels() {
+        // split [seq, "d * 3"] into 3 → each output [seq, "d"] (fused-QKV pattern).
+        let shapes = HashMap::from([("x".to_string(), shape(&["seq", "d * 3"]))]);
+        let args = vec![pos("x"), pos("3"), kw("axis", "1")];
+
+        let result = compute_split_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![
+                shape(&["seq", "d"]),
+                shape(&["seq", "d"]),
+                shape(&["seq", "d"]),
             ])
         );
     }

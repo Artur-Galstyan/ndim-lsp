@@ -5622,6 +5622,243 @@ def f(x: Float[Array, "3 5"]):
     }
 
     #[test]
+    fn test_direct_self_attr_layer_call() {
+        // Direct `self.fc(x)` application (no vmap) — the common forward style.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+class M(eqx.Module):
+    fc: eqx.nn.Linear
+
+    def __init__(self, key):
+        self.fc = eqx.nn.Linear(4, 7, key=key)
+
+    def __call__(self, x: Float[Array, "batch 4"]):
+        y = self.fc(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "y"),
+            Some(&shape(&["batch", "7"]))
+        );
+    }
+
+    #[test]
+    fn test_direct_self_attr_conv_through_activation() {
+        // `jax.nn.relu(self.conv(x))` — direct call nested inside an activation.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import equinox as eqx
+class M(eqx.Module):
+    conv: eqx.nn.Conv2d
+
+    def __init__(self, key):
+        self.conv = eqx.nn.Conv2d(3, 16, 3, key=key)
+
+    def __call__(self, x: Float[Array, "3 32 32"]):
+        h = jax.nn.relu(self.conv(x))
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "h"),
+            Some(&shape(&["16", "30", "30"]))
+        );
+    }
+
+    #[test]
+    fn test_fused_qkv_split_factor_cancellation() {
+        // Linear(d, 3*d) then split(qkv, 3) must cancel to `d`, so the later
+        // proj layer's in_features matches.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+class M(eqx.Module):
+    qkv: eqx.nn.Linear
+    proj: eqx.nn.Linear
+
+    def __init__(self, d, key):
+        self.qkv = eqx.nn.Linear(d, d * 3, key=key)
+        self.proj = eqx.nn.Linear(d, d, key=key)
+
+    def __call__(self, x: Float[Array, "seq d"]):
+        qkv = jax.vmap(self.qkv)(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        out = jax.vmap(self.proj)(v)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "v"),
+            Some(&shape(&["seq", "d"]))
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "out"),
+            Some(&shape(&["seq", "d"]))
+        );
+    }
+
+    #[test]
+    fn test_symbolic_dim_normalization_self_attr_alias() {
+        // `self.dt_rank` (from a split index) and `dt_rank` (the Linear
+        // in_features) are the same value via `self.dt_rank = dt_rank`. Without
+        // normalization this mismatches; with it, the vmap layer resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+class M(eqx.Module):
+    proj: eqx.nn.Linear
+    dt_rank: int
+
+    def __init__(self, dt_rank, key):
+        self.proj = eqx.nn.Linear(dt_rank, 8, key=key)
+        self.dt_rank = dt_rank
+
+    def __call__(self, x: Float[Array, "seq combined"]):
+        delta, rest = jnp.split(x, [self.dt_rank], axis=-1)
+        y = jax.vmap(self.proj)(delta)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(
+            analysis.errors.is_empty(),
+            "symbolic dim mismatch should be normalized away: {:?}",
+            analysis.errors
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "y"),
+            Some(&shape(&["seq", "8"]))
+        );
+        // The split output dim is canonicalized to the bare identifier.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "delta"),
+            Some(&shape(&["seq", "dt_rank"]))
+        );
+    }
+
+    #[test]
+    fn test_subscript_integer_drops_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"seq d\"]):\n    y = x[0]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(find_shape_in_scope(&analysis, "f", "y"), Some(&shape(&["d"])));
+    }
+
+    #[test]
+    fn test_subscript_integer_on_rank1_is_scalar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"n\"]):\n    y = x[0]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn test_subscript_slice_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"seq hidden\"]):\n    y = x[:, :3]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["seq", "3"]))
+        );
+    }
+
+    #[test]
+    fn test_subscript_numeric_slice_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        // x[1:3, 0]: axis0 -> 3-1=2, axis1 integer -> dropped.
+        let code = "def f(x: Float[Array, \"10 5\"]):\n    y = x[1:3, 0]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(find_shape_in_scope(&analysis, "f", "y"), Some(&shape(&["2"])));
+    }
+
+    #[test]
+    fn test_subscript_ellipsis_newaxis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"a b\"]):\n    y = x[..., None]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["a", "b", "1"]))
+        );
+    }
+
+    #[test]
+    fn test_subscript_newaxis_middle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"a b\"]):\n    y = x[:, None]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["a", "1", "b"]))
+        );
+    }
+
+    #[test]
+    fn test_subscript_full_slice_preserves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "def f(x: Float[Array, \"seq d\"]):\n    y = x[:]\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["seq", "d"]))
+        );
+    }
+
+    #[test]
+    fn test_subscript_feeds_downstream() {
+        // A sliced result must carry a shape into the next op (the whole point
+        // of subscript support: stop blackholing the rest of the function).
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"seq d\"]):\n    row = x[0]\n    z = jnp.exp(row)\n";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(find_shape_in_scope(&analysis, "f", "z"), Some(&shape(&["d"])));
+    }
+
+    #[test]
     fn test_assignment_shapes_record_each_reassignment() {
         // Reassigning x must yield one record per assignment line (issue #28),
         // unlike scope.shapes which keeps only the final shape.
@@ -5830,6 +6067,98 @@ def f(a: Float[Array, "3 5"], b: Float[Array, "5 2"]):
         assert_eq!(
             find_shape_in_scope(&analysis, "f", "z"),
             Some(&shape(&"3 2".split(' ').collect::<Vec<_>>()))
+        );
+    }
+}
+
+/// Corpus-driven shape-coverage harness. Runs the analyzer over real model
+/// files in `corpus/` and ranks the assignments it cannot shape ("dark
+/// spots") by frequency, so the highest-impact gaps prioritize themselves.
+/// Run with: `cargo test corpus_coverage_report -- --nocapture`.
+#[cfg(test)]
+mod coverage_harness {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn read(_path: &PathBuf) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn corpus_coverage_report() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "py").unwrap_or(false))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no corpus files in {:?}", dir);
+
+        let roots: Vec<PathBuf> = Vec::new();
+        let mut total = 0usize;
+        let mut shaped = 0usize;
+        let mut buckets: BTreeMap<String, usize> = BTreeMap::new();
+        let mut per_file: Vec<(String, usize, usize)> = Vec::new();
+        let mut details: Vec<(String, u32, String)> = Vec::new();
+
+        for path in &files {
+            let code = fs::read_to_string(path).unwrap();
+            let tree = parse(&code);
+            let report =
+                analyze_coverage(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            total += report.total;
+            shaped += report.shaped;
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            for d in &report.dark {
+                *buckets.entry(d.kind.clone()).or_default() += 1;
+                details.push((name.clone(), d.line + 1, d.kind.clone()));
+            }
+            per_file.push((name, report.shaped, report.total));
+        }
+
+        let mut ranked: Vec<(String, usize)> = buckets.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let pct = |s: usize, t: usize| 100.0 * (s as f64) / (t.max(1) as f64);
+        println!("\n=== corpus shape coverage ===");
+        for (name, s, t) in &per_file {
+            println!("  {:<22} {}/{} ({:.0}%)", name, s, t, pct(*s, *t));
+        }
+        println!(
+            "  {:<22} {}/{} ({:.0}%)",
+            "TOTAL",
+            shaped,
+            total,
+            pct(shaped, total)
+        );
+        println!("\n=== dark spots by frequency ===");
+        for (kind, n) in &ranked {
+            println!("  {:>3}  {}", n, kind);
+        }
+        if !details.is_empty() {
+            println!("\n=== dark spots (detail) ===");
+            for (file, line, kind) in &details {
+                println!("  {}:{}  {}", file, line, kind);
+            }
+        }
+        println!();
+
+        // Regression floor: coverage shouldn't silently drop. Tighten as gaps close.
+        assert!(
+            pct(shaped, total) >= 50.0,
+            "corpus coverage regressed to {:.0}%",
+            pct(shaped, total)
         );
     }
 }

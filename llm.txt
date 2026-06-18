@@ -9,8 +9,16 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with 1035+ tests in the lib target plus 10 integration tests.
+- `cargo test --quiet` passes with ~1188 tests across the lib + integration suites.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
+- `cargo test corpus_coverage_report -- --nocapture` prints a shape-coverage
+  report over `corpus/*.py` (currently mamba_ssm, attention, conv_net,
+  transformer_block), ranks un-shapeable assignments ("dark spots") by
+  frequency, and lists each one as `file:line  kind`. This is the
+  prioritization tool: implement the top-ranked gap, re-measure, then grow the
+  corpus. Coverage is 100% (35/35) on the current four files — the next move is
+  to add more/different model files (RNN/`scan`, embeddings, a CNN with
+  pooling) to surface the next gaps.
 
 Rule for agents working on this repo
 ------------------------------------
@@ -52,8 +60,10 @@ Current file layout
     - `LayerApplication`
     - `ShapeError`
     - `FunctionShapeScope` (function-scoped shape map)
-    - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`)
+    - `AssignmentShape` (`line`, `name`, `shape`) — per-assignment record for inlay hints
+    - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`, `assignment_shapes`)
   - Public helpers: `scope_for_byte`, `scope_index_for_byte`.
+  - (`CoverageReport` / `DarkSpot` live in `src/analysis.rs`.)
 
 - `src/python_ast.rs`
   - Pure tree-sitter Python extraction helpers.
@@ -65,6 +75,8 @@ Current file layout
     - `find_top_level_symbol`
     - `extract_callable_signature`
     - `extract_method_calls`
+    - `extract_self_attr_calls` — `self.<attr> = call(...)` assignments
+    - `extract_self_attr_aliases` — `self.<attr> = <ident>` → `{attr -> ident}`
 
 - `src/resolution.rs`
   - Import/module/call/implementation resolution.
@@ -95,20 +107,36 @@ Current file layout
     - `classify_layer_call`
     - `extract_layer_assignments`
     - `extract_layer_applications`
+    - `extract_self_attr_layers` — resolves `self.<attr> = <constructor>` (e.g.
+      from `__init__`) to a `{attr -> LayerKind}` map; used by inline vmap (#35).
     - `apply_layer_application`
     - `apply_layer_applications`
 
 - `src/analysis.rs`
-  - High-level orchestration.
+  - High-level orchestration + the recursive shape evaluator.
   - Important functions:
     - `analyze_layer_shapes` — full pipeline:
-      1. seed shapes from jaxtyping annotations
-      2. build import map
-      3. extract layer assignments
-      4. walk free calls + method calls in source order, dispatching each to layer apps, known-function rules, or method-call rules; update shapes; collect `ShapeError`s
+      1. seed shapes from jaxtyping annotations (params + class fields)
+      2. build import map; extract layer + self-attr-layer assignments
+      3. `propagate_calls`: walk every assignment in source order, dispatching
+         each RHS to `shape_of_expression` (recursive); bind single + tuple
+         LHS; collect `ShapeError`s and per-assignment `AssignmentShape`s
+    - `shape_of_expression` and its arms (`shape_of_call`, `shape_of_attribute`,
+      `shape_of_unary`, `shape_of_subscript` + `slice_dim`,
+      `shape_of_binary_operator`, `shape_of_inline_vmap`, `apply_inline_vmap_layer`)
+    - `handle_tuple_assignment` / `tuple_rhs_shapes` — tuple-pattern unpacking
+    - `normalize_dim` / `normalize_shape` — canonicalize `self.<attr>` dims via
+      the alias map at storage time
+    - `analyze_coverage` → `CoverageReport { total, shaped, dark: Vec<DarkSpot> }`
+      — powers the `corpus_coverage_report` harness
+
+- `corpus/*.py`
+  - Real model files (Mamba SSM, attention, ConvNet, transformer block) the
+    coverage harness analyzes. Add more to surface the next gaps.
 
 - `src/integration_tests.rs`
-  - Cross-module/end-to-end tests.
+  - Cross-module/end-to-end tests, plus the `coverage_harness` module
+    (`corpus_coverage_report`).
 
 - `TO_IMPLEMENT.md`
   - Tracker for built-in functions/classes and whether they are classified, have shape rules, and have tests.
@@ -194,28 +222,68 @@ What works now
    - `pad`
    - `rot90`
 
+11. Recursive shape evaluator (replaces flat query extraction)
+   - `shape_of_expression` walks an assignment RHS bottom-up: `call`,
+     `attribute`, `identifier`, `unary_operator`, `subscript`,
+     `parenthesized_expression`, `binary_operator`.
+   - Nested/chained calls in one expression now propagate, e.g.
+     `jnp.exp(a @ b)`, `x.reshape(3,4).sum(axis=1)`,
+     `jax.nn.softplus(jax.vmap(self.proj)(x))`.
+
+12. `self.<field>` attribute access (issue #31)
+   - Class fields with jaxtyping annotations (e.g.
+     `A_log: Float[Array, "d_inner d_state"]`) are extracted into module
+     scope; `shape_of_attribute` resolves `self.A_log`, including through
+     chained methods like `self.A_log.astype(jnp.float32)`.
+
+13. Tuple-pattern unpacking (issue #30)
+   - `a, b = jnp.split(x, ...)` binds per-element shapes via
+     `compute_split_shapes`; `L, _ = x.shape` binds each dim as a zero-rank
+     scalar (`_` skipped). Handled in source order, interleaved with single
+     assignments, by `handle_tuple_assignment` / `tuple_rhs_shapes`.
+
+14. vmap of attribute callables + inline vmap (issue #35)
+   - `jax.vmap(self.layer)(x)` resolves `self.layer` to a layer built in
+     `__init__` (`extract_self_attr_layers`) and applies it batched over the
+     leading axis. `jax.vmap(f)(x)` inline form reuses `apply_vmap_call`.
+
+14b. Direct self-attribute layer application
+   - `self.fc(x)` / `jax.nn.relu(self.conv(x))` (no vmap) — the dominant
+     forward-method style. `shape_of_call` resolves `self.<attr>` against
+     `self_attr_layers` and applies the layer rule directly. Covered by
+     `corpus/conv_net.py`.
+
+14c. Symbolic factor cancellation in `split`
+   - `Linear(d, 3*d)` then `split(qkv, 3)` cancels the literal factor so each
+     chunk is `d`, not `split(d * 3, 3)` (`cancel_product_factor` in
+     `known_functions.rs`). The fused-QKV pattern in `corpus/transformer_block.py`.
+
+15. Per-assignment shape records for inlay hints (issue #28)
+   - `LayerShapeAnalysis.assignment_shapes: Vec<AssignmentShape>` records the
+     shape at *each* (non-annotated) assignment line, so a reassigned variable
+     shows a hint per line. `compute_inlay_hints` reads this directly (no
+     re-walk; `find_variable_line` removed).
+
+16. Session-lifetime import-resolution cache (issue #36 / PR #38)
+   - `ResolutionCache` keyed on `(import-path-segments, roots-fingerprint)` is
+     shared across `analyze_layer_shapes` calls. Caches `ResolvedImplementation`
+     (not signature extraction). See `corpus`/cross-file integration tests.
+
 Known limitations / important caveats
 -------------------------------------
 
 - `src/main.rs` is wired end-to-end: `republish_diagnostics` runs `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as LSP diagnostics; `on_hover` renders shape strings; inlay hints are emitted. Diagnostic severity is configurable via `initializationOptions.diagnostic_severity` (`error`/`warning`/`information`/`hint`, case-insensitive; defaults to `ERROR`). `ShapeError`'s tree-sitter range is converted to LSP range via `ts_range_to_lsp_range`.
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
-- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)` are wired end-to-end through `analyze_layer_shapes`. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)`, `x.to(...)` are not yet covered.
-- Free function calls (e.g. `jnp.sum(x)`, `np.reshape(x, (3, 4))`) are now propagated by the pipeline as well, in source order. Chained/nested calls inside a single expression (`jnp.sum(jnp.flatten(x))`) are still ignored because `extract_calls` only captures the outer assignment-level call.
-- Multi-output functions need a richer return type than `Option<Vec<String>>`:
-  - `split`
-  - `meshgrid`
-  - `svd`
-  - `eig`
-  - etc.
-- Higher-order functions need separate modeling:
-  - `vmap`
-  - `grad`
-  - `scan`
-  - etc.
+- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`, `x.astype(...)`, `x.to(...)` are wired end-to-end. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)` are not yet covered.
+- Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
+- Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (numeric `a:b` and `:n` folded; others approximated by the original axis), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. Advanced/boolean array indexing is approximated as a single axis drop.
+- Multi-output functions: `split` family is done (tuple-pattern LHS bound via `compute_split_shapes`). Still single-shape / `Ok(None)`: `meshgrid`, `svd`, `eig`, `qr` — extend `tuple_rhs_shapes` to cover them.
+- Symbolic dims are bare strings compared by exact equality. `self.<attr>` is canonicalized to its `self.<attr> = <ident>` alias (from `__init__`) before a shape is stored, so `self.dt_rank` ≡ `dt_rank` (see `extract_self_attr_aliases` + `normalize_dim`/`normalize_shape`). Limitations: only identifier-RHS aliases; the map is file-global (cross-class same-name collisions are last-wins); layer ctor args carrying `self.` (e.g. `Linear(self.d_inner, ...)`) are not yet normalized; no constant folding across different spellings (`d_state*2` vs `2*d_state`).
+- Higher-order functions: `vmap` is modeled (free/inline/attribute). `grad`, `scan`, `pmap` are not.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
 - Layer assignments are tracked with their defining byte position via `extract_layer_assignments_scoped` (returns `Vec<LayerAssignment>`). At call time, `analyze_layer_shapes` picks the innermost function-scoped layer whose enclosing scope contains the call site. The flat `LayerShapeAnalysis.layers` HashMap is preserved (last-wins) for backward compatibility with existing tests, but resolution no longer uses it.
-- Current `ShapeError` has `variable`, `message`, and tree-sitter `Range`; LSP conversion is not yet implemented.
+- `ShapeError` has `variable`, `message`, and a tree-sitter `Range`, converted to an LSP range by `ts_range_to_lsp_range` in `src/main.rs`.
 
 How to continue
 ---------------
@@ -227,26 +295,38 @@ cargo test --quiet
 cargo clippy --all-targets --all-features
 ```
 
-Expected remaining clippy warnings are only from `src/main.rs` placeholders unless that file is cleaned up.
+Clippy is fully clean (including `src/main.rs`); keep it that way.
 
 Recommended next implementation steps
 -------------------------------------
 
-Steps 1–3 and 5 from prior versions of this doc are now done (LSP wiring, method-call support, function-scoped shape maps). Current open targets:
+**Prioritize by the coverage harness, not by gut.** Run
+`cargo test corpus_coverage_report -- --nocapture`, read the ranked dark spots,
+and implement the top one. Grow `corpus/*.py` so the ranking stays
+representative. Current open targets, in impact order:
 
-1. Tuple-unpacking propagation for multi-output functions
-   - `split`, `meshgrid`, `svd`, `eig`, etc. already either return `Ok(None)` or model a single shape.
-   - Extend the shape-result type to express a tuple of shapes, and teach `analyze_layer_shapes` to bind tuple-pattern LHS like `a, b = jnp.split(x, 2)`.
+1. Grow the corpus — coverage is 100% on the current four files, so add more
+   (a CNN with explicit pooling, an RNN/GRU using `scan`, embeddings) to
+   surface the next ranked gaps. The harness is only as good as its corpus.
 
-2. Diagnostic severity configuration — DONE
-   - `parse_severity` in `src/main.rs` reads `initializationOptions.diagnostic_severity` and `republish_diagnostics` plumbs it through `shape_error_to_diagnostic`.
+2. More multi-output tuple-unpacking — `meshgrid`, `svd`, `eig`, `qr`. `split`
+   is done; extend the `tuple_rhs_shapes` dispatch in `src/analysis.rs`.
 
-3. Cross-function shape tracing
-   - Return-type annotations (`-> Float[Array, "..."]`) are not yet used. Wire them in so calls to user-defined helpers propagate shapes.
+3. Cross-*file* return-type tracing — same-file `-> Float[Array, "..."]`
+   helpers already propagate (`apply_user_function` + `bind_and_substitute`);
+   imported helpers don't yet.
 
-4. Flax (`flax.linen.Dense`) and attention layers in `src/layers.rs`.
+4. `x.expand(...)` / `x.repeat(...)` methods; augmented assignment (`x += ...`);
+   normalize `self.`-prefixed layer ctor args; constant-fold symbolic dims.
 
-5. Keep `TO_IMPLEMENT.md` and `README.md` honest
+5. Flax (`flax.linen.Dense`/`Conv`) and attention layers in `src/layers.rs`.
+
+(Done since last revision: subscript/indexing — `shape_of_subscript`;
+symbolic-dim normalization — `extract_self_attr_aliases` + `normalize_dim`;
+direct self-attr layer calls; and `split` factor cancellation —
+`cancel_product_factor`.)
+
+6. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.
    - When a real shape rule exists, mark Shape rule ✅.
    - When tests exist for that shape rule, mark Tests ✅.

@@ -11,8 +11,7 @@ use crate::layers::{
     apply_layer_application, extract_layer_assignments_scoped, extract_self_attr_layers,
 };
 use crate::python_ast::{
-    build_import_map, extract_call_arguments,
-    extract_jaxtyping_shapes,
+    build_import_map, extract_call_arguments, extract_jaxtyping_shapes, extract_self_attr_aliases,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target};
 
@@ -35,6 +34,7 @@ where
         extract_layer_assignments_scoped(node, text, search_roots, &read_file, max_depth, cache)?;
     let self_attr_layers =
         extract_self_attr_layers(node, text, search_roots, &read_file, max_depth, cache)?;
+    let self_attr_aliases = extract_self_attr_aliases(node, text)?;
 
     let (applications, errors, assignment_shapes) = propagate_calls(
         node,
@@ -42,6 +42,7 @@ where
         &import_map,
         &layer_records,
         &self_attr_layers,
+        &self_attr_aliases,
         &mut scopes,
     )?;
 
@@ -57,6 +58,114 @@ where
         errors,
         assignment_shapes,
     })
+}
+
+/// A non-annotated assignment whose RHS the analyzer could not shape.
+/// `kind` buckets the cause (e.g. `"subscript"`, `"call:jnp.diff"`) so the
+/// coverage harness can rank gaps by how often they actually occur.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DarkSpot {
+    pub line: u32,
+    pub kind: String,
+}
+
+/// Shape-coverage of a single source file: how many assignments got a shape
+/// vs. went dark, and what the dark ones were. Drives the corpus harness that
+/// prioritizes which structural gaps / functions to implement next.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageReport {
+    /// Non-annotated, non-`_` assignments considered.
+    pub total: usize,
+    pub shaped: usize,
+    pub dark: Vec<DarkSpot>,
+}
+
+/// Run the analyzer over a file and report which assignments went dark.
+pub fn analyze_coverage<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<CoverageReport, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let analysis = analyze_layer_shapes(node, text, search_roots, read_file, max_depth, cache)?;
+    let shaped: std::collections::HashSet<(u32, &str)> = analysis
+        .assignment_shapes
+        .iter()
+        .map(|r| (r.line, r.name.as_str()))
+        .collect();
+
+    let import_map = build_import_map(node, text)?;
+    let items = collect_assignment_items(node, text)?;
+
+    let mut total = 0;
+    let mut shaped_count = 0;
+    let mut dark = Vec::new();
+
+    for (lhs, rhs, assignment) in items {
+        // Annotated assignments carry a user-written shape — not a gap.
+        if assignment.child_by_field_name("type").is_some() {
+            continue;
+        }
+        let names: Vec<String> = match lhs {
+            Lhs::Single(name) => vec![name],
+            Lhs::Tuple(names) => names.into_iter().flatten().collect(),
+        };
+        if names.is_empty() {
+            continue; // all `_` targets
+        }
+        let line = assignment.start_position().row as u32;
+        total += 1;
+        if names.iter().any(|n| shaped.contains(&(line, n.as_str()))) {
+            shaped_count += 1;
+        } else {
+            dark.push(DarkSpot {
+                line,
+                kind: dark_spot_kind(rhs, text, &import_map),
+            });
+        }
+    }
+
+    Ok(CoverageReport {
+        total,
+        shaped: shaped_count,
+        dark,
+    })
+}
+
+/// Bucket a dark assignment's RHS by cause. Calls are labelled with their
+/// (resolved) function name so missing functions surface by name.
+fn dark_spot_kind(rhs: Node, text: &str, import_map: &HashMap<String, ImportPath>) -> String {
+    match rhs.kind() {
+        "subscript" => "subscript".to_string(),
+        "unary_operator" => "unary".to_string(),
+        "binary_operator" => "binary_operator".to_string(),
+        "attribute" => "attribute".to_string(),
+        "call" => {
+            let Some(func) = rhs.child_by_field_name("function") else {
+                return "call".to_string();
+            };
+            // Inline-call functions (e.g. `vmap(f)(x)`) have no plain name.
+            if func.kind() == "call" {
+                return "call:inline".to_string();
+            }
+            let Ok(raw) = func.utf8_text(text.as_bytes()) else {
+                return "call".to_string();
+            };
+            let resolved = resolve_call_target(raw, import_map);
+            let name = if resolved.parts.is_empty() {
+                raw.to_string()
+            } else {
+                resolved.parts.join(".")
+            };
+            format!("call:{name}")
+        }
+        other => other.to_string(),
+    }
 }
 
 fn find_scoped_layer<'a>(
@@ -103,6 +212,9 @@ struct ShapeCtx<'a> {
     /// `self.<attr>` → layer, from constructor assignments in `__init__`.
     /// Used to resolve `jax.vmap(self.<attr>)(x)` (issue #35).
     self_attr_layers: &'a HashMap<String, LayerKind>,
+    /// `<attr>` → identifier, from `self.<attr> = <ident>` assignments. Used to
+    /// canonicalize symbolic dims (`self.dt_rank` ≡ `dt_rank`) before storage.
+    aliases: &'a HashMap<String, String>,
     scopes: &'a mut [FunctionShapeScope],
     vmap_targets: &'a mut HashMap<String, VmapInfo>,
     applications: &'a mut Vec<LayerApplication>,
@@ -120,6 +232,46 @@ struct ShapeCtx<'a> {
     synthetics: HashMap<(usize, String), Vec<String>>,
 }
 
+/// Canonicalize every dim of a shape through the `self.<attr> = <ident>`
+/// alias map (no-op when the map is empty or no dim mentions `self.`).
+fn normalize_shape(shape: Vec<String>, aliases: &HashMap<String, String>) -> Vec<String> {
+    if aliases.is_empty() {
+        return shape;
+    }
+    shape.into_iter().map(|d| normalize_dim(&d, aliases)).collect()
+}
+
+/// Replace each `self.<attr>` token in a dim expression with its aliased value
+/// (e.g. `self.dt_rank + self.d_state` → `dt_rank + d_state` when both attrs
+/// were assigned from same-named identifiers). Tokens whose attribute has no
+/// alias are left untouched.
+fn normalize_dim(dim: &str, aliases: &HashMap<String, String>) -> String {
+    if !dim.contains("self.") {
+        return dim.to_string();
+    }
+    let bytes = dim.as_bytes();
+    let mut result = String::with_capacity(dim.len());
+    let mut i = 0;
+    while i < dim.len() {
+        if dim[i..].starts_with("self.") {
+            let attr_start = i + 5;
+            let mut j = attr_start;
+            while j < dim.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if let Some(val) = aliases.get(&dim[attr_start..j]) {
+                result.push_str(val);
+                i = j;
+                continue;
+            }
+        }
+        let ch = dim[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
+}
+
 impl<'a> ShapeCtx<'a> {
     /// Insert a shape under a synthetic name and return that name.
     /// Used when an inline expression (e.g. a nested call) produces a shape
@@ -129,6 +281,7 @@ impl<'a> ShapeCtx<'a> {
     fn bind_synthetic(&mut self, shape: Vec<String>, scope_idx: usize) -> String {
         let name = format!("__synth_{}", self.synthetic_counter);
         self.synthetic_counter += 1;
+        let shape = normalize_shape(shape, self.aliases);
         self.synthetics.insert((scope_idx, name.clone()), shape);
         name
     }
@@ -142,6 +295,7 @@ impl<'a> ShapeCtx<'a> {
         shape: Vec<String>,
         line: Option<u32>,
     ) {
+        let shape = normalize_shape(shape, self.aliases);
         if let Some(line) = line {
             self.assignment_shapes.push(AssignmentShape {
                 line,
@@ -236,9 +390,99 @@ fn shape_of_unary(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     shape_of_expression(operand, ctx)
 }
 
-/// Subscript: `x[0]`, `x[i:j]`, etc.  No shape rule in v1 — return None.
-fn shape_of_subscript(_node: Node, _ctx: &mut ShapeCtx) -> Option<Vec<String>> {
-    None
+/// Subscript / indexing: `x[0]`, `x[i:j]`, `x[:, :d]`, `x[..., None]`.
+///
+/// Walks the index list against the value's shape, numpy-style:
+/// - integer / scalar index → drops that axis (rank −1);
+/// - slice → keeps the axis (dim narrowed where computable, else approximated
+///   by the original axis — preserves rank);
+/// - `None` / newaxis → inserts a size-1 axis;
+/// - `...` (ellipsis) → expands to the un-indexed middle axes, unchanged;
+/// - axes past the last index are kept unchanged (implicit full slices).
+///
+/// Advanced/boolean array indexing is approximated as a single axis-drop —
+/// the common `x[i]` case is exact; fancy indexing is rare in model code.
+fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let value_node = node.child_by_field_name("value")?;
+    let input_shape = shape_of_expression(value_node, ctx)?;
+    let rank = input_shape.len();
+
+    // Index nodes are every named child except the value.
+    let mut indices = Vec::new();
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i as u32)?;
+        if child.id() != value_node.id() {
+            indices.push(child);
+        }
+    }
+
+    // Axes consumed by indices that map onto an input axis (everything except
+    // `None`/newaxis and the ellipsis itself). The ellipsis fills the rest.
+    let consuming = indices
+        .iter()
+        .filter(|n| !matches!(n.kind(), "none" | "ellipsis"))
+        .count();
+    let ellipsis_axes = rank.saturating_sub(consuming);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut axis = 0usize;
+
+    for idx in &indices {
+        match idx.kind() {
+            "ellipsis" => {
+                for _ in 0..ellipsis_axes {
+                    out.push(input_shape.get(axis)?.clone());
+                    axis += 1;
+                }
+            }
+            "none" => out.push("1".to_string()),
+            "slice" => {
+                let orig = input_shape.get(axis)?;
+                let text = idx.utf8_text(ctx.text.as_bytes()).ok()?;
+                out.push(slice_dim(text, orig));
+                axis += 1;
+            }
+            // integer / identifier / other scalar index → drop the axis.
+            _ => {
+                input_shape.get(axis)?; // bounds-check: over-indexing → None
+                axis += 1;
+            }
+        }
+    }
+
+    // Trailing axes not addressed by any index stay as implicit full slices.
+    while axis < rank {
+        out.push(input_shape[axis].clone());
+        axis += 1;
+    }
+
+    Some(out)
+}
+
+/// Resulting dim for a single sliced axis. Computes the length when it's
+/// obvious (`:n` → `n`; numeric `a:b` → `b-a`), otherwise approximates by the
+/// original axis so rank is preserved.
+fn slice_dim(slice_text: &str, orig_dim: &str) -> String {
+    let parts: Vec<&str> = slice_text.trim().split(':').collect();
+    let start = parts.first().copied().unwrap_or("").trim();
+    let stop = parts.get(1).copied().unwrap_or("").trim();
+    let step = parts.get(2).copied().unwrap_or("").trim();
+
+    // Full slice (`:` / `::`) → unchanged.
+    if start.is_empty() && stop.is_empty() && step.is_empty() {
+        return orig_dim.to_string();
+    }
+    // No step, known stop:
+    if step.is_empty() && !stop.is_empty() {
+        if start.is_empty() {
+            return stop.to_string(); // `:n` → n
+        }
+        if let (Ok(a), Ok(b)) = (start.parse::<i64>(), stop.parse::<i64>()) {
+            return (b - a).max(0).to_string(); // numeric `a:b`
+        }
+    }
+    // Stepped / symbolic-bounded / start-only: approximate by the original axis.
+    orig_dim.to_string()
 }
 
 /// Find the operator text between left and right children of a binary_operator node.
@@ -355,6 +599,41 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             .utf8_text(ctx.text.as_bytes())
             .ok()?
             .to_string();
+
+        // Direct self-attribute layer call: `self.conv1(x)` / `self.fc(h)`,
+        // the dominant equinox/torch forward-method style. `self.<attr>`
+        // resolves to a layer built in `__init__`; apply it directly (the
+        // layer rule already handles its own input rank).
+        if obj_node.kind() == "identifier"
+            && obj_node.utf8_text(ctx.text.as_bytes()).ok()? == "self"
+            && let Some(layer) = ctx.self_attr_layers.get(&method_name).cloned()
+        {
+            let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+            let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+            let CallArgument::Positional { value: input } = args.first()?.clone() else {
+                return None;
+            };
+            let application = LayerApplication {
+                variable: String::new(),
+                layer: format!("self.{method_name}"),
+                input,
+                kind: layer,
+                range: args_node.range(),
+            };
+            let merged = ctx.merged_shapes(scope_idx);
+            return match apply_layer_application(&application, &merged) {
+                Ok(Some(output)) => Some(output),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            };
+        }
 
         // Distinguish between:
         //   (a) Chained method call: x.reshape(3,4).sum(axis=1)
@@ -856,6 +1135,7 @@ fn propagate_calls(
     import_map: &HashMap<String, ImportPath>,
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, LayerKind>,
+    aliases: &HashMap<String, String>,
     scopes: &mut [FunctionShapeScope],
 ) -> Result<PropagateOutput, String> {
     let mut applications = Vec::new();
@@ -871,6 +1151,7 @@ fn propagate_calls(
         import_map,
         layer_records,
         self_attr_layers,
+        aliases,
         scopes,
         vmap_targets: &mut vmap_targets,
         applications: &mut applications,
@@ -1849,6 +2130,7 @@ mod shape_of_expression_tests {
         let mut assignment_shapes = Vec::new();
         let mut vmap_targets = HashMap::new();
         let self_attr_layers = HashMap::new();
+        let aliases = HashMap::new();
 
         let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
 
@@ -1857,6 +2139,7 @@ mod shape_of_expression_tests {
             import_map: &import_map,
             layer_records: &layer_records,
             self_attr_layers: &self_attr_layers,
+            aliases: &aliases,
             scopes: &mut scopes,
             vmap_targets: &mut vmap_targets,
             applications: &mut applications,
@@ -2019,14 +2302,34 @@ def f(x: Float[Array, "3 5"]):
     }
 
     #[test]
-    fn test_subscript_returns_none() {
+    fn test_normalize_dim_self_attr_alias() {
+        let mut aliases = HashMap::new();
+        aliases.insert("dt_rank".to_string(), "dt_rank".to_string());
+        aliases.insert("d_state".to_string(), "d_state".to_string());
+        // single token
+        assert_eq!(normalize_dim("self.dt_rank", &aliases), "dt_rank");
+        // inside an expression, multiple tokens
+        assert_eq!(
+            normalize_dim("self.dt_rank + self.d_state", &aliases),
+            "dt_rank + d_state"
+        );
+        // unaliased self.attr is left untouched
+        assert_eq!(normalize_dim("self.unknown", &aliases), "self.unknown");
+        // prefix collision: self.dt_rank must not match self.dt_rank2
+        assert_eq!(normalize_dim("self.dt_rank2", &aliases), "self.dt_rank2");
+        // no self. → unchanged
+        assert_eq!(normalize_dim("seq_length", &aliases), "seq_length");
+    }
+
+    #[test]
+    fn test_subscript_integer_drops_leading_axis() {
         let code = r#"
 def f(x: Float[Array, "3 5"]):
     y = x[0]
 "#;
         let analysis = analyze_simple(code);
-        // Subscript not supported in v1 — should not produce a shape.
-        assert_eq!(find_shape(&analysis, "y"), None);
+        // x[0] drops the leading axis -> rank-1.
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["5"])));
     }
 
     #[test]
@@ -2135,4 +2438,5 @@ def f(x: Float[Array, "3 5"]):
         );
     }
 }
+
 
