@@ -5,7 +5,9 @@ use tree_sitter::Node;
 #[cfg(test)]
 use tree_sitter::Range;
 
-use crate::python_ast::{build_import_map, extract_call_arguments, extract_calls};
+use crate::python_ast::{
+    build_import_map, extract_call_arguments, extract_calls, extract_self_attr_calls,
+};
 use crate::resolution::{
     ResolutionCache, bind_call_arguments, resolve_call_signature, resolve_call_target,
 };
@@ -265,6 +267,49 @@ where
     }
 
     Ok(records)
+}
+
+/// Resolve `self.<attr> = <layer constructor>` assignments (typically in an
+/// `__init__`) to a map of bare attribute name → `LayerKind`. Mirrors the
+/// catalog-first / disk-fallback resolution of `extract_layer_assignments_scoped`.
+pub fn extract_self_attr_layers<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<HashMap<String, LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let import_map = build_import_map(node, text)?;
+    let calls = extract_self_attr_calls(node, text)?;
+    let mut layers = HashMap::new();
+
+    for call in calls {
+        let resolved_call = match try_catalog_signature(&call, node, text, &import_map)? {
+            Some(c) => Some(c),
+            None => resolve_call_signature(
+                &call,
+                text,
+                &import_map,
+                search_roots,
+                &read_file,
+                max_depth,
+                cache,
+            )?,
+        };
+        let Some(resolved_call) = resolved_call else {
+            continue;
+        };
+        let Some(layer) = classify_layer_call(&resolved_call) else {
+            continue;
+        };
+        layers.insert(call.variable, layer);
+    }
+
+    Ok(layers)
 }
 
 pub fn extract_layer_applications(

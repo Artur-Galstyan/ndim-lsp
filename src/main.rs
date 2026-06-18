@@ -344,67 +344,53 @@ impl Backend {
 
         let analysis = self.get_analysis(uri, version).await?;
 
-        // Take an owned snapshot of the text and use it for the rest of the
-        // function. The tree we parse below indexes into THIS string; if we
-        // re-read `document_text` later we may see a newer version whose bytes
-        // no longer match the tree, producing wrong line numbers or silent
-        // `utf8_text` failures.
+        // Owned snapshot of the text, used only for line-length (UTF-16)
+        // computation. Assignment lines come from the analysis itself.
         let text: String = {
             let doc_lock = self.document_text.read().await;
             doc_lock.get(uri)?.clone()
         };
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .ok()?;
-        let tree = parser.parse(&text, None)?;
-        let root = tree.root_node();
 
         let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
         let mut seen: HashSet<(u32, String)> = HashSet::new();
 
-        for scope in &analysis.scopes {
-            for (var_name, shape) in &scope.shapes {
-                if var_name.starts_with('_') {
-                    continue;
-                }
-
-                let Some(line) =
-                    find_variable_line(&root, &text, var_name, scope.start_byte, scope.end_byte)
-                else {
-                    continue;
-                };
-
-                if !seen.insert((line, var_name.clone())) {
-                    continue;
-                }
-
-                if line < visible_range.start.line || line > visible_range.end.line {
-                    continue;
-                }
-
-                let label = if shape.is_empty() {
-                    ": Scalar".to_string()
-                } else {
-                    format!(": [{}]", shape.join(", "))
-                };
-                let char_pos = line_length(&text, line);
-
-                hints.push(InlayHint {
-                    position: Position {
-                        line,
-                        character: char_pos,
-                    },
-                    label: InlayHintLabel::String(label),
-                    kind: Some(InlayHintKind::TYPE),
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: Some(true),
-                    data: None,
-                });
+        // One hint per (non-annotated) assignment site, in source order, so a
+        // reassigned variable shows its shape at each line (issue #28).
+        for rec in &analysis.assignment_shapes {
+            if rec.name.starts_with('_') {
+                continue;
             }
+            let line = rec.line;
+
+            if !seen.insert((line, rec.name.clone())) {
+                continue;
+            }
+
+            if line < visible_range.start.line || line > visible_range.end.line {
+                continue;
+            }
+
+            let label = if rec.shape.is_empty() {
+                ": Scalar".to_string()
+            } else {
+                format!(": [{}]", rec.shape.join(", "))
+            };
+            let char_pos = line_length(&text, line);
+
+            hints.push(InlayHint {
+                position: Position {
+                    line,
+                    character: char_pos,
+                },
+                label: InlayHintLabel::String(label),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None,
+                padding_left: None,
+                padding_right: Some(true),
+                data: None,
+            });
         }
 
         let build_ms = t_build.elapsed().as_millis();
@@ -575,56 +561,6 @@ fn format_hover(var_name: &str, shape: &[String]) -> String {
     }
 }
 
-/// Find the 0-based line number of the last assignment to `var_name` within
-/// the byte range [start_byte, end_byte). Returns `None` if no assignment found.
-fn find_variable_line(
-    root: &tree_sitter::Node,
-    text: &str,
-    var_name: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<u32> {
-    let mut cursor = root.walk();
-    let mut result: Option<u32> = None;
-
-    // DFS over all nodes within the byte range
-    walk_nodes(&mut cursor, &mut |node| {
-        if node.start_byte() > end_byte || node.end_byte() < start_byte {
-            return false; // skip children outside scope
-        }
-        if node.kind() == "assignment"
-            && node.child_by_field_name("type").is_none() // skip annotated assignments (duplicate of user-written type)
-            && let Some(lhs) = node.child(0)
-            && lhs.kind() == "identifier"
-            && let Ok(name) = lhs.utf8_text(text.as_bytes())
-            && name == var_name
-        {
-            result = Some(lhs.start_position().row as u32);
-        }
-        true // continue walking
-    });
-
-    result
-}
-
-/// Walk all nodes in DFS order, calling `f` for each node.
-/// If `f` returns false, children of that node are skipped.
-fn walk_nodes(cursor: &mut tree_sitter::TreeCursor, f: &mut impl FnMut(tree_sitter::Node) -> bool) {
-    loop {
-        let descend = f(cursor.node());
-        if descend && cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return;
-            }
-        }
-    }
-}
 
 /// Return the UTF-16 code-unit count of the given 0-based line in `text`.
 /// LSP `Position.character` is UTF-16 code units by default.
@@ -1175,54 +1111,4 @@ mod tests {
         assert_eq!(line_length(text, 99), 0);
     }
 
-    #[test]
-    fn find_variable_line_finds_assignment() {
-        let text = "x = 1\ny = 2\n";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(text, None).unwrap();
-        let root = tree.root_node();
-
-        assert_eq!(find_variable_line(&root, text, "x", 0, text.len()), Some(0));
-        assert_eq!(find_variable_line(&root, text, "y", 0, text.len()), Some(1));
-        assert_eq!(find_variable_line(&root, text, "z", 0, text.len()), None);
-    }
-
-    #[test]
-    fn find_variable_line_respects_byte_range() {
-        let text = "x = 1\nx = 2\n";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(text, None).unwrap();
-        let root = tree.root_node();
-
-        // Only look within the second line's byte range
-        let second_line_start = "x = 1\n".len();
-        assert_eq!(
-            find_variable_line(&root, text, "x", second_line_start, text.len()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn find_variable_line_skips_annotated_assignment() {
-        // Annotated assignments have a 'type' field; find_variable_line should skip them
-        // to avoid duplicating the user-written type annotation.
-        let text = "y: int = 1\nz = 2\n";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(text, None).unwrap();
-        let root = tree.root_node();
-
-        // 'y' has a type annotation — should be skipped
-        assert_eq!(find_variable_line(&root, text, "y", 0, text.len()), None);
-        // 'z' is a bare assignment — should be found
-        assert_eq!(find_variable_line(&root, text, "z", 0, text.len()), Some(1));
-    }
 }

@@ -72,6 +72,63 @@ mod analyze_layer_shapes_tests {
     }
 
     #[test]
+    fn test_resolution_cache_shared_across_files() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A user-defined symbol on the search root. Unlike equinox.nn.*, it is
+        // not in the hardcoded catalog, so resolving it actually walks disk
+        // through resolve_call_signature — the path the ResolutionCache guards.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("mymod.py"),
+            "class Block:\n    def __init__(self, a, b): pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let read_count = AtomicUsize::new(0);
+        let counting_read = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+
+        // Two distinct source files (different document URIs in the LSP) that
+        // both resolve the same shared symbol `mymod.Block`.
+        let a_py = "import mymod\ndef f():\n    layer = mymod.Block(3, 5)";
+        let b_py = "from mymod import Block\ndef g():\n    layer = Block(3, 5)";
+
+        let cache = new_resolution_cache();
+
+        let tree_a = parse(a_py);
+        analyze_layer_shapes(tree_a.root_node(), a_py, &roots, counting_read, 5, Some(&cache))
+            .unwrap();
+        let reads_a = read_count.load(Ordering::Relaxed);
+        assert!(reads_a > 0, "first file should hit disk");
+
+        read_count.store(0, Ordering::Relaxed);
+
+        let tree_b = parse(b_py);
+        analyze_layer_shapes(tree_b.root_node(), b_py, &roots, counting_read, 5, Some(&cache))
+            .unwrap();
+        let reads_b = read_count.load(Ordering::Relaxed);
+
+        // The second file reuses the cached ResolvedImplementation for the
+        // shared symbol, so it reads strictly less than the first (the only
+        // residual read is signature extraction, which #38's cache doesn't
+        // cover). A regression that built a fresh cache per analyze call would
+        // re-read everything and not advance the hit counter.
+        assert!(
+            reads_b < reads_a,
+            "second file should read less than the first (cache reuse): \
+             reads_a={reads_a} reads_b={reads_b}"
+        );
+        assert!(
+            cache.hits.load(Ordering::Relaxed) >= 1,
+            "expected at least one cache hit after analyzing the second file"
+        );
+    }
+
+    #[test]
     fn test_analyzes_chained_layer_shapes() {
         let tmp = tempfile::tempdir().unwrap();
         write_equinox_linear(&tmp);
@@ -5349,8 +5406,8 @@ def caller(x: Float[Array, "B n"]) -> None:
 mod recursive_evaluator_tests {
     use super::*;
 
-    /// Tests routed through analyze_layer_shapes (the public API)
-    /// to catch wiring regressions and the synthetic-name-leak class of bug.
+    // Tests routed through analyze_layer_shapes (the public API)
+    // to catch wiring regressions and the synthetic-name-leak class of bug.
 
     fn parse(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -5406,6 +5463,52 @@ def f(a: Float[Array, "3 5"], b: Float[Array, "4 2"]):
     }
 
     #[test]
+    fn test_bare_call_shape_error_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(x: Float[Array, "3 5"], y: Float[Array, "4 2"]):
+    jnp.matmul(x, y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            analysis.errors
+        );
+        assert!(
+            analysis.errors[0].message.contains("matmul dimension mismatch"),
+            "unexpected error message: {}",
+            analysis.errors[0].message
+        );
+        // No LHS — variable should be empty.
+        assert_eq!(analysis.errors[0].variable, "");
+    }
+
+    #[test]
+    fn test_bare_call_compatible_shapes_no_error_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(x: Float[Array, "3 5"], y: Float[Array, "5 2"]):
+    jnp.matmul(x, y)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+    }
+
+    #[test]
     fn test_no_synth_keys_in_scopes_via_analyze() {
         let tmp = tempfile::tempdir().unwrap();
         let code = r#"
@@ -5447,6 +5550,262 @@ def f(x: Float[Array, "3 4"]):
         assert_eq!(
             find_shape_in_scope(&analysis, "f", "y"),
             Some(&shape(&["3"]))
+        );
+    }
+
+    #[test]
+    fn test_self_attribute_direct_field_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+class M:
+    A_log: Float[Array, "d_inner d_state"]
+
+    def __call__(self, x: Float[Array, "seq d_inner"]):
+        B = self.A_log
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "B"),
+            Some(&shape(&["d_inner", "d_state"]))
+        );
+    }
+
+    #[test]
+    fn test_self_attribute_through_astype_and_unary_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Mirrors the Mamba SelectiveStateSpace repro in issue #31.
+        let code = r#"
+import jax.numpy as jnp
+class M:
+    A_log: Float[Array, "d_inner d_state"]
+    D: Float[Array, "d_inner"]
+
+    def __call__(self, x: Float[Array, "seq d_inner"]):
+        A = -jnp.exp(self.A_log.astype(jnp.float32))
+        D = self.D.astype(jnp.float32)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "A"),
+            Some(&shape(&["d_inner", "d_state"]))
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "D"),
+            Some(&shape(&["d_inner"]))
+        );
+    }
+
+    #[test]
+    fn test_qualified_free_function_still_resolves_after_self_attr() {
+        // Regression: the self-attribute receiver path must fall through for
+        // qualified free functions like jax.nn.softplus(x).
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+def f(x: Float[Array, "3 5"]):
+    y = jax.nn.softplus(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["3", "5"]))
+        );
+    }
+
+    #[test]
+    fn test_assignment_shapes_record_each_reassignment() {
+        // Reassigning x must yield one record per assignment line (issue #28),
+        // unlike scope.shapes which keeps only the final shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(a: Float[Array, "3 5"], b: Float[Array, "5 2"]):
+    x = a @ b
+    x = jnp.reshape(x, (6,))
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        let xs: Vec<_> = analysis
+            .assignment_shapes
+            .iter()
+            .filter(|r| r.name == "x")
+            .collect();
+        assert_eq!(
+            xs.len(),
+            2,
+            "expected two records for x: {:?}",
+            analysis.assignment_shapes
+        );
+        assert_eq!(xs[0].shape, shape(&["3", "2"]));
+        assert_eq!(xs[1].shape, shape(&["6"]));
+        assert_ne!(xs[0].line, xs[1].line);
+    }
+
+    #[test]
+    fn test_assignment_shapes_skip_annotated() {
+        // Annotated assignments shouldn't produce inlay records (the user
+        // already wrote the type).
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(a: Float[Array, "3 5"], b: Float[Array, "5 2"]):
+    c: Float[Array, "3 2"] = a @ b
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(
+            analysis.assignment_shapes.iter().all(|r| r.name != "c"),
+            "annotated assignment leaked into inlay records: {:?}",
+            analysis.assignment_shapes
+        );
+    }
+
+    #[test]
+    fn test_tuple_unpack_split_via_analyze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(x: Float[Array, "10 6"]):
+    a, b = jnp.split(x, 2, axis=1)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "a"),
+            Some(&shape(&["10", "3"]))
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "b"),
+            Some(&shape(&["10", "3"]))
+        );
+    }
+
+    #[test]
+    fn test_tuple_unpack_split_chained_source_order_via_analyze() {
+        // The split input comes from an earlier assignment and a later
+        // assignment consumes a split output — verifies interleaved ordering.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax.numpy as jnp
+def f(x: Float[Array, "10 6"]):
+    y = jnp.exp(x)
+    a, b = jnp.split(y, 2, axis=1)
+    z = jnp.exp(a)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "z"),
+            Some(&shape(&["10", "3"]))
+        );
+    }
+
+    #[test]
+    fn test_tuple_unpack_shape_attribute_via_analyze() {
+        // L, _ = x.shape — L is an integer dim (zero-rank), _ is skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+def f(x: Float[Array, "seq d"]):
+    L, _ = x.shape
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "L"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(find_shape_in_scope(&analysis, "f", "_"), None);
+    }
+
+    #[test]
+    fn test_inline_vmap_of_self_attr_layer_via_analyze() {
+        // jax.vmap(self.input_proj)(x): self.input_proj is a Linear built in
+        // __init__; vmap maps it over x's leading axis. (issue #35)
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+import jax
+class M:
+    input_proj: eqx.nn.Linear
+
+    def __init__(self):
+        self.input_proj = eqx.nn.Linear(4, 7)
+
+    def __call__(self, x: Float[Array, "seq 4"]):
+        y = jax.vmap(self.input_proj)(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "y"),
+            Some(&shape(&["seq", "7"]))
+        );
+    }
+
+    #[test]
+    fn test_inline_vmap_of_self_attr_layer_mismatch_via_analyze() {
+        // x's per-element last dim (5) disagrees with Linear in_features (4).
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+import jax
+class M:
+    input_proj: eqx.nn.Linear
+
+    def __init__(self):
+        self.input_proj = eqx.nn.Linear(4, 7)
+
+    def __call__(self, x: Float[Array, "seq 5"]):
+        y = jax.vmap(self.input_proj)(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(analysis.errors.len(), 1, "expected one error: {:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_inline_vmap_of_bare_function_via_analyze() {
+        // jax.vmap(g)(x) with g a user function — inline form, no intermediate
+        // binding. Reuses the existing vmap-call expansion.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+def g(v: Float[Array, "d"]) -> Float[Array, "d"]:
+    return v
+
+def f(x: Float[Array, "batch d"]):
+    y = jax.vmap(g)(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["batch", "d"]))
         );
     }
 

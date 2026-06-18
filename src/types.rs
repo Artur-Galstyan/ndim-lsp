@@ -252,12 +252,25 @@ pub struct FunctionShapeScope {
     pub param_order: Vec<String>,
 }
 
+/// One record per (non-annotated) assignment that produced a shape, in the
+/// order assignments were processed. Unlike `FunctionShapeScope::shapes`
+/// (which keeps only the last shape per name), this preserves the shape at
+/// *each* assignment site so inlay hints can be emitted per reassignment.
+#[derive(Debug, PartialEq, Clone)]
+pub struct AssignmentShape {
+    /// 0-based row of the assignment's LHS.
+    pub line: u32,
+    pub name: String,
+    pub shape: Vec<String>,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct LayerShapeAnalysis {
     pub scopes: Vec<FunctionShapeScope>,
     pub layers: HashMap<String, LayerKind>,
     pub applications: Vec<LayerApplication>,
     pub errors: Vec<ShapeError>,
+    pub assignment_shapes: Vec<AssignmentShape>,
 }
 
 impl LayerShapeAnalysis {

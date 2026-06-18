@@ -5,8 +5,11 @@ use tree_sitter::Node;
 
 use crate::known_functions::{
     apply_known_function, apply_method_call, classify_known_function, classify_method_call,
+    compute_split_shapes,
 };
-use crate::layers::{apply_layer_application, extract_layer_assignments_scoped};
+use crate::layers::{
+    apply_layer_application, extract_layer_assignments_scoped, extract_self_attr_layers,
+};
 use crate::python_ast::{
     build_import_map, extract_call_arguments,
     extract_jaxtyping_shapes,
@@ -29,10 +32,18 @@ where
     let mut scopes = extract_jaxtyping_shapes(node, text)?;
     let import_map = build_import_map(node, text)?;
     let layer_records =
-        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, cache)?;
+        extract_layer_assignments_scoped(node, text, search_roots, &read_file, max_depth, cache)?;
+    let self_attr_layers =
+        extract_self_attr_layers(node, text, search_roots, &read_file, max_depth, cache)?;
 
-    let (applications, errors) =
-        propagate_calls(node, text, &import_map, &layer_records, &mut scopes)?;
+    let (applications, errors, assignment_shapes) = propagate_calls(
+        node,
+        text,
+        &import_map,
+        &layer_records,
+        &self_attr_layers,
+        &mut scopes,
+    )?;
 
     let mut layers = HashMap::new();
     for rec in &layer_records {
@@ -44,6 +55,7 @@ where
         layers,
         applications,
         errors,
+        assignment_shapes,
     })
 }
 
@@ -88,10 +100,15 @@ struct ShapeCtx<'a> {
     text: &'a str,
     import_map: &'a HashMap<String, ImportPath>,
     layer_records: &'a [LayerAssignment],
+    /// `self.<attr>` → layer, from constructor assignments in `__init__`.
+    /// Used to resolve `jax.vmap(self.<attr>)(x)` (issue #35).
+    self_attr_layers: &'a HashMap<String, LayerKind>,
     scopes: &'a mut [FunctionShapeScope],
     vmap_targets: &'a mut HashMap<String, VmapInfo>,
     applications: &'a mut Vec<LayerApplication>,
     errors: &'a mut Vec<ShapeError>,
+    /// Per-assignment shape records for inlay hints (issue #28).
+    assignment_shapes: &'a mut Vec<AssignmentShape>,
     /// Monotonic counter for synthetic variable names used to bind inline
     /// expression shapes so that known-function / method-call helpers can
     /// look them up by name.
@@ -114,6 +131,25 @@ impl<'a> ShapeCtx<'a> {
         self.synthetic_counter += 1;
         self.synthetics.insert((scope_idx, name.clone()), shape);
         name
+    }
+
+    /// Bind a user-visible shape and, when `line` is `Some` (a non-annotated
+    /// assignment), record it for per-reassignment inlay hints (issue #28).
+    fn record_binding(
+        &mut self,
+        scope_idx: usize,
+        name: &str,
+        shape: Vec<String>,
+        line: Option<u32>,
+    ) {
+        if let Some(line) = line {
+            self.assignment_shapes.push(AssignmentShape {
+                line,
+                name: name.to_string(),
+                shape: shape.clone(),
+            });
+        }
+        self.scopes[scope_idx].shapes.insert(name.to_string(), shape);
     }
 
     /// Look up a shape by name in the given scope, checking both real
@@ -169,13 +205,27 @@ fn shape_of_identifier(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     ctx.resolve_shape(name, scope_idx)
 }
 
-/// An `attribute` node that is *not* the `function` field of a call.
-/// This can appear in chained expressions like `x.reshape(3,4).sum(axis=1)`
-/// where the tree-sitter parse produces a single `call` whose `function`
-/// field is an attribute chain — that case is handled in `shape_of_call`.
-/// A standalone attribute (e.g. `obj.field`) doesn't have a shape rule in v1.
-fn shape_of_attribute(_node: Node, _ctx: &mut ShapeCtx) -> Option<Vec<String>> {
-    None
+/// A standalone `attribute` node (not the `function` field of a call).
+///
+/// Handles `self.<field>` (issue #31): class fields carrying jaxtyping
+/// annotations are extracted into the module scope (scope 0) by
+/// `extract_jaxtyping_shapes`, so we resolve `self.<field>` to that shape.
+///
+/// Other attribute chains like `x.reshape(3,4).sum(axis=1)` are handled in
+/// `shape_of_call`, where the parse produces a `call` whose `function` is the
+/// attribute. A non-`self` attribute (e.g. `obj.field`) has no shape rule.
+fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let obj = node.child_by_field_name("object")?;
+    if obj.kind() != "identifier" || obj.utf8_text(ctx.text.as_bytes()).ok()? != "self" {
+        return None;
+    }
+    let field = node
+        .child_by_field_name("attribute")?
+        .utf8_text(ctx.text.as_bytes())
+        .ok()?;
+    // ponytail: class fields land flat in module scope (scope 0); two classes
+    // with a same-named field resolve last-wins. Add per-class scoping if bitten.
+    ctx.resolve_shape(field, 0)
 }
 
 /// Unary operator: propagate the operand's shape unchanged.
@@ -280,6 +330,14 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let func_node = node.child_by_field_name("function")?;
     let args_node = node.child_by_field_name("arguments")?;
 
+    // ── Inline vmap application (issue #35) ──
+    // `jax.vmap(self.layer)(x)` / `eqx.filter_vmap(f)(x)` parse as a call whose
+    // `function` field is itself a vmap call. A call-of-a-call only has a shape
+    // rule in this inline-vmap form; otherwise there's nothing to resolve.
+    if func_node.kind() == "call" {
+        return shape_of_inline_vmap(func_node, args_node, scope_idx, ctx);
+    }
+
     // ── Chained method calls ──
     // In tree-sitter Python, `x.reshape(3,4).sum(axis=1)` parses as a
     // single `call` node whose `function` is an `attribute` like
@@ -310,42 +368,41 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         // For (b), we fall through to free-function resolution.
         // For (c), we dispatch to classify_method_call.
 
-        let is_chained = obj_node.kind() == "call";
+        // (a) Method call on a sub-expression we can shape:
+        //       - a chained call: `x.reshape(3,4).sum(axis=1)` (obj is a call)
+        //       - a self attribute: `self.A_log.astype(...)` (obj is an
+        //         attribute, issue #31)
+        //     Resolve the receiver recursively; if it has a shape, treat the
+        //     outer call as a method call on the result.
+        if obj_node.kind() == "call" || obj_node.kind() == "attribute" {
+            if let Some(receiver_shape) = shape_of_expression(obj_node, ctx) {
+                let receiver_name = ctx.bind_synthetic(receiver_shape, scope_idx);
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
 
-        if is_chained {
-            // (a) Chained method call: resolve the receiver (the inner
-            // call), then treat the outer call as a method call on the result.
-            let receiver_shape = shape_of_expression(obj_node, ctx);
-            let receiver_name = if let Some(shape) = receiver_shape {
-                ctx.bind_synthetic(shape, scope_idx)
-            } else {
+                if let Some(known) = classify_method_call(&method_name) {
+                    let merged = ctx.merged_shapes(scope_idx);
+                    let result = apply_method_call(&known, &receiver_name, &args, &merged);
+                    return match result {
+                        Ok(Some(shape)) => Some(shape),
+                        Ok(None) => None,
+                        Err(message) => {
+                            ctx.errors.push(ShapeError {
+                                variable: method_name,
+                                message,
+                                range: args_node.range(),
+                            });
+                            None
+                        }
+                    };
+                }
                 return None;
-            };
-
-            let args = extract_call_arguments(args_node, ctx.text).ok()?;
-
-            if let Some(known) = classify_method_call(&method_name) {
-                let merged = ctx.merged_shapes(scope_idx);
-                let result = apply_method_call(
-                    &known,
-                    &receiver_name,
-                    &args,
-                    &merged,
-                );
-                return match result {
-                    Ok(Some(shape)) => Some(shape),
-                    Ok(None) => None,
-                    Err(message) => {
-                        ctx.errors.push(ShapeError {
-                            variable: method_name,
-                            message,
-                            range: args_node.range(),
-                        });
-                        None
-                    }
-                };
             }
-            return None;
+            // Receiver has no shape. For a `call` receiver there's nothing
+            // else to try. For an `attribute` (e.g. `jax.nn` in
+            // `jax.nn.softplus(x)`), fall through to free-function resolution.
+            if obj_node.kind() == "call" {
+                return None;
+            }
         }
 
         // (c) Simple method call: x.reshape(3, 4)
@@ -789,33 +846,58 @@ fn prepend_batch_dim(mut shape: Vec<String>, axis: isize, dim: String) -> Vec<St
     shape
 }
 
+/// Output of `propagate_calls`: layer applications, shape errors, and the
+/// per-assignment shape records used for inlay hints.
+type PropagateOutput = (Vec<LayerApplication>, Vec<ShapeError>, Vec<AssignmentShape>);
+
 fn propagate_calls(
     node: Node,
     text: &str,
     import_map: &HashMap<String, ImportPath>,
     layer_records: &[LayerAssignment],
+    self_attr_layers: &HashMap<String, LayerKind>,
     scopes: &mut [FunctionShapeScope],
-) -> Result<(Vec<LayerApplication>, Vec<ShapeError>), String> {
+) -> Result<PropagateOutput, String> {
     let mut applications = Vec::new();
     let mut errors = Vec::new();
+    let mut assignment_shapes = Vec::new();
     let mut vmap_targets: HashMap<String, VmapInfo> = HashMap::new();
 
-    // Collect all assignments (with identifier LHS) in source order.
-    let assignments = collect_identifier_assignments(node, text)?;
+    // Collect all assignments (identifier and tuple-pattern LHS) in source order.
+    let assignments = collect_assignment_items(node, text)?;
 
     let mut ctx = ShapeCtx {
         text,
         import_map,
         layer_records,
+        self_attr_layers,
         scopes,
         vmap_targets: &mut vmap_targets,
         applications: &mut applications,
         errors: &mut errors,
+        assignment_shapes: &mut assignment_shapes,
         synthetic_counter: 0,
         synthetics: HashMap::new(),
     };
 
-    for (lhs_name, rhs_node, _assignment_node) in assignments {
+    for (lhs, rhs_node, assignment_node) in assignments {
+        // Inlay hints display non-annotated assignments only (an annotated
+        // assignment already shows the user's written type). `None` here means
+        // "bind the shape but emit no inlay record".
+        let display_line = if assignment_node.child_by_field_name("type").is_none() {
+            Some(assignment_node.start_position().row as u32)
+        } else {
+            None
+        };
+
+        // Tuple-pattern unpacking (issue #30) — bind each element and move on.
+        let lhs_name = match lhs {
+            Lhs::Single(name) => name,
+            Lhs::Tuple(names) => {
+                handle_tuple_assignment(&names, rhs_node, display_line, &mut ctx);
+                continue;
+            }
+        };
         let scope_idx = match scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) {
             Some(idx) => idx,
             None => continue,
@@ -884,9 +966,12 @@ fn propagate_calls(
                                 let result = apply_layer_application(&application, &merged);
                                 match result {
                                     Ok(Some(output)) => {
-                                        ctx.scopes[scope_idx]
-                                            .shapes
-                                            .insert(lhs_name.clone(), output);
+                                        ctx.record_binding(
+                                            scope_idx,
+                                            &lhs_name,
+                                            output,
+                                            display_line,
+                                        );
                                     }
                                     Ok(None) => {}
                                     Err(message) => ctx.errors.push(ShapeError {
@@ -914,7 +999,7 @@ fn propagate_calls(
         }
 
         if let Some(shape) = result {
-            ctx.scopes[scope_idx].shapes.insert(lhs_name.clone(), shape);
+            ctx.record_binding(scope_idx, &lhs_name, shape, display_line);
         }
     }
 
@@ -933,25 +1018,34 @@ fn propagate_calls(
         }
     }
 
-    Ok((applications, errors))
+    Ok((applications, errors, assignment_shapes))
 }
 
-/// Collect all assignment statements where the LHS is a simple identifier,
-/// in source order. Returns (lhs_name, rhs_node, assignment_node).
-fn collect_identifier_assignments<'a>(
+/// Left-hand side of an assignment we propagate shapes through.
+enum Lhs {
+    /// `x = ...`
+    Single(String),
+    /// `a, b = ...` / `(a, b) = ...` / `[a, b] = ...`. Each element is the
+    /// target name, or `None` for `_` and non-identifier elements (skipped).
+    Tuple(Vec<Option<String>>),
+}
+
+/// Collect all assignment statements (identifier and tuple-pattern LHS) in
+/// source order. Returns (lhs, rhs_node, assignment_node).
+fn collect_assignment_items<'a>(
     node: Node<'a>,
     text: &str,
-) -> Result<Vec<(String, Node<'a>, Node<'a>)>, String> {
+) -> Result<Vec<(Lhs, Node<'a>, Node<'a>)>, String> {
     let mut result = Vec::new();
-    collect_assignments_recursive(node, text, &mut result)?;
+    collect_items_recursive(node, text, &mut result)?;
     result.sort_by_key(|(_, rhs, _)| rhs.start_byte());
     Ok(result)
 }
 
-fn collect_assignments_recursive<'a>(
+fn collect_items_recursive<'a>(
     node: Node<'a>,
     text: &str,
-    out: &mut Vec<(String, Node<'a>, Node<'a>)>,
+    out: &mut Vec<(Lhs, Node<'a>, Node<'a>)>,
 ) -> Result<(), String> {
     for i in 0..node.named_child_count() {
         let child = node.named_child(i as u32).unwrap();
@@ -963,35 +1057,136 @@ fn collect_assignments_recursive<'a>(
             for j in 0..child.named_child_count() {
                 let inner = child.named_child(j as u32).unwrap();
                 if inner.kind() == "assignment" {
-                    try_extract_assignment(inner, text, out);
+                    push_assignment_item(inner, text, out);
                 }
             }
             continue;
         } else if child.kind() == "assignment" {
-            try_extract_assignment(child, text, out);
+            push_assignment_item(child, text, out);
             // Also don't recurse into bare assignment nodes to avoid
             // double-counting.
             continue;
         }
 
-        collect_assignments_recursive(child, text, out)?;
+        collect_items_recursive(child, text, out)?;
     }
     Ok(())
 }
 
-fn try_extract_assignment<'a>(
+fn push_assignment_item<'a>(
     assignment: Node<'a>,
     text: &str,
-    out: &mut Vec<(String, Node<'a>, Node<'a>)>,
+    out: &mut Vec<(Lhs, Node<'a>, Node<'a>)>,
 ) {
-    let left = assignment.child_by_field_name("left");
-    let right = assignment.child_by_field_name("right");
+    let (Some(lhs), Some(rhs)) = (
+        assignment.child_by_field_name("left"),
+        assignment.child_by_field_name("right"),
+    ) else {
+        return;
+    };
 
-    if let (Some(lhs), Some(rhs)) = (left, right)
-        && lhs.kind() == "identifier"
-            && let Ok(name) = lhs.utf8_text(text.as_bytes()) {
-                out.push((name.to_string(), rhs, assignment));
+    match lhs.kind() {
+        "identifier" => {
+            if let Ok(name) = lhs.utf8_text(text.as_bytes()) {
+                out.push((Lhs::Single(name.to_string()), rhs, assignment));
             }
+        }
+        "pattern_list" | "tuple_pattern" | "list_pattern" => {
+            let mut names = Vec::new();
+            for k in 0..lhs.named_child_count() {
+                let el = lhs.named_child(k as u32).unwrap();
+                let name = if el.kind() == "identifier" {
+                    match el.utf8_text(text.as_bytes()) {
+                        Ok("_") | Err(_) => None,
+                        Ok(t) => Some(t.to_string()),
+                    }
+                } else {
+                    None
+                };
+                names.push(name);
+            }
+            out.push((Lhs::Tuple(names), rhs, assignment));
+        }
+        _ => {}
+    }
+}
+
+/// Bind a tuple-pattern assignment's element shapes (issue #30).
+fn handle_tuple_assignment(
+    names: &[Option<String>],
+    rhs_node: Node,
+    display_line: Option<u32>,
+    ctx: &mut ShapeCtx,
+) {
+    let Some(scope_idx) = scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) else {
+        return;
+    };
+    let Some(elem_shapes) = tuple_rhs_shapes(rhs_node, names.len(), scope_idx, ctx) else {
+        return;
+    };
+    for (name, shape) in names.iter().zip(elem_shapes) {
+        if let (Some(name), Some(shape)) = (name, shape) {
+            ctx.record_binding(scope_idx, name, shape, display_line);
+        }
+    }
+}
+
+/// Compute one shape per element of a tuple-unpacked RHS. Returns `None` if the
+/// RHS isn't a multi-output form we model. Per-element `None` means "skip this
+/// target" (e.g. an integer dim from `x.shape`).
+///
+/// Modelled forms:
+/// - `x.shape` → one zero-rank (scalar) element per dim of `x`.
+/// - `jnp.split` / `np.split` / `array_split` / `tensor_split` → the per-array
+///   shapes from `compute_split_shapes`.
+///
+/// Other multi-output functions (`meshgrid`, `svd`, `eig`, …) are not modelled
+/// yet and fall through to `None`.
+fn tuple_rhs_shapes(
+    rhs: Node,
+    n_targets: usize,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<Option<Vec<String>>>> {
+    match rhs.kind() {
+        "attribute" => {
+            let attr = rhs.child_by_field_name("attribute")?;
+            if attr.utf8_text(ctx.text.as_bytes()).ok()? != "shape" {
+                return None;
+            }
+            let obj = rhs.child_by_field_name("object")?;
+            let obj_shape = shape_of_expression(obj, ctx)?;
+            if obj_shape.len() != n_targets {
+                return None;
+            }
+            // Each unpacked dim is an integer scalar (zero-rank).
+            Some(obj_shape.iter().map(|_| Some(Vec::new())).collect())
+        }
+        "call" => {
+            let func = rhs.child_by_field_name("function")?;
+            let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
+            let resolved = resolve_call_target(target, ctx.import_map);
+            if !matches!(classify_known_function(&resolved), Some(KnownFunction::Split)) {
+                return None;
+            }
+            let args_node = rhs.child_by_field_name("arguments")?;
+            let args = extract_call_arguments(args_node, ctx.text).ok()?;
+            let merged = ctx.merged_shapes(scope_idx);
+            match compute_split_shapes(&args, &merged) {
+                Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 
@@ -1060,7 +1255,7 @@ fn collect_value_statements_recursive<'a>(
                     }
                 }
                 // Don't recurse — assignments inside expression_statement
-                // are already handled by collect_identifier_assignments.
+                // are already handled by collect_assignment_items.
             }
             _ => {
                 collect_value_statements_recursive(child, _text, out)?;
@@ -1163,6 +1358,116 @@ fn apply_vmap_call(
 
     // i. Store result — done by caller.
     Ok(Some(output))
+}
+
+/// Resolve an inline vmap application `vmap(callable)(args)` (issue #35).
+///
+/// `inner_call` is the `vmap(callable)` call; `outer_args_node` holds the
+/// arguments applied to it. Returns the batched output shape, or `None` if
+/// the inner call isn't a vmap we can model.
+fn shape_of_inline_vmap(
+    inner_call: Node,
+    outer_args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let inner_func = inner_call.child_by_field_name("function")?;
+    let inner_target = inner_func.utf8_text(ctx.text.as_bytes()).ok()?;
+    let resolved = resolve_call_target(inner_target, ctx.import_map);
+    if !matches!(classify_known_function(&resolved), Some(KnownFunction::Vmap)) {
+        return None;
+    }
+
+    let inner_args_node = inner_call.child_by_field_name("arguments")?;
+    let inner_args = extract_call_arguments(inner_args_node, ctx.text).ok()?;
+    let callable = inner_args.iter().find_map(|a| match a {
+        CallArgument::Positional { value } => Some(value.clone()),
+        _ => None,
+    })?;
+    let in_axes = parse_int_keyword(&inner_args, "in_axes", 0)?;
+    let out_axes = parse_int_keyword(&inner_args, "out_axes", 0)?;
+
+    let outer_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
+
+    // Case A: the vmapped callable is `self.<attr>` resolving to a known layer.
+    if let Some(attr) = callable.strip_prefix("self.")
+        && let Some(layer) = ctx.self_attr_layers.get(attr).cloned()
+    {
+        return apply_inline_vmap_layer(
+            &layer,
+            &outer_args,
+            in_axes,
+            out_axes,
+            scope_idx,
+            outer_args_node.range(),
+            ctx,
+        );
+    }
+
+    // Case B: the callable is a bare identifier — a user function in this file.
+    if !callable.contains('.') {
+        let info = VmapInfo {
+            wrapped: callable,
+            in_axes,
+            out_axes,
+        };
+        let merged = ctx.merged_shapes(scope_idx);
+        return match apply_vmap_call(&info, &outer_args, &merged, ctx.scopes) {
+            Ok(shape) => shape,
+            Err(message) => {
+                ctx.errors.push(ShapeError {
+                    variable: String::new(),
+                    message,
+                    range: outer_args_node.range(),
+                });
+                None
+            }
+        };
+    }
+
+    None
+}
+
+/// Apply a layer batched over its leading axis: peel the batch dim at
+/// `in_axes`, run the layer's normal shape rule on the per-element shape,
+/// then re-insert the batch dim at `out_axes`.
+fn apply_inline_vmap_layer(
+    layer: &LayerKind,
+    outer_args: &[CallArgument],
+    in_axes: isize,
+    out_axes: isize,
+    scope_idx: usize,
+    range: tree_sitter::Range,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let input_name = outer_args.iter().find_map(|a| match a {
+        CallArgument::Positional { value } => Some(value.clone()),
+        _ => None,
+    })?;
+    let input_shape = ctx.resolve_shape(&input_name, scope_idx)?;
+
+    let (peeled, batch_dim) = peel_batch_dim(&input_shape, in_axes).ok()?;
+    let synth = ctx.bind_synthetic(peeled, scope_idx);
+    let application = LayerApplication {
+        variable: String::new(),
+        layer: "vmap".to_string(),
+        input: synth,
+        kind: layer.clone(),
+        range,
+    };
+    let merged = ctx.merged_shapes(scope_idx);
+    match apply_layer_application(&application, &merged) {
+        Ok(Some(output)) => Some(prepend_batch_dim(output, out_axes, batch_dim)),
+        Ok(None) => None,
+        Err(message) => {
+            ctx.errors.push(ShapeError {
+                variable: String::new(),
+                message,
+                range,
+            });
+            None
+        }
+    }
 }
 
 /// Search for a `FunctionShapeScope` whose `function_name` matches `target`,
@@ -1541,23 +1846,30 @@ mod shape_of_expression_tests {
 
         let mut applications = Vec::new();
         let mut errors = Vec::new();
+        let mut assignment_shapes = Vec::new();
         let mut vmap_targets = HashMap::new();
+        let self_attr_layers = HashMap::new();
 
-        let assignments = collect_identifier_assignments(tree.root_node(), code).unwrap();
+        let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
 
         let mut ctx = ShapeCtx {
             text: code,
             import_map: &import_map,
             layer_records: &layer_records,
+            self_attr_layers: &self_attr_layers,
             scopes: &mut scopes,
             vmap_targets: &mut vmap_targets,
             applications: &mut applications,
             errors: &mut errors,
+            assignment_shapes: &mut assignment_shapes,
             synthetic_counter: 0,
             synthetics: HashMap::new(),
         };
 
-        for (lhs_name, rhs_node, _assignment_node) in assignments {
+        for (lhs, rhs_node, _assignment_node) in assignments {
+            let Lhs::Single(lhs_name) = lhs else {
+                continue;
+            };
             let scope_idx = match scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) {
                 Some(idx) => idx,
                 None => continue,
@@ -1574,6 +1886,7 @@ mod shape_of_expression_tests {
             layers,
             applications,
             errors,
+            assignment_shapes: Vec::new(),
         }
     }
 
@@ -1822,3 +2135,4 @@ def f(x: Float[Array, "3 5"]):
         );
     }
 }
+

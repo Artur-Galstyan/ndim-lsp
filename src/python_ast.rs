@@ -802,6 +802,88 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     Ok(result)
 }
 
+/// Like `extract_calls`, but for assignments whose LHS is `self.<attr>`
+/// (e.g. `self.input_proj = eqx.nn.Linear(d_inner, dt_rank)` in an
+/// `__init__`). `CallInfo::variable` is the bare attribute name
+/// (`input_proj`). Used to resolve `self.<attr>` references to a layer.
+pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
+    let mut result: Vec<CallInfo> = Vec::new();
+    let query_string = r#"
+        (assignment
+          left: (attribute
+            object: (identifier) @obj
+            attribute: (identifier) @attr)
+          right: (call
+            function: [
+              (identifier) @fn_id
+              (attribute) @fn_attr
+            ]
+          )
+        ) @assignment
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
+        .map_err(|e| e.to_string())?;
+
+    let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
+    let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
+    let fn_id_idx = query.capture_index_for_name("fn_id").ok_or("fn_id not found")?;
+    let fn_attr_idx = query.capture_index_for_name("fn_attr").ok_or("fn_attr not found")?;
+    let assignment_idx = query
+        .capture_index_for_name("assignment")
+        .ok_or("assignment not found")?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, node, text.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        let mut is_self = false;
+        let mut variable = String::new();
+        let mut target = String::new();
+        let mut args_node_range: Option<Range> = None;
+
+        for capture in match_.captures {
+            if capture.index == obj_idx {
+                is_self = capture.node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?
+                    == "self";
+            } else if capture.index == attr_idx {
+                variable = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            } else if capture.index == assignment_idx {
+                let right = capture
+                    .node
+                    .child_by_field_name("right")
+                    .ok_or("right child not found")?;
+                let arguments = right
+                    .child_by_field_name("arguments")
+                    .ok_or("arguments child not found")?;
+                args_node_range = Some(arguments.range());
+            } else if capture.index == fn_id_idx || capture.index == fn_attr_idx {
+                target = capture
+                    .node
+                    .utf8_text(text.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .to_string();
+            }
+        }
+
+        if !is_self {
+            continue;
+        }
+        let args_node_range = args_node_range.ok_or("args_node_range not found")?;
+        result.push(CallInfo {
+            variable,
+            target,
+            args_node_range,
+        });
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod call_argument_tests {
     use super::*;
