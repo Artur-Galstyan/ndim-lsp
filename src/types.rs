@@ -130,6 +130,22 @@ pub enum LayerKind {
         stride: String,
         padding: String,
     },
+    /// Max/Avg pooling, channels-first like Conv: channels preserved, the
+    /// trailing `spatial_rank` dims follow the conv output formula.
+    Pool {
+        name: String,
+        spatial_rank: usize,
+        kernel_size: String,
+        stride: String,
+        padding: String,
+    },
+    /// Adaptive pooling: the trailing `spatial_rank` dims all become
+    /// `output_size`, channels preserved.
+    AdaptivePool {
+        name: String,
+        spatial_rank: usize,
+        output_size: String,
+    },
     /// Index lookup table: appends `embedding_size` to the input shape
     /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
     Embedding {

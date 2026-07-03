@@ -1,6 +1,5 @@
-# A torch-style CNN with explicit pooling layers. MaxPool2d/AdaptiveAvgPool2d
-# are not modelled yet — their assignments are expected dark spots that keep
-# the pooling gap ranked in the coverage report.
+# A torch-style CNN with explicit pooling layers (MaxPool2d halves the
+# spatial dims, AdaptiveAvgPool2d collapses them to output_size).
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Array

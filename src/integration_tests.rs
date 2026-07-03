@@ -6382,3 +6382,36 @@ mod symbolic_ctor_dim_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pooling_layer_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// End-to-end mirror of corpus/cnn_pool.py's forward pass.
+    #[test]
+    fn test_cnn_with_pooling_forward() {
+        let code = "import torch\nimport torch.nn as nn\ndef f(x: Float[Array, \"3 32 32\"]):\n    conv1 = nn.Conv2d(3, 16, 3, padding=1)\n    pool1 = nn.MaxPool2d(2)\n    conv2 = nn.Conv2d(16, 32, 3, padding=1)\n    pool2 = nn.AdaptiveAvgPool2d(1)\n    fc = nn.Linear(32, 10)\n    h = conv1(x)\n    h = pool1(h)\n    h = conv2(h)\n    h = pool2(h)\n    pooled = h.mean(axis=(1, 2))\n    logits = fc(pooled)\n    return logits";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["32", "1", "1"])));
+        assert_eq!(find_shape(&analysis, "pooled"), Some(&shape(&["32"])));
+        assert_eq!(find_shape(&analysis, "logits"), Some(&shape(&["10"])));
+    }
+}

@@ -245,7 +245,7 @@ Legend:
 | `LayerNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; LayerNorm enforces min rank 1. |
 | `GroupNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; GroupNorm enforces min rank 1. |
 | activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; activations accept any rank. |
-| pooling layers | ❌ | ❌ | ❌ | Spatial formula. |
+| pooling layers | ✅ | ✅ | ✅ | Max/Avg/Adaptive{Max,Avg}Pool 1d/2d/3d, channels-first; conv output formula (adaptive sets spatial dims to output_size). Torch stride default (= kernel_size). |
 | attention layers | ❌ | ❌ | ❌ | Query/key/value shape rules. |
 
 ## Method calls
@@ -300,15 +300,14 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **87%** (47/54) across mamba_ssm, attention, conv_net,
+(`d*3` split 3 → `d`). Corpus coverage is **91%** (49/54) across mamba_ssm, attention, conv_net,
 transformer_block, rnn_scan, embedding_lm, cnn_pool — the dark spots are the
 ranked gap list below.
 
 Current open work, roughly in impact order:
 
 1. **Model the ranked dark spots** — corpus now has rnn_scan.py, cnn_pool.py,
-   embedding_lm.py; top gaps: literal-operand binary ops, `jax.lax.scan`,
-   pooling layers, `self.<method>` calls.
+   embedding_lm.py; top gaps: literal-operand binary ops, `jax.lax.scan`, `self.<method>` calls.
 2. **More multi-output tuple-unpacking** — `meshgrid`, `svd`, `eig`, `qr`
    (split is done; reuse the `tuple_rhs_shapes` dispatch in `analysis.rs`).
 3. **Cross-*file* return-type tracing** — same-file helpers already propagate;

@@ -86,6 +86,51 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 _ => None,
             }
         }
+        "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
+            let spatial_rank = pool_spatial_rank(owner)?;
+            let kernel_size = call.bindings.get("kernel_size")?.clone();
+            if kernel_size.starts_with('(') {
+                return None;
+            }
+            // torch default: stride = kernel_size. (equinox defaults to
+            // stride=1 — divergence accepted until it bites.)
+            let stride = call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| kernel_size.clone());
+            if stride.starts_with('(') {
+                return None;
+            }
+            let padding = call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string());
+            if padding.starts_with('(') {
+                return None;
+            }
+            Some(LayerKind::Pool {
+                name: owner.to_string(),
+                spatial_rank,
+                kernel_size,
+                stride,
+                padding,
+            })
+        }
+        "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
+        | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => {
+            let spatial_rank = pool_spatial_rank(owner)?;
+            let output_size = call.bindings.get("output_size")?.clone();
+            if output_size.starts_with('(') {
+                return None;
+            }
+            Some(LayerKind::AdaptivePool {
+                name: owner.to_string(),
+                spatial_rank,
+                output_size,
+            })
+        }
         // equinox names it `embedding_size`, torch `embedding_dim`.
         "Embedding" => Some(LayerKind::Embedding {
             embedding_size: call
@@ -102,6 +147,15 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
         }),
         _ => None,
     }
+}
+
+/// Spatial rank from a pooling class name's `1d`/`2d`/`3d` suffix.
+fn pool_spatial_rank(name: &str) -> Option<usize> {
+    name.strip_suffix('d')?
+        .chars()
+        .last()?
+        .to_digit(10)
+        .map(|d| d as usize)
 }
 
 /// Built-in catalog of framework layer constructors.
@@ -143,6 +197,11 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     let params: &[&str] = match class_name {
         "Linear" => &["self", "in_features", "out_features", "use_bias"],
         "Embedding" => &["self", "num_embeddings", "embedding_size"],
+        "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
+            &["self", "kernel_size", "stride", "padding"]
+        }
+        "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
+        | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => &["self", "output_size"],
         "Conv1d" | "Conv2d" | "Conv3d" => &[
             "self",
             "in_channels",
@@ -643,6 +702,56 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
+        // Channels-first pooling: channels preserved, trailing spatial dims
+        // follow the conv output formula.
+        LayerKind::Pool {
+            name,
+            spatial_rank,
+            kernel_size,
+            stride,
+            padding,
+        } => {
+            let min_rank = spatial_rank + 1;
+            if input_shape.len() < min_rank {
+                return Err(format!(
+                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
+                    name,
+                    app.layer,
+                    min_rank,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let start = input_shape.len() - spatial_rank;
+            for dim in &mut output_shape[start..] {
+                *dim = conv_spatial_dim(dim, kernel_size, stride, padding);
+            }
+            Ok(Some(output_shape))
+        }
+        LayerKind::AdaptivePool {
+            name,
+            spatial_rank,
+            output_size,
+        } => {
+            let min_rank = spatial_rank + 1;
+            if input_shape.len() < min_rank {
+                return Err(format!(
+                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
+                    name,
+                    app.layer,
+                    min_rank,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let start = input_shape.len() - spatial_rank;
+            for dim in &mut output_shape[start..] {
+                dim.clone_from(output_size);
+            }
+            Ok(Some(output_shape))
+        }
         // Index lookup: appends the embedding dim to the (integer) input shape.
         LayerKind::Embedding { embedding_size } => {
             let mut output_shape = input_shape.clone();
@@ -2199,6 +2308,136 @@ mod catalog_first_extract_layer_assignments_tests {
             apply_layer_application(&app("idx"), &shapes).unwrap(),
             Some(vec!["512".to_string()])
         );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_maxpool2d_without_disk() {
+        let code = "import torch\npool = torch.nn.MaxPool2d(2)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("pool"),
+            Some(&LayerKind::Pool {
+                name: "MaxPool2d".to_string(),
+                spatial_rank: 2,
+                kernel_size: "2".to_string(),
+                stride: "2".to_string(),
+                padding: "0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_adaptive_avgpool_without_disk() {
+        let code = "import torch\npool = torch.nn.AdaptiveAvgPool2d(1)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("pool"),
+            Some(&LayerKind::AdaptivePool {
+                name: "AdaptiveAvgPool2d".to_string(),
+                spatial_rank: 2,
+                output_size: "1".to_string()
+            })
+        );
+    }
+
+    fn pool_app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: "y".to_string(),
+            layer: "pool".to_string(),
+            input: input.to_string(),
+            kind,
+            range: tree_sitter::Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+        }
+    }
+
+    #[test]
+    fn test_apply_maxpool2d_halves_spatial_dims() {
+        let shapes = HashMap::from([(
+            "x".to_string(),
+            vec!["16".to_string(), "32".to_string(), "32".to_string()],
+        )]);
+        let kind = LayerKind::Pool {
+            name: "MaxPool2d".to_string(),
+            spatial_rank: 2,
+            kernel_size: "2".to_string(),
+            stride: "2".to_string(),
+            padding: "0".to_string(),
+        };
+
+        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
+
+        assert_eq!(
+            output,
+            Some(vec!["16".to_string(), "16".to_string(), "16".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_apply_maxpool1d_symbolic_spatial_dim() {
+        let shapes = HashMap::from([("x".to_string(), vec!["c".to_string(), "L".to_string()])]);
+        let kind = LayerKind::Pool {
+            name: "MaxPool1d".to_string(),
+            spatial_rank: 1,
+            kernel_size: "2".to_string(),
+            stride: "2".to_string(),
+            padding: "0".to_string(),
+        };
+
+        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
+
+        assert_eq!(
+            output,
+            Some(vec!["c".to_string(), "(L-2)/2+1".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_apply_adaptive_pool_sets_spatial_dims() {
+        let shapes = HashMap::from([(
+            "x".to_string(),
+            vec!["32".to_string(), "16".to_string(), "16".to_string()],
+        )]);
+        let kind = LayerKind::AdaptivePool {
+            name: "AdaptiveAvgPool2d".to_string(),
+            spatial_rank: 2,
+            output_size: "1".to_string(),
+        };
+
+        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
+
+        assert_eq!(
+            output,
+            Some(vec!["32".to_string(), "1".to_string(), "1".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_apply_pool_rank_too_low_errors() {
+        let shapes = HashMap::from([("x".to_string(), vec!["16".to_string()])]);
+        let kind = LayerKind::Pool {
+            name: "MaxPool2d".to_string(),
+            spatial_rank: 2,
+            kernel_size: "2".to_string(),
+            stride: "2".to_string(),
+            padding: "0".to_string(),
+        };
+
+        let err = apply_layer_application(&pool_app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 3 dims"));
     }
 
     #[test]
