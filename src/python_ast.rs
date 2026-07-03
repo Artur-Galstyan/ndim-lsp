@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use tree_sitter::{Node, Query, QueryCursor, Range, StreamingIterator};
 
@@ -397,15 +398,17 @@ pub fn find_top_level_symbol(
     text: &str,
     name: &str,
 ) -> Result<Option<PythonSymbol>, String> {
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (module (class_definition name: (_) @cls_def))
         (module (function_definition name: (_) @fn_def))
         (module (import_statement) @import)
         (module (import_from_statement) @import)
     "#;
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
     let Some(class_idx) = query.capture_index_for_name("cls_def") else {
         return Err("Failed to find capture index for 'cls_def'".to_string());
     };
@@ -418,7 +421,7 @@ pub fn find_top_level_symbol(
     };
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
     let mut found = None;
 
     while let Some(match_) = matches.next() {
@@ -493,12 +496,14 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
         Ok((module, name.to_string(), first.to_string()))
     }
 
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (import_statement name: (_) @import)
         (import_from_statement module_name: (_) @module_name name: (_) @name)
     "#;
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
 
     let Some(import_statement_idx) = query.capture_index_for_name("import") else {
         return Err("Failed to capture index for name 'import'".to_string());
@@ -512,7 +517,7 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
     };
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
 
     let mut import_map: HashMap<String, ImportPath> = HashMap::new();
 
@@ -646,7 +651,7 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
 
 pub fn extract_method_calls(node: Node, text: &str) -> Result<Vec<MethodCallInfo>, String> {
     let mut result: Vec<MethodCallInfo> = Vec::new();
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (assignment
           left: (identifier) @var
           right: (call
@@ -658,8 +663,10 @@ pub fn extract_method_calls(node: Node, text: &str) -> Result<Vec<MethodCallInfo
         ) @assignment
     "#;
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
 
     let Some(var_idx) = query.capture_index_for_name("var") else {
         return Err("var not found".to_string());
@@ -675,7 +682,7 @@ pub fn extract_method_calls(node: Node, text: &str) -> Result<Vec<MethodCallInfo
     };
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
 
     while let Some(match_) = matches.next() {
         let mut variable = String::new();
@@ -727,7 +734,7 @@ pub fn extract_method_calls(node: Node, text: &str) -> Result<Vec<MethodCallInfo
 
 pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     let mut result: Vec<CallInfo> = Vec::new();
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (assignment
           left: (identifier) @var
           right: (call
@@ -739,8 +746,10 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
         ) @assignment
     "#;
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
 
     let Some(var_idx) = query.capture_index_for_name("var") else {
         return Err("var not found".to_string());
@@ -759,7 +768,7 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     };
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
 
     while let Some(match_) = matches.next() {
         let mut variable = String::new();
@@ -808,7 +817,7 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
 /// (`input_proj`). Used to resolve `self.<attr>` references to a layer.
 pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
     let mut result: Vec<CallInfo> = Vec::new();
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (assignment
           left: (attribute
             object: (identifier) @obj
@@ -822,8 +831,10 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
         ) @assignment
     "#;
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
 
     let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
     let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
@@ -834,7 +845,7 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
         .ok_or("assignment not found")?;
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
 
     while let Some(match_) = matches.next() {
         let mut is_self = false;
@@ -898,7 +909,7 @@ pub fn extract_self_attr_aliases(
     text: &str,
 ) -> Result<HashMap<String, String>, String> {
     let mut aliases = HashMap::new();
-    let query_string = r#"
+    const QUERY_STRING: &str = r#"
         (assignment
           left: (attribute
             object: (identifier) @obj
@@ -906,14 +917,16 @@ pub fn extract_self_attr_aliases(
           right: (identifier) @val)
     "#;
 
-    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_string)
-        .map_err(|e| e.to_string())?;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let query = &*QUERY;
     let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
     let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
     let val_idx = query.capture_index_for_name("val").ok_or("val not found")?;
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, node, text.as_bytes());
+    let mut matches = cursor.matches(query, node, text.as_bytes());
 
     while let Some(match_) = matches.next() {
         let mut is_self = false;

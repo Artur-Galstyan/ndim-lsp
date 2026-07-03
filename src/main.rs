@@ -15,20 +15,29 @@ use tower_lsp::lsp_types::{
     WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tree_sitter::Parser;
+use tree_sitter::{Parser, Tree};
 
 use ndim_lsp::{
     LayerShapeAnalysis, ResolutionCache, ShapeError, analyze_layer_shapes, clear_resolution_cache,
     new_resolution_cache,
 };
 
+/// Analysis plus the exact text/tree it was computed from, so hover and
+/// inlay hints reuse the parse instead of re-parsing per request.
+#[derive(Clone)]
+pub struct CachedAnalysis {
+    pub analysis: Arc<LayerShapeAnalysis>,
+    pub text: Arc<str>,
+    pub tree: Arc<Tree>,
+}
+
 pub struct Backend {
     pub client: Client,
     pub document_text: RwLock<HashMap<Url, String>>,
     pub workspace_roots: RwLock<Vec<PathBuf>>,
-    /// Cache: URI → (version, analysis). Invalidated on text change.
-    /// Stored as `Arc` so cache hits clone a pointer, not the whole analysis.
-    pub analysis_cache: RwLock<HashMap<Url, (i32, Arc<LayerShapeAnalysis>)>>,
+    /// Cache: URI → (version, analysis+snapshot). Invalidated on text change.
+    /// Stored as `Arc`s so cache hits clone pointers, not the whole analysis.
+    pub analysis_cache: RwLock<HashMap<Url, (i32, CachedAnalysis)>>,
     /// Current version for each URI (set on did_open/did_change).
     pub document_version: RwLock<HashMap<Url, i32>>,
     /// Session-lifetime cache for resolved import targets.
@@ -171,14 +180,14 @@ impl Backend {
     /// believes is current; if the document advances during analysis the
     /// freshly-computed entry is dropped instead of poisoning a newer cached
     /// result.
-    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<Arc<LayerShapeAnalysis>> {
+    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<CachedAnalysis> {
         // Check cache hit first (read-only lock, cheap)
         {
             let cache = self.analysis_cache.read().await;
-            if let Some((cached_ver, analysis)) = cache.get(uri)
+            if let Some((cached_ver, cached)) = cache.get(uri)
                 && *cached_ver == version
             {
-                return Some(Arc::clone(analysis));
+                return Some(cached.clone());
             }
         }
 
@@ -271,7 +280,11 @@ impl Backend {
             )
             .await;
 
-        let analysis = Arc::new(analysis);
+        let cached = CachedAnalysis {
+            analysis: Arc::new(analysis),
+            text: Arc::from(text),
+            tree: Arc::new(tree),
+        };
         // Only publish to the cache if the document hasn't advanced past the
         // version we analyzed. Otherwise we'd overwrite a (potentially newer)
         // entry with stale results.
@@ -281,11 +294,11 @@ impl Backend {
             drop(ver_lock);
             if current == Some(version) {
                 let mut cache = self.analysis_cache.write().await;
-                cache.insert(uri.clone(), (version, Arc::clone(&analysis)));
+                cache.insert(uri.clone(), (version, cached.clone()));
             }
         }
 
-        Some(analysis)
+        Some(cached)
     }
 
     async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
@@ -303,7 +316,7 @@ impl Backend {
         }
 
         // Run analysis (will populate cache)
-        let Some(analysis) = self.get_analysis(uri, version).await else {
+        let Some(cached) = self.get_analysis(uri, version).await else {
             self.client
                 .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
                 .await;
@@ -311,7 +324,8 @@ impl Backend {
         };
 
         let severity = *self.diagnostic_severity.read().await;
-        let diagnostics: Vec<Diagnostic> = analysis
+        let diagnostics: Vec<Diagnostic> = cached
+            .analysis
             .errors
             .iter()
             .cloned()
@@ -342,14 +356,13 @@ impl Backend {
             cache.get(uri).is_some_and(|(v, _)| *v == version)
         };
 
-        let analysis = self.get_analysis(uri, version).await?;
+        let cached = self.get_analysis(uri, version).await?;
+        let analysis = &cached.analysis;
 
-        // Owned snapshot of the text, used only for line-length (UTF-16)
-        // computation. Assignment lines come from the analysis itself.
-        let text: String = {
-            let doc_lock = self.document_text.read().await;
-            doc_lock.get(uri)?.clone()
-        };
+        // Line lengths (UTF-16) for the visible window, computed in one pass
+        // over the snapshot text the analysis was built from.
+        let line_lens =
+            line_lengths_in_range(&cached.text, visible_range.start.line, visible_range.end.line);
 
         let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
@@ -376,7 +389,7 @@ impl Backend {
             } else {
                 format!(": [{}]", rec.shape.join(", "))
             };
-            let char_pos = line_length(&text, line);
+            let char_pos = line_lens.get(&line).copied().unwrap_or(0);
 
             hints.push(InlayHint {
                 position: Position {
@@ -435,29 +448,14 @@ impl Backend {
             cache.get(uri).is_some_and(|(v, _)| *v == version)
         };
 
-        // Take an owned text snapshot for tree-sitter so `cursor_byte` is
-        // computed against the same bytes we'll later index into via
-        // `analysis.scopes`. If the document advances between here and
-        // `get_analysis` returning, the version check below rejects the
-        // mismatched pair.
-        let text: String = {
-            let doc_lock = self.document_text.read().await;
-            match doc_lock.get(uri) {
-                Some(t) => t.clone(),
-                None => return Ok(None),
-            }
+        // The cached snapshot carries the text and tree the analysis was
+        // computed from, so `cursor_byte` and `analysis.scopes` byte ranges
+        // are consistent by construction — no re-parse per hover.
+        let cached = match self.get_analysis(uri, version).await {
+            Some(c) => c,
+            None => return Ok(None),
         };
-        let mut parser = Parser::new();
-        if parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let Some(tree) = parser.parse(&text, None) else {
-            return Ok(None);
-        };
-        let root = tree.root_node();
+        let root = cached.tree.root_node();
         let point = tree_sitter::Point::new(pos.line as usize, pos.character as usize);
         let Some(node) = root.descendant_for_point_range(point, point) else {
             return Ok(None);
@@ -465,17 +463,11 @@ impl Backend {
         if node.kind() != "identifier" {
             return Ok(None);
         }
-        let var_name = match node.utf8_text(text.as_bytes()) {
+        let var_name = match node.utf8_text(cached.text.as_bytes()) {
             Ok(v) => v.to_string(),
             Err(_) => return Ok(None),
         };
         let cursor_byte = node.start_byte();
-
-        // Get analysis (cached or fresh)
-        let analysis = match self.get_analysis(uri, version).await {
-            Some(a) => a,
-            None => return Ok(None),
-        };
 
         // If the document advanced while we were waiting on `get_analysis`,
         // `cursor_byte` points into stale text and `analysis.scopes` byte
@@ -499,7 +491,7 @@ impl Backend {
             .await;
 
         // Walk from innermost scope outward, looking for the variable
-        let shape = match find_shape_for_variable(&analysis.scopes, cursor_byte, &var_name) {
+        let shape = match find_shape_for_variable(&cached.analysis.scopes, cursor_byte, &var_name) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -562,13 +554,16 @@ fn format_hover(var_name: &str, shape: &[String]) -> String {
 }
 
 
-/// Return the UTF-16 code-unit count of the given 0-based line in `text`.
-/// LSP `Position.character` is UTF-16 code units by default.
-fn line_length(text: &str, line: u32) -> u32 {
+/// UTF-16 code-unit counts (LSP `Position.character` units) for each 0-based
+/// line in `start..=end`, computed in a single pass over `text`. Lines past
+/// the end of the text are simply absent from the map.
+fn line_lengths_in_range(text: &str, start: u32, end: u32) -> HashMap<u32, u32> {
     text.lines()
-        .nth(line as usize)
-        .map(|l| l.encode_utf16().count() as u32)
-        .unwrap_or(0)
+        .enumerate()
+        .skip(start as usize)
+        .take((end as usize).saturating_sub(start as usize) + 1)
+        .map(|(i, l)| (i as u32, l.encode_utf16().count() as u32))
+        .collect()
 }
 
 /// Map an `initializationOptions` value to a diagnostic severity.
@@ -1083,17 +1078,19 @@ mod tests {
     #[test]
     fn line_length_basic() {
         let text = "x = 1\ny = 2\n";
-        assert_eq!(line_length(text, 0), 5);
-        assert_eq!(line_length(text, 1), 5);
+        let lens = line_lengths_in_range(text, 0, 1);
+        assert_eq!(lens.get(&0).copied(), Some(5));
+        assert_eq!(lens.get(&1).copied(), Some(5));
     }
 
     #[test]
     fn line_length_utf16() {
         // α is U+03B1 → 2 UTF-16 code units. "α = 1" → 2+3 = 5 code units, but 5+2=7 bytes.
         let text = "\u{03b1} = 1\n";
-        assert_eq!(line_length(text, 0), 5); // UTF-16 code units, not bytes
+        let lens = line_lengths_in_range(text, 0, 0);
+        assert_eq!(lens.get(&0).copied(), Some(5)); // UTF-16 code units, not bytes
         assert_ne!(
-            line_length(text, 0) as usize,
+            lens[&0] as usize,
             text.lines().next().unwrap().len()
         ); // bytes ≠ code units
     }
@@ -1101,14 +1098,26 @@ mod tests {
     #[test]
     fn line_length_empty_line() {
         let text = "\n\n";
-        assert_eq!(line_length(text, 0), 0);
-        assert_eq!(line_length(text, 1), 0);
+        let lens = line_lengths_in_range(text, 0, 1);
+        assert_eq!(lens.get(&0).copied(), Some(0));
+        assert_eq!(lens.get(&1).copied(), Some(0));
     }
 
     #[test]
     fn line_length_out_of_range() {
         let text = "abc\n";
-        assert_eq!(line_length(text, 99), 0);
+        // Lines past the end of the text are absent; callers default to 0.
+        assert_eq!(line_lengths_in_range(text, 99, 120).get(&99), None);
+    }
+
+    #[test]
+    fn line_length_window_excludes_outside_lines() {
+        let text = "a\nbb\nccc\ndddd\n";
+        let lens = line_lengths_in_range(text, 1, 2);
+        assert_eq!(lens.get(&0), None);
+        assert_eq!(lens.get(&1).copied(), Some(2));
+        assert_eq!(lens.get(&2).copied(), Some(3));
+        assert_eq!(lens.get(&3), None);
     }
 
 }
