@@ -478,7 +478,7 @@ fn apply_conv_layer(
 
     let channels_idx = input_shape.len() - spatial_rank - 1;
     let channels_dim = &input_shape[channels_idx];
-    if channels_dim != in_channels {
+    if dims_provably_mismatch(in_channels, channels_dim) {
         return Err(format!(
             "{} layer '{}' expected {} input channels, got {} for '{}'",
             layer_name, app.layer, in_channels, channels_dim, app.input
@@ -523,6 +523,40 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
     }
 }
 
+/// Canonicalize a dim expression for comparison: strip whitespace and sort
+/// commutative `+` terms / `*` factors so `a + b` matches `b+a`. Expressions
+/// with parens or non-commutative operators are only whitespace-stripped.
+fn canonical_dim(dim: &str) -> String {
+    let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.contains(['(', '-', '/']) {
+        return stripped;
+    }
+    let mut terms: Vec<String> = stripped
+        .split('+')
+        .map(|term| {
+            let mut factors: Vec<&str> = term.split('*').collect();
+            factors.sort_unstable();
+            factors.join("*")
+        })
+        .collect();
+    terms.sort_unstable();
+    terms.join("+")
+}
+
+fn dims_match(a: &str, b: &str) -> bool {
+    canonical_dim(a) == canonical_dim(b)
+}
+
+/// A layer's expected dim comes from constructor-argument text, a different
+/// vocabulary than jaxtyping annotation dims (issue #47). A mismatch is only
+/// an error when both sides are concrete integers; otherwise it's unprovable
+/// and the layer's output shape is trusted.
+fn dims_provably_mismatch(expected: &str, actual: &str) -> bool {
+    !dims_match(expected, actual)
+        && expected.trim().parse::<u64>().is_ok()
+        && actual.trim().parse::<u64>().is_ok()
+}
+
 pub fn apply_layer_application(
     app: &LayerApplication,
     shapes: &dyn ShapeLookup,
@@ -543,7 +577,7 @@ pub fn apply_layer_application(
                 ));
             };
 
-            if last_dim != in_features {
+            if dims_provably_mismatch(in_features, last_dim) {
                 return Err(format!(
                     "Linear layer '{}' expected input last dim {}, got {} for '{}'",
                     app.layer, in_features, last_dim, app.input
@@ -769,25 +803,27 @@ mod apply_layer_application_tests {
     }
 
     #[test]
-    fn test_symbolic_mismatch_returns_error() {
+    fn test_symbolic_mismatch_propagates() {
+        // Issue #47: "features" comes from ctor-argument text, "other" from a
+        // jaxtyping annotation — different vocabularies, unprovable mismatch.
+        // The layer output is trusted instead of erroring.
         let app = app("x", linear("features", "hidden"));
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "other"]))]);
 
-        let error = apply_layer_application(&app, &shapes).unwrap_err();
+        let output = apply_layer_application(&app, &shapes).unwrap();
 
-        assert!(error.contains("expected input last dim features"));
-        assert!(error.contains("got other"));
+        assert_eq!(output, Some(shape(&["batch", "hidden"])));
     }
 
     #[test]
-    fn test_numeric_and_symbolic_dims_do_not_match() {
+    fn test_numeric_and_symbolic_dims_propagate() {
+        // Issue #47: one symbolic side means the mismatch is unprovable.
         let app = app("x", linear("features", "hidden"));
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
 
-        let error = apply_layer_application(&app, &shapes).unwrap_err();
+        let output = apply_layer_application(&app, &shapes).unwrap();
 
-        assert!(error.contains("expected input last dim features"));
-        assert!(error.contains("got 3"));
+        assert_eq!(output, Some(shape(&["batch", "hidden"])));
     }
 
     #[test]

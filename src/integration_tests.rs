@@ -285,7 +285,11 @@ mod analyze_layer_shapes_tests {
     }
 
     #[test]
-    fn test_analysis_failed_assignment_does_not_overwrite_existing_shape() {
+    fn test_analysis_failed_assignment_evicts_stale_shape() {
+        // Issue #46: after a reassignment whose RHS can't be shaped (here, a
+        // failing layer application), the old binding must not survive —
+        // downstream uses would reason from stale data and emit false
+        // diagnostics.
         let tmp = tempfile::tempdir().unwrap();
         write_equinox_linear(&tmp);
         let code = "import equinox as eqx\ndef f(y: Float[Array, \"old shape\"], x: Float[Array, \"batch 3\"]):\n    bad_layer = eqx.nn.Linear(4, 5)\n    y = bad_layer(x)";
@@ -296,7 +300,23 @@ mod analyze_layer_shapes_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert_eq!(analysis.errors[0].variable, "y");
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["old", "shape"])));
+        assert_eq!(find_shape(&analysis, "y"), None);
+    }
+
+    #[test]
+    fn test_unshapeable_reassignment_evicts_and_suppresses_downstream_errors() {
+        // Issue #46 repro shape: an unclassified callable reassigns `h`; the
+        // stale conv-output shape must not leak into the later reshape and
+        // produce a false size-mismatch error.
+        let code = "def f(h: Float[Array, \"16 32 32\"]):\n    h = unknown_pool(h)\n    flat = h.reshape(32)";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "h"), None);
+        assert_eq!(find_shape(&analysis, "flat"), None);
     }
 
     #[test]
@@ -1470,29 +1490,37 @@ mod additional_edge_case_tests {
         linear("3", "5"),
         "got 4"
     );
-    apply_err_case!(
-        apply_case_sensitive_symbols,
+    // Symbolic/unprovable mismatches propagate instead of erroring (#47);
+    // whitespace and commutative +/* spelling are normalized before compare.
+    apply_ok_case!(
+        apply_case_sensitive_symbols_propagate,
         &["Batch", "Features"],
         linear("features", "out"),
-        "got Features"
+        &["Batch", "out"]
     );
-    apply_err_case!(
-        apply_whitespace_not_normalized_in_dims,
+    apply_ok_case!(
+        apply_whitespace_normalized_in_dims,
         &["features "],
         linear("features", "out"),
-        "got features "
+        &["out"]
     );
-    apply_err_case!(
-        apply_expression_dim_exact_mismatch,
+    apply_ok_case!(
+        apply_expression_dim_whitespace_normalized,
         &["hidden * 2"],
         linear("hidden*2", "out"),
-        "got hidden * 2"
+        &["out"]
     );
-    apply_err_case!(
-        apply_empty_last_dim_mismatch,
+    apply_ok_case!(
+        apply_commutative_sum_dims_match,
+        &["hidden+features"],
+        linear("features + hidden", "out"),
+        &["out"]
+    );
+    apply_ok_case!(
+        apply_empty_last_dim_propagates,
         &[""],
         linear("features", "out"),
-        "got "
+        &["out"]
     );
 
     macro_rules! annotation_case {
@@ -1660,29 +1688,32 @@ mod additional_edge_case_tests {
         linear("...", "out"),
         &["batch", "out"]
     );
-    apply_err_case!(
-        apply_comma_dimension_mismatch,
+    // Symbolic mismatches at the layer boundary are unprovable (ctor-arg
+    // vocabulary vs annotation vocabulary, issue #47): the layer output is
+    // trusted and propagated instead of erroring.
+    apply_ok_case!(
+        apply_comma_dimension_mismatch_propagates,
         &["batch", "features"],
         linear("features,", "out"),
-        "got features"
+        &["batch", "out"]
     );
-    apply_err_case!(
-        apply_question_mark_dimension_mismatch,
+    apply_ok_case!(
+        apply_question_mark_dimension_mismatch_propagates,
         &["batch", "features"],
         linear("features?", "out"),
-        "got features"
+        &["batch", "out"]
     );
-    apply_err_case!(
-        apply_ellipsis_dimension_mismatch,
+    apply_ok_case!(
+        apply_ellipsis_dimension_mismatch_propagates,
         &["batch", "features"],
         linear("...", "out"),
-        "got features"
+        &["batch", "out"]
     );
-    apply_err_case!(
-        apply_colon_dimension_mismatch,
+    apply_ok_case!(
+        apply_colon_dimension_mismatch_propagates,
         &["batch", "time"],
         linear("time:2", "out"),
-        "got time"
+        &["batch", "out"]
     );
 
     macro_rules! classify_case {
@@ -3072,12 +3103,13 @@ mod conv_layer_tests {
     }
 
     #[test]
-    fn test_conv2d_symbolic_channels_mismatch_error() {
+    fn test_conv2d_symbolic_channels_mismatch_propagates() {
+        // Issue #47: symbolic ctor channels vs symbolic annotation dim is an
+        // unprovable mismatch — trust the conv and propagate its output.
         let app = layer_app("x", conv2d("in_c", "16", "3", "1", "0"));
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "other", "H", "W"]))]);
-        let err = apply_layer_application(&app, &shapes).unwrap_err();
-        assert!(err.contains("expected in_c input channels"));
-        assert!(err.contains("got other"));
+        let output = apply_layer_application(&app, &shapes).unwrap().unwrap();
+        assert_eq!(output[1], "16");
     }
 
     #[test]
@@ -6315,5 +6347,38 @@ mod corpus_no_false_errors {
                 analysis.errors
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod symbolic_ctor_dim_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    /// Issue #47 repro: concat-into-Linear gate where the Linear's in_features
+    /// text ("input_size + hidden_size") can never string-match the
+    /// concatenated annotation dims ("hidden+features"). Must produce no
+    /// error and propagate the layer's output width.
+    #[test]
+    fn test_concat_into_symbolic_linear_no_false_error() {
+        let code = "import jax\nimport jax.numpy as jnp\nimport equinox as eqx\n\nclass GRUCell(eqx.Module):\n    wz: eqx.nn.Linear\n\n    def __init__(self, input_size, hidden_size, key):\n        self.wz = eqx.nn.Linear(input_size + hidden_size, hidden_size, key=key)\n\n    def step(self, h: Float[Array, \"hidden\"], x: Float[Array, \"features\"]):\n        hx = jnp.concatenate([h, x])\n        z = jax.nn.sigmoid(self.wz(hx))\n        return z";
+        let tree = parse(code);
+
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(
+            find_shape(&analysis, "z"),
+            Some(&vec!["hidden_size".to_string()])
+        );
     }
 }

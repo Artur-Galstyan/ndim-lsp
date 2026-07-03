@@ -325,6 +325,13 @@ impl<'a> ShapeCtx<'a> {
         self.scopes[scope_idx].shapes.insert(name.to_string(), shape);
     }
 
+    /// Drop a stale binding when a reassignment's RHS can't be shaped.
+    /// Keeping the old shape would make every downstream use reason from
+    /// stale data and report confident false diagnostics (issue #46).
+    fn evict_binding(&mut self, scope_idx: usize, name: &str) {
+        self.scopes[scope_idx].shapes.remove(name);
+    }
+
     /// Look up a shape by name in the given scope, checking both real
     /// user-visible shapes and the synthetic side-channel.
     fn resolve_shape(&self, name: &str, scope_idx: usize) -> Option<Vec<String>> {
@@ -1264,12 +1271,17 @@ fn propagate_calls(
                                             display_line,
                                         );
                                     }
-                                    Ok(None) => {}
-                                    Err(message) => ctx.errors.push(ShapeError {
-                                        variable: lhs_name.clone(),
-                                        message,
-                                        range: application.range,
-                                    }),
+                                    Ok(None) => {
+                                        ctx.evict_binding(scope_idx, &lhs_name);
+                                    }
+                                    Err(message) => {
+                                        ctx.evict_binding(scope_idx, &lhs_name);
+                                        ctx.errors.push(ShapeError {
+                                            variable: lhs_name.clone(),
+                                            message,
+                                            range: application.range,
+                                        });
+                                    }
                                 }
                                 ctx.applications.push(application);
                                 continue;
@@ -1291,6 +1303,11 @@ fn propagate_calls(
 
         if let Some(shape) = result {
             ctx.record_binding(scope_idx, &lhs_name, shape, display_line);
+        } else if display_line.is_some() {
+            // Non-annotated reassignment with an unshapeable RHS: the old
+            // binding is stale now (issue #46). Annotated assignments keep
+            // their user-written shape.
+            ctx.evict_binding(scope_idx, &lhs_name);
         }
     }
 
@@ -1465,11 +1482,19 @@ fn handle_tuple_assignment(
         return;
     };
     let Some(elem_shapes) = tuple_rhs_shapes(rhs_node, names.len(), scope_idx, ctx) else {
+        // Unmodelled multi-output RHS: prior bindings for the targets are
+        // stale now (issue #46).
+        for name in names.iter().flatten() {
+            ctx.evict_binding(scope_idx, name);
+        }
         return;
     };
     for (name, shape) in names.iter().zip(elem_shapes) {
-        if let (Some(name), Some(shape)) = (name, shape) {
-            ctx.record_binding(scope_idx, name, shape, display_line);
+        if let Some(name) = name {
+            match shape {
+                Some(shape) => ctx.record_binding(scope_idx, name, shape, display_line),
+                None => ctx.evict_binding(scope_idx, name),
+            }
         }
     }
 }
