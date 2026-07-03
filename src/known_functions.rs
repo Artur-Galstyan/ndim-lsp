@@ -442,6 +442,9 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "sort" => Some(KnownFunction::Sort),
         "cumsum" => Some(KnownFunction::Cumsum),
         "cumprod" => Some(KnownFunction::Cumprod),
+        "tile" => Some(KnownFunction::Tile),
+        "repeat" | "repeat_interleave" => Some(KnownFunction::Repeat),
+        "expand" | "broadcast_to" => Some(KnownFunction::BroadcastTo),
         "astype" => Some(KnownFunction::Astype),
         "copy" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
@@ -457,6 +460,17 @@ pub fn apply_method_call(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
+    // torch `x.repeat(2, 3)` tiles per-dim; numpy `a.repeat(n[, axis])`
+    // repeats elements. ≥2 positional args → torch tile semantics.
+    let positional_count = args
+        .iter()
+        .filter(|arg| matches!(arg, CallArgument::Positional { .. }))
+        .count();
+    let method = if matches!(method, KnownFunction::Repeat) && positional_count >= 2 {
+        &KnownFunction::Tile
+    } else {
+        method
+    };
     let synthesized = synthesize_method_args(method, receiver, args);
     apply_known_function(method, &synthesized, shapes)
 }
@@ -473,7 +487,11 @@ fn synthesize_method_args(
 
     let needs_tuple_collapse = matches!(
         method,
-        KnownFunction::Reshape | KnownFunction::Permute | KnownFunction::Transpose
+        KnownFunction::Reshape
+            | KnownFunction::Permute
+            | KnownFunction::Transpose
+            | KnownFunction::Tile
+            | KnownFunction::BroadcastTo
     ) && positional_count >= 2;
 
     let mut result = Vec::with_capacity(args.len() + 1);
@@ -1747,9 +1765,9 @@ fn apply_known_broadcast_to(
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    if shapes.shape(input_name).is_none() {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
-    }
+    };
 
     let mut shape_value = None;
     let mut seen_first_positional = false;
@@ -1767,7 +1785,18 @@ fn apply_known_broadcast_to(
         }
     }
 
-    Ok(shape_value.and_then(parse_shape_value))
+    let Some(mut target) = shape_value.and_then(parse_shape_value) else {
+        return Ok(None);
+    };
+    // torch `x.expand(...)`: -1 means "keep this dim". Right-align against
+    // the input shape (expand may prepend new leading dims).
+    let offset = target.len().saturating_sub(input_shape.len());
+    for (i, dim) in target.iter_mut().enumerate() {
+        if dim == "-1" && i >= offset {
+            dim.clone_from(&input_shape[i - offset]);
+        }
+    }
+    Ok(Some(target))
 }
 
 fn apply_known_broadcast_arrays(
@@ -5998,6 +6027,60 @@ mod method_call_tests {
         let result = apply_method_call(&KnownFunction::Reshape, "x", &args, &shapes);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_classify_expand_repeat_tile() {
+        assert_eq!(
+            classify_method_call("expand"),
+            Some(KnownFunction::BroadcastTo)
+        );
+        assert_eq!(classify_method_call("repeat"), Some(KnownFunction::Repeat));
+        assert_eq!(
+            classify_method_call("repeat_interleave"),
+            Some(KnownFunction::Repeat)
+        );
+        assert_eq!(classify_method_call("tile"), Some(KnownFunction::Tile));
+    }
+
+    #[test]
+    fn test_apply_torch_repeat_multi_positional_tiles() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+        let args = vec![pos("4"), pos("5")];
+
+        let output = apply_method_call(&KnownFunction::Repeat, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "15"])));
+    }
+
+    #[test]
+    fn test_apply_numpy_repeat_single_arg_with_axis() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+        let args = vec![pos("4"), kw("axis", "0")];
+
+        let output = apply_method_call(&KnownFunction::Repeat, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "3"])));
+    }
+
+    #[test]
+    fn test_apply_expand_with_minus_one_keeps_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["1", "d"]))]);
+        let args = vec![pos("batch"), pos("-1")];
+
+        let output = apply_method_call(&KnownFunction::BroadcastTo, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "d"])));
+    }
+
+    #[test]
+    fn test_apply_expand_prepends_leading_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["d"]))]);
+        let args = vec![pos("batch"), pos("-1")];
+
+        let output = apply_method_call(&KnownFunction::BroadcastTo, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "d"])));
     }
 
     #[test]

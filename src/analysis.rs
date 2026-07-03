@@ -112,7 +112,7 @@ where
             continue;
         }
         let names: Vec<String> = match lhs {
-            Lhs::Single(name) => vec![name],
+            Lhs::Single(name) | Lhs::Augmented(name) => vec![name],
             Lhs::Tuple(names) => names.into_iter().flatten().collect(),
         };
         if names.is_empty() {
@@ -1181,6 +1181,10 @@ fn propagate_calls(
         // Tuple-pattern unpacking (issue #30) — bind each element and move on.
         let lhs_name = match lhs {
             Lhs::Single(name) => name,
+            Lhs::Augmented(name) => {
+                handle_augmented_assignment(&name, rhs_node, assignment_node, display_line, &mut ctx);
+                continue;
+            }
             Lhs::Tuple(names) => {
                 handle_tuple_assignment(&names, rhs_node, display_line, &mut ctx);
                 continue;
@@ -1312,6 +1316,9 @@ fn propagate_calls(
 enum Lhs {
     /// `x = ...`
     Single(String),
+    /// `x += ...` / `x @= ...` etc. — combines the existing LHS shape with
+    /// the RHS shape instead of replacing it.
+    Augmented(String),
     /// `a, b = ...` / `(a, b) = ...` / `[a, b] = ...`. Each element is the
     /// target name, or `None` for `_` and non-identifier elements (skipped).
     Tuple(Vec<Option<String>>),
@@ -1343,12 +1350,12 @@ fn collect_items_recursive<'a>(
             // all its children.
             for j in 0..child.named_child_count() {
                 let inner = child.named_child(j as u32).unwrap();
-                if inner.kind() == "assignment" {
+                if inner.kind() == "assignment" || inner.kind() == "augmented_assignment" {
                     push_assignment_item(inner, text, out);
                 }
             }
             continue;
-        } else if child.kind() == "assignment" {
+        } else if child.kind() == "assignment" || child.kind() == "augmented_assignment" {
             push_assignment_item(child, text, out);
             // Also don't recurse into bare assignment nodes to avoid
             // double-counting.
@@ -1375,7 +1382,12 @@ fn push_assignment_item<'a>(
     match lhs.kind() {
         "identifier" => {
             if let Ok(name) = lhs.utf8_text(text.as_bytes()) {
-                out.push((Lhs::Single(name.to_string()), rhs, assignment));
+                let lhs = if assignment.kind() == "augmented_assignment" {
+                    Lhs::Augmented(name.to_string())
+                } else {
+                    Lhs::Single(name.to_string())
+                };
+                out.push((lhs, rhs, assignment));
             }
         }
         "pattern_list" | "tuple_pattern" | "list_pattern" => {
@@ -1395,6 +1407,50 @@ fn push_assignment_item<'a>(
             out.push((Lhs::Tuple(names), rhs, assignment));
         }
         _ => {}
+    }
+}
+
+/// Propagate `x += expr` / `x @= expr`: the new shape of `x` combines its
+/// existing shape with the RHS shape (broadcast for elementwise ops, matmul
+/// for `@=`) rather than replacing it. Missing shapes skip silently.
+fn handle_augmented_assignment(
+    name: &str,
+    rhs_node: Node,
+    assignment_node: Node,
+    display_line: Option<u32>,
+    ctx: &mut ShapeCtx,
+) {
+    let Some(scope_idx) = scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) else {
+        return;
+    };
+    let Some(lhs_shape) = ctx.resolve_shape(name, scope_idx) else {
+        return;
+    };
+    let Some(rhs_shape) = shape_of_expression(rhs_node, ctx) else {
+        return;
+    };
+
+    let op_text = assignment_node
+        .child_by_field_name("operator")
+        .and_then(|op| op.utf8_text(ctx.text.as_bytes()).ok())
+        .unwrap_or("+=");
+    let result = match op_text {
+        "@=" => apply_matmul_shape(&lhs_shape, &rhs_shape, name, "rhs"),
+        "-=" => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Sub),
+        "*=" => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Mul),
+        "/=" => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Div),
+        // +=, and any other in-place op (//=, **=, %=, bitwise) is
+        // elementwise-broadcasting for shape purposes.
+        _ => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Add),
+    };
+    match result {
+        Ok(Some(shape)) => ctx.record_binding(scope_idx, name, shape, display_line),
+        Ok(None) => {}
+        Err(message) => ctx.errors.push(ShapeError {
+            variable: name.to_string(),
+            message,
+            range: assignment_node.range(),
+        }),
     }
 }
 

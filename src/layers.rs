@@ -86,6 +86,14 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 _ => None,
             }
         }
+        // equinox names it `embedding_size`, torch `embedding_dim`.
+        "Embedding" => Some(LayerKind::Embedding {
+            embedding_size: call
+                .bindings
+                .get("embedding_size")
+                .or_else(|| call.bindings.get("embedding_dim"))?
+                .clone(),
+        }),
         // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations)
         "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
         | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
@@ -134,6 +142,7 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     let class_name = parts.last()?.as_str();
     let params: &[&str] = match class_name {
         "Linear" => &["self", "in_features", "out_features", "use_bias"],
+        "Embedding" => &["self", "num_embeddings", "embedding_size"],
         "Conv1d" | "Conv2d" | "Conv3d" => &[
             "self",
             "in_channels",
@@ -600,6 +609,12 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
+        // Index lookup: appends the embedding dim to the (integer) input shape.
+        LayerKind::Embedding { embedding_size } => {
+            let mut output_shape = input_shape.clone();
+            output_shape.push(embedding_size.clone());
+            Ok(Some(output_shape))
+        }
         // Shape-preserving layers: output shape equals input shape, but some
         // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
         LayerKind::ShapePreserving { name } => {
@@ -2079,6 +2094,74 @@ mod catalog_first_extract_layer_assignments_tests {
                 in_features: "128".to_string(),
                 out_features: "256".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_equinox_embedding_without_disk() {
+        let code = "import equinox as eqx\nemb = eqx.nn.Embedding(10000, 512)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("emb"),
+            Some(&LayerKind::Embedding {
+                embedding_size: "512".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_embedding_kwarg_without_disk() {
+        let code = "import torch\nemb = torch.nn.Embedding(10000, embedding_dim=768)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("emb"),
+            Some(&LayerKind::Embedding {
+                embedding_size: "768".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_apply_embedding_appends_dim() {
+        let shapes = HashMap::from([
+            ("tokens".to_string(), vec!["batch".to_string(), "seq".to_string()]),
+            ("idx".to_string(), Vec::new()),
+        ]);
+        let kind = LayerKind::Embedding {
+            embedding_size: "512".to_string(),
+        };
+        let app = |input: &str| LayerApplication {
+            variable: "y".to_string(),
+            layer: "emb".to_string(),
+            input: input.to_string(),
+            kind: kind.clone(),
+            range: tree_sitter::Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+        };
+
+        assert_eq!(
+            apply_layer_application(&app("tokens"), &shapes).unwrap(),
+            Some(vec![
+                "batch".to_string(),
+                "seq".to_string(),
+                "512".to_string()
+            ])
+        );
+        assert_eq!(
+            apply_layer_application(&app("idx"), &shapes).unwrap(),
+            Some(vec!["512".to_string()])
         );
     }
 

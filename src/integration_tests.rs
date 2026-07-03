@@ -6162,3 +6162,158 @@ mod coverage_harness {
         );
     }
 }
+
+#[cfg(test)]
+mod augmented_assignment_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_plus_equals_broadcast_keeps_shape() {
+        let code = "def f(x: Float[Array, \"batch f\"], bias: Float[Array, \"f\"]):\n    x += bias";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "f"])));
+        assert!(
+            analysis
+                .assignment_shapes
+                .iter()
+                .any(|r| r.name == "x" && r.shape == shape(&["batch", "f"]))
+        );
+    }
+
+    #[test]
+    fn test_plus_equals_incompatible_errors() {
+        let code =
+            "def f(x: Float[Array, \"batch f\"], y: Float[Array, \"batch g\"]):\n    x += y";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert_eq!(analysis.errors[0].variable, "x");
+    }
+
+    #[test]
+    fn test_matmul_equals_updates_shape() {
+        let code = "def f(h: Float[Array, \"batch d1\"], w: Float[Array, \"d1 d2\"]):\n    h @= w";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["batch", "d2"])));
+    }
+
+    #[test]
+    fn test_times_equals_scalar_literal_skips_silently() {
+        let code = "def f(x: Float[Array, \"batch f\"]):\n    x *= 2";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "f"])));
+    }
+
+    #[test]
+    fn test_plus_equals_with_call_rhs() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch f\"], y: Float[Array, \"batch f\"]):\n    x += jnp.exp(y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "f"])));
+    }
+}
+
+#[cfg(test)]
+mod embedding_layer_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_torch_embedding_appends_dim() {
+        let code = "import torch\ndef f(tokens: Int[Array, \"batch seq\"]):\n    emb = torch.nn.Embedding(10000, 512)\n    y = emb(tokens)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "seq", "512"]))
+        );
+    }
+
+    #[test]
+    fn test_equinox_embedding_appends_dim() {
+        let code = "import equinox as eqx\ndef f(tokens: Int[Array, \"seq\"]):\n    emb = eqx.nn.Embedding(10000, 512)\n    y = emb(tokens)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["seq", "512"])));
+    }
+}
+
+#[cfg(test)]
+mod corpus_no_false_errors {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tree_sitter::Parser;
+
+    /// Corpus files are valid model code — analysis must not publish
+    /// diagnostics for any of them. Dark spots (no shape) are fine;
+    /// errors are not.
+    #[test]
+    fn corpus_files_produce_no_errors() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("py") {
+                continue;
+            }
+            let code = fs::read_to_string(&path).unwrap();
+            let tree = parser.parse(&code, None).unwrap();
+            let analysis =
+                analyze_layer_shapes(tree.root_node(), &code, &[], |_| None, 5, None).unwrap();
+            assert!(
+                analysis.errors.is_empty(),
+                "{:?} produced errors: {:?}",
+                path.file_name().unwrap(),
+                analysis.errors
+            );
+        }
+    }
+}

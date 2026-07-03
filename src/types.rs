@@ -130,6 +130,11 @@ pub enum LayerKind {
         stride: String,
         padding: String,
     },
+    /// Index lookup table: appends `embedding_size` to the input shape
+    /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
+    Embedding {
+        embedding_size: String,
+    },
     ShapePreserving {
         name: String,
     },
