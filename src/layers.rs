@@ -271,6 +271,26 @@ fn try_catalog_signature(
     }))
 }
 
+/// Classify a bare constructor call node (e.g. the `nn.Dense(features=64)` in
+/// `nn.Dense(features=64)(x)`) against the built-in catalog. No disk I/O —
+/// the inline idiom is only supported for catalogued framework layers.
+pub fn classify_inline_constructor(
+    ctor_call: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+) -> Option<LayerKind> {
+    let func = ctor_call.child_by_field_name("function")?;
+    let target = func.utf8_text(text.as_bytes()).ok()?;
+    let args_node = ctor_call.child_by_field_name("arguments")?;
+    let call = CallInfo {
+        variable: String::new(),
+        target: target.to_string(),
+        args_node_range: args_node.range(),
+    };
+    let resolved = try_catalog_signature(&call, ctor_call, text, import_map).ok()??;
+    classify_layer_call(&resolved)
+}
+
 pub fn extract_layer_assignments<F>(
     node: Node,
     text: &str,

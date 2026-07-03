@@ -6501,3 +6501,53 @@ mod literal_binop_scan_method_tests {
         assert!(analysis.errors[0].message.contains("expected rank 1"));
     }
 }
+
+#[cfg(test)]
+mod inline_layer_application_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_equinox_linear_constructed_and_applied_inline() {
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    y = eqx.nn.Linear(3, 5)(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+    }
+
+    #[test]
+    fn test_inline_layer_concrete_mismatch_errors() {
+        let code = "import equinox as eqx\ndef f(x: Float[Array, \"batch 4\"]):\n    y = eqx.nn.Linear(3, 5)(x)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert!(analysis.errors[0].message.contains("got 4"));
+    }
+
+    #[test]
+    fn test_inline_layer_nested_in_activation() {
+        let code = "import jax\nimport equinox as eqx\ndef f(x: Float[Array, \"batch 3\"]):\n    y = jax.nn.relu(eqx.nn.Linear(3, 5)(x))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
+    }
+}

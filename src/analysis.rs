@@ -8,7 +8,8 @@ use crate::known_functions::{
     compute_split_shapes,
 };
 use crate::layers::{
-    apply_layer_application, extract_layer_assignments_scoped, extract_self_attr_layers,
+    apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
+    extract_self_attr_layers,
 };
 use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_jaxtyping_shapes, extract_self_attr_aliases,
@@ -619,12 +620,15 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let func_node = node.child_by_field_name("function")?;
     let args_node = node.child_by_field_name("arguments")?;
 
-    // ── Inline vmap application (issue #35) ──
-    // `jax.vmap(self.layer)(x)` / `eqx.filter_vmap(f)(x)` parse as a call whose
-    // `function` field is itself a vmap call. A call-of-a-call only has a shape
-    // rule in this inline-vmap form; otherwise there's nothing to resolve.
+    // ── Call-of-a-call ──
+    // `jax.vmap(self.layer)(x)` (inline vmap, issue #35) or a layer
+    // constructed and applied in one expression like `nn.Dense(64)(x)`
+    // (the dominant flax style).
     if func_node.kind() == "call" {
-        return shape_of_inline_vmap(func_node, args_node, scope_idx, ctx);
+        if let Some(shape) = shape_of_inline_vmap(func_node, args_node, scope_idx, ctx) {
+            return Some(shape);
+        }
+        return shape_of_inline_layer(func_node, args_node, scope_idx, ctx);
     }
 
     // ── Chained method calls ──
@@ -1848,6 +1852,46 @@ fn shape_of_inline_vmap(
     }
 
     None
+}
+
+/// Resolve `Layer(...)(x)` — a catalogued layer constructed and applied in
+/// one expression, e.g. flax's `nn.Dense(features=64)(x)` or
+/// `eqx.nn.Linear(3, 5)(x)`.
+fn shape_of_inline_layer(
+    ctor_call: Node,
+    outer_args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let kind = classify_inline_constructor(ctor_call, ctx.text, ctx.import_map)?;
+    let raw_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
+    let args = resolve_call_args(raw_args, outer_args_node, scope_idx, ctx)?;
+    let CallArgument::Positional { value: input } = args.first()?.clone() else {
+        return None;
+    };
+    let layer = ctor_call
+        .utf8_text(ctx.text.as_bytes())
+        .unwrap_or("")
+        .to_string();
+    let application = LayerApplication {
+        variable: String::new(),
+        layer,
+        input,
+        kind,
+        range: outer_args_node.range(),
+    };
+    match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
+        Ok(Some(output)) => Some(output),
+        Ok(None) => None,
+        Err(message) => {
+            ctx.errors.push(ShapeError {
+                variable: String::new(),
+                message,
+                range: outer_args_node.range(),
+            });
+            None
+        }
+    }
 }
 
 /// Apply a layer batched over its leading axis: peel the batch dim at
