@@ -6777,3 +6777,51 @@ mod linalg_tuple_unpacking_tests {
         assert_eq!(find_shape(&analysis, "u"), None);
     }
 }
+
+#[cfg(test)]
+mod multihead_attention_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// End-to-end mirror of corpus/torch_attention.py's forward pass.
+    #[test]
+    fn test_multihead_attention_tuple_unpacking() {
+        let code = "import torch\nimport torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n        self.norm = nn.LayerNorm(512)\n        self.ff = nn.Linear(512, 512)\n\n    def forward(self, x: Float[Array, \"seq 512\"]):\n        attn_out, attn_weights = self.attn(x, x, x)\n        h = x + attn_out\n        h = self.norm(h)\n        h += self.ff(h)\n        return h";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "attn_out"), Some(&shape(&["seq", "512"])));
+        assert_eq!(
+            find_shape(&analysis, "attn_weights"),
+            Some(&shape(&["seq", "seq"]))
+        );
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["seq", "512"])));
+    }
+
+    #[test]
+    fn test_multihead_attention_cross_attention_weights() {
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out, w = self.attn(q, kv, kv)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["tgt", "src"])));
+    }
+}

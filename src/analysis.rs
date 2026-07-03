@@ -1565,6 +1565,42 @@ fn tuple_rhs_shapes(
         "call" => {
             let func = rhs.child_by_field_name("function")?;
             let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
+
+            // `attn_out, attn_weights = self.attn(q, k, v)` where self.attn
+            // is a MultiheadAttention built in __init__: output has the
+            // query's shape; weights are (..., L, S) with default
+            // average_attn_weights.
+            if let Some(attr) = target.strip_prefix("self.")
+                && matches!(
+                    ctx.self_attr_layers.get(attr),
+                    Some(LayerKind::MultiheadAttention { .. })
+                )
+            {
+                if n_targets != 2 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut positionals = args.iter().filter_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                });
+                let query = positionals.next()?;
+                let key = positionals.next().unwrap_or(query);
+                let query_shape = ctx.resolve_shape(query, scope_idx)?;
+                if query_shape.len() < 2 {
+                    return None;
+                }
+                let weights = ctx.resolve_shape(key, scope_idx).and_then(|key_shape| {
+                    let s = key_shape.get(key_shape.len().checked_sub(2)?)?.clone();
+                    let mut w = query_shape.clone();
+                    w.pop();
+                    w.push(s);
+                    Some(w)
+                });
+                return Some(vec![Some(query_shape), weights]);
+            }
+
             let resolved = resolve_call_target(target, ctx.import_map);
             let known = classify_known_function(&resolved);
 

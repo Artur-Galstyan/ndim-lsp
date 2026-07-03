@@ -159,6 +159,12 @@ pub enum LayerKind {
         spatial_rank: usize,
         output_size: String,
     },
+    /// torch.nn.MultiheadAttention — returns an (output, weights) tuple:
+    /// output has the query's shape, weights are (..., L, S) with L/S the
+    /// query/key sequence lengths. Only tuple-unpacking LHS is modelled.
+    MultiheadAttention {
+        embed_dim: String,
+    },
     /// Index lookup table: appends `embedding_size` to the input shape
     /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
     Embedding {

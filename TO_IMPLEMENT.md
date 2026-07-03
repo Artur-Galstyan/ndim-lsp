@@ -246,7 +246,7 @@ Legend:
 | `GroupNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; GroupNorm enforces min rank 1. |
 | activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; activations accept any rank. |
 | pooling layers | ✅ | ✅ | ✅ | Max/Avg/Adaptive{Max,Avg}Pool 1d/2d/3d, channels-first; conv output formula (adaptive sets spatial dims to output_size). Torch stride default (= kernel_size). |
-| attention layers | ❌ | ❌ | ❌ | Query/key/value shape rules. |
+| `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Tuple LHS: output = query shape, weights = (…, L, S); default average_attn_weights. Other attention layers still ❌. |
 
 ## Method calls
 
@@ -300,14 +300,14 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **95%** (71/75) across eleven corpus files; the dark spots
+(`d*3` split 3 → `d`). Corpus coverage is **100%** (75/75) across eleven corpus files; the dark spots
 below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
-   (corpus/torch_attention.py). Also: scan's stacked `ys` output is still
-   skipped (needs body output inference).
+1. **Grow the corpus again** — 100% on the current eleven files. Known
+   remaining approximations: scan's stacked `ys` output, strided flax Conv,
+   non-default svd/qr/meshgrid modes.
 2. **Cross-*file* return-type tracing** — same-file helpers already propagate;
    imported helpers don't yet.
 3. **Remaining single-function shape rules** — see ❌ rows above

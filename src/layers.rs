@@ -160,6 +160,9 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 output_size,
             })
         }
+        "MultiheadAttention" => Some(LayerKind::MultiheadAttention {
+            embed_dim: call.bindings.get("embed_dim")?.clone(),
+        }),
         // equinox names it `embedding_size`, torch `embedding_dim`.
         "Embedding" => Some(LayerKind::Embedding {
             embedding_size: call
@@ -234,6 +237,7 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         }
         "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
         | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => &["self", "output_size"],
+        "MultiheadAttention" => &["self", "embed_dim", "num_heads"],
         "Conv1d" | "Conv2d" | "Conv3d" => &[
             "self",
             "in_channels",
@@ -754,6 +758,10 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
+        // Returns an (output, weights) tuple — a single shape can't express
+        // it, so direct application skips; tuple unpacking is handled in
+        // analysis::tuple_rhs_shapes.
+        LayerKind::MultiheadAttention { .. } => Ok(None),
         // flax channels-last: last dim becomes `features`, nothing to check
         // (flax infers the input width at runtime).
         LayerKind::Dense { features } => {
