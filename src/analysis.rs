@@ -1594,6 +1594,28 @@ fn tuple_rhs_shapes(
                 return Some(vec![Some(init_shape), None]);
             }
 
+            // Multi-output linear algebra + meshgrid (v1: default modes only —
+            // any keyword argument like full_matrices/mode/indexing skips).
+            if matches!(
+                known,
+                Some(
+                    KnownFunction::LinalgSvd
+                        | KnownFunction::LinalgQr
+                        | KnownFunction::LinalgEig
+                        | KnownFunction::Meshgrid
+                )
+            ) {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                if args
+                    .iter()
+                    .any(|a| matches!(a, CallArgument::Keyword { .. }))
+                {
+                    return None;
+                }
+                return linalg_tuple_shapes(&known?, &args, n_targets, scope_idx, ctx);
+            }
+
             if !matches!(known, Some(KnownFunction::Split)) {
                 return None;
             }
@@ -1616,6 +1638,101 @@ fn tuple_rhs_shapes(
     }
 }
 
+
+/// `min(a, b)` as a dim: computed when both concrete, `a` when they match
+/// textually, an opaque `min(a,b)` symbol otherwise.
+fn min_dim(a: &str, b: &str) -> String {
+    if let (Ok(x), Ok(y)) = (a.parse::<usize>(), b.parse::<usize>()) {
+        return x.min(y).to_string();
+    }
+    if a == b {
+        return a.to_string();
+    }
+    format!("min({},{})", a, b)
+}
+
+/// Per-target shapes for multi-output linalg calls and meshgrid, default
+/// modes only (numpy semantics):
+/// - `u, s, vt = svd(a)`: a (m, n) → (m, m), (min(m,n),), (n, n)
+/// - `q, r = qr(a)`: a (m, n) → (m, min(m,n)), (min(m,n), n)
+/// - `evals, evecs = eig/eigh(a)`: a (…, n) → (n,), (n, n)
+/// - `gx, gy = meshgrid(xs, ys)`: 'xy' indexing → both (ny, nx)
+fn linalg_tuple_shapes(
+    known: &KnownFunction,
+    args: &[CallArgument],
+    n_targets: usize,
+    scope_idx: usize,
+    ctx: &ShapeCtx,
+) -> Option<Vec<Option<Vec<String>>>> {
+    let positionals: Vec<&str> = args
+        .iter()
+        .filter_map(|a| match a {
+            CallArgument::Positional { value } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    match known {
+        KnownFunction::Meshgrid => {
+            if positionals.len() != n_targets {
+                return None;
+            }
+            let mut lens = Vec::with_capacity(positionals.len());
+            for name in &positionals {
+                let shape = ctx.resolve_shape(name, scope_idx)?;
+                let [len] = shape.as_slice() else {
+                    return None;
+                };
+                lens.push(len.clone());
+            }
+            // Default 'xy' indexing swaps the first two axes.
+            if lens.len() >= 2 {
+                lens.swap(0, 1);
+            }
+            Some(vec![Some(lens); n_targets])
+        }
+        _ => {
+            let input = positionals.first()?;
+            let shape = ctx.resolve_shape(input, scope_idx)?;
+            let [m, n] = shape.as_slice() else {
+                return None;
+            };
+            match known {
+                KnownFunction::LinalgSvd => {
+                    if n_targets != 3 {
+                        return None;
+                    }
+                    let k = min_dim(m, n);
+                    Some(vec![
+                        Some(vec![m.clone(), m.clone()]),
+                        Some(vec![k]),
+                        Some(vec![n.clone(), n.clone()]),
+                    ])
+                }
+                KnownFunction::LinalgQr => {
+                    if n_targets != 2 {
+                        return None;
+                    }
+                    let k = min_dim(m, n);
+                    Some(vec![
+                        Some(vec![m.clone(), k.clone()]),
+                        Some(vec![k, n.clone()]),
+                    ])
+                }
+                KnownFunction::LinalgEig => {
+                    if n_targets != 2 {
+                        return None;
+                    }
+                    Some(vec![
+                        Some(vec![n.clone()]),
+                        Some(vec![n.clone(), n.clone()]),
+                    ])
+                }
+                _ => None,
+            }
+        }
+    }
+}
 
 /// Collect the inner expression nodes from return_statement, yield, and
 /// assert_statement nodes. These are value-position contexts where

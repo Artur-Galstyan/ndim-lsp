@@ -6703,3 +6703,77 @@ mod einops_tests {
         assert_eq!(find_shape(&analysis, "y"), None);
     }
 }
+
+#[cfg(test)]
+mod linalg_tuple_unpacking_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_svd_unpacking() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"n d\"]):\n    u, s, vt = jnp.linalg.svd(a)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "u"), Some(&shape(&["n", "n"])));
+        assert_eq!(find_shape(&analysis, "s"), Some(&shape(&["min(n,d)"])));
+        assert_eq!(find_shape(&analysis, "vt"), Some(&shape(&["d", "d"])));
+    }
+
+    #[test]
+    fn test_qr_unpacking_concrete() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"6 4\"]):\n    q, r = jnp.linalg.qr(a)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "q"), Some(&shape(&["6", "4"])));
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&["4", "4"])));
+    }
+
+    #[test]
+    fn test_eigh_unpacking() {
+        let code = "import jax.numpy as jnp\ndef f(w: Float[Array, \"d d\"]):\n    evals, evecs = jnp.linalg.eigh(w)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "evals"), Some(&shape(&["d"])));
+        assert_eq!(find_shape(&analysis, "evecs"), Some(&shape(&["d", "d"])));
+    }
+
+    #[test]
+    fn test_meshgrid_xy_indexing() {
+        let code = "import jax.numpy as jnp\ndef f(xs: Float[Array, \"nx\"], ys: Float[Array, \"ny\"]):\n    gx, gy = jnp.meshgrid(xs, ys)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "gx"), Some(&shape(&["ny", "nx"])));
+        assert_eq!(find_shape(&analysis, "gy"), Some(&shape(&["ny", "nx"])));
+    }
+
+    #[test]
+    fn test_svd_with_keyword_skips() {
+        // Non-default modes aren't modelled; must skip, not guess.
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"n d\"]):\n    u, s, vt = jnp.linalg.svd(a, full_matrices=False)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "u"), None);
+    }
+}

@@ -195,6 +195,9 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         return match name.as_str() {
             "inv" => Some(KnownFunction::LinalgInv),
             "det" => Some(KnownFunction::LinalgDet),
+            "svd" => Some(KnownFunction::LinalgSvd),
+            "qr" => Some(KnownFunction::LinalgQr),
+            "eig" | "eigh" => Some(KnownFunction::LinalgEig),
             _ => None,
         };
     }

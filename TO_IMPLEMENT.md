@@ -53,7 +53,7 @@ Legend:
 | `jnp.tri` / `np.tri` | ❌ | ❌ | ❌ | Matrix shape `(N, M?)`. |
 | `jnp.tril` / `np.tril` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.triu` / `np.triu` | ✅ | ✅ | ✅ | Shape-preserving. |
-| `jnp.meshgrid` / `np.meshgrid` | ✅ | ❌ | ❌ | Multiple output arrays; indexing mode matters. |
+| `jnp.meshgrid` / `np.meshgrid` | ✅ | ✅ | ✅ | Tuple LHS, default 'xy' indexing; keyword args skip. |
 | `jnp.indices` / `np.indices` | ❌ | ❌ | ❌ | Prepends rank dimension. |
 
 ## JAX NumPy / NumPy shape transforms
@@ -162,9 +162,9 @@ Legend:
 | `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ✅ | ✅ | ✅ | Square matrix -> batch shape; validates last two dims. |
 | `jnp.linalg.inv` / `np.linalg.inv` / `torch.linalg.inv` | ✅ | ✅ | ✅ | Shape-preserving for square matrices; validates last two dims. |
 | `jnp.linalg.solve` / `np.linalg.solve` / `torch.linalg.solve` | ❌ | ❌ | ❌ | Matrix solve shape rules. |
-| `jnp.linalg.svd` / `np.linalg.svd` / `torch.linalg.svd` | ❌ | ❌ | ❌ | Multiple outputs. |
-| `jnp.linalg.eig` / `np.linalg.eig` / `torch.linalg.eig` | ❌ | ❌ | ❌ | Multiple outputs. |
-| `jnp.linalg.qr` / `np.linalg.qr` / `torch.linalg.qr` | ❌ | ❌ | ❌ | Multiple outputs. |
+| `jnp.linalg.eig` / `np.linalg.eig` / `torch.linalg.eig` | ✅ | ✅ | ✅ | Tuple LHS: (n,), (n, n). `eigh` too. |
+| `jnp.linalg.qr` / `np.linalg.qr` / `torch.linalg.qr` | ✅ | ✅ | ✅ | Tuple LHS, reduced mode: (m, min(m,n)), (min(m,n), n). |
+| `jnp.linalg.svd` / `np.linalg.svd` / `torch.linalg.svd` | ✅ | ✅ | ✅ | Tuple LHS, full_matrices default: (m, m), (min(m,n),), (n, n); keyword args skip. |
 | `jnp.linalg.cholesky` / `np.linalg.cholesky` / `torch.linalg.cholesky` | ❌ | ❌ | ❌ | Shape-preserving square matrix. |
 
 ## Torch array creation / transforms
@@ -199,7 +199,7 @@ Legend:
 | `torch.repeat` | ✅ | ✅ | ✅ | Tensor method and function nuance. |
 | `torch.take` | ✅ | ✅ | ✅ | Output follows indices. |
 | `torch.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
-| `torch.meshgrid` | ✅ | ❌ | ❌ | Multiple outputs. |
+| `torch.meshgrid` | ✅ | ✅ | ✅ | Same rule as numpy meshgrid. |
 | `torch.diag` | ✅ | ✅ | ✅ | 1D↔2D. |
 | `torch.diagonal` | ✅ | ✅ | ✅ | Diagonal extraction. |
 | `torch.trace` | ✅ | ✅ | ✅ | 2D -> scalar. |
@@ -300,18 +300,16 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **89%** (67/75) across eleven corpus files; the dark spots
+(`d*3` split 3 → `d`). Corpus coverage is **95%** (71/75) across eleven corpus files; the dark spots
 below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
-   (corpus/linalg_pca.py; reuse the `tuple_rhs_shapes` dispatch, like scan).
-3. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
+1. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
    (corpus/torch_attention.py). Also: scan's stacked `ys` output is still
    skipped (needs body output inference).
-4. **Cross-*file* return-type tracing** — same-file helpers already propagate;
+2. **Cross-*file* return-type tracing** — same-file helpers already propagate;
    imported helpers don't yet.
-5. **Remaining single-function shape rules** — see ❌ rows above
+3. **Remaining single-function shape rules** — see ❌ rows above
    (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
    `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).
