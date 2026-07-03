@@ -150,7 +150,7 @@ Legend:
 |---|---:|---:|---:|---|
 | `jnp.matmul` / `np.matmul` / `torch.matmul` | ✅ | ✅ | ✅ | Batch matmul broadcasting + inner dim check. |
 | `jnp.dot` / `np.dot` / `torch.dot` | ✅ | ✅ | ✅ | Rank-dependent dot semantics. |
-| `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ❌ | ❌ | Equation parser needed. |
+| `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ✅ | ✅ | Explicit-output equations; matmul/transpose/batched cases tested. |
 | `jax.lax.dot` | ✅ | ✅ | ✅ | Dot semantics. |
 | `jax.lax.dot_general` | ✅ | ✅ | ✅ | Currently approximated as matmul. |
 | `jnp.vdot` / `np.vdot` | ✅ | ✅ | ✅ | Flattened dot — scalar output. |
@@ -231,6 +231,7 @@ Legend:
 |---|---:|---:|---:|---|
 | `equinox.nn.Linear` | ✅ | ✅ | ✅ | Implemented as `LayerKind::Linear`. |
 | `torch.nn.Linear` | ✅ | ✅ | ✅ | Same last-dim transform. |
+| `equinox.nn.Embedding` / `torch.nn.Embedding` | ✅ | ✅ | ✅ | Appends the embedding dim to the input shape. |
 | `flax.linen.Dense` | ❌ | ❌ | ❌ | Last-dim transform. |
 | `equinox.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
 | `equinox.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
@@ -279,8 +280,8 @@ Legend:
 | `x.sort(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `x.cumsum(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `x.cumprod(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
-| `x.repeat(...)` | ❌ | ❌ | ❌ | Torch/Numpy semantics differ; out of scope for first method-call pass. |
-| `x.expand(...)` | ❌ | ❌ | ❌ | Broadcast view. |
+| `x.repeat(...)` | ✅ | ✅ | ✅ | 1 positional arg → numpy repeat; ≥2 → torch tile semantics. `x.repeat_interleave` and `x.tile` too. |
+| `x.expand(...)` | ✅ | ✅ | ✅ | Maps to broadcast_to; -1 keeps the input dim. `x.broadcast_to` too. |
 | `x.to(...)` | ✅ | ✅ | ✅ | Shape-preserving (dtype/device cast). |
 
 ## Open targets (current)
@@ -299,19 +300,20 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **100%** (35/35) across mamba_ssm,
-attention, conv_net, transformer_block.
+(`d*3` split 3 → `d`). Corpus coverage is **87%** (47/54) across mamba_ssm, attention, conv_net,
+transformer_block, rnn_scan, embedding_lm, cnn_pool — the dark spots are the
+ranked gap list below.
 
 Current open work, roughly in impact order:
 
-1. **Grow the corpus** — 100% on the current four files; add more (CNN with
-   explicit pooling, RNN/GRU via `scan`, embeddings) to surface the next gaps.
+1. **Model the ranked dark spots** — corpus now has rnn_scan.py, cnn_pool.py,
+   embedding_lm.py; top gaps: literal-operand binary ops, `jax.lax.scan`,
+   pooling layers, `self.<method>` calls.
 2. **More multi-output tuple-unpacking** — `meshgrid`, `svd`, `eig`, `qr`
    (split is done; reuse the `tuple_rhs_shapes` dispatch in `analysis.rs`).
 3. **Cross-*file* return-type tracing** — same-file helpers already propagate;
    imported helpers don't yet.
-4. **`x.expand(...)` / `x.repeat(...)` methods**, augmented assignment (`x +=`).
-5. **Flax (`flax.linen.Dense`/`Conv`) and attention layers** in `src/layers.rs`.
-6. **Remaining single-function shape rules** — see ❌ rows above
+4. **Flax (`flax.linen.Dense`/`Conv`) and attention layers** in `src/layers.rs`.
+5. **Remaining single-function shape rules** — see ❌ rows above
    (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
    `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).
