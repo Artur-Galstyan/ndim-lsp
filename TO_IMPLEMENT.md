@@ -300,20 +300,25 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **100%** (54/54) across mamba_ssm, attention, conv_net,
-transformer_block, rnn_scan, embedding_lm, cnn_pool.
+(`d*3` split 3 → `d`). Corpus coverage is **76%** (57/75) across eleven corpus files; the dark spots
+below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **Grow the corpus again** — 100% on the current seven files; add new model
-   patterns (einops, torch forward with batchnorm training flags, flax) to
-   surface the next ranked gaps. Known remaining approximation: scan's
-   stacked `ys` output is skipped (needs body output inference).
-2. **More multi-output tuple-unpacking** — `meshgrid`, `svd`, `eig`, `qr`
-   (split is done; reuse the `tuple_rhs_shapes` dispatch in `analysis.rs`).
-3. **Cross-*file* return-type tracing** — same-file helpers already propagate;
+1. **Immediate-application calls** — flax's `nn.Dense(features=64)(x)` idiom
+   (`call:inline` ×3, top-ranked); generalize the call-of-a-call path beyond
+   inline vmap (corpus/flax_mlp.py).
+2. **einops** — `rearrange`/`reduce`/`repeat` pattern-string shape rules
+   (corpus/einops_vit.py).
+3. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
+   (corpus/linalg_pca.py; reuse the `tuple_rhs_shapes` dispatch, like scan).
+4. **Flax layers** — `flax.linen.Dense`/`Conv`/`avg_pool`/`relu`,
+   channels-LAST layout (corpus/flax_mlp.py).
+5. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
+   (corpus/torch_attention.py). Also: scan's stacked `ys` output is still
+   skipped (needs body output inference).
+6. **Cross-*file* return-type tracing** — same-file helpers already propagate;
    imported helpers don't yet.
-4. **Flax (`flax.linen.Dense`/`Conv`) and attention layers** in `src/layers.rs`.
-5. **Remaining single-function shape rules** — see ❌ rows above
+7. **Remaining single-function shape rules** — see ❌ rows above
    (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
    `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).
