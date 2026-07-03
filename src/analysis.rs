@@ -2251,6 +2251,16 @@ fn is_shape_preserving_call(resolved: &ResolvedTarget) -> bool {
         );
     }
 
+    // flax.linen activations (same set as jax.nn — flax re-exports them)
+    if module == ["flax", "linen"] {
+        return matches!(
+            name,
+            "relu" | "sigmoid" | "softplus" | "silu" | "swish" | "gelu"
+                | "elu" | "leaky_relu" | "selu" | "celu" | "log_sigmoid"
+                | "log_softmax" | "softmax" | "tanh" | "standardize"
+        );
+    }
+
     // jax.numpy / numpy elementwise math
     if module == ["jax", "numpy"] || module == ["numpy"] {
         return matches!(name,

@@ -208,6 +208,13 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         };
     }
 
+    if module == ["flax", "linen"] {
+        return match name.as_str() {
+            "avg_pool" | "max_pool" => Some(KnownFunction::FlaxPool),
+            _ => None,
+        };
+    }
+
     None
 }
 
@@ -601,8 +608,85 @@ pub fn apply_known_function(
         KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
         KnownFunction::Einsum => apply_known_einsum(args, shapes),
         KnownFunction::Split => apply_known_split(args, shapes),
+        KnownFunction::FlaxPool => apply_known_flax_pool(args, shapes),
         _ => Ok(None),
     }
+}
+
+/// `flax.linen.avg_pool(x, window_shape=(2, 2), strides=(2, 2))` — channels-
+/// LAST: the window applies to the dims immediately before the trailing
+/// channel dim. Default strides = 1, default padding VALID:
+/// out = (d - w)/s + 1. Concrete dims only in v1; symbolic inputs skip.
+fn apply_known_flax_pool(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.shape(input_name) else {
+        return Ok(None);
+    };
+
+    let mut window = None;
+    let mut strides = None;
+    let mut seen_first_positional = false;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if !seen_first_positional {
+                    seen_first_positional = true;
+                    continue;
+                }
+                if window.is_none() {
+                    window = parse_shape_value(value);
+                } else if strides.is_none() {
+                    strides = parse_shape_value(value);
+                }
+            }
+            CallArgument::Keyword { name, value } if name == "window_shape" => {
+                window = parse_shape_value(value)
+            }
+            CallArgument::Keyword { name, value } if name == "strides" => {
+                strides = parse_shape_value(value)
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    let strides = strides.unwrap_or_else(|| vec!["1".to_string(); window.len()]);
+    if strides.len() != window.len() {
+        return Ok(None);
+    }
+
+    let spatial_rank = window.len();
+    if input_shape.len() < spatial_rank + 1 {
+        return Err(format!(
+            "flax pool requires input with at least {} dims, got {} for '{}'",
+            spatial_rank + 1,
+            input_shape.len(),
+            input_name
+        ));
+    }
+    let start = input_shape.len() - spatial_rank - 1;
+    let mut output = input_shape.clone();
+    for i in 0..spatial_rank {
+        let dim = &input_shape[start + i];
+        let (Ok(d), Ok(w), Ok(s)) = (
+            dim.parse::<isize>(),
+            window[i].parse::<isize>(),
+            strides[i].parse::<isize>(),
+        ) else {
+            return Ok(None);
+        };
+        if s <= 0 {
+            return Ok(None);
+        }
+        output[start + i] = ((d - w) / s + 1).to_string();
+    }
+    Ok(Some(output))
 }
 
 fn sequence_arg_value(args: &[CallArgument]) -> Option<&str> {

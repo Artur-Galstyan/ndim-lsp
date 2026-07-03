@@ -232,14 +232,14 @@ Legend:
 | `equinox.nn.Linear` | ✅ | ✅ | ✅ | Implemented as `LayerKind::Linear`. |
 | `torch.nn.Linear` | ✅ | ✅ | ✅ | Same last-dim transform. |
 | `equinox.nn.Embedding` / `torch.nn.Embedding` | ✅ | ✅ | ✅ | Appends the embedding dim to the input shape. |
-| `flax.linen.Dense` | ❌ | ❌ | ❌ | Last-dim transform. |
+| `flax.linen.Dense` | ✅ | ✅ | ✅ | Channels-last: last dim → features; input width runtime-inferred, nothing to check. |
 | `equinox.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
 | `equinox.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
 | `equinox.nn.Conv3d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
 | `torch.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
 | `torch.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
 | `torch.nn.Conv3d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported; dilation≠1 gives approximate output. |
-| `flax.linen.Conv` | ❌ | ❌ | ❌ | Spatial formula. |
+| `flax.linen.Conv` | ✅ | ✅ | ✅ | Channels-last, stride-1/SAME only (non-default strides refused); last dim → features. avg_pool/max_pool functions modelled (VALID, concrete dims). |
 | `Dropout` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; Dropout1d/2d/3d enforce min rank (no batch required, matching Conv convention). |
 | `BatchNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; BatchNorm1d/2d/3d enforce min rank (no batch required, matching Conv convention); equinox BatchNorm is rank-agnostic. |
 | `LayerNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; LayerNorm enforces min rank 1. |
@@ -300,25 +300,20 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **76%** (57/75) across eleven corpus files; the dark spots
+(`d*3` split 3 → `d`). Corpus coverage is **84%** (63/75) across eleven corpus files; the dark spots
 below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **Immediate-application calls** — flax's `nn.Dense(features=64)(x)` idiom
-   (`call:inline` ×3, top-ranked); generalize the call-of-a-call path beyond
-   inline vmap (corpus/flax_mlp.py).
-2. **einops** — `rearrange`/`reduce`/`repeat` pattern-string shape rules
+1. **einops** — `rearrange`/`reduce`/`repeat` pattern-string shape rules
    (corpus/einops_vit.py).
-3. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
+2. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
    (corpus/linalg_pca.py; reuse the `tuple_rhs_shapes` dispatch, like scan).
-4. **Flax layers** — `flax.linen.Dense`/`Conv`/`avg_pool`/`relu`,
-   channels-LAST layout (corpus/flax_mlp.py).
-5. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
+3. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
    (corpus/torch_attention.py). Also: scan's stacked `ys` output is still
    skipped (needs body output inference).
-6. **Cross-*file* return-type tracing** — same-file helpers already propagate;
+4. **Cross-*file* return-type tracing** — same-file helpers already propagate;
    imported helpers don't yet.
-7. **Remaining single-function shape rules** — see ❌ rows above
+5. **Remaining single-function shape rules** — see ❌ rows above
    (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
    `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).

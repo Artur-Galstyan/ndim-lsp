@@ -130,6 +130,19 @@ pub enum LayerKind {
         stride: String,
         padding: String,
     },
+    /// flax.linen.Dense — channels-last: replaces the last dim with
+    /// `features`. Input width is runtime-inferred by flax, so there is
+    /// nothing to check.
+    Dense {
+        features: String,
+    },
+    /// flax.linen.Conv with default stride / SAME padding: channels-last,
+    /// spatial dims unchanged, last dim becomes `features`. Non-default
+    /// strides are refused at classification time.
+    FlaxConv {
+        features: String,
+        spatial_rank: usize,
+    },
     /// Max/Avg pooling, channels-first like Conv: channels preserved, the
     /// trailing `spatial_rank` dims follow the conv output formula.
     Pool {
@@ -189,6 +202,7 @@ pub enum KnownFunction {
     Eye,
     Vmap,
     Scan,
+    FlaxPool,
     BroadcastTo,
     BroadcastArrays,
     AtLeast1D,

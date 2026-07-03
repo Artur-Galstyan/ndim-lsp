@@ -6551,3 +6551,60 @@ mod inline_layer_application_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
     }
 }
+
+#[cfg(test)]
+mod flax_layer_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// End-to-end mirror of corpus/flax_mlp.py: channels-last conv stem,
+    /// avg_pool, inline Dense applications.
+    #[test]
+    fn test_flax_forward_pass() {
+        let code = "import flax.linen as nn\ndef f(x: Float[Array, \"32 32 3\"]):\n    h = nn.Conv(features=16, kernel_size=(3, 3))(x)\n    h = nn.relu(h)\n    h = nn.avg_pool(h, window_shape=(2, 2), strides=(2, 2))\n    flat = h.reshape(-1)\n    h2 = nn.Dense(features=64)(flat)\n    logits = nn.Dense(features=10)(h2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["16", "16", "16"])));
+        assert_eq!(find_shape(&analysis, "flat"), Some(&shape(&["4096"])));
+        assert_eq!(find_shape(&analysis, "h2"), Some(&shape(&["64"])));
+        assert_eq!(find_shape(&analysis, "logits"), Some(&shape(&["10"])));
+    }
+
+    #[test]
+    fn test_flax_dense_symbolic_input() {
+        let code = "import flax.linen as nn\ndef f(x: Float[Array, \"batch d\"]):\n    y = nn.Dense(features=128)(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "128"])));
+    }
+
+    #[test]
+    fn test_flax_conv_nondefault_stride_refused() {
+        // v1 models only stride-1/SAME; a strided flax Conv must not produce
+        // a (wrong) shape.
+        let code = "import flax.linen as nn\ndef f(x: Float[Array, \"32 32 3\"]):\n    h = nn.Conv(features=16, kernel_size=(3, 3), strides=(2, 2))(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "h"), None);
+    }
+}

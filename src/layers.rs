@@ -20,8 +20,11 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     let is_torch_module = call.implementation.target.module_parts.len() >= 2
         && call.implementation.target.module_parts[0] == "torch"
         && call.implementation.target.module_parts[1] == "nn";
+    let is_flax_module = call.implementation.target.module_parts.len() >= 2
+        && call.implementation.target.module_parts[0] == "flax"
+        && call.implementation.target.module_parts[1] == "linen";
 
-    if !is_equinox_module && !is_torch_module {
+    if !is_equinox_module && !is_torch_module && !is_flax_module {
         return None;
     }
 
@@ -85,6 +88,32 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 }),
                 _ => None,
             }
+        }
+        "Dense" => Some(LayerKind::Dense {
+            features: call.bindings.get("features")?.clone(),
+        }),
+        "Conv" if is_flax_module => {
+            let features = call.bindings.get("features")?.clone();
+            let kernel_size = call.bindings.get("kernel_size")?;
+            // Spatial rank from the kernel tuple: (3, 3) → 2, scalar → 1.
+            let spatial_rank = if kernel_size.starts_with('(') {
+                kernel_size.matches(',').count() + usize::from(!kernel_size.ends_with(",)"))
+            } else {
+                1
+            };
+            // v1 models only the default stride-1 / SAME-padding case.
+            if let Some(strides) = call.bindings.get("strides")
+                && strides.trim_matches(['(', ')', ' ']).split(',').any(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && s != "1"
+                })
+            {
+                return None;
+            }
+            Some(LayerKind::FlaxConv {
+                features,
+                spatial_rank,
+            })
         }
         "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
             let spatial_rank = pool_spatial_rank(owner)?;
@@ -187,14 +216,17 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     }
     let framework = parts[0].as_str();
     let module = parts[1].as_str();
-    if module != "nn" {
-        return None;
-    }
-    if framework != "equinox" && framework != "torch" {
+    let known_framework = (module == "nn" && (framework == "equinox" || framework == "torch"))
+        || (module == "linen" && framework == "flax");
+    if !known_framework {
         return None;
     }
     let class_name = parts.last()?.as_str();
     let params: &[&str] = match class_name {
+        "Dense" => &["self", "features", "use_bias"],
+        "Conv" if framework == "flax" => {
+            &["self", "features", "kernel_size", "strides", "padding"]
+        }
         "Linear" => &["self", "in_features", "out_features", "use_bias"],
         "Embedding" => &["self", "num_embeddings", "embedding_size"],
         "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
@@ -722,6 +754,40 @@ pub fn apply_layer_application(
             stride,
             padding,
         ),
+        // flax channels-last: last dim becomes `features`, nothing to check
+        // (flax infers the input width at runtime).
+        LayerKind::Dense { features } => {
+            if input_shape.is_empty() {
+                return Err(format!(
+                    "Cannot apply Dense layer '{}' to scalar input '{}'",
+                    app.layer, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = features.clone();
+            Ok(Some(output_shape))
+        }
+        LayerKind::FlaxConv {
+            features,
+            spatial_rank,
+        } => {
+            let min_rank = spatial_rank + 1;
+            if input_shape.len() < min_rank {
+                return Err(format!(
+                    "Conv layer '{}' requires input with at least {} dims, got {} for '{}'",
+                    app.layer,
+                    min_rank,
+                    input_shape.len(),
+                    app.input
+                ));
+            }
+            // Stride-1 / SAME padding: spatial dims unchanged.
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = features.clone();
+            Ok(Some(output_shape))
+        }
         // Channels-first pooling: channels preserved, trailing spatial dims
         // follow the conv output formula.
         LayerKind::Pool {
@@ -2189,7 +2255,14 @@ mod known_layer_signature_tests {
     #[test]
     fn test_unknown_framework_returns_none() {
         assert!(known_layer_signature(&parts(&["jax", "nn", "Linear"])).is_none());
-        assert!(known_layer_signature(&parts(&["flax", "linen", "Dense"])).is_none());
+        assert!(known_layer_signature(&parts(&["flax", "nn", "Dense"])).is_none());
+    }
+
+    #[test]
+    fn test_flax_linen_dense_in_catalog() {
+        let sig = known_layer_signature(&parts(&["flax", "linen", "Dense"])).unwrap();
+        assert_eq!(sig.owner.as_deref(), Some("Dense"));
+        assert!(sig.params.contains(&"features".to_string()));
     }
 
     #[test]
