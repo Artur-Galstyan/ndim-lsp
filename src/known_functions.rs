@@ -215,6 +215,15 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         };
     }
 
+    if module == ["einops"] {
+        return match name.as_str() {
+            "rearrange" => Some(KnownFunction::EinopsRearrange),
+            "reduce" => Some(KnownFunction::EinopsReduce),
+            "repeat" => Some(KnownFunction::EinopsRepeat),
+            _ => None,
+        };
+    }
+
     None
 }
 
@@ -609,8 +618,168 @@ pub fn apply_known_function(
         KnownFunction::Einsum => apply_known_einsum(args, shapes),
         KnownFunction::Split => apply_known_split(args, shapes),
         KnownFunction::FlaxPool => apply_known_flax_pool(args, shapes),
+        KnownFunction::EinopsRearrange | KnownFunction::EinopsReduce
+        | KnownFunction::EinopsRepeat => apply_known_einops(args, shapes),
         _ => Ok(None),
     }
+}
+
+/// Parse one side of an einops pattern into axis groups:
+/// `"c (h p1) (w p2)"` → `[[c], [h, p1], [w, p2]]`. Nested parens or
+/// non-identifier tokens reject the pattern.
+fn parse_einops_groups(side: &str) -> Option<Vec<Vec<String>>> {
+    let spaced = side.replace('(', " ( ").replace(')', " ) ");
+    let mut groups = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for token in spaced.split_whitespace() {
+        match token {
+            "(" => {
+                if current.is_some() {
+                    return None;
+                }
+                current = Some(Vec::new());
+            }
+            ")" => groups.push(current.take()?),
+            name => {
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    return None;
+                }
+                match &mut current {
+                    Some(group) => group.push(name.to_string()),
+                    None => groups.push(vec![name.to_string()]),
+                }
+            }
+        }
+    }
+    if current.is_some() {
+        return None;
+    }
+    Some(groups)
+}
+
+/// `einops.rearrange / reduce / repeat` — the pattern string carries the
+/// full shape algebra. LHS groups bind axis names against the input dims
+/// (composite groups solve one unknown factor by division, concrete dims
+/// only); RHS groups multiply bound axes back together. Keyword arguments
+/// (`p1=16`, `n=4`) pre-seed the bindings. Ellipsis patterns skip (v1).
+fn apply_known_einops(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let positional = positional_arg_values(args);
+    let Some(input_name) = positional.first() else {
+        return Ok(None);
+    };
+    let Some(input_shape) = shapes.shape(input_name.as_str()) else {
+        return Ok(None);
+    };
+    let Some(pattern_raw) = positional.get(1) else {
+        return Ok(None);
+    };
+
+    let trimmed = pattern_raw.trim();
+    let pattern = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        return Ok(None);
+    };
+    if pattern.contains("...") {
+        return Ok(None);
+    }
+    let Some((lhs, rhs)) = pattern.split_once("->") else {
+        return Ok(None);
+    };
+    let Some(lhs_groups) = parse_einops_groups(lhs) else {
+        return Ok(None);
+    };
+    let Some(rhs_groups) = parse_einops_groups(rhs) else {
+        return Ok(None);
+    };
+
+    if lhs_groups.len() != input_shape.len() {
+        return Err(format!(
+            "einops pattern '{}' expects rank {}, got rank {} for '{}'",
+            pattern,
+            lhs_groups.len(),
+            input_shape.len(),
+            input_name
+        ));
+    }
+
+    // Axis bindings, pre-seeded from keyword args (p1=16, n=4, …).
+    let mut bound: HashMap<String, String> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            CallArgument::Keyword { name, value } => Some((name.clone(), value.clone())),
+            _ => None,
+        })
+        .collect();
+
+    for (group, dim) in lhs_groups.iter().zip(input_shape.iter()) {
+        if let [name] = group.as_slice() {
+            if name != "1" {
+                bound.entry(name.clone()).or_insert_with(|| dim.clone());
+            }
+            continue;
+        }
+        // Composite group: solve at most one unknown factor by division.
+        let mut unknown: Option<&String> = None;
+        let mut known_product: usize = 1;
+        let mut knowns_concrete = true;
+        for factor in group {
+            let value = if factor == "1" {
+                Some("1".to_string())
+            } else {
+                bound.get(factor).cloned()
+            };
+            match value {
+                Some(v) => match v.parse::<usize>() {
+                    Ok(n) => known_product *= n,
+                    Err(_) => knowns_concrete = false,
+                },
+                None if unknown.is_none() => unknown = Some(factor),
+                None => return Ok(None),
+            }
+        }
+        if let Some(factor) = unknown {
+            if !knowns_concrete || known_product == 0 {
+                return Ok(None);
+            }
+            let Ok(d) = dim.parse::<usize>() else {
+                return Ok(None);
+            };
+            if d % known_product != 0 {
+                return Err(format!(
+                    "einops: dim {} is not divisible by the known factors ({}) of axis '{}'",
+                    d, known_product, factor
+                ));
+            }
+            bound.insert(factor.clone(), (d / known_product).to_string());
+        }
+    }
+
+    let mut output = Vec::with_capacity(rhs_groups.len());
+    for group in &rhs_groups {
+        let mut dim = "1".to_string();
+        for factor in group {
+            let value = if factor == "1" {
+                "1".to_string()
+            } else {
+                match bound.get(factor) {
+                    Some(v) => v.clone(),
+                    None => return Ok(None),
+                }
+            };
+            dim = multiply_dim(&dim, &value);
+        }
+        output.push(dim);
+    }
+    Ok(Some(output))
 }
 
 /// `flax.linen.avg_pool(x, window_shape=(2, 2), strides=(2, 2))` — channels-

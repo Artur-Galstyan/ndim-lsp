@@ -6608,3 +6608,98 @@ mod flax_layer_tests {
         assert_eq!(find_shape(&analysis, "h"), None);
     }
 }
+
+#[cfg(test)]
+mod einops_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_rearrange_patchify() {
+        let code = "from einops import rearrange\ndef f(img: Float[Array, \"3 224 224\"]):\n    patches = rearrange(img, \"c (h p1) (w p2) -> (h w) (p1 p2 c)\", p1=16, p2=16)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "patches"), Some(&shape(&["196", "768"])));
+    }
+
+    #[test]
+    fn test_rearrange_symbolic_transpose() {
+        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"b s d -> s b d\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["s", "b", "d"])));
+    }
+
+    #[test]
+    fn test_rearrange_symbolic_merge() {
+        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"b s d -> (b s) d\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b*s", "d"])));
+    }
+
+    #[test]
+    fn test_reduce_mean() {
+        let code = "from einops import reduce\ndef f(x: Float[Array, \"n d\"]):\n    pooled = reduce(x, \"n d -> d\", \"mean\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "pooled"), Some(&shape(&["d"])));
+    }
+
+    #[test]
+    fn test_repeat_new_axis() {
+        let code = "from einops import repeat\ndef f(cls: Float[Array, \"dim\"]):\n    stacked = repeat(cls, \"d -> n d\", n=4)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "stacked"), Some(&shape(&["4", "dim"])));
+    }
+
+    #[test]
+    fn test_rearrange_rank_mismatch_errors() {
+        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b d\"]):\n    y = rearrange(x, \"b s d -> s b d\")";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert!(analysis.errors[0].message.contains("expects rank 3"));
+    }
+
+    #[test]
+    fn test_rearrange_indivisible_errors() {
+        let code = "from einops import rearrange\ndef f(img: Float[Array, \"3 224 224\"]):\n    patches = rearrange(img, \"c (h p1) (w p2) -> (h w) (p1 p2 c)\", p1=15, p2=15)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert!(analysis.errors[0].message.contains("not divisible"));
+    }
+
+    #[test]
+    fn test_ellipsis_pattern_skips() {
+        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"... d -> d ...\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), None);
+    }
+}

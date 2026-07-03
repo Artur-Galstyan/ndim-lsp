@@ -300,14 +300,12 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **84%** (63/75) across eleven corpus files; the dark spots
+(`d*3` split 3 → `d`). Corpus coverage is **89%** (67/75) across eleven corpus files; the dark spots
 below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **einops** — `rearrange`/`reduce`/`repeat` pattern-string shape rules
-   (corpus/einops_vit.py).
-2. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
+1. **Multi-output tuple-unpacking** — `svd`, `qr`, `eigh`, `meshgrid`
    (corpus/linalg_pca.py; reuse the `tuple_rhs_shapes` dispatch, like scan).
 3. **`nn.MultiheadAttention`** — returns an (output, weights) tuple
    (corpus/torch_attention.py). Also: scan's stacked `ys` output is still
