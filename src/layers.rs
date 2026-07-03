@@ -516,9 +516,9 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
 
 pub fn apply_layer_application(
     app: &LayerApplication,
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_shape) = shapes.get(&app.input) else {
+    let Some(input_shape) = shapes.shape(&app.input) else {
         return Ok(None);
     };
 

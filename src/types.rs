@@ -2,6 +2,19 @@ use std::{collections::HashMap, path::PathBuf};
 
 use tree_sitter::Range;
 
+/// Name → shape resolution for the apply helpers. Implemented by plain
+/// per-scope `HashMap`s and by `ScopeShapes` in `analysis`, which also sees
+/// synthetic bindings without cloning the scope map (#43).
+pub trait ShapeLookup {
+    fn shape(&self, name: &str) -> Option<&Vec<String>>;
+}
+
+impl ShapeLookup for HashMap<String, Vec<String>> {
+    fn shape(&self, name: &str) -> Option<&Vec<String>> {
+        self.get(name)
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImportPath {
     pub dots: usize,

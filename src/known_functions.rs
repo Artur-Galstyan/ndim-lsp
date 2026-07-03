@@ -455,7 +455,7 @@ pub fn apply_method_call(
     method: &KnownFunction,
     receiver: &str,
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let synthesized = synthesize_method_args(method, receiver, args);
     apply_known_function(method, &synthesized, shapes)
@@ -506,7 +506,7 @@ fn synthesize_method_args(
 pub fn apply_known_function(
     function: &KnownFunction,
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     match function {
         KnownFunction::Concatenate => apply_known_concatenate(args, shapes),
@@ -621,7 +621,7 @@ fn axis_arg(args: &[CallArgument], default: isize) -> isize {
 
 fn apply_known_einsum(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let positional_values = positional_arg_values(args);
     let Some(equation) = positional_values.first() else {
@@ -669,7 +669,7 @@ fn apply_known_einsum(
     let mut label_map: HashMap<char, String> = HashMap::new();
 
     for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
-        let Some(shape) = shapes.get(operand_name.as_str()) else {
+        let Some(shape) = shapes.shape(operand_name.as_str()) else {
             return Ok(None);
         };
 
@@ -712,7 +712,7 @@ fn apply_known_einsum(
 
 fn apply_known_concatenate(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(first_value) = sequence_arg_value(args) else {
         return Ok(None);
@@ -726,7 +726,7 @@ fn apply_known_concatenate(
 
     let mut input_shapes = Vec::new();
     for input_name in &input_names {
-        let Some(shape) = shapes.get(input_name) else {
+        let Some(shape) = shapes.shape(input_name) else {
             return Ok(None);
         };
         input_shapes.push(shape.clone());
@@ -782,7 +782,7 @@ fn apply_known_concatenate(
 
 fn apply_known_stack(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(first_value) = sequence_arg_value(args) else {
         return Ok(None);
@@ -793,7 +793,7 @@ fn apply_known_stack(
 
     let mut input_shapes = Vec::new();
     for input_name in &input_names {
-        let Some(shape) = shapes.get(input_name) else {
+        let Some(shape) = shapes.shape(input_name) else {
             return Ok(None);
         };
         input_shapes.push(shape.clone());
@@ -842,12 +842,12 @@ fn apply_known_stack(
 
 fn apply_known_reshape(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -938,7 +938,7 @@ fn apply_known_reshape(
     Ok(Some(output_shape))
 }
 
-fn resolve_shape_index(dim: &str, shapes: &HashMap<String, Vec<String>>) -> Option<String> {
+fn resolve_shape_index(dim: &str, shapes: &dyn ShapeLookup) -> Option<String> {
     let dim = dim.trim();
     let suffix_start = dim.find(".shape[")?;
     let (ident, rest) = dim.split_at(suffix_start);
@@ -948,7 +948,7 @@ fn resolve_shape_index(dim: &str, shapes: &HashMap<String, Vec<String>>) -> Opti
     }
     let idx_part = rest.strip_prefix(".shape[")?.strip_suffix(']')?;
     let idx: isize = idx_part.trim().parse().ok()?;
-    let shape = shapes.get(ident)?;
+    let shape = shapes.shape(ident)?;
     let resolved = if idx >= 0 {
         shape.get(idx as usize)?
     } else {
@@ -973,12 +973,12 @@ fn infer_symbolic_minus_one(input_shape: &[String], known_dims: &[String]) -> Op
 
 fn apply_known_flatten(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -998,12 +998,12 @@ fn normalize_axis(axis: isize, rank: usize, context: &str) -> Result<usize, Stri
 
 fn apply_known_transpose(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     let rank = input_shape.len();
@@ -1055,12 +1055,12 @@ fn apply_known_transpose(
 
 fn apply_known_swapaxes(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     let rank = input_shape.len();
@@ -1101,12 +1101,12 @@ fn apply_known_swapaxes(
 
 fn apply_known_moveaxis(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     let rank = input_shape.len();
@@ -1176,12 +1176,12 @@ fn apply_known_moveaxis(
 
 fn apply_known_expand_dims(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     let output_rank = input_shape.len() + 1;
@@ -1223,12 +1223,12 @@ fn apply_known_expand_dims(
 
 fn apply_known_squeeze(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     let mut axes = None;
@@ -1280,13 +1280,13 @@ fn apply_known_squeeze(
 
 fn apply_known_atleast(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
     min_rank: usize,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     if input_shape.len() >= min_rank {
@@ -1394,15 +1394,15 @@ fn apply_known_eye(args: &[CallArgument]) -> Result<Option<Vec<String>>, String>
 
 fn apply_known_matmul(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(left) = shapes.get(&left_name) else {
+    let Some(left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(right) = shapes.get(&right_name) else {
+    let Some(right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1465,15 +1465,15 @@ fn apply_known_matmul(
 
 fn apply_known_dot(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(left) = shapes.get(&left_name) else {
+    let Some(left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(right) = shapes.get(&right_name) else {
+    let Some(right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1503,15 +1503,15 @@ fn apply_known_dot(
 
 fn apply_known_tensordot(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(left) = shapes.get(&left_name) else {
+    let Some(left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(right) = shapes.get(&right_name) else {
+    let Some(right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1564,15 +1564,15 @@ fn apply_known_tensordot(
 
 fn apply_known_outer(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(left) = shapes.get(&left_name) else {
+    let Some(left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(right) = shapes.get(&right_name) else {
+    let Some(right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1596,15 +1596,15 @@ fn apply_known_outer(
 
 fn apply_known_inner(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(left) = shapes.get(&left_name) else {
+    let Some(left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(right) = shapes.get(&right_name) else {
+    let Some(right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1628,15 +1628,15 @@ fn apply_known_inner(
 
 fn apply_known_vdot(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((left_name, right_name)) = first_two_positional_values(args) else {
         return Ok(None);
     };
-    let Some(_left) = shapes.get(&left_name) else {
+    let Some(_left) = shapes.shape(&left_name) else {
         return Ok(None);
     };
-    let Some(_right) = shapes.get(&right_name) else {
+    let Some(_right) = shapes.shape(&right_name) else {
         return Ok(None);
     };
 
@@ -1645,12 +1645,12 @@ fn apply_known_vdot(
 
 fn apply_known_diag(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     match input_shape.as_slice() {
@@ -1665,12 +1665,12 @@ fn apply_known_diag(
 
 fn apply_known_diagonal(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -1689,12 +1689,12 @@ fn apply_known_diagonal(
 
 fn apply_known_trace(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -1708,16 +1708,16 @@ fn apply_known_trace(
 
 fn apply_known_take(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let values = positional_arg_values(args);
     if values.len() < 2 {
         return Ok(None);
     }
-    let Some(input_shape) = shapes.get(&values[0]) else {
+    let Some(input_shape) = shapes.shape(&values[0]) else {
         return Ok(None);
     };
-    let Some(indices_shape) = shapes.get(&values[1]) else {
+    let Some(indices_shape) = shapes.shape(&values[1]) else {
         return Ok(None);
     };
     let mut axis = None;
@@ -1742,12 +1742,12 @@ fn apply_known_take(
 
 fn apply_known_broadcast_to(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    if !shapes.contains_key(input_name) {
+    if shapes.shape(input_name).is_none() {
         return Ok(None);
     }
 
@@ -1772,7 +1772,7 @@ fn apply_known_broadcast_to(
 
 fn apply_known_broadcast_arrays(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let values = positional_arg_values(args);
     let input_names = if values.len() == 1 {
@@ -1786,7 +1786,7 @@ fn apply_known_broadcast_arrays(
 
     let mut output = Vec::new();
     for input_name in input_names {
-        let Some(shape) = shapes.get(&input_name) else {
+        let Some(shape) = shapes.shape(&input_name) else {
             return Ok(None);
         };
         output = broadcast_two_shapes(&output, shape)?;
@@ -1796,12 +1796,12 @@ fn apply_known_broadcast_arrays(
 
 fn apply_known_tile(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -1843,12 +1843,12 @@ fn apply_known_tile(
 
 fn apply_known_repeat(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -1894,12 +1894,12 @@ fn apply_known_repeat(
 
 fn apply_known_shape_preserving(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    Ok(shapes.get(input_name).cloned())
+    Ok(shapes.shape(input_name).cloned())
 }
 
 fn concat_shapes_along_axis(
@@ -1977,7 +1977,7 @@ fn stack_family_shape(kind: &str, shape: &[String]) -> Vec<String> {
 
 fn apply_known_stack_family(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
     kind: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(first_value) = sequence_arg_value(args) else {
@@ -1989,7 +1989,7 @@ fn apply_known_stack_family(
 
     let mut input_shapes = Vec::new();
     for input_name in input_names {
-        let Some(shape) = shapes.get(&input_name) else {
+        let Some(shape) = shapes.shape(&input_name) else {
             return Ok(None);
         };
         input_shapes.push(stack_family_shape(kind, shape));
@@ -2014,12 +2014,12 @@ fn apply_known_stack_family(
 
 fn apply_known_rot90(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -2083,12 +2083,12 @@ fn apply_known_rot90(
 
 fn apply_known_pad(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -2142,7 +2142,7 @@ fn apply_known_pad(
 
 fn apply_known_where(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let values = positional_arg_values(args);
     if values.len() < 3 {
@@ -2150,7 +2150,7 @@ fn apply_known_where(
     }
     let mut output = Vec::new();
     for value in values.iter().take(3) {
-        let Some(shape) = shapes.get(value) else {
+        let Some(shape) = shapes.shape(value) else {
             return Ok(None);
         };
         output = broadcast_two_shapes(&output, shape)?;
@@ -2160,12 +2160,12 @@ fn apply_known_where(
 
 fn apply_known_reduction(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -2262,12 +2262,12 @@ fn apply_known_reduction(
 
 fn apply_known_linalg_inv(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -2292,12 +2292,12 @@ fn apply_known_linalg_inv(
 
 fn apply_known_linalg_det(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
 
@@ -2339,7 +2339,7 @@ fn apply_known_linalg_det(
 /// the unpacked targets.
 fn apply_known_split(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     // Validate — surface errors to the user but don’t store a shape.
     let _ = compute_split_shapes(args, shapes)?;
@@ -2411,13 +2411,13 @@ fn cancel_product_factor(dim: &str, n: usize) -> Option<String> {
 
 pub fn compute_split_shapes(
     args: &[CallArgument],
-    shapes: &HashMap<String, Vec<String>>,
+    shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<Vec<String>>>, String> {
     // ── input array ──────────────────────────────────────────────────
     let Some(input_name) = first_array_arg(args) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.get(input_name) else {
+    let Some(input_shape) = shapes.shape(input_name) else {
         return Ok(None);
     };
     if input_shape.is_empty() {

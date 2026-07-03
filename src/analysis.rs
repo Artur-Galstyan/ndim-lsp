@@ -229,7 +229,23 @@ struct ShapeCtx<'a> {
     /// to `resolve_shape` lookups but are NOT persisted to
     /// `scopes[...].shapes`, preventing __synth_* keys from leaking
     /// into the LSP's inlay hints.
-    synthetics: HashMap<(usize, String), Vec<String>>,
+    synthetics: HashMap<usize, HashMap<String, Vec<String>>>,
+}
+
+/// Borrowed view of one scope's shapes plus its synthetic bindings.
+/// Passed to the apply helpers as `&dyn ShapeLookup` so no merged map is
+/// ever cloned (#43).
+struct ScopeShapes<'c> {
+    shapes: &'c HashMap<String, Vec<String>>,
+    synthetics: Option<&'c HashMap<String, Vec<String>>>,
+}
+
+impl ShapeLookup for ScopeShapes<'_> {
+    fn shape(&self, name: &str) -> Option<&Vec<String>> {
+        self.shapes
+            .get(name)
+            .or_else(|| self.synthetics?.get(name))
+    }
 }
 
 /// Canonicalize every dim of a shape through the `self.<attr> = <ident>`
@@ -282,7 +298,10 @@ impl<'a> ShapeCtx<'a> {
         let name = format!("__synth_{}", self.synthetic_counter);
         self.synthetic_counter += 1;
         let shape = normalize_shape(shape, self.aliases);
-        self.synthetics.insert((scope_idx, name.clone()), shape);
+        self.synthetics
+            .entry(scope_idx)
+            .or_default()
+            .insert(name.clone(), shape);
         name
     }
 
@@ -309,22 +328,16 @@ impl<'a> ShapeCtx<'a> {
     /// Look up a shape by name in the given scope, checking both real
     /// user-visible shapes and the synthetic side-channel.
     fn resolve_shape(&self, name: &str, scope_idx: usize) -> Option<Vec<String>> {
-        self.scopes[scope_idx].shapes.get(name).cloned()
-            .or_else(|| self.synthetics.get(&(scope_idx, name.to_string())).cloned())
+        self.scope_shapes(scope_idx).shape(name).cloned()
     }
 
-    /// Produce a merged shapes map for a given scope that includes both
-    /// user-visible shapes and synthetic bindings. Used when passing shapes
-    /// to helper functions like `apply_known_function` that accept
-    /// `&HashMap<String, Vec<String>>`.
-    fn merged_shapes(&self, scope_idx: usize) -> HashMap<String, Vec<String>> {
-        let mut merged = self.scopes[scope_idx].shapes.clone();
-        for ((si, name), shape) in &self.synthetics {
-            if *si == scope_idx {
-                merged.insert(name.clone(), shape.clone());
-            }
+    /// Zero-copy `ShapeLookup` over a scope's shapes plus its synthetic
+    /// bindings, for passing to the apply helpers.
+    fn scope_shapes(&self, scope_idx: usize) -> ScopeShapes<'_> {
+        ScopeShapes {
+            shapes: &self.scopes[scope_idx].shapes,
+            synthetics: self.synthetics.get(&scope_idx),
         }
-        merged
     }
 }
 
@@ -620,8 +633,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 kind: layer,
                 range: args_node.range(),
             };
-            let merged = ctx.merged_shapes(scope_idx);
-            return match apply_layer_application(&application, &merged) {
+            return match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
                 Ok(Some(output)) => Some(output),
                 Ok(None) => None,
                 Err(message) => {
@@ -659,8 +671,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let args = extract_call_arguments(args_node, ctx.text).ok()?;
 
                 if let Some(known) = classify_method_call(&method_name) {
-                    let merged = ctx.merged_shapes(scope_idx);
-                    let result = apply_method_call(&known, &receiver_name, &args, &merged);
+                    let result = apply_method_call(&known, &receiver_name, &args, &ctx.scope_shapes(scope_idx));
                     return match result {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
@@ -698,12 +709,11 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let args = extract_call_arguments(args_node, ctx.text).ok()?;
 
                 if let Some(known) = classify_method_call(&method_name) {
-                    let merged = ctx.merged_shapes(scope_idx);
                     let result = apply_method_call(
                         &known,
                         &receiver_name,
                         &args,
-                        &merged,
+                        &ctx.scope_shapes(scope_idx),
                     );
                     return match result {
                         Ok(Some(shape)) => Some(shape),
@@ -758,8 +768,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             kind: kind.clone(),
             range: args_node.range(),
         };
-        let merged = ctx.merged_shapes(scope_idx);
-        let result = apply_layer_application(&application, &merged);
+        let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
         ctx.applications.push(LayerApplication {
             variable: application.variable.clone(),
             layer: application.layer.clone(),
@@ -785,11 +794,10 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 2. vmap-target check
     if let Some(info) = ctx.vmap_targets.get(&target).cloned() {
-        let merged = ctx.merged_shapes(scope_idx);
         let result = apply_vmap_call(
             &info,
             &args,
-            &merged,
+            &ctx.scope_shapes(scope_idx),
             ctx.scopes,
         );
         return match result {
@@ -812,7 +820,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             &target,
             call_byte,
             &args,
-            &ctx.merged_shapes(scope_idx),
+            &ctx.scope_shapes(scope_idx),
             ctx.scopes,
         ) {
             return match result {
@@ -848,8 +856,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 5. Known-function check
     if let Some(known) = classify_known_function(&resolved) {
-        let merged = ctx.merged_shapes(scope_idx);
-        let result = apply_known_function(&known, &args, &merged);
+        let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
@@ -1243,8 +1250,7 @@ fn propagate_calls(
                                     kind: kind.clone(),
                                     range: an.range(),
                                 };
-                                let merged = ctx.merged_shapes(scope_idx);
-                                let result = apply_layer_application(&application, &merged);
+                                let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
                                 match result {
                                     Ok(Some(output)) => {
                                         ctx.record_binding(
@@ -1452,8 +1458,7 @@ fn tuple_rhs_shapes(
             }
             let args_node = rhs.child_by_field_name("arguments")?;
             let args = extract_call_arguments(args_node, ctx.text).ok()?;
-            let merged = ctx.merged_shapes(scope_idx);
-            match compute_split_shapes(&args, &merged) {
+            match compute_split_shapes(&args, &ctx.scope_shapes(scope_idx)) {
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
@@ -1560,7 +1565,7 @@ fn collect_value_statements_recursive<'a>(
 fn apply_vmap_call(
     info: &VmapInfo,
     args: &[CallArgument],
-    caller_shapes: &HashMap<String, Vec<String>>,
+    caller_shapes: &dyn ShapeLookup,
     scopes: &[FunctionShapeScope],
 ) -> Result<Option<Vec<String>>, String> {
     // a. Resolve each positional arg's shape from caller_shapes.
@@ -1573,7 +1578,7 @@ fn apply_vmap_call(
             // Skip non-positional args silently (v1 doesn't pass kwargs through vmap).
             continue;
         };
-        let Some(shape) = caller_shapes.get(value.as_str()) else {
+        let Some(shape) = caller_shapes.shape(value.as_str()) else {
             // Arg has no known shape — skip silently.
             return Ok(None);
         };
@@ -1692,8 +1697,7 @@ fn shape_of_inline_vmap(
             in_axes,
             out_axes,
         };
-        let merged = ctx.merged_shapes(scope_idx);
-        return match apply_vmap_call(&info, &outer_args, &merged, ctx.scopes) {
+        return match apply_vmap_call(&info, &outer_args, &ctx.scope_shapes(scope_idx), ctx.scopes) {
             Ok(shape) => shape,
             Err(message) => {
                 ctx.errors.push(ShapeError {
@@ -1736,8 +1740,7 @@ fn apply_inline_vmap_layer(
         kind: layer.clone(),
         range,
     };
-    let merged = ctx.merged_shapes(scope_idx);
-    match apply_layer_application(&application, &merged) {
+    match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
         Ok(Some(output)) => Some(prepend_batch_dim(output, out_axes, batch_dim)),
         Ok(None) => None,
         Err(message) => {
@@ -1890,7 +1893,7 @@ fn apply_user_function(
     target: &str,
     call_byte: usize,
     args: &[CallArgument],
-    caller_shapes: &HashMap<String, Vec<String>>,
+    caller_shapes: &dyn ShapeLookup,
     scopes: &[FunctionShapeScope],
 ) -> Option<Result<Option<Vec<String>>, String>> {
     let scope_idx = find_callee_scope(target, Some(call_byte), scopes)?;
@@ -1913,7 +1916,7 @@ fn apply_user_function(
                 let Some(param_name) = param_names.get(positional_idx) else {
                     break; // more positional args than annotated params — ignore extras
                 };
-                let Some(shape) = caller_shapes.get(value.as_str()) else {
+                let Some(shape) = caller_shapes.shape(value.as_str()) else {
                     // Arg has no known shape (literal, untracked variable, etc.)
                     // — skip entire function. v1 intentionally bails early
                     // rather than partially validating some args, to avoid
@@ -1927,7 +1930,7 @@ fn apply_user_function(
             CallArgument::Keyword { name, value } => {
                 // v1: honour keyword args whose name matches a declared param.
                 if callee.shapes.contains_key(name) {
-                    let Some(shape) = caller_shapes.get(value.as_str()) else {
+                    let Some(shape) = caller_shapes.shape(value.as_str()) else {
                         return Some(Ok(None));
                     };
                     arg_shapes.push((name, shape.clone()));
