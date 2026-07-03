@@ -1,7 +1,6 @@
 # A GRU-style recurrent cell driven by `jax.lax.scan`, the canonical JAX RNN
-# pattern (separate input/hidden projections). `scan` and the `self.step`
-# method call are not modelled yet — expected dark spots that keep those gaps
-# ranked in the coverage report.
+# pattern (separate input/hidden projections). Exercises literal-operand
+# binary ops, `self.step` method propagation, and scan carry binding.
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -39,7 +38,10 @@ class GRUCell(eqx.Module):
         xs: Float[Array, "seq input_size"],
         h0: Float[Array, "hidden_size"],
     ):
-        def body(carry, x):
+        def body(
+            carry: Float[Array, "hidden_size"],
+            x: Float[Array, "input_size"],
+        ):
             new_carry = self.step(carry, x)
             return new_carry, new_carry
 

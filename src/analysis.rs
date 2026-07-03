@@ -526,17 +526,29 @@ fn find_binary_op_text<'a>(
 
 /// Binary operator: delegates to the existing `apply_binary_op`-style logic
 /// but works on tree-sitter nodes directly rather than `BinaryOpInfo`.
+/// A binary-op operand: a scalar literal (`2`, `1.0`) or an array with a
+/// resolved shape. Scalars broadcast trivially against any array.
+enum BinopOperand {
+    Scalar,
+    Shaped(Vec<String>),
+}
+
+fn binop_operand(node: Node, scope_idx: usize, ctx: &mut ShapeCtx) -> Option<BinopOperand> {
+    match node.kind() {
+        "integer" | "float" => Some(BinopOperand::Scalar),
+        "identifier" => {
+            let name = node.utf8_text(ctx.text.as_bytes()).ok()?;
+            ctx.resolve_shape(name, scope_idx).map(BinopOperand::Shaped)
+        }
+        // Nested expressions (calls, parenthesized binops, unary ops, …)
+        // recurse through the main evaluator.
+        _ => shape_of_expression(node, ctx).map(BinopOperand::Shaped),
+    }
+}
+
 fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let left_node = node.child_by_field_name("left")?;
     let right_node = node.child_by_field_name("right")?;
-
-    // Both sides must be identifiers for v1 binary-op resolution.
-    if left_node.kind() != "identifier" || right_node.kind() != "identifier" {
-        return None;
-    }
-
-    let left_name = left_node.utf8_text(ctx.text.as_bytes()).ok()?.to_string();
-    let right_name = right_node.utf8_text(ctx.text.as_bytes()).ok()?.to_string();
 
     // Determine the operator text.
     let op_text = find_binary_op_text(node, &left_node, &right_node, ctx.text)?;
@@ -551,11 +563,24 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
     };
 
     let scope_idx = scope_index_for_byte(ctx.scopes, node.start_byte())?;
-    let left_shape = ctx.resolve_shape(&left_name, scope_idx)?;
-    let right_shape = ctx.resolve_shape(&right_name, scope_idx)?;
+    let left = binop_operand(left_node, scope_idx, ctx)?;
+    let right = binop_operand(right_node, scope_idx, ctx)?;
 
+    let (left_shape, right_shape) = match (left, right) {
+        // Scalar literals broadcast: the result keeps the array side's shape.
+        // (Scalar @ array is invalid Python; skip silently.)
+        (BinopOperand::Scalar, BinopOperand::Shaped(s))
+        | (BinopOperand::Shaped(s), BinopOperand::Scalar) => {
+            return (op != BinaryOp::MatMul).then_some(s);
+        }
+        (BinopOperand::Scalar, BinopOperand::Scalar) => return None,
+        (BinopOperand::Shaped(l), BinopOperand::Shaped(r)) => (l, r),
+    };
+
+    let left_name = left_node.utf8_text(ctx.text.as_bytes()).unwrap_or("?");
+    let right_name = right_node.utf8_text(ctx.text.as_bytes()).unwrap_or("?");
     let result = match op {
-        BinaryOp::MatMul => apply_matmul_shape(&left_shape, &right_shape, &left_name, &right_name),
+        BinaryOp::MatMul => apply_matmul_shape(&left_shape, &right_shape, left_name, right_name),
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
             apply_elementwise_shape(&left_shape, &right_shape, op)
         }
@@ -821,10 +846,13 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         };
     }
 
-    // 3. User-defined function propagation
-    if !target.contains('.')
+    // 3. User-defined function propagation. `self.<method>(...)` resolves
+    // to the method's function scope by bare name — methods are function
+    // definitions like any other.
+    let user_target = target.strip_prefix("self.").unwrap_or(&target);
+    if !user_target.contains('.')
         && let Some(result) = apply_user_function(
-            &target,
+            user_target,
             call_byte,
             &args,
             &ctx.scope_shapes(scope_idx),
@@ -1534,7 +1562,35 @@ fn tuple_rhs_shapes(
             let func = rhs.child_by_field_name("function")?;
             let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
             let resolved = resolve_call_target(target, ctx.import_map);
-            if !matches!(classify_known_function(&resolved), Some(KnownFunction::Split)) {
+            let known = classify_known_function(&resolved);
+
+            // `final_carry, ys = jax.lax.scan(body, init, xs)` — the carry is
+            // invariant, so final_carry gets init's shape. ys would need the
+            // body's per-step output shape; skipped (evicts any stale binding).
+            if matches!(known, Some(KnownFunction::Scan)) {
+                if n_targets != 2 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut positionals = args.iter().filter_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                });
+                let init = args
+                    .iter()
+                    .find_map(|a| match a {
+                        CallArgument::Keyword { name, value } if name == "init" => {
+                            Some(value.as_str())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| positionals.nth(1))?;
+                let init_shape = ctx.resolve_shape(init, scope_idx)?;
+                return Some(vec![Some(init_shape), None]);
+            }
+
+            if !matches!(known, Some(KnownFunction::Split)) {
                 return None;
             }
             let args_node = rhs.child_by_field_name("arguments")?;

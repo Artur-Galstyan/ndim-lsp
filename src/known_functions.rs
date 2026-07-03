@@ -203,6 +203,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         return match name.as_str() {
             "dot" => Some(KnownFunction::Dot),
             "dot_general" => Some(KnownFunction::Matmul),
+            "scan" => Some(KnownFunction::Scan),
             _ => None,
         };
     }

@@ -188,6 +188,7 @@ pub enum KnownFunction {
     Arange,
     Eye,
     Vmap,
+    Scan,
     BroadcastTo,
     BroadcastArrays,
     AtLeast1D,

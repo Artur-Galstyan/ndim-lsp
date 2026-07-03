@@ -22,7 +22,7 @@ Legend:
 | `jax.jacrev` | ❌ | ❌ | ❌ | Adds Jacobian dimensions. |
 | `jax.hessian` | ❌ | ❌ | ❌ | Adds two derivative dimension groups. |
 | `jax.pmap` | ❌ | ❌ | ❌ | Similar to `vmap`, device axis semantics. |
-| `jax.lax.scan` | ❌ | ❌ | ❌ | Loop/carry sequence semantics. |
+| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant); stacked ys skipped (needs body output inference). |
 | `jax.lax.map` | ❌ | ❌ | ❌ | Map over leading axis. |
 | `jax.lax.cond` | ❌ | ❌ | ❌ | Branch output shape agreement. |
 | `jax.lax.switch` | ❌ | ❌ | ❌ | Branch output shape agreement. |
@@ -300,14 +300,15 @@ frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
 first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
 this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
 `<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **91%** (49/54) across mamba_ssm, attention, conv_net,
-transformer_block, rnn_scan, embedding_lm, cnn_pool — the dark spots are the
-ranked gap list below.
+(`d*3` split 3 → `d`). Corpus coverage is **100%** (54/54) across mamba_ssm, attention, conv_net,
+transformer_block, rnn_scan, embedding_lm, cnn_pool.
 
 Current open work, roughly in impact order:
 
-1. **Model the ranked dark spots** — corpus now has rnn_scan.py, cnn_pool.py,
-   embedding_lm.py; top gaps: literal-operand binary ops, `jax.lax.scan`, `self.<method>` calls.
+1. **Grow the corpus again** — 100% on the current seven files; add new model
+   patterns (einops, torch forward with batchnorm training flags, flax) to
+   surface the next ranked gaps. Known remaining approximation: scan's
+   stacked `ys` output is skipped (needs body output inference).
 2. **More multi-output tuple-unpacking** — `meshgrid`, `svd`, `eig`, `qr`
    (split is done; reuse the `tuple_rhs_shapes` dispatch in `analysis.rs`).
 3. **Cross-*file* return-type tracing** — same-file helpers already propagate;

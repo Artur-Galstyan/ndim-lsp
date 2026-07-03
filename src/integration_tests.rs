@@ -6188,7 +6188,7 @@ mod coverage_harness {
 
         // Regression floor: coverage shouldn't silently drop. Tighten as gaps close.
         assert!(
-            pct(shaped, total) >= 50.0,
+            pct(shaped, total) >= 75.0,
             "corpus coverage regressed to {:.0}%",
             pct(shaped, total)
         );
@@ -6413,5 +6413,91 @@ mod pooling_layer_tests {
         assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["32", "1", "1"])));
         assert_eq!(find_shape(&analysis, "pooled"), Some(&shape(&["32"])));
         assert_eq!(find_shape(&analysis, "logits"), Some(&shape(&["10"])));
+    }
+}
+
+#[cfg(test)]
+mod literal_binop_scan_method_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_binop_scalar_literal_keeps_array_shape() {
+        let code = "def f(h: Float[Array, \"batch d\"]):\n    normed = h / 2.0\n    scaled = 3 * h";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "normed"), Some(&shape(&["batch", "d"])));
+        assert_eq!(find_shape(&analysis, "scaled"), Some(&shape(&["batch", "d"])));
+    }
+
+    #[test]
+    fn test_binop_nested_gate_expression() {
+        let code = "def f(z: Float[Array, \"d\"], h: Float[Array, \"d\"], t: Float[Array, \"d\"]):\n    h_new = (1 - z) * h + z * t";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "h_new"), Some(&shape(&["d"])));
+    }
+
+    #[test]
+    fn test_binop_nested_mismatch_still_errors() {
+        let code = "def f(z: Float[Array, \"d1\"], h: Float[Array, \"d2\"]):\n    bad = (1 - z) * h";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_binds_final_carry_from_init() {
+        let code = "import jax\ndef f(h0: Float[Array, \"hidden\"], xs: Float[Array, \"seq features\"]):\n    def body(c, x):\n        return c, c\n    h_final, hs = jax.lax.scan(body, h0, xs)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "hs"), None);
+    }
+
+    #[test]
+    fn test_scan_init_keyword() {
+        let code = "import jax\ndef f(h0: Float[Array, \"hidden\"], xs: Float[Array, \"seq features\"]):\n    def body(c, x):\n        return c, c\n    h_final, hs = jax.lax.scan(body, init=h0, xs=xs)";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
+    }
+
+    #[test]
+    fn test_self_method_call_propagates_return_shape() {
+        let code = "class M:\n    def step(self, h: Float[Array, \"hidden\"], x: Float[Array, \"features\"]) -> Float[Array, \"hidden\"]:\n        return h\n\n    def run(self, a: Float[Array, \"hidden\"], b: Float[Array, \"features\"]):\n        out = self.step(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["hidden"])));
+    }
+
+    #[test]
+    fn test_self_method_call_rank_mismatch_errors() {
+        let code = "class M:\n    def step(self, h: Float[Array, \"hidden\"]) -> Float[Array, \"hidden\"]:\n        return h\n\n    def run(self, a: Float[Array, \"batch hidden\"]):\n        out = self.step(a)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1);
+        assert!(analysis.errors[0].message.contains("expected rank 1"));
     }
 }
