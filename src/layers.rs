@@ -2416,6 +2416,7 @@ mod apply_layer_applications_tests {
             shapes,
             return_shape: None,
             param_order: Vec::new(),
+        all_params: Vec::new(),
         }]
     }
 

@@ -667,6 +667,7 @@ mod end_to_end_layer_shape_tests {
             shapes,
             return_shape: None,
             param_order: Vec::new(),
+        all_params: Vec::new(),
         }]
     }
 
@@ -2087,6 +2088,7 @@ mod torch_nn_linear_tests {
             shapes,
             return_shape: None,
             param_order: Vec::new(),
+        all_params: Vec::new(),
         }]
     }
 
@@ -6462,10 +6464,11 @@ mod scan_tuple_carry_corpus_mirror_tests {
     /// homogeneous `(mean, var)` tuple carry threaded through
     /// `jax.lax.scan` via an aliased variable (`init = (mean0, var0)`),
     /// then re-destructured from the flat scan-result binding
-    /// (`final_mean, final_var = final_carry`). `ema_step`'s internal body
-    /// (`mean, var = carry`) stays unshaped — the body function's own
-    /// scope has no annotation for `carry` and isn't seeded from the scan
-    /// call site (a structural gap, not fixed here).
+    /// (`final_mean, final_var = final_carry`). Lazy call-site parameter
+    /// seeding now shapes `ema_step`'s internal body too: `carry` is seeded
+    /// from `init`'s shape, so `mean, var = carry` resolves, and `means`
+    /// (`ys`) is traced from the body's second return element
+    /// (`new_mean`) with `xs`'s leading axis prepended.
     #[test]
     fn test_running_ema_tuple_carry_mirror() {
         let code = "\
@@ -6495,18 +6498,24 @@ def running_ema(
         assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
-        // `means` (ys) needs per-step body-output tracing — unmodelled.
-        assert_eq!(find_shape(&analysis, "means"), None);
-        // Un-annotated, un-seeded carry inside the body stays dark.
-        assert_eq!(find_shape(&analysis, "mean"), None);
+        // `means` (ys): xs's leading "seq" axis prepended to the body's
+        // per-step `new_mean` output.
+        assert_eq!(
+            find_shape(&analysis, "means"),
+            Some(&shape(&["seq", "features"]))
+        );
+        // Seeded carry destructuring inside the body now resolves.
+        assert_eq!(find_shape(&analysis, "mean"), Some(&shape(&["features"])));
     }
 
     /// End-to-end mirror of corpus/eqx_lstm_gru_scan.py's `LSTMEncoder`:
     /// an inline `(h0, c0)` tuple carry through `jax.lax.scan`, plus the
     /// direct single-step `self.lstm(x, (h0, c0))` call outside the scan
-    /// (already worked before this change). The scan body's internal
-    /// `h, c = carry` stays unshaped for the same structural reason as
-    /// `ema_step` above.
+    /// (already worked before this change). Lazy call-site parameter
+    /// seeding now shapes the nested `body` closure too: `carry` is seeded
+    /// from `(h0, c0)`'s shape, so `h, c = carry` resolves, and `hs` is
+    /// traced from the body's second return element (`h_new`) with
+    /// `encoded`'s leading axis prepended.
     #[test]
     fn test_lstm_encoder_tuple_carry_mirror() {
         let code = "\
@@ -6540,13 +6549,16 @@ class LSTMEncoder(eqx.Module):
 ";
         let analysis = analyze(code);
 
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "step_h"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "carry_final"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "c_final"), Some(&shape(&["hidden"])));
-        assert_eq!(find_shape(&analysis, "hs"), None);
-        // Un-annotated, un-seeded carry inside the nested `body` stays dark.
-        assert_eq!(find_shape(&analysis, "h"), None);
+        // `hs`: encoded's leading "seq" axis prepended to the body's
+        // per-step `h_new` output.
+        assert_eq!(find_shape(&analysis, "hs"), Some(&shape(&["seq", "hidden"])));
+        // Seeded carry destructuring inside the nested `body` now resolves.
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["hidden"])));
     }
 }
 
@@ -6634,8 +6646,10 @@ mod coverage_harness {
         println!();
 
         // Regression floor: coverage shouldn't silently drop. Tighten as gaps close.
+        // Raised from 85 to 90 after lazy call-site parameter seeding closed
+        // the last 9 dark spots (corpus is 176/176 = 100% as of this wave).
         assert!(
-            pct(shaped, total) >= 85.0,
+            pct(shaped, total) >= 90.0,
             "corpus coverage regressed to {:.0}%",
             pct(shaped, total)
         );
@@ -6914,12 +6928,16 @@ mod literal_binop_scan_method_tests {
 
     #[test]
     fn test_scan_binds_final_carry_from_init() {
+        // `body`'s params are un-annotated, but lazy call-site parameter
+        // seeding shapes it anyway: `c` <- `h0`'s shape, so `return c, c`
+        // traces `hs` to `c`'s (seeded) shape with `xs`'s leading axis
+        // prepended.
         let code = "import jax\ndef f(h0: Float[Array, \"hidden\"], xs: Float[Array, \"seq features\"]):\n    def body(c, x):\n        return c, c\n    h_final, hs = jax.lax.scan(body, h0, xs)";
         let analysis = analyze(code);
 
-        assert!(analysis.errors.is_empty());
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
-        assert_eq!(find_shape(&analysis, "hs"), None);
+        assert_eq!(find_shape(&analysis, "hs"), Some(&shape(&["seq", "hidden"])));
     }
 
     #[test]
@@ -6944,7 +6962,11 @@ mod literal_binop_scan_method_tests {
     fn test_scan_aliased_tuple_literal_carry() {
         // `init = (mean0, var0)` bound earlier, then passed by name —
         // resolves the same way as the inline form since `init`'s own
-        // assignment already stored the homogeneous shape.
+        // assignment already stored the homogeneous shape. `step`'s
+        // un-annotated params are seeded from the call site: `x` <-
+        // `xs`'s shape minus its leading axis, so `return carry, x`
+        // traces `means` to `x`'s (seeded) shape with `xs`'s leading axis
+        // prepended back on.
         let code = "import jax.numpy as jnp\nimport jax\ndef f(xs: Float[Array, \"seq features\"], mean0: Float[Array, \"features\"], var0: Float[Array, \"features\"]):\n    def step(carry, x):\n        return carry, x\n    init = (mean0, var0)\n    final_carry, means = jax.lax.scan(step, init, xs)\n    final_mean, final_var = final_carry";
         let analysis = analyze(code);
 
@@ -6953,7 +6975,10 @@ mod literal_binop_scan_method_tests {
         assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
-        assert_eq!(find_shape(&analysis, "means"), None);
+        assert_eq!(
+            find_shape(&analysis, "means"),
+            Some(&shape(&["seq", "features"]))
+        );
     }
 
     #[test]
@@ -8678,5 +8703,189 @@ mod binary_op_related_information_tests {
 
         assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         assert!(analysis.errors[0].related.is_none());
+    }
+}
+
+
+
+
+
+#[cfg(test)]
+mod lazy_call_site_parameter_seeding_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// Mirrors corpus/scope_soup.py's `inner(h)` dark spot: a nested
+    /// closure whose OWN param has no annotation is now shaped by seeding
+    /// it from the call site's argument shape.
+    #[test]
+    fn test_nested_closure_unannotated_param_seeded_from_call_site() {
+        let code = "def outer(x: Float[Array, \"6 4\"]):\n    def inner(h):\n        y = h.reshape(-1)\n        return y\n    out = inner(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["24"])));
+        // First-call-wins write-back also shapes the closure's own body
+        // (hover/inlay UX inside `inner`).
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
+    }
+
+    /// A same-file helper with an un-annotated param, called from two
+    /// different sites with DIFFERENT argument shapes. Each call site must
+    /// resolve to ITS OWN correct shape — the second (non-first)
+    /// specialization must not reuse or be polluted by the first's seeded
+    /// values (a `HashMap::entry(..).or_insert(..)` bug where the second
+    /// call's seed would be silently dropped because the key was already
+    /// present from the first call's first-call-wins write-back).
+    #[test]
+    fn test_multi_call_site_specialization_resolves_independently() {
+        let code = "\
+def double(x):
+    y = x + x
+    return y
+
+def f(a: Float[Array, \"3 4\"], b: Float[Array, \"5\"]):
+    out_a = double(a)
+    out_b = double(b)
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out_a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "out_b"), Some(&shape(&["5"])));
+    }
+
+    /// Same as above but with three call sites and a keyword-argument call
+    /// mixed in, to exercise both positional and keyword seeding across
+    /// multiple independent specializations of the same scope.
+    #[test]
+    fn test_multi_call_site_specialization_keyword_and_positional() {
+        let code = "\
+def project(inp):
+    out = inp.sum(axis=0)
+    return out
+
+def f(a: Float[Array, \"3 4\"], b: Float[Array, \"5 6 7\"]):
+    p_a = project(a)
+    p_b = project(inp=b)
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "p_a"), Some(&shape(&["4"])));
+        assert_eq!(find_shape(&analysis, "p_b"), Some(&shape(&["6", "7"])));
+    }
+
+    /// Direct recursion with an un-annotated carry param must not hang or
+    /// stack-overflow: re-entering a scope already being specialized
+    /// returns `None` for that inner call, so the recursive call itself
+    /// stays unshaped, but that must not crash or poison the outer call's
+    /// own (unrelated) shape.
+    #[test]
+    fn test_recursion_guard_direct_self_call() {
+        let code = "\
+def loop(carry, n):
+    if n == 0:
+        return carry
+    return loop(carry, n - 1)
+
+def f(x: Float[Array, \"batch d\"]):
+    out = loop(x, 3)
+";
+        let analysis = analyze(code);
+
+        // No panic/hang is the primary assertion; a correct-but-conservative
+        // outcome (the recursive inner call can't be resolved, so the
+        // multi-return-statement trace sees divergent targets and stays
+        // dark) is acceptable — soundness over completeness for recursion.
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    }
+
+    /// Mutual recursion (`ping` <-> `pong`) with un-annotated params must
+    /// also terminate rather than infinitely re-entering each other's
+    /// specialization.
+    #[test]
+    fn test_recursion_guard_mutual_recursion() {
+        let code = "\
+def ping(carry, n):
+    if n <= 0:
+        return carry
+    return pong(carry, n - 1)
+
+def pong(carry, n):
+    if n <= 0:
+        return carry
+    return ping(carry, n - 1)
+
+def f(x: Float[Array, \"batch d\"]):
+    out = ping(x, 4)
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    }
+
+    /// A same-file helper with an un-annotated param whose body computes a
+    /// `return <expr>` (not a bare identifier) — extends the older
+    /// bare-identifier-only return trace to arbitrary expressions.
+    #[test]
+    fn test_seeded_function_return_expr_tracing() {
+        let code = "\
+def scaled(x):
+    return x * 2.0
+
+def f(a: Float[Array, \"batch d\"]):
+    out = scaled(a)
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["batch", "d"])));
+    }
+
+    /// `return <expr>` tracing also covers a chained-call expression, not
+    /// just a binary operator.
+    #[test]
+    fn test_seeded_function_return_chained_call_expr() {
+        let code = "\
+def flatten_sum(x):
+    return x.reshape(-1).sum()
+
+def f(a: Float[Array, \"3 4\"]):
+    out = flatten_sum(a)
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&[])));
+    }
+
+    /// A fully-annotated same-file function is unaffected by this
+    /// mechanism — it still goes through the older annotation-only path,
+    /// and a non-identifier return still isn't traced (regression check
+    /// mirroring `test_self_method_call_non_identifier_return_not_traced`).
+    #[test]
+    fn test_fully_annotated_function_unaffected_by_seeding() {
+        let code = "class M:\n    def forward(self, h: Float[Array, \"d\"]):\n        return h + 1\n\n    def run(self, a: Float[Array, \"d\"]):\n        out = self.forward(a)";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 }

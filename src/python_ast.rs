@@ -279,15 +279,32 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                 .map(|s| s.to_string());
             let mut function_shapes = HashMap::new();
             let mut param_order = Vec::new();
+            let mut all_params = Vec::new();
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 for i in 0..parameters.named_child_count() {
                     let Some(parameter) = parameters.named_child(i as u32) else {
                         continue;
                     };
+                    if let Some(name) = first_identifier(parameter, text)? {
+                        all_params.push(name);
+                    }
                     let Some(type_node) = parameter.child_by_field_name("type") else {
                         continue;
                     };
                     if !contains_array_type(type_node, text)? {
+                        // Plain scalar-typed params (`decay: float = 0.9`)
+                        // can never be array-shaped — seed them as rank-0
+                        // ("scalar") so they broadcast correctly in binops
+                        // (e.g. `mean + (1 - decay) * delta`) instead of
+                        // going dark for lack of any shape info at all.
+                        // Anything else non-array (str, a custom class,
+                        // Optional[...], etc.) is left untouched.
+                        if let Ok(type_name) = type_node.utf8_text(text.as_bytes())
+                            && matches!(type_name, "int" | "float" | "bool" | "complex")
+                            && let Some(name) = first_identifier(parameter, text)?
+                        {
+                            function_shapes.insert(name, Vec::new());
+                        }
                         continue;
                     }
                     let Some(raw_shape) = find_string_literal(type_node, text)? else {
@@ -327,6 +344,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                 shapes: function_shapes,
                 return_shape,
                 param_order,
+                all_params,
             });
             new_idx
         } else {
@@ -373,6 +391,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
         shapes: HashMap::new(),
         return_shape: None,
         param_order: Vec::new(),
+        all_params: Vec::new(),
     }];
     visit(node, text, &mut scopes, 0)?;
     Ok(scopes)
@@ -1424,13 +1443,37 @@ mod extract_jaxtyping_shapes_tests {
     }
 
     #[test]
-    fn test_skips_annotation_without_shape_string() {
+    fn test_scalar_typed_param_seeded_as_rank_zero() {
+        // `x: int` (a plain scalar Python type, not a jaxtyping array) can
+        // never be array-shaped — it's seeded as rank-0 ("scalar") so it
+        // broadcasts correctly in binops (e.g. `arr + x`) instead of going
+        // dark for lack of any shape info at all (lazy call-site parameter
+        // seeding's `decay: float`-style params).
         let code = "def f(x: int): pass";
         let tree = parse(code);
 
         let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
-        assert!(scope_by_name(&scopes, "f").shapes.is_empty());
+        assert_eq!(
+            scope_by_name(&scopes, "f").shapes.get("x"),
+            Some(&Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn test_non_scalar_non_array_annotation_still_skipped() {
+        // A plain type annotation that is neither a jaxtyping array nor one
+        // of the recognized scalar types (`int`/`float`/`bool`/`complex`) —
+        // e.g. a custom class or `str` — has no static shape info and is
+        // left out of `shapes` entirely (not even a rank-0 guess).
+        let code = "def f(x: str, y: MyClass): pass";
+        let tree = parse(code);
+
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+
+        let f = scope_by_name(&scopes, "f");
+        assert!(!f.shapes.contains_key("x"));
+        assert!(!f.shapes.contains_key("y"));
     }
 
     #[test]
@@ -3230,3 +3273,6 @@ def forward(x):
         assert_eq!(calls[1].method, "mean");
     }
 }
+
+
+

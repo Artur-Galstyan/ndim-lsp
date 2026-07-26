@@ -979,6 +979,7 @@ mod tests {
                 shapes: outer_shapes,
                 return_shape: None,
                 param_order: Vec::new(),
+            all_params: Vec::new(),
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
@@ -987,6 +988,7 @@ mod tests {
                 shapes: inner_shapes,
                 return_shape: None,
                 param_order: Vec::new(),
+            all_params: Vec::new(),
             },
         ];
 
@@ -1013,6 +1015,7 @@ mod tests {
                 shapes: outer_shapes,
                 return_shape: None,
                 param_order: Vec::new(),
+            all_params: Vec::new(),
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
@@ -1021,6 +1024,7 @@ mod tests {
                 shapes: inner_shapes,
                 return_shape: None,
                 param_order: Vec::new(),
+            all_params: Vec::new(),
             },
         ];
 
@@ -1041,6 +1045,7 @@ mod tests {
             shapes: HashMap::new(),
             return_shape: None,
             param_order: Vec::new(),
+        all_params: Vec::new(),
         }];
 
         let result = find_shape_for_variable(&scopes, 50, "z");

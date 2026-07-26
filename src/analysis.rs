@@ -266,6 +266,43 @@ struct ShapeCtx<'a> {
     /// `scopes[...].shapes`, preventing __synth_* keys from leaking
     /// into the LSP's inlay hints.
     synthetics: HashMap<usize, HashMap<String, Vec<String>>>,
+    /// `function_definition` node for each entry of `scopes` (aligned by
+    /// index; `None` for the module scope at index 0), precomputed once so
+    /// lazy call-site parameter seeding (`specialize_callee_call`) can find
+    /// a callee's own body/return statements without re-walking the whole
+    /// tree per call site.
+    scope_function_nodes: &'a [Option<Node<'a>>],
+    /// Stack of scope indices currently being lazily specialized (lazy
+    /// call-site parameter seeding) — a recursion/cycle guard. Re-entering a
+    /// scope already on this stack (direct or mutual recursion) aborts that
+    /// specialization with `None` rather than looping forever; depth is
+    /// additionally capped at `MAX_SPECIALIZATION_DEPTH`.
+    active_specializations: Vec<usize>,
+    /// Scope indices that have already had a "first-call-wins" successful
+    /// specialization (see `specialize_callee_call`). Only the first
+    /// specialization of a given scope writes its computed local shapes,
+    /// `assignment_shapes`, and `errors` back into the shared analysis;
+    /// every later specialization of the same scope (a different call site,
+    /// possibly with different argument shapes) runs in an ephemeral copy
+    /// that is discarded afterward, so it can't corrupt the first call's
+    /// hover/inlay info or leak errors that only apply to its own seeding.
+    specialized_scopes: std::collections::HashSet<usize>,
+    /// Snapshot of every scope's `shapes` map taken ONCE, before any
+    /// assignment is processed and before any specialization ever runs —
+    /// i.e. exactly the jaxtyping/scalar-type annotations `extract_
+    /// jaxtyping_shapes` produced, call-site-independent by construction.
+    ///
+    /// This is the correctness-critical piece of lazy call-site parameter
+    /// seeding: `specialize_callee_call` must always start a fresh
+    /// specialization from THIS baseline, never from the live (mutable)
+    /// `scopes[...].shapes` — the live map may already carry a PRIOR call
+    /// site's seeded params/locals (first-call-wins write-back), and
+    /// blindly cloning it as the new starting point would leak that other
+    /// call site's argument shapes into this one (`x.entry(name).or_insert`
+    /// is a no-op once `x` is already present). Also used to decide,
+    /// call-site-independently, whether a callee is "fully annotated" (safe
+    /// for the older `apply_user_function` path) vs. needs seeding.
+    original_shapes: &'a [HashMap<String, Vec<String>>],
 }
 
 /// Borrowed view of one scope's shapes plus its synthetic bindings.
@@ -1055,25 +1092,56 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // annotation (e.g. a typical `forward(self, x: Float[Array, "..."])`),
     // `apply_user_function` falls back to tracing a bare `return <name>`
     // statement against the callee's own already-computed body shapes.
+    //
+    // Gated on the callee being FULLY annotated (checked against the
+    // call-site-independent `original_shapes` snapshot, never the live,
+    // mutable `scopes[...].shapes`): `apply_user_function`'s bare-return
+    // trace reads `callee.shapes.get(name)` directly, which is only sound
+    // when every one of the callee's params was statically annotated (so
+    // its body shapes are the same regardless of which call site asks) —
+    // once lazy call-site parameter seeding (3b) has ever specialized a
+    // partially-annotated callee, its `shapes` map holds a PARTICULAR call
+    // site's seeded values, and reusing them here for a call site with
+    // different argument shapes would silently propagate the wrong shape.
+    // Partially-annotated callees always go through 3b instead, which
+    // re-seeds fresh from `original_shapes` on every call.
     let user_target = target.strip_prefix("self.").unwrap_or(&target);
-    if !user_target.contains('.')
-        && let Some(result) = apply_user_function(
-            user_target,
-            call_byte,
-            &args,
-            &ctx.scope_shapes(scope_idx),
-            ctx.scopes,
-            ctx.text,
-        ) {
-            return match result {
-                Ok(Some(shape)) => Some(shape),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
-                    None
+    if !user_target.contains('.') {
+        let callee_idx = find_callee_scope(user_target, Some(call_byte), ctx.scopes);
+        let fully_annotated = callee_idx.is_none_or(|idx| callee_all_params_annotated(idx, ctx));
+
+        if fully_annotated {
+            if let Some(result) = apply_user_function(
+                user_target,
+                call_byte,
+                &args,
+                &ctx.scope_shapes(scope_idx),
+                ctx.scopes,
+                ctx.text,
+            ) {
+                match result {
+                    Ok(Some(shape)) => return Some(shape),
+                    Ok(None) => {}
+                    Err(message) => {
+                        ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
+                        return None;
+                    }
                 }
-            };
+            }
+        } else {
+            // 3b. Lazy call-site parameter seeding (`llm.txt`'s "Known
+            // architectural limit"): the callee is a same-file function,
+            // nested closure, or `self.<method>` with at least one
+            // un-annotated parameter. Seed the un-annotated params from
+            // this call site's resolved argument shapes and evaluate the
+            // callee's body on demand.
+            if let Some(shape) =
+                apply_seeded_user_function(user_target, call_byte, &args, scope_idx, ctx)
+            {
+                return Some(shape);
+            }
         }
+    }
 
     // 4. vmap *recording* (e.g. `vf = jax.vmap(f)`)
     let resolved = resolve_call_target(&target, ctx.import_map);
@@ -1414,6 +1482,21 @@ fn prepend_batch_dim(mut shape: Vec<String>, axis: isize, dim: String) -> Vec<St
 /// per-assignment shape records used for inlay hints.
 type PropagateOutput = (Vec<LayerApplication>, Vec<ShapeError>, Vec<AssignmentShape>);
 
+/// Collect every `function_definition` node in `node`'s subtree, in the
+/// same pre-order (push-before-recurse) traversal `extract_jaxtyping_shapes`
+/// uses to push scopes — so index `i` here corresponds exactly to
+/// `scopes[i + 1]` (the module scope at index 0 has no function node).
+fn collect_function_definition_nodes<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    if node.kind() == "function_definition" {
+        out.push(node);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            collect_function_definition_nodes(child, out);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn propagate_calls(
     node: Node,
@@ -1436,6 +1519,22 @@ fn propagate_calls(
     // Collect all assignments (identifier and tuple-pattern LHS) in source order.
     let assignments = collect_assignment_items(node, text)?;
 
+    let mut function_nodes = Vec::new();
+    collect_function_definition_nodes(node, &mut function_nodes);
+    let mut scope_function_nodes: Vec<Option<Node>> = std::iter::once(None)
+        .chain(function_nodes.into_iter().map(Some))
+        .collect();
+    // Defensive: the two traversals are structurally identical, but if a
+    // future edit to either desyncs them, pad/truncate rather than panic —
+    // lazy seeding simply won't find a body for any scope past the mismatch.
+    scope_function_nodes.resize(scopes.len(), None);
+
+    // Snapshot BEFORE any assignment/specialization runs — see the
+    // `original_shapes` field doc for why this must never be re-derived
+    // from the (mutable) live scopes later.
+    let original_shapes: Vec<HashMap<String, Vec<String>>> =
+        scopes.iter().map(|s| s.shapes.clone()).collect();
+
     let mut ctx = ShapeCtx {
         text,
         import_map,
@@ -1453,139 +1552,14 @@ fn propagate_calls(
         assignment_shapes: &mut assignment_shapes,
         synthetic_counter: 0,
         synthetics: HashMap::new(),
+        scope_function_nodes: &scope_function_nodes,
+        active_specializations: Vec::new(),
+        specialized_scopes: std::collections::HashSet::new(),
+        original_shapes: &original_shapes,
     };
 
     for (lhs, rhs_node, assignment_node) in assignments {
-        // Inlay hints display non-annotated assignments only (an annotated
-        // assignment already shows the user's written type). `None` here means
-        // "bind the shape but emit no inlay record".
-        let display_line = if assignment_node.child_by_field_name("type").is_none() {
-            Some(assignment_node.start_position().row as u32)
-        } else {
-            None
-        };
-
-        // Tuple-pattern unpacking (issue #30) — bind each element and move on.
-        let lhs_name = match lhs {
-            Lhs::Single(name) => name,
-            Lhs::Augmented(name) => {
-                handle_augmented_assignment(&name, rhs_node, assignment_node, display_line, &mut ctx);
-                continue;
-            }
-            Lhs::Tuple(names) => {
-                handle_tuple_assignment(&names, rhs_node, display_line, &mut ctx);
-                continue;
-            }
-        };
-        let scope_idx = match scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) {
-            Some(idx) => idx,
-            None => continue,
-        };
-
-        // Special-case vmap *recording* before delegating to
-        // shape_of_expression.  vmap bindings like `vf = jax.vmap(f)`
-        // produce no output shape of their own but need to be recorded
-        // so that later calls to `vf(...)` can be expanded.
-        //
-        // TODO: Consider threading lhs_name through ShapeCtx so that
-        // shape_of_call can own the vmap-recording path too, eliminating
-        // this duplication.  Currently shape_of_call doesn't know the
-        // LHS variable name for the assignment.
-        if rhs_node.kind() == "call"
-            && let Some(func_node) = rhs_node.child_by_field_name("function") {
-                let target = func_node.utf8_text(text.as_bytes()).ok().unwrap_or("");
-                let resolved = resolve_call_target(target, import_map);
-                if let Some(KnownFunction::Vmap) = classify_known_function(&resolved) {
-                    let args_node = rhs_node.child_by_field_name("arguments");
-                    if let Some(an) = args_node
-                        && let Ok(args) = extract_call_arguments(an, text)
-                            && let Some(info) = parse_vmap_call(&args) {
-                                ctx.vmap_targets.insert(lhs_name.clone(), info);
-                            }
-                    // vmap binding has no output shape — skip to next assignment.
-                    continue;
-                }
-            }
-
-        // Also need to handle the old-style layer applications. The
-        // layer-application path in shape_of_call doesn't know the LHS
-        // variable name, so we do a pre-check here for layer calls.
-        // Inline expression arguments (e.g. `layer(jnp.exp(x))`) are
-        // resolved via resolve_call_args so nested inputs get a shape.
-        //
-        // TODO: Same as vmap above — threading lhs_name through ShapeCtx
-        // would let shape_of_call own the layer-application path, removing
-        // this duplication.
-        if rhs_node.kind() == "call"
-            && let Some(func_node) = rhs_node.child_by_field_name("function") {
-                let target = func_node.utf8_text(text.as_bytes()).ok().unwrap_or("");
-                let call_byte = rhs_node.start_byte();
-                if let Some(kind) =
-                    find_scoped_layer(ctx.layer_records, ctx.scopes, call_byte, target)
-                {
-                    let args_node = rhs_node.child_by_field_name("arguments");
-                    if let Some(an) = args_node
-                        && let Ok(raw_args) = extract_call_arguments(an, text)
-                            // Recursively evaluate inline expression args (e.g.
-                            // `layer(jnp.exp(x))`) so the input resolves to a
-                            // synthetic name with a known shape.
-                            && let Some(args) =
-                                resolve_call_args(raw_args, an, scope_idx, &mut ctx)
-                            && let Some(CallArgument::Positional { value: input }) =
-                                args.first().cloned()
-                            {
-                                let application = LayerApplication {
-                                    variable: lhs_name.clone(),
-                                    layer: target.to_string(),
-                                    input,
-                                    kind: kind.clone(),
-                                    range: an.range(),
-                                };
-                                let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
-                                match result {
-                                    Ok(Some(output)) => {
-                                        ctx.record_binding(
-                                            scope_idx,
-                                            &lhs_name,
-                                            output,
-                                            display_line,
-                                            call_byte,
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        ctx.evict_binding(scope_idx, &lhs_name);
-                                    }
-                                    Err(message) => {
-                                        ctx.evict_binding(scope_idx, &lhs_name);
-                                        ctx.errors.push(ShapeError::mismatch(lhs_name.clone(), message, application.range));
-                                    }
-                                }
-                                ctx.applications.push(application);
-                                continue;
-                            }
-                }
-            }
-
-        // Delegate to the recursive evaluator.
-        let errors_before = ctx.errors.len();
-        let result = shape_of_expression(rhs_node, &mut ctx);
-
-        // Fix up error variable names: shape_of_expression doesn't know the
-        // LHS variable name, so it records errors with placeholder names
-        // (the function target or expression text). Replace with the actual
-        // LHS name.
-        for err in &mut ctx.errors[errors_before..] {
-            err.variable = lhs_name.clone();
-        }
-
-        if let Some(shape) = result {
-            ctx.record_binding(scope_idx, &lhs_name, shape, display_line, rhs_node.start_byte());
-        } else if display_line.is_some() {
-            // Non-annotated reassignment with an unshapeable RHS: the old
-            // binding is stale now (issue #46). Annotated assignments keep
-            // their user-written shape.
-            ctx.evict_binding(scope_idx, &lhs_name);
-        }
+        process_assignment_item(lhs, rhs_node, assignment_node, &mut ctx);
     }
 
     // Also handle binary-operator expressions in return/yield/assert
@@ -1604,6 +1578,144 @@ fn propagate_calls(
     }
 
     Ok((applications, errors, assignment_shapes))
+}
+
+/// Process one collected assignment item, binding its LHS to the RHS's
+/// computed shape (or evicting a stale binding). Shared by the top-level
+/// whole-file walk (`propagate_calls`) and lazy call-site parameter seeding
+/// (`specialize_callee_call`, which re-collects and replays just a single
+/// callee's own assignments on demand).
+fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx: &mut ShapeCtx) {
+    // Inlay hints display non-annotated assignments only (an annotated
+    // assignment already shows the user's written type). `None` here means
+    // "bind the shape but emit no inlay record".
+    let display_line = if assignment_node.child_by_field_name("type").is_none() {
+        Some(assignment_node.start_position().row as u32)
+    } else {
+        None
+    };
+
+    // Tuple-pattern unpacking (issue #30) — bind each element and move on.
+    let lhs_name = match lhs {
+        Lhs::Single(name) => name,
+        Lhs::Augmented(name) => {
+            handle_augmented_assignment(&name, rhs_node, assignment_node, display_line, ctx);
+            return;
+        }
+        Lhs::Tuple(names) => {
+            handle_tuple_assignment(&names, rhs_node, display_line, ctx);
+            return;
+        }
+    };
+    let scope_idx = match scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    // Special-case vmap *recording* before delegating to
+    // shape_of_expression.  vmap bindings like `vf = jax.vmap(f)`
+    // produce no output shape of their own but need to be recorded
+    // so that later calls to `vf(...)` can be expanded.
+    //
+    // TODO: Consider threading lhs_name through ShapeCtx so that
+    // shape_of_call can own the vmap-recording path too, eliminating
+    // this duplication.  Currently shape_of_call doesn't know the
+    // LHS variable name for the assignment.
+    if rhs_node.kind() == "call"
+        && let Some(func_node) = rhs_node.child_by_field_name("function") {
+            let target = func_node.utf8_text(ctx.text.as_bytes()).ok().unwrap_or("");
+            let resolved = resolve_call_target(target, ctx.import_map);
+            if let Some(KnownFunction::Vmap) = classify_known_function(&resolved) {
+                let args_node = rhs_node.child_by_field_name("arguments");
+                if let Some(an) = args_node
+                    && let Ok(args) = extract_call_arguments(an, ctx.text)
+                        && let Some(info) = parse_vmap_call(&args) {
+                            ctx.vmap_targets.insert(lhs_name.clone(), info);
+                        }
+                // vmap binding has no output shape — skip to next assignment.
+                return;
+            }
+        }
+
+    // Also need to handle the old-style layer applications. The
+    // layer-application path in shape_of_call doesn't know the LHS
+    // variable name, so we do a pre-check here for layer calls.
+    // Inline expression arguments (e.g. `layer(jnp.exp(x))`) are
+    // resolved via resolve_call_args so nested inputs get a shape.
+    //
+    // TODO: Same as vmap above — threading lhs_name through ShapeCtx
+    // would let shape_of_call own the layer-application path, removing
+    // this duplication.
+    if rhs_node.kind() == "call"
+        && let Some(func_node) = rhs_node.child_by_field_name("function") {
+            let target = func_node.utf8_text(ctx.text.as_bytes()).ok().unwrap_or("");
+            let call_byte = rhs_node.start_byte();
+            if let Some(kind) =
+                find_scoped_layer(ctx.layer_records, ctx.scopes, call_byte, target)
+            {
+                let args_node = rhs_node.child_by_field_name("arguments");
+                if let Some(an) = args_node
+                    && let Ok(raw_args) = extract_call_arguments(an, ctx.text)
+                        // Recursively evaluate inline expression args (e.g.
+                        // `layer(jnp.exp(x))`) so the input resolves to a
+                        // synthetic name with a known shape.
+                        && let Some(args) =
+                            resolve_call_args(raw_args, an, scope_idx, ctx)
+                        && let Some(CallArgument::Positional { value: input }) =
+                            args.first().cloned()
+                        {
+                            let application = LayerApplication {
+                                variable: lhs_name.clone(),
+                                layer: target.to_string(),
+                                input,
+                                kind: kind.clone(),
+                                range: an.range(),
+                            };
+                            let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+                            match result {
+                                Ok(Some(output)) => {
+                                    ctx.record_binding(
+                                        scope_idx,
+                                        &lhs_name,
+                                        output,
+                                        display_line,
+                                        call_byte,
+                                    );
+                                }
+                                Ok(None) => {
+                                    ctx.evict_binding(scope_idx, &lhs_name);
+                                }
+                                Err(message) => {
+                                    ctx.evict_binding(scope_idx, &lhs_name);
+                                    ctx.errors.push(ShapeError::mismatch(lhs_name.clone(), message, application.range));
+                                }
+                            }
+                            ctx.applications.push(application);
+                            return;
+                        }
+            }
+        }
+
+    // Delegate to the recursive evaluator.
+    let errors_before = ctx.errors.len();
+    let result = shape_of_expression(rhs_node, ctx);
+
+    // Fix up error variable names: shape_of_expression doesn't know the
+    // LHS variable name, so it records errors with placeholder names
+    // (the function target or expression text). Replace with the actual
+    // LHS name.
+    for err in &mut ctx.errors[errors_before..] {
+        err.variable = lhs_name.clone();
+    }
+
+    if let Some(shape) = result {
+        ctx.record_binding(scope_idx, &lhs_name, shape, display_line, rhs_node.start_byte());
+    } else if display_line.is_some() {
+        // Non-annotated reassignment with an unshapeable RHS: the old
+        // binding is stale now (issue #46). Annotated assignments keep
+        // their user-written shape.
+        ctx.evict_binding(scope_idx, &lhs_name);
+    }
 }
 
 /// Left-hand side of an assignment we propagate shapes through.
@@ -2062,19 +2174,39 @@ fn tuple_rhs_shapes(
             // inline tuple carry (`scan(body, (h0, c0), xs)`) or a
             // previously-bound tuple-literal variable (`init = (mean0,
             // var0)`) both resolve via `shape_of_tuple`'s homogeneous-shape
-            // rule, same as a plain single-array carry. `ys` would need the
-            // body's per-step output shape; skipped (evicts any stale
-            // binding).
+            // rule, same as a plain single-array carry. `ys` needs the
+            // body's per-step output shape: when `body` is a same-file
+            // function/closure, seed its params (carry <- init's shape, the
+            // per-step element <- `xs`'s shape minus its leading axis) and
+            // evaluate its body lazily (`scan_body_ys_shape`); `ys` is then
+            // the body's second return element with `xs`'s leading dim
+            // prepended. Anything not modelled (qualified/`self.` body,
+            // missing `xs`, un-traceable body return, …) evicts any stale
+            // `ys` binding rather than guessing.
             if matches!(known, Some(KnownFunction::Scan)) {
                 if n_targets != 2 {
                     return None;
                 }
                 let args_node = rhs.child_by_field_name("arguments")?;
+                let body_node = find_keyword_arg_node(args_node, "f", ctx.text.as_bytes())
+                    .and_then(|kw| kw.child_by_field_name("value"))
+                    .or_else(|| find_positional_arg_node(args_node, 0));
                 let init_node = find_keyword_arg_node(args_node, "init", ctx.text.as_bytes())
                     .and_then(|kw| kw.child_by_field_name("value"))
                     .or_else(|| find_positional_arg_node(args_node, 1))?;
                 let init_shape = shape_of_expression(init_node, ctx)?;
-                return Some(vec![Some(init_shape), None]);
+                let xs_node = find_keyword_arg_node(args_node, "xs", ctx.text.as_bytes())
+                    .and_then(|kw| kw.child_by_field_name("value"))
+                    .or_else(|| find_positional_arg_node(args_node, 2));
+
+                let ys_shape = match (body_node, xs_node) {
+                    (Some(body_node), Some(xs_node)) => {
+                        scan_body_ys_shape(body_node, &init_shape, xs_node, rhs.start_byte(), ctx)
+                    }
+                    _ => None,
+                };
+
+                return Some(vec![Some(init_shape), ys_shape]);
             }
 
             // `values, indices = jax.lax.top_k(operand, k)` — both outputs
@@ -3095,6 +3227,349 @@ fn collect_bare_return_identifiers(
     Some(())
 }
 
+// ── Lazy call-site parameter seeding ────────────────────────────────────
+//
+// The mechanism above (`apply_user_function` / `bind_and_substitute` /
+// `trace_user_function_return`) requires the callee's OWN annotations (or,
+// for the bare-identifier-return fallback, shapes the callee's body already
+// computed from its own annotations in the one global whole-file pass) —
+// it can never shape a callee whose parameters aren't annotated, even when
+// every call site passes fully-shaped arguments (`llm.txt`'s "Known
+// architectural limit"). The functions below are the extension: resolve a
+// call to a same-file function/closure/method scope, seed its UN-annotated
+// params from this call site's argument shapes, and evaluate its body on
+// demand ("lazily", i.e. only when a call site actually needs it).
+
+/// Recursion/cycle guard depth cap for `specialize_callee_call` — deep but
+/// non-cyclic call chains bail rather than recursing unboundedly.
+const MAX_SPECIALIZATION_DEPTH: usize = 8;
+
+/// Outcome of lazily evaluating a same-file callee's body with seeded
+/// parameter shapes.
+#[derive(Debug, Default)]
+struct SpecializedReturn {
+    /// Shape of the return expression when it is NOT a bare tuple literal —
+    /// covers a bare-identifier return, a general `return <expr>`, and the
+    /// "every `return` statement names the same identifier" case.
+    single: Option<Vec<String>>,
+    /// Per-element shapes when the (single) return statement's expression
+    /// is a bare tuple literal `return (a, b, ...)` — needed by `lax.scan`
+    /// body seeding, which needs the carry and the per-step output
+    /// individually rather than collapsed into one shape.
+    tuple: Option<Vec<Option<Vec<String>>>>,
+}
+
+/// This function's own `return` statement expression node(s), not
+/// descending into nested function/class/lambda bodies (a `return` there
+/// belongs to a different scope). Mirrors `collect_bare_return_identifiers`
+/// but collects the expression node itself rather than requiring/parsing a
+/// bare identifier, so the caller can evaluate arbitrary expressions.
+fn collect_own_return_exprs<'t>(block: Node<'t>, out: &mut Vec<Node<'t>>) {
+    for i in 0..block.named_child_count() {
+        let Some(child) = block.named_child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "return_statement" => {
+                if let Some(value) = child.named_child(0) {
+                    out.push(value);
+                }
+            }
+            "function_definition" | "class_definition" | "lambda" => continue,
+            _ => collect_own_return_exprs(child, out),
+        }
+    }
+}
+
+/// Evaluate the callee's own return statement(s) against its (specialized)
+/// scope. A single return statement is evaluated via the full recursive
+/// `shape_of_expression` machinery — a bare tuple literal's elements are
+/// kept distinct (`tuple`), anything else (bare identifier or general
+/// expression) is one shape (`single`). Multiple return statements are only
+/// resolved when every one is the same bare identifier (mirrors the older,
+/// more conservative `trace_bare_return_identifier` convention) — genuinely
+/// divergent return expressions across branches aren't unifiable without
+/// deeper control-flow analysis, so they stay `None`.
+fn trace_specialized_return(body: Node, callee_idx: usize, ctx: &mut ShapeCtx) -> SpecializedReturn {
+    let mut returns = Vec::new();
+    collect_own_return_exprs(body, &mut returns);
+
+    match returns.len() {
+        0 => SpecializedReturn::default(),
+        1 => {
+            let node = returns[0];
+            // `return a, b` (no enclosing parens) parses as an
+            // `expression_list`, not a `tuple` node — structurally
+            // identical (same named-child layout), just without parens.
+            if node.kind() == "tuple" || node.kind() == "expression_list" {
+                let mut elems = Vec::with_capacity(node.named_child_count());
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    elems.push(shape_of_expression(child, ctx));
+                }
+                SpecializedReturn {
+                    single: None,
+                    tuple: Some(elems),
+                }
+            } else {
+                SpecializedReturn {
+                    single: shape_of_expression(node, ctx),
+                    tuple: None,
+                }
+            }
+        }
+        _ => {
+            let mut name: Option<&str> = None;
+            for n in &returns {
+                if n.kind() != "identifier" {
+                    return SpecializedReturn::default();
+                }
+                let Ok(text) = n.utf8_text(ctx.text.as_bytes()) else {
+                    return SpecializedReturn::default();
+                };
+                match name {
+                    None => name = Some(text),
+                    Some(existing) if existing != text => return SpecializedReturn::default(),
+                    _ => {}
+                }
+            }
+            let single = name.and_then(|n| ctx.scopes[callee_idx].shapes.get(n).cloned());
+            SpecializedReturn { single, tuple: None }
+        }
+    }
+}
+
+/// Lazily evaluate a same-file callee scope's body with `seeded_params`
+/// merged on top of its own jaxtyping annotations, in an ephemeral
+/// specialized copy of its scope — so one call site's argument shapes never
+/// corrupt another's.
+///
+/// SPECIALIZATION vs GLOBAL STATE: for editor UX (hover/inlay inside the
+/// callee body), the FIRST successful specialization of a given scope is
+/// written back to the real scope (+ `assignment_shapes`/`errors`) —
+/// first-call-wins, tracked by `ctx.specialized_scopes`. Every later
+/// specialization of the same scope (a different call site, possibly with
+/// different argument shapes) reverts its own mutations at the end, so it
+/// can't overwrite the first call's hover info or leak errors that only
+/// apply to its own seeding.
+///
+/// Recursion/cycles: re-entering a scope already being specialized (a
+/// direct or mutual recursive call) returns `None` immediately, and the
+/// active-specialization stack is capped at `MAX_SPECIALIZATION_DEPTH`.
+fn specialize_callee_call(
+    callee_idx: usize,
+    seeded_params: HashMap<String, Vec<String>>,
+    ctx: &mut ShapeCtx,
+) -> Option<SpecializedReturn> {
+    if ctx.active_specializations.contains(&callee_idx)
+        || ctx.active_specializations.len() >= MAX_SPECIALIZATION_DEPTH
+    {
+        return None;
+    }
+    let func_node = (*ctx.scope_function_nodes.get(callee_idx)?)?;
+
+    // Always start from the call-site-independent baseline (`original_
+    // shapes`), NEVER from the live `scopes[callee_idx].shapes` — the live
+    // map may already hold a prior call site's seeded params/locals
+    // (first-call-wins write-back), and cloning that would leak this
+    // call's un-annotated params from a DIFFERENT call site's shapes.
+    let mut specialized_shapes = ctx
+        .original_shapes
+        .get(callee_idx)
+        .cloned()
+        .unwrap_or_default();
+    for (name, shape) in seeded_params {
+        specialized_shapes.entry(name).or_insert(shape);
+    }
+
+    let is_first = !ctx.specialized_scopes.contains(&callee_idx);
+    let saved_shapes = std::mem::replace(&mut ctx.scopes[callee_idx].shapes, specialized_shapes);
+    let errors_before = ctx.errors.len();
+    let assignments_before = ctx.assignment_shapes.len();
+
+    ctx.active_specializations.push(callee_idx);
+
+    // Re-collect just this callee's own assignments (cheap — bounded by its
+    // own body size, not the whole file) and replay them through the same
+    // per-assignment logic the top-level pass uses. Items whose innermost
+    // scope isn't exactly `callee_idx` belong to a nested closure defined
+    // inside this body — that closure gets its own scope and is evaluated
+    // lazily, on its own, if/when it is itself called.
+    let body_assignments = collect_assignment_items(func_node, ctx.text).unwrap_or_default();
+    for (lhs, rhs_node, assignment_node) in body_assignments {
+        if scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) == Some(callee_idx) {
+            process_assignment_item(lhs, rhs_node, assignment_node, ctx);
+        }
+    }
+
+    let ret = match func_node.child_by_field_name("body") {
+        Some(body) => trace_specialized_return(body, callee_idx, ctx),
+        None => SpecializedReturn::default(),
+    };
+
+    ctx.active_specializations.pop();
+
+    if is_first {
+        ctx.specialized_scopes.insert(callee_idx);
+    } else {
+        ctx.scopes[callee_idx].shapes = saved_shapes;
+        ctx.errors.truncate(errors_before);
+        ctx.assignment_shapes.truncate(assignments_before);
+    }
+
+    Some(ret)
+}
+
+/// Whether every one of a callee's params (`all_params`, skipping a leading
+/// `self`/`cls`) was statically annotated at extraction time — checked
+/// against the immutable `original_shapes` snapshot, NOT the live (mutable)
+/// `scopes[...].shapes`, so a prior specialization's write-back for a
+/// DIFFERENT call site never makes this incorrectly report "fully
+/// annotated" (see `original_shapes`'s doc comment).
+fn callee_all_params_annotated(callee_idx: usize, ctx: &ShapeCtx) -> bool {
+    let all_params = &ctx.scopes[callee_idx].all_params;
+    let params: &[String] = match all_params.first().map(String::as_str) {
+        Some("self") | Some("cls") => &all_params[1..],
+        _ => all_params,
+    };
+    let Some(original) = ctx.original_shapes.get(callee_idx) else {
+        return false;
+    };
+    params.iter().all(|p| original.contains_key(p))
+}
+
+/// Map a call's resolved arguments onto the callee's FULL declared
+/// parameter list (`all_params` — annotated and un-annotated, in
+/// declaration order), skipping a leading `self`/`cls` (same convention as
+/// `resolution::bind_call_arguments`). Returns `(param_name, shape)` for
+/// every param whose incoming argument shape is resolvable in the caller's
+/// scope; an unresolvable argument just means that param goes unseeded (not
+/// a hard bail) — any body expression that actually depends on it stays
+/// dark, same as any other unresolvable lookup elsewhere in this evaluator.
+fn seed_params_from_call(
+    all_params: &[String],
+    args: &[CallArgument],
+    caller_scope_idx: usize,
+    ctx: &ShapeCtx,
+) -> HashMap<String, Vec<String>> {
+    let params: &[String] = match all_params.first().map(String::as_str) {
+        Some("self") | Some("cls") => &all_params[1..],
+        _ => all_params,
+    };
+    let mut seeded = HashMap::new();
+    let mut positional_idx = 0usize;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if let Some(param) = params.get(positional_idx)
+                    && let Some(shape) = ctx.resolve_shape(value, caller_scope_idx)
+                {
+                    seeded.insert(param.clone(), shape);
+                }
+                positional_idx += 1;
+            }
+            CallArgument::Keyword { name, value } => {
+                if params.iter().any(|p| p == name)
+                    && let Some(shape) = ctx.resolve_shape(value, caller_scope_idx)
+                {
+                    seeded.insert(name.clone(), shape);
+                }
+            }
+        }
+    }
+    seeded
+}
+
+/// Fallback for a same-file call whose callee (a top-level function, a
+/// nested closure, or a `self.<method>`) has at least one un-annotated
+/// parameter: seed the un-annotated params from this call site's resolved
+/// argument shapes and evaluate the callee's body on demand. Tried only
+/// after `apply_user_function`'s existing annotation/bare-return-trace path
+/// has already run and found nothing — when every param is already
+/// annotated, that path already covers the call (or correctly found
+/// nothing to propagate), so this returns `None` up front rather than
+/// re-doing the same work.
+fn apply_seeded_user_function(
+    target: &str,
+    call_byte: usize,
+    args: &[CallArgument],
+    caller_scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let callee_idx = find_callee_scope(target, Some(call_byte), ctx.scopes)?;
+    let all_params = ctx.scopes[callee_idx].all_params.clone();
+    let seeded = seed_params_from_call(&all_params, args, caller_scope_idx, ctx);
+    let result = specialize_callee_call(callee_idx, seeded, ctx)?;
+    match result.tuple {
+        Some(elems) => {
+            // A bare-tuple return in a single-assignment context is only
+            // representable as one array shape when every element shares
+            // the same shape (mirrors `shape_of_tuple`'s homogeneous-carry
+            // convention already used for scan/RNN state tuples).
+            let mut shape: Option<Vec<String>> = None;
+            for elem in elems {
+                let elem = elem?;
+                match &shape {
+                    None => shape = Some(elem),
+                    Some(s) if *s == elem => {}
+                    Some(_) => return None,
+                }
+            }
+            shape
+        }
+        None => result.single,
+    }
+}
+
+/// `jax.lax.scan` body seeding (the flagship consumer of lazy call-site
+/// parameter seeding): given the scan's `body` callable node, `init`'s
+/// already-computed shape, and the `xs` node, seed `body`'s first param
+/// with the carry shape and its second with `xs`'s shape minus its leading
+/// (scan) axis, evaluate `body`'s return lazily, and return `ys` — the
+/// body's second return element (`y`) with `xs`'s leading dim prepended
+/// back on. Only a bare same-file function/closure `body` is modelled (a
+/// qualified name or `self.<method>` isn't traced here); `None` for
+/// anything not statically derivable (missing `xs` shape, body not found,
+/// body's return isn't a 2-tuple, …).
+fn scan_body_ys_shape(
+    body_node: Node,
+    init_shape: &[String],
+    xs_node: Node,
+    scan_call_byte: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let body_name = body_node.utf8_text(ctx.text.as_bytes()).ok()?;
+    if body_name.contains('.') {
+        return None;
+    }
+    let xs_shape = shape_of_expression(xs_node, ctx)?;
+    let (leading, rest) = xs_shape.split_first()?;
+    let leading = leading.clone();
+    let rest = rest.to_vec();
+
+    let callee_idx = find_callee_scope(body_name, Some(scan_call_byte), ctx.scopes)?;
+    let all_params = ctx.scopes[callee_idx].all_params.clone();
+    let mut seeded = HashMap::new();
+    if let Some(carry_param) = all_params.first() {
+        seeded.insert(carry_param.clone(), init_shape.to_vec());
+    }
+    if let Some(elem_param) = all_params.get(1) {
+        seeded.insert(elem_param.clone(), rest);
+    }
+
+    let result = specialize_callee_call(callee_idx, seeded, ctx)?;
+    let mut elems = result.tuple?;
+    if elems.len() != 2 {
+        return None;
+    }
+    let y_shape = elems.remove(1)?;
+    let mut out = vec![leading];
+    out.extend(y_shape);
+    Some(out)
+}
+
 /// Attempt to resolve `target` as a user-defined function in the same file
 /// and propagate its declared (or traced) return shape to the call site.
 ///
@@ -3303,9 +3778,18 @@ fn apply_elementwise_shape(
     right: &[String],
     op: BinaryOp,
 ) -> Result<Option<Vec<String>>, String> {
-    // Scalar / rank-0: Ok(None) for now
-    if left.is_empty() || right.is_empty() {
-        return Ok(None);
+    // A resolved rank-0 ("scalar") shape — e.g. a plain `decay: float`
+    // function parameter (seeded as `[]` by `extract_jaxtyping_shapes`), or
+    // an int unpacked from `x.shape` — broadcasts against anything, same as
+    // a literal scalar (numpy semantics: a 0-d array is a scalar).
+    if left.is_empty() && right.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    if left.is_empty() {
+        return Ok(Some(right.to_vec()));
+    }
+    if right.is_empty() {
+        return Ok(Some(left.to_vec()));
     }
 
     let op_symbol = match op {
@@ -3453,6 +3937,15 @@ mod shape_of_expression_tests {
 
         let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
 
+        let mut function_nodes = Vec::new();
+        collect_function_definition_nodes(tree.root_node(), &mut function_nodes);
+        let mut scope_function_nodes: Vec<Option<Node>> = std::iter::once(None)
+            .chain(function_nodes.into_iter().map(Some))
+            .collect();
+        scope_function_nodes.resize(scopes.len(), None);
+        let original_shapes: Vec<HashMap<String, Vec<String>>> =
+            scopes.iter().map(|s| s.shapes.clone()).collect();
+
         let mut ctx = ShapeCtx {
             text: code,
             import_map: &import_map,
@@ -3470,6 +3963,10 @@ mod shape_of_expression_tests {
             assignment_shapes: &mut assignment_shapes,
             synthetic_counter: 0,
             synthetics: HashMap::new(),
+            scope_function_nodes: &scope_function_nodes,
+            active_specializations: Vec::new(),
+            specialized_scopes: std::collections::HashSet::new(),
+            original_shapes: &original_shapes,
         };
 
         for (lhs, rhs_node, _assignment_node) in assignments {
@@ -3812,10 +4309,19 @@ def f(x: Float[Array, "3 5"]):
     }
 
     #[test]
-    fn test_broadcast_scalar_empty_returns_none() {
+    fn test_broadcast_rank_zero_broadcasts_like_scalar() {
+        // A resolved rank-0 ("scalar") shape — e.g. a plain `decay: float`
+        // function parameter seeded as `[]` by `extract_jaxtyping_shapes`
+        // — broadcasts against anything, same as a literal scalar (numpy
+        // semantics: a 0-d array is a scalar). Needed for lazy call-site
+        // parameter seeding to shape binops like `mean + (1 - decay) * delta`.
         let x = shape(&["3", "5"]);
-        assert_eq!(apply_elementwise_shape(&[], &x, BinaryOp::Add), Ok(None));
-        assert_eq!(apply_elementwise_shape(&x, &[], BinaryOp::Add), Ok(None));
+        assert_eq!(apply_elementwise_shape(&[], &x, BinaryOp::Add), Ok(Some(x.clone())));
+        assert_eq!(apply_elementwise_shape(&x, &[], BinaryOp::Add), Ok(Some(x)));
+        assert_eq!(
+            apply_elementwise_shape(&[], &[], BinaryOp::Add),
+            Ok(Some(Vec::new()))
+        );
     }
 
     #[test]

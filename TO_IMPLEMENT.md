@@ -22,7 +22,7 @@ Legend:
 | `jax.jacrev` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad`. |
 | `jax.hessian` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (two derivative dimension groups). |
 | `jax.pmap` | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics, not statically derivable with the current design. |
-| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant). `init` is evaluated as a real expression node, so a homogeneous-shape tuple carry (`(a, b)` with equal element shapes, inline at the call site or via a previously-bound tuple-literal variable — `shape_of_tuple`) resolves the same way as a plain single-array carry; heterogeneous-shape tuple carries stay `Ok(None)`. Stacked `ys` still skipped (needs per-step body-output inference) — same for the body function's *internal* un-annotated carry destructuring (no cross-function seeding from the call site into the body's own scope; see `scan_tuple_carry_corpus_mirror_tests` in integration_tests.rs for the documented gap). |
+| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant). `init` is evaluated as a real expression node, so a homogeneous-shape tuple carry (`(a, b)` with equal element shapes, inline at the call site or via a previously-bound tuple-literal variable — `shape_of_tuple`) resolves the same way as a plain single-array carry; heterogeneous-shape tuple carries stay `Ok(None)`. Stacked `ys` is now modelled too, via lazy call-site parameter seeding (see "Lazy call-site parameter seeding" below): when `body` is a same-file function/closure, its params are seeded (`carry` <- `init`'s shape, the per-step element <- `xs`'s shape minus its leading axis) and its body evaluated on demand (`scan_body_ys_shape` in analysis.rs); `ys` is the body's second return element with `xs`'s leading dim prepended back on. A qualified (`module.func`) or `self.<method>` body still isn't traced this way. |
 | `jax.lax.map` | ✅ | ✅ | ✅ | Maps over the leading axis like `vmap(f)(xs)` with `in_axes=out_axes=0`; reuses `apply_vmap_call`/`apply_inline_vmap_layer` (bare user function or `self.<attr>` layer). Special-cased in `shape_of_call` (needs the callee-scope lookup machinery, not just `args`+`shapes`). |
 | `jax.lax.cond` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — branch output shape isn't derivable without analyzing both branch functions (out of scope for now). |
 | `jax.lax.switch` | ✅ | ❌ | ✅ | Same as `cond` — classified, conservatively `Ok(None)`. |
@@ -418,6 +418,67 @@ Legend:
 | `x.diagonal(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Diagonal`'s rule (method form of `torch.diagonal`). |
 | `x.tril(...)` / `x.triu(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Tril`/`KnownFunction::Triu`'s shape-preserving rules. |
 
+## Lazy call-site parameter seeding
+
+Closes the architectural limit documented in `llm.txt`'s "Known
+architectural limit (the next big thing)": previously, a callee whose
+parameters weren't jaxtyping-annotated could never be shaped, even when
+every call site passed fully-shaped arguments — `lax.scan` body functions
+destructuring their carry, nested closures, and helper functions relying on
+inference all went dark.
+
+- **Mechanism** (`analysis.rs`): when a call resolves to a same-file
+  function scope (top-level function, nested closure, or `self.<method>`)
+  that isn't FULLY annotated (checked against `original_shapes`, an
+  immutable snapshot of every scope's annotations taken before any
+  assignment/specialization runs — never the live, mutable `scopes[...].
+  shapes`), `apply_seeded_user_function` seeds its un-annotated params from
+  the call site's resolved argument shapes (`seed_params_from_call`, using
+  the new `FunctionShapeScope::all_params` field — every declared param,
+  unlike `param_order`, which is annotated-only) and evaluates its body on
+  demand (`specialize_callee_call`): re-collects and replays just that
+  function's own assignments, computes the return shape via the extended
+  return tracer (`trace_specialized_return` — bare identifier, general
+  `return <expr>` via `shape_of_expression`, or a bare-tuple/`expression_
+  list` return's elements kept distinct), and reports whichever the caller
+  needs. A fully-annotated callee is unaffected — it still goes through the
+  older `apply_user_function`/`bind_and_substitute`/`trace_user_function_
+  return` path unchanged.
+- **Specialization vs. global state**: every specialization runs against a
+  scope-local shapes map seeded fresh from `original_shapes` (so one call
+  site's argument shapes can never leak into another's). First-call-wins:
+  the FIRST successful specialization of a given scope writes its computed
+  locals + `assignment_shapes` + `errors` back into the shared analysis
+  (editor hover/inlay inside the callee body); every later specialization
+  of the same scope reverts its own mutations afterward.
+- **Recursion/cycles**: an active-specialization stack in `ShapeCtx` makes
+  re-entering a scope already being specialized return `None` immediately;
+  depth capped at 8 (`MAX_SPECIALIZATION_DEPTH`).
+- **Scalar-typed params**: a plain `int`/`float`/`bool`/`complex`-typed
+  parameter (e.g. `decay: float = 0.9`) is seeded as rank-0 (`[]`) at
+  extraction time (`extract_jaxtyping_shapes`) — sound (never an array by
+  Python's own type system), and needed for binops like `mean + (1 -
+  decay) * delta` to shape instead of going dark. `apply_elementwise_shape`
+  and `binop_operand` broadcast a resolved rank-0 shape like a literal
+  scalar.
+- **`jax.lax.scan` body seeding** (the flagship consumer, `scan_body_ys_
+  shape`): for `carry_out, ys = lax.scan(body, init, xs)` with a same-file
+  `body`, seeds `body`'s first param from `init`'s shape and its second
+  from `xs`'s shape minus its leading axis, then traces `ys` from the
+  body's second return element with `xs`'s leading dim prepended back.
+- **Corpus impact**: closed all 9 dark spots from the previous wave —
+  `lax_scan_ema.py`, `eqx_lstm_gru_scan.py`, and `scope_soup.py` all reach
+  100%; overall corpus is 176/176 (100%), floor raised from 85 to 90.
+  `scan_tuple_carry_corpus_mirror_tests` and the wave-6 regression tests in
+  `integration_tests.rs` were flipped from asserting darkness to asserting
+  the new shaped values. New coverage: `lazy_call_site_parameter_seeding_
+  tests` (multi-call-site specialization, recursion guard, closure param
+  seeding, `return <expr>` tracing).
+- **Deviation from the original design note**: cross-*file* imported
+  helpers are still not covered by this mechanism (same as before) — only
+  same-file scopes, since `all_params`/`original_shapes`/`scope_function_
+  nodes` are all keyed by the in-file `scopes` array.
+
 ## Open targets (current)
 
 Earlier suggested-order items (concatenate/stack, reductions, reshape/flatten,
@@ -449,11 +510,13 @@ below are the current ranked gap list.
 
 Current open work, roughly in impact order:
 
-1. **Grow the corpus again** — 100% on the current eleven files. Known
-   remaining approximations: scan's stacked `ys` output, strided flax Conv,
-   non-default svd/qr/meshgrid modes.
-2. **Cross-*file* return-type tracing** — same-file helpers already propagate;
-   imported helpers don't yet.
+1. **Grow the corpus again** — 100% (176/176) as of the lazy call-site
+   parameter seeding wave (see that section above). Known remaining
+   approximations: strided flax Conv, non-default svd/qr/meshgrid modes.
+   Scan's stacked `ys` output is now modelled for same-file bodies.
+2. **Cross-*file* return-type tracing** — same-file helpers already propagate
+   (including, as of this wave, same-file callees with un-annotated params
+   via lazy call-site parameter seeding); imported helpers don't yet.
 3. **Remaining single-function shape rules** — see ❌ rows above
    (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
    `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).

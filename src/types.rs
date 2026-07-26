@@ -866,6 +866,14 @@ pub struct FunctionShapeScope {
     /// Used by cross-function shape propagation to match positional call
     /// arguments to declared parameter shapes.
     pub param_order: Vec<String>,
+    /// EVERY declared parameter name (annotated or not), in declaration
+    /// order, including `self`/`cls`. Used by lazy call-site parameter
+    /// seeding (`analysis::specialize_callee_call`) to map a call's
+    /// positional/keyword arguments onto the callee's full parameter list —
+    /// `param_order` can't be reused for this since it only contains
+    /// jaxtyping-annotated params, so its index doesn't match the true
+    /// declared position when annotated and un-annotated params are mixed.
+    pub all_params: Vec<String>,
 }
 
 /// One record per (non-annotated) assignment that produced a shape, in the
