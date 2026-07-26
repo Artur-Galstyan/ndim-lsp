@@ -9,7 +9,8 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with ~1586 tests across the lib + integration suites (plus 1 ignored benchmark).
+- `cargo test --quiet` passes with ~1673 tests across the lib + integration suites (plus 1 ignored benchmark).
+- Corpus coverage is 100% (125/125) over 18 files in `corpus/`.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
   timing harness over `bench/benchmark_large.py` (~4.5k lines, regenerate with
@@ -343,28 +344,35 @@ modules, jax.grad family, device collectives, data-dependent outputs).
 and implement the top one. Grow `corpus/*.py` so the ranking stays
 representative. Current open targets, in impact order:
 
-1. Grow the corpus with files exercising the newly-implemented ops (torch
-   tensor-method style models, einops-heavy ViTs, ConvTranspose decoders,
-   RNN/LSTM models) so the harness ranks the NEXT real gaps.
+(Done in the latest waves: Sequential/SpectralNorm/WeightNorm/einops-layer
+composition — `LayerKind::Sequential`/`EinopsPattern` in layers.rs; real
+`torch.split(split_size)` semantics — `KnownFunction::TorchSplit`;
+symbolic-dim canonicalization at comparison time — `canonicalize_dim`/
+`dims_canonically_equal` in types.rs, so `d*2` ≡ `2*d`; class-scoped alias
+map; cross-file return-type tracing for imported helpers —
+`resolve_imported_function_shape` + signature cache in resolution.rs;
+expression arguments bound as synthetics in method-call positions; nested
+`vmap(vmap(...))`; MHA single-LHS + vmap'd binding; per-error-kind
+severities — `ShapeErrorKind::{Mismatch,Approximation}` → configurable
+ERROR/WARNING via `diagnostic_severity`/`approximation_severity` init
+options, exposed in the VSCode extension settings.)
 
-2. Composite containers — `Sequential` (thread shapes through the wrapped
-   layer list), `SpectralNorm`/`WeightNorm` (resolve the wrapped layer and
-   delegate). The highest-value remaining ❌ rows.
+1. Grow the corpus further (flax-heavy models, jax.lax.scan pipelines,
+   torch training-step files) — the harness is at 100%, so new files are
+   the only way to surface the next ranked gaps.
 
-3. Cross-*file* return-type tracing — same-file `-> Float[Array, "..."]`
-   helpers already propagate (`apply_user_function` + `bind_and_substitute`);
-   imported helpers don't yet.
+2. Remaining ❌ tracker rows with feasible-but-deferred notes: Fold/Unfold
+   window geometry, `jax.lax.gather` GatherDimensionNumbers modeling,
+   `einops.unpack`, true tuple `(output, state)` binding for RNN layers
+   under tuple LHS.
 
-4. Tuple state for RNN/MHA-style layers applied WITHOUT tuple LHS; real
-   `torch.split(split_size)` semantics (current rule treats the arg as a
-   section count, matching the jnp behavior but not torch's); normalize
-   `self.`-prefixed layer ctor args; constant-fold symbolic dims
-   (`d_state*2` vs `2*d_state`); class-scope the alias map like the layer map.
+3. Normalize `self.`-prefixed layer ctor args (`Linear(self.d_inner, ...)`);
+   extend canonicalization to subtraction/division and parenthesized forms.
 
-5. Per-error-kind diagnostic severity (add a kind field to `ShapeError`,
-   map approximate rules to warning/hint in `main.rs`).
+4. related_information on two-operand diagnostics (point at the other
+   operand's definition site); inlay-hint tooltips.
 
-6. Keep `TO_IMPLEMENT.md` and `README.md` honest
+5. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.
    - When a real shape rule exists, mark Shape rule ✅.
    - When tests exist for that shape rule, mark Tests ✅.
