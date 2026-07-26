@@ -9,11 +9,11 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with ~1259 tests across the lib + integration suites (plus 1 ignored benchmark).
+- `cargo test --quiet` passes with ~1586 tests across the lib + integration suites (plus 1 ignored benchmark).
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
-  timing harness over `bench/benchmark_large.py` (3730 lines, regenerate with
-  `python3 bench/generate_benchmark.py`): parse ~9 ms, analyze ~21 ms median
+  timing harness over `bench/benchmark_large.py` (~4.5k lines, regenerate with
+  `python3 bench/generate_benchmark.py`): parse ~10 ms, analyze ~25 ms median
   in release. It asserts >1000 inferred shapes and that the diagnostic count
   exactly equals the file's deliberate `# expected-error:` markers — fewer
   means missed detection, more means false positives. Treat it as the
@@ -323,31 +323,46 @@ Clippy is fully clean (including `src/main.rs`); keep it that way.
 Recommended next implementation steps
 -------------------------------------
 
+**The exhaustive tracker pass is done.** TO_IMPLEMENT.md went from 152 open
+rows to 21; everything feasible now has classify + shape rule + tests:
+jax.lax structured ops (map/scan-adjacent, slice/pad/broadcast families,
+top_k/sort, conv_general_dilated default case), the full jnp/np
+creation/transform/indexing/reduction matrix, torch functions AND
+torch.Tensor methods (incl. tuple outputs topk/chunk/unbind/kthvalue/median
+via `tuple_rhs_shapes`, `x.T`/`x.mT` via `shape_of_attribute`), einops
+einsum/pack/parse_shape + ellipsis `...` patterns, and the NN layer catalog
+(ConvTranspose, RNN/LSTM/GRU + cells, Flatten/Unflatten, Upsample,
+PixelShuffle, pad layers, InstanceNorm/RMSNorm, Bilinear, CosineSimilarity,
+eqx MLP; equinox MultiheadAttention ctor binding fixed — it binds
+`query_size`, not torch's `embed_dim`). The 21 remaining ❌ rows each carry
+an honest infeasibility/composite note (Sequential, Fold/Unfold, wrapper
+modules, jax.grad family, device collectives, data-dependent outputs).
+
 **Prioritize by the coverage harness, not by gut.** Run
 `cargo test corpus_coverage_report -- --nocapture`, read the ranked dark spots,
 and implement the top one. Grow `corpus/*.py` so the ranking stays
 representative. Current open targets, in impact order:
 
-1. Grow the corpus — coverage is 100% on the current four files, so add more
-   (a CNN with explicit pooling, an RNN/GRU using `scan`, embeddings) to
-   surface the next ranked gaps. The harness is only as good as its corpus.
+1. Grow the corpus with files exercising the newly-implemented ops (torch
+   tensor-method style models, einops-heavy ViTs, ConvTranspose decoders,
+   RNN/LSTM models) so the harness ranks the NEXT real gaps.
 
-2. More multi-output tuple-unpacking — `meshgrid`, `svd`, `eig`, `qr`. `split`
-   is done; extend the `tuple_rhs_shapes` dispatch in `src/analysis.rs`.
+2. Composite containers — `Sequential` (thread shapes through the wrapped
+   layer list), `SpectralNorm`/`WeightNorm` (resolve the wrapped layer and
+   delegate). The highest-value remaining ❌ rows.
 
 3. Cross-*file* return-type tracing — same-file `-> Float[Array, "..."]`
    helpers already propagate (`apply_user_function` + `bind_and_substitute`);
    imported helpers don't yet.
 
-4. `x.expand(...)` / `x.repeat(...)` methods; augmented assignment (`x += ...`);
-   normalize `self.`-prefixed layer ctor args; constant-fold symbolic dims.
+4. Tuple state for RNN/MHA-style layers applied WITHOUT tuple LHS; real
+   `torch.split(split_size)` semantics (current rule treats the arg as a
+   section count, matching the jnp behavior but not torch's); normalize
+   `self.`-prefixed layer ctor args; constant-fold symbolic dims
+   (`d_state*2` vs `2*d_state`); class-scope the alias map like the layer map.
 
-5. Flax (`flax.linen.Dense`/`Conv`) and attention layers in `src/layers.rs`.
-
-(Done since last revision: subscript/indexing — `shape_of_subscript`;
-symbolic-dim normalization — `extract_self_attr_aliases` + `normalize_dim`;
-direct self-attr layer calls; and `split` factor cancellation —
-`cancel_product_factor`.)
+5. Per-error-kind diagnostic severity (add a kind field to `ShapeError`,
+   map approximate rules to warning/hint in `main.rs`).
 
 6. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.

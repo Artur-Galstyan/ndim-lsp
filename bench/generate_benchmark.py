@@ -18,7 +18,38 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import equinox as eqx
+from einops import rearrange, reduce
 from jaxtyping import Float, Array
+
+
+'''
+
+NEW_OPS = '''\
+class UpBlock{i}(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_{i}(
+    x: Float[Array, "b{i} n{i} d{i}"],
+    labels: Float[Array, "b{i} n{i}"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 '''
@@ -190,7 +221,7 @@ def broken_concat_{i}(
 
 '''
 
-BLOCKS = [TRANSFORMER, GRU, NUMPY_SOUP, INDEXING_SOUP, CONV_NET]
+BLOCKS = [TRANSFORMER, GRU, NUMPY_SOUP, INDEXING_SOUP, CONV_NET, NEW_OPS]
 REPS = 30          # 30 * 5 templates + errors -> ~4400 lines
 ERROR_EVERY = 6    # one error block per 6 repetitions
 

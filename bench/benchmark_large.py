@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import equinox as eqx
+from einops import rearrange, reduce
 from jaxtyping import Float, Array
 
 
@@ -125,6 +126,33 @@ class ConvNet0(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock0(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_0(
+    x: Float[Array, "b0 n0 d0"],
+    labels: Float[Array, "b0 n0"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class BrokenMLP0(eqx.Module):
@@ -276,6 +304,33 @@ class ConvNet1(eqx.Module):
         return probs
 
 
+class UpBlock1(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_1(
+    x: Float[Array, "b1 n1 d1"],
+    labels: Float[Array, "b1 n1"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock2(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -393,6 +448,33 @@ class ConvNet2(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock2(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_2(
+    x: Float[Array, "b2 n2 d2"],
+    labels: Float[Array, "b2 n2"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock3(eqx.Module):
@@ -514,6 +596,33 @@ class ConvNet3(eqx.Module):
         return probs
 
 
+class UpBlock3(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_3(
+    x: Float[Array, "b3 n3 d3"],
+    labels: Float[Array, "b3 n3"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock4(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -631,6 +740,33 @@ class ConvNet4(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock4(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_4(
+    x: Float[Array, "b4 n4 d4"],
+    labels: Float[Array, "b4 n4"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock5(eqx.Module):
@@ -752,6 +888,33 @@ class ConvNet5(eqx.Module):
         return probs
 
 
+class UpBlock5(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_5(
+    x: Float[Array, "b5 n5 d5"],
+    labels: Float[Array, "b5 n5"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock6(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -869,6 +1032,33 @@ class ConvNet6(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock6(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_6(
+    x: Float[Array, "b6 n6 d6"],
+    labels: Float[Array, "b6 n6"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class BrokenMLP6(eqx.Module):
@@ -1020,6 +1210,33 @@ class ConvNet7(eqx.Module):
         return probs
 
 
+class UpBlock7(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_7(
+    x: Float[Array, "b7 n7 d7"],
+    labels: Float[Array, "b7 n7"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock8(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -1137,6 +1354,33 @@ class ConvNet8(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock8(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_8(
+    x: Float[Array, "b8 n8 d8"],
+    labels: Float[Array, "b8 n8"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock9(eqx.Module):
@@ -1258,6 +1502,33 @@ class ConvNet9(eqx.Module):
         return probs
 
 
+class UpBlock9(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_9(
+    x: Float[Array, "b9 n9 d9"],
+    labels: Float[Array, "b9 n9"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock10(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -1375,6 +1646,33 @@ class ConvNet10(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock10(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_10(
+    x: Float[Array, "b10 n10 d10"],
+    labels: Float[Array, "b10 n10"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock11(eqx.Module):
@@ -1496,6 +1794,33 @@ class ConvNet11(eqx.Module):
         return probs
 
 
+class UpBlock11(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_11(
+    x: Float[Array, "b11 n11 d11"],
+    labels: Float[Array, "b11 n11"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock12(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -1613,6 +1938,33 @@ class ConvNet12(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock12(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_12(
+    x: Float[Array, "b12 n12 d12"],
+    labels: Float[Array, "b12 n12"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class BrokenMLP12(eqx.Module):
@@ -1764,6 +2116,33 @@ class ConvNet13(eqx.Module):
         return probs
 
 
+class UpBlock13(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_13(
+    x: Float[Array, "b13 n13 d13"],
+    labels: Float[Array, "b13 n13"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock14(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -1881,6 +2260,33 @@ class ConvNet14(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock14(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_14(
+    x: Float[Array, "b14 n14 d14"],
+    labels: Float[Array, "b14 n14"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock15(eqx.Module):
@@ -2002,6 +2408,33 @@ class ConvNet15(eqx.Module):
         return probs
 
 
+class UpBlock15(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_15(
+    x: Float[Array, "b15 n15 d15"],
+    labels: Float[Array, "b15 n15"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock16(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -2119,6 +2552,33 @@ class ConvNet16(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock16(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_16(
+    x: Float[Array, "b16 n16 d16"],
+    labels: Float[Array, "b16 n16"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock17(eqx.Module):
@@ -2240,6 +2700,33 @@ class ConvNet17(eqx.Module):
         return probs
 
 
+class UpBlock17(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_17(
+    x: Float[Array, "b17 n17 d17"],
+    labels: Float[Array, "b17 n17"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock18(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -2357,6 +2844,33 @@ class ConvNet18(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock18(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_18(
+    x: Float[Array, "b18 n18 d18"],
+    labels: Float[Array, "b18 n18"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class BrokenMLP18(eqx.Module):
@@ -2508,6 +3022,33 @@ class ConvNet19(eqx.Module):
         return probs
 
 
+class UpBlock19(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_19(
+    x: Float[Array, "b19 n19 d19"],
+    labels: Float[Array, "b19 n19"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock20(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -2625,6 +3166,33 @@ class ConvNet20(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock20(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_20(
+    x: Float[Array, "b20 n20 d20"],
+    labels: Float[Array, "b20 n20"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock21(eqx.Module):
@@ -2746,6 +3314,33 @@ class ConvNet21(eqx.Module):
         return probs
 
 
+class UpBlock21(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_21(
+    x: Float[Array, "b21 n21 d21"],
+    labels: Float[Array, "b21 n21"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock22(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -2863,6 +3458,33 @@ class ConvNet22(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock22(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_22(
+    x: Float[Array, "b22 n22 d22"],
+    labels: Float[Array, "b22 n22"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock23(eqx.Module):
@@ -2984,6 +3606,33 @@ class ConvNet23(eqx.Module):
         return probs
 
 
+class UpBlock23(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_23(
+    x: Float[Array, "b23 n23 d23"],
+    labels: Float[Array, "b23 n23"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock24(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -3101,6 +3750,33 @@ class ConvNet24(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock24(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_24(
+    x: Float[Array, "b24 n24 d24"],
+    labels: Float[Array, "b24 n24"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class BrokenMLP24(eqx.Module):
@@ -3252,6 +3928,33 @@ class ConvNet25(eqx.Module):
         return probs
 
 
+class UpBlock25(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_25(
+    x: Float[Array, "b25 n25 d25"],
+    labels: Float[Array, "b25 n25"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock26(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -3369,6 +4072,33 @@ class ConvNet26(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock26(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_26(
+    x: Float[Array, "b26 n26 d26"],
+    labels: Float[Array, "b26 n26"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
 class TransformerBlock27(eqx.Module):
@@ -3490,6 +4220,33 @@ class ConvNet27(eqx.Module):
         return probs
 
 
+class UpBlock27(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_27(
+    x: Float[Array, "b27 n27 d27"],
+    labels: Float[Array, "b27 n27"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock28(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -3609,6 +4366,33 @@ class ConvNet28(eqx.Module):
         return probs
 
 
+class UpBlock28(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_28(
+    x: Float[Array, "b28 n28 d28"],
+    labels: Float[Array, "b28 n28"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
+
+
 class TransformerBlock29(eqx.Module):
     norm1: eqx.nn.LayerNorm
     norm2: eqx.nn.LayerNorm
@@ -3726,5 +4510,32 @@ class ConvNet29(eqx.Module):
         logits = self.fc(pooled)
         probs = jax.nn.softmax(logits)
         return probs
+
+
+class UpBlock29(eqx.Module):
+    up: eqx.nn.ConvTranspose2d
+    def __init__(self, key):
+        self.up = eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=key)
+
+    def __call__(self, x: Float[Array, "32 16 16"]):
+        h = self.up(x)
+        return h
+
+
+def new_ops_29(
+    x: Float[Array, "b29 n29 d29"],
+    labels: Float[Array, "b29 n29"],
+):
+    t2 = x.mT
+    vals, idx = x.topk(5)
+    z = x.new_zeros((4, 7))
+    s = x.softmax(-1)
+    fl = x.flatten()
+    total = fl.sum()
+    pooled = reduce(x, "... d -> ...", "mean")
+    merged = rearrange(x, "b n d -> b (n d)")
+    oh = jax.nn.one_hot(labels, 10)
+    picked = jnp.take_along_axis(x, idx, axis=-1)
+    return t2, vals, z, s, total, pooled, merged, oh, picked
 
 
