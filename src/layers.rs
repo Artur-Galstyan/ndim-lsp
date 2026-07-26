@@ -41,7 +41,7 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
         return None;
     }
 
-    match owner {
+    let kind = match owner {
         "Linear" => Some(LayerKind::Linear {
             in_features: call.bindings.get("in_features")?.clone(),
             out_features: call.bindings.get("out_features")?.clone(),
@@ -193,14 +193,16 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .clone(),
         }),
         // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations,
-        // Identity, InstanceNorm, RMSNorm, AlphaDropout, and the two Transformer*Layer
-        // modules — TransformerEncoderLayer/TransformerDecoderLayer preserve d_model on
-        // their primary input; TransformerDecoderLayer's second (`memory`) input isn't
-        // tracked, same single-input limitation as Bilinear/CosineSimilarity below).
+        // Identity, InstanceNorm, RMSNorm, AlphaDropout, LocalResponseNorm (normalizes
+        // across a window of neighboring channels, output shape == input shape), and the
+        // two Transformer*Layer modules — TransformerEncoderLayer/TransformerDecoderLayer
+        // preserve d_model on their primary input; TransformerDecoderLayer's second
+        // (`memory`) input isn't tracked, same single-input limitation as
+        // Bilinear/CosineSimilarity below).
         "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
         | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
         | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
-        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout"
+        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout" | "LocalResponseNorm"
         | "TransformerEncoderLayer" | "TransformerDecoderLayer" => {
             Some(LayerKind::ShapePreserving {
                 name: owner.to_string(),
@@ -301,6 +303,33 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
             in_size: call.bindings.get("in_size")?.clone(),
             out_size: call.bindings.get("out_size")?.clone(),
         }),
+        // torch.nn.Unfold(kernel_size, dilation=1, padding=0, stride=1):
+        // geometry args are stored as raw ctor text (scalar or 2-tuple) and
+        // parsed at apply time, mirroring `Upsample`.
+        "Unfold" => Some(LayerKind::Unfold {
+            kernel_size: call.bindings.get("kernel_size")?.clone(),
+            stride: call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+            padding: call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+            dilation: call
+                .bindings
+                .get("dilation")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+        }),
+        // torch.nn.Fold(output_size, kernel_size, ...): only the two dims
+        // that feed the output-shape formula are tracked.
+        "Fold" => Some(LayerKind::Fold {
+            output_size: call.bindings.get("output_size")?.clone(),
+            kernel_size: call.bindings.get("kernel_size")?.clone(),
+        }),
         // einops.layers.{torch,flax}.Rearrange/Reduce: the pattern string and
         // any axis-length kwargs pass straight through to
         // `apply_known_einops` at apply time (see `LayerKind::EinopsPattern`).
@@ -319,6 +348,246 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
             })
         }
         _ => None,
+    };
+    // `Linear(self.d_inner, out_features)` binds `in_features` as the
+    // literal ctor text `"self.d_inner"`, which would never match a
+    // same-named `d_inner` jaxtyping annotation dim (a different
+    // vocabulary — see `dims_match`). Strip the `self.`-prefix here,
+    // centrally, right at classification, so every `LayerKind`'s dim
+    // fields (including nested `Sequential` children) get it for free.
+    kind.map(strip_self_prefixes)
+}
+
+/// Strip a `self.` prefix from a ctor-arg dim expression's identifier
+/// tokens (`"self.d_inner"` → `"d_inner"`, `"self.d_inner*2"` →
+/// `"d_inner*2"`). This only strips the token-level prefix; it does not
+/// consult the `self.<attr> = <ident>` alias map (`extract_self_attr_aliases*`
+/// in `python_ast.rs`) the way `normalize_dim` in `analysis.rs` does, since
+/// that map isn't available at layer-classification time without threading
+/// it through every `classify_layer_call`/`resolve_layer_kind_for_call`
+/// call site. In the overwhelmingly common case the attribute is assigned
+/// from a same-named parameter (`self.d_inner = d_inner`), so the stripped
+/// form already matches the annotation dim directly; the rarer
+/// differently-named case is left to whatever later alias normalization
+/// applies to the *shape* side of the comparison.
+fn strip_self_prefix(dim: &str) -> String {
+    if !dim.contains("self.") {
+        return dim.to_string();
+    }
+    let mut result = String::with_capacity(dim.len());
+    let mut i = 0;
+    while i < dim.len() {
+        if dim[i..].starts_with("self.") {
+            i += 5; // skip "self."
+            continue;
+        }
+        let ch = dim[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
+}
+
+/// Apply [`strip_self_prefix`] to every `String` dim field of a `LayerKind`,
+/// recursing into `Sequential`'s children and `EinopsPattern`'s kwarg
+/// values. `name`/`pattern` fields (class names, einops pattern text) are
+/// left untouched — they aren't dim expressions.
+fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
+    match kind {
+        LayerKind::Linear {
+            in_features,
+            out_features,
+        } => LayerKind::Linear {
+            in_features: strip_self_prefix(&in_features),
+            out_features: strip_self_prefix(&out_features),
+        },
+        LayerKind::Conv1d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => LayerKind::Conv1d {
+            in_channels: strip_self_prefix(&in_channels),
+            out_channels: strip_self_prefix(&out_channels),
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::Conv2d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => LayerKind::Conv2d {
+            in_channels: strip_self_prefix(&in_channels),
+            out_channels: strip_self_prefix(&out_channels),
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::Conv3d {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => LayerKind::Conv3d {
+            in_channels: strip_self_prefix(&in_channels),
+            out_channels: strip_self_prefix(&out_channels),
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::Dense { features } => LayerKind::Dense {
+            features: strip_self_prefix(&features),
+        },
+        LayerKind::FlaxConv {
+            features,
+            spatial_rank,
+        } => LayerKind::FlaxConv {
+            features: strip_self_prefix(&features),
+            spatial_rank,
+        },
+        LayerKind::Pool {
+            name,
+            spatial_rank,
+            kernel_size,
+            stride,
+            padding,
+        } => LayerKind::Pool {
+            name,
+            spatial_rank,
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::AdaptivePool {
+            name,
+            spatial_rank,
+            output_size,
+        } => LayerKind::AdaptivePool {
+            name,
+            spatial_rank,
+            output_size: strip_self_prefix(&output_size),
+        },
+        LayerKind::MultiheadAttention { feature_dim } => LayerKind::MultiheadAttention {
+            feature_dim: strip_self_prefix(&feature_dim),
+        },
+        LayerKind::Embedding { embedding_size } => LayerKind::Embedding {
+            embedding_size: strip_self_prefix(&embedding_size),
+        },
+        LayerKind::ShapePreserving { name } => LayerKind::ShapePreserving { name },
+        LayerKind::Flatten { start_dim, end_dim } => LayerKind::Flatten {
+            start_dim: strip_self_prefix(&start_dim),
+            end_dim: strip_self_prefix(&end_dim),
+        },
+        LayerKind::Unflatten { dim, sizes } => LayerKind::Unflatten {
+            dim: strip_self_prefix(&dim),
+            sizes: strip_self_prefix(&sizes),
+        },
+        LayerKind::Upsample { scale_factor, size } => LayerKind::Upsample {
+            scale_factor: scale_factor.map(|s| strip_self_prefix(&s)),
+            size: size.map(|s| strip_self_prefix(&s)),
+        },
+        LayerKind::ConvTranspose {
+            spatial_rank,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => LayerKind::ConvTranspose {
+            spatial_rank,
+            in_channels: strip_self_prefix(&in_channels),
+            out_channels: strip_self_prefix(&out_channels),
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::Rnn {
+            name,
+            input_size,
+            hidden_size,
+        } => LayerKind::Rnn {
+            name,
+            input_size: strip_self_prefix(&input_size),
+            hidden_size: strip_self_prefix(&hidden_size),
+        },
+        LayerKind::RnnCell {
+            name,
+            input_size,
+            hidden_size,
+        } => LayerKind::RnnCell {
+            name,
+            input_size: strip_self_prefix(&input_size),
+            hidden_size: strip_self_prefix(&hidden_size),
+        },
+        LayerKind::PixelShuffle { upscale_factor } => LayerKind::PixelShuffle {
+            upscale_factor: strip_self_prefix(&upscale_factor),
+        },
+        LayerKind::PixelUnshuffle { downscale_factor } => LayerKind::PixelUnshuffle {
+            downscale_factor: strip_self_prefix(&downscale_factor),
+        },
+        LayerKind::Pad {
+            name,
+            spatial_rank,
+            padding,
+        } => LayerKind::Pad {
+            name,
+            spatial_rank,
+            padding: strip_self_prefix(&padding),
+        },
+        LayerKind::Bilinear {
+            in1_features,
+            in2_features,
+            out_features,
+        } => LayerKind::Bilinear {
+            in1_features: strip_self_prefix(&in1_features),
+            in2_features: strip_self_prefix(&in2_features),
+            out_features: strip_self_prefix(&out_features),
+        },
+        LayerKind::CosineSimilarity { dim } => LayerKind::CosineSimilarity {
+            dim: strip_self_prefix(&dim),
+        },
+        LayerKind::Mlp { in_size, out_size } => LayerKind::Mlp {
+            in_size: strip_self_prefix(&in_size),
+            out_size: strip_self_prefix(&out_size),
+        },
+        LayerKind::Unfold {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        } => LayerKind::Unfold {
+            kernel_size: strip_self_prefix(&kernel_size),
+            stride: strip_self_prefix(&stride),
+            padding: strip_self_prefix(&padding),
+            dilation: strip_self_prefix(&dilation),
+        },
+        LayerKind::Fold {
+            output_size,
+            kernel_size,
+        } => LayerKind::Fold {
+            output_size: strip_self_prefix(&output_size),
+            kernel_size: strip_self_prefix(&kernel_size),
+        },
+        LayerKind::Sequential { children } => LayerKind::Sequential {
+            children: children.into_iter().map(strip_self_prefixes).collect(),
+        },
+        LayerKind::EinopsPattern {
+            name,
+            pattern,
+            kwargs,
+        } => LayerKind::EinopsPattern {
+            name,
+            pattern,
+            kwargs: kwargs
+                .into_iter()
+                .map(|(k, v)| (k, strip_self_prefix(&v)))
+                .collect(),
+        },
     }
 }
 
@@ -408,7 +677,7 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
         | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
         | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
-        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout"
+        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout" | "LocalResponseNorm"
         | "TransformerEncoderLayer" | "TransformerDecoderLayer" => &["self"],
         "Flatten" => &["self", "start_dim", "end_dim"],
         "Unflatten" => &["self", "dim", "sizes"],
@@ -455,6 +724,10 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         ],
         "Rearrange" if framework == "einops" => &["self", "pattern"],
         "Reduce" if framework == "einops" => &["self", "pattern", "reduction"],
+        // torch.nn.Unfold(kernel_size, dilation=1, padding=0, stride=1);
+        // torch.nn.Fold(output_size, kernel_size, dilation=1, padding=0, stride=1).
+        "Unfold" => &["self", "kernel_size", "dilation", "padding", "stride"],
+        "Fold" => &["self", "output_size", "kernel_size", "dilation", "padding", "stride"],
         _ => return None,
     };
 
@@ -1193,6 +1466,68 @@ fn parse_dim_sequence(text: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Parse a per-axis geometry arg (`kernel_size`/`stride`/`padding`/
+/// `dilation` for `Unfold`/`Fold`) that torch accepts as either a single
+/// value (applied to both H and W) or an explicit 2-tuple/list. Returns
+/// `None` for anything else (e.g. a `>2`-length tuple), so the caller can
+/// treat it as unknown rather than guessing.
+fn parse_pair_arg(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('(') || trimmed.starts_with('[') {
+        let parts = parse_dim_sequence(trimmed)?;
+        if parts.len() == 2 {
+            Some((parts[0].clone(), parts[1].clone()))
+        } else {
+            None
+        }
+    } else if trimmed.is_empty() {
+        None
+    } else {
+        Some((trimmed.to_string(), trimmed.to_string()))
+    }
+}
+
+/// Dilated ("effective") kernel size `d*(k-1)+1`, the same substitution
+/// `known_functions.rs`'s `LaxConvGeneralDilated`/`FunctionalConv*` rules use
+/// before reusing the plain conv output-dim formula. Exact when `kernel`/
+/// `dilation` are both literal ints; when `dilation` is literal `1` the
+/// effective size is `kernel` unchanged regardless of whether `kernel`
+/// itself is literal (covering the overwhelmingly common default even for
+/// symbolic kernel sizes). Any other non-literal combination isn't
+/// foldable and returns `None`.
+fn effective_kernel_size(kernel: &str, dilation: &str) -> Option<String> {
+    if let (Ok(k), Ok(d)) = (kernel.trim().parse::<i64>(), dilation.trim().parse::<i64>()) {
+        return Some((d * (k - 1) + 1).to_string());
+    }
+    if dilation.trim() == "1" {
+        return Some(kernel.to_string());
+    }
+    None
+}
+
+/// Divide a dim by the product of one or more (possibly symbolic) factors.
+/// Errs only when the dim and every factor are literal ints and the
+/// division doesn't come out even (a provable contradiction); otherwise a
+/// symbolic `dim/(f0*f1*...)` string — mirrors `div_dim`'s policy, extended
+/// to a multi-factor (possibly symbolic) divisor for `Fold`'s channel-dim
+/// recovery.
+fn div_dim_by_dims(dim: &str, factors: &[String]) -> Result<String, String> {
+    if let Some(dim_val) = dim.parse::<u64>().ok()
+        && let Some(factor_vals) = factors
+            .iter()
+            .map(|f| f.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()
+    {
+        let divisor: u64 = factor_vals.iter().product();
+        if divisor != 0 && dim_val % divisor == 0 {
+            return Ok((dim_val / divisor).to_string());
+        } else if divisor != 0 {
+            return Err(format!("{} is not evenly divisible by {}", dim_val, divisor));
+        }
+    }
+    Ok(format!("{}/({})", dim, product_dims(factors)))
+}
+
 /// Shared minimum-rank guard used by every layer whose validity depends on
 /// input rank (Conv/Pool/ConvTranspose/shape-preserving families). Returns
 /// the standard "requires input with at least N dims" error when the input
@@ -1726,6 +2061,65 @@ fn apply_layer_kind(
             let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = out_size.clone();
+            Ok(Some(output_shape))
+        }
+        // torch.nn.Unfold: channels-first (C, H, W) / (N, C, H, W) ->
+        // (C*kh*kw, L) / (N, C*kh*kw, L), L = num_blocks_h * num_blocks_w.
+        LayerKind::Unfold {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        } => {
+            check_min_rank("Unfold", layer, input, input_shape.len(), 3)?;
+            let rank = input_shape.len();
+            let channels_idx = rank - 3;
+            let (Some((kh, kw)), Some((sh, sw)), Some((ph, pw)), Some((dh, dw))) = (
+                parse_pair_arg(kernel_size),
+                parse_pair_arg(stride),
+                parse_pair_arg(padding),
+                parse_pair_arg(dilation),
+            ) else {
+                return Ok(None);
+            };
+            let (Some(eff_kh), Some(eff_kw)) =
+                (effective_kernel_size(&kh, &dh), effective_kernel_size(&kw, &dw))
+            else {
+                return Ok(None);
+            };
+
+            let blocks_h = conv_spatial_dim(&input_shape[channels_idx + 1], &eff_kh, &sh, &ph);
+            let blocks_w = conv_spatial_dim(&input_shape[channels_idx + 2], &eff_kw, &sw, &pw);
+            let l = product_dims(&[blocks_h, blocks_w]);
+            let out_channels = product_dims(&[input_shape[channels_idx].clone(), kh, kw]);
+
+            let mut output_shape = input_shape[..channels_idx].to_vec();
+            output_shape.push(out_channels);
+            output_shape.push(l);
+            Ok(Some(output_shape))
+        }
+        // torch.nn.Fold: inverse of Unfold — (C*kh*kw, L) / (N, C*kh*kw, L)
+        // -> (C, oh, ow) / (N, C, oh, ow). `L` isn't cross-checked.
+        LayerKind::Fold {
+            output_size,
+            kernel_size,
+        } => {
+            check_min_rank("Fold", layer, input, input_shape.len(), 2)?;
+            let rank = input_shape.len();
+            let channels_idx = rank - 2;
+            let (Some((oh, ow)), Some((kh, kw))) =
+                (parse_pair_arg(output_size), parse_pair_arg(kernel_size))
+            else {
+                return Ok(None);
+            };
+
+            let channels_out = div_dim_by_dims(&input_shape[channels_idx], &[kh, kw])
+                .map_err(|e| format!("Fold layer '{}': {}", layer, e))?;
+
+            let mut output_shape = input_shape[..channels_idx].to_vec();
+            output_shape.push(channels_out);
+            output_shape.push(oh);
+            output_shape.push(ow);
             Ok(Some(output_shape))
         }
         // Shape-preserving layers: output shape equals input shape, but some
@@ -3225,6 +3619,150 @@ mod classify_layer_call_tests {
 
         assert_eq!(classify_layer_call(&call), None);
     }
+
+    // --- torch.nn.Unfold / torch.nn.Fold ---
+
+    #[test]
+    fn test_classifies_torch_unfold_scalar_args() {
+        let call = call(
+            &["torch", "nn", "fold"],
+            Some("Unfold"),
+            "__init__",
+            &[("kernel_size", "3")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Unfold {
+                kernel_size: "3".to_string(),
+                stride: "1".to_string(),
+                padding: "0".to_string(),
+                dilation: "1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_classifies_torch_unfold_tuple_args() {
+        let call = call(
+            &["torch", "nn", "fold"],
+            Some("Unfold"),
+            "__init__",
+            &[
+                ("kernel_size", "(2, 3)"),
+                ("stride", "(1, 2)"),
+                ("padding", "1"),
+            ],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Unfold {
+                kernel_size: "(2, 3)".to_string(),
+                stride: "(1, 2)".to_string(),
+                padding: "1".to_string(),
+                dilation: "1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_unfold_missing_kernel_size_returns_none() {
+        let call = call(&["torch", "nn", "fold"], Some("Unfold"), "__init__", &[]);
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_classifies_torch_fold() {
+        let call = call(
+            &["torch", "nn", "fold"],
+            Some("Fold"),
+            "__init__",
+            &[("output_size", "(4, 5)"), ("kernel_size", "2")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Fold {
+                output_size: "(4, 5)".to_string(),
+                kernel_size: "2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_fold_missing_output_size_returns_none() {
+        let call = call(
+            &["torch", "nn", "fold"],
+            Some("Fold"),
+            "__init__",
+            &[("kernel_size", "2")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    // --- torch.nn.LocalResponseNorm ---
+
+    #[test]
+    fn test_classifies_local_response_norm_as_shape_preserving() {
+        let call = call(
+            &["torch", "nn", "normalization"],
+            Some("LocalResponseNorm"),
+            "__init__",
+            &[("size", "5")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::ShapePreserving {
+                name: "LocalResponseNorm".to_string()
+            })
+        );
+    }
+
+    // --- self.-prefixed ctor args (issue noted in llm.txt: `Linear(self.d_inner, ...)`) ---
+
+    #[test]
+    fn test_strips_self_prefix_from_ctor_arg() {
+        // Mirrors llm.txt's noted gap: `Linear(self.d_inner, out_features)`
+        // binds `in_features` as the literal text `"self.d_inner"`, which
+        // must normalize to `"d_inner"` to match a same-named jaxtyping
+        // annotation dim.
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "self.d_inner"), ("out_features", "10")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Linear {
+                in_features: "d_inner".to_string(),
+                out_features: "10".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_strips_self_prefix_from_compound_ctor_arg() {
+        let call = call(
+            &["equinox", "nn", "_linear"],
+            Some("Linear"),
+            "__init__",
+            &[("in_features", "self.d_inner*2"), ("out_features", "10")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::Linear {
+                in_features: "d_inner*2".to_string(),
+                out_features: "10".to_string(),
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4157,6 +4695,104 @@ mod catalog_first_extract_layer_assignments_tests {
             })
         );
     }
+
+    // --- torch.nn.Unfold / Fold / LocalResponseNorm, end-to-end ---
+
+    #[test]
+    fn test_catalog_resolves_torch_unfold_without_disk() {
+        let code = "import torch\nlayer = torch.nn.Unfold(kernel_size=3, stride=1, padding=0)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Unfold {
+                kernel_size: "3".to_string(),
+                stride: "1".to_string(),
+                padding: "0".to_string(),
+                dilation: "1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_fold_without_disk() {
+        let code = "import torch\nlayer = torch.nn.Fold(output_size=(4, 4), kernel_size=2)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Fold {
+                output_size: "(4, 4)".to_string(),
+                kernel_size: "2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_local_response_norm_without_disk() {
+        let code = "import torch\nlayer = torch.nn.LocalResponseNorm(5)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::ShapePreserving {
+                name: "LocalResponseNorm".to_string()
+            })
+        );
+    }
+
+    // --- self.-prefixed ctor args, end-to-end (recursion through Sequential too) ---
+
+    #[test]
+    fn test_catalog_self_prefixed_linear_ctor_arg_strips_prefix() {
+        let code = "import torch\nlayer = torch.nn.Linear(self.d_inner, 10)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "d_inner".to_string(),
+                out_features: "10".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_self_prefixed_ctor_arg_stripped_inside_sequential_child() {
+        let code = "import torch.nn as nn\n\
+                     net = nn.Sequential(nn.Linear(self.d_inner, 10), nn.ReLU())";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("net"),
+            Some(&LayerKind::Sequential {
+                children: vec![
+                    LayerKind::Linear {
+                        in_features: "d_inner".to_string(),
+                        out_features: "10".to_string(),
+                    },
+                    LayerKind::ShapePreserving {
+                        name: "ReLU".to_string(),
+                    },
+                ]
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4759,5 +5395,184 @@ mod new_layer_kind_apply_tests {
         let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
 
         assert_eq!(out, Some(shape(&["2", "10"])));
+    }
+
+    // --- Unfold ---
+
+    fn unfold(kernel_size: &str, stride: &str, padding: &str, dilation: &str) -> LayerKind {
+        LayerKind::Unfold {
+            kernel_size: kernel_size.to_string(),
+            stride: stride.to_string(),
+            padding: padding.to_string(),
+            dilation: dilation.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_unfold_concrete_scalar_args() {
+        // floor((8+0-3)/1)+1 = 6 blocks per axis; L = 6*6 = 36; channels = 3*3*3 = 27.
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = unfold("3", "1", "0", "1");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["27", "36"])));
+    }
+
+    #[test]
+    fn test_unfold_batched_input_preserves_leading_batch_dim() {
+        let shapes = shapes_of(&[("x", &["2", "3", "8", "8"])]);
+        let kind = unfold("3", "1", "0", "1");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "27", "36"])));
+    }
+
+    #[test]
+    fn test_unfold_per_axis_tuple_kernel_stride_padding() {
+        // blocks_h = floor((10-2)/2)+1 = 5; blocks_w = floor((12-3)/3)+1 = 4;
+        // L = 20; channels = 3*2*3 = 18.
+        let shapes = shapes_of(&[("x", &["3", "10", "12"])]);
+        let kind = unfold("(2, 3)", "(2, 3)", "0", "1");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["18", "20"])));
+    }
+
+    #[test]
+    fn test_unfold_dilation_extends_effective_kernel() {
+        // eff_k = 2*(3-1)+1 = 5; blocks = floor((7-5)/1)+1 = 3; L = 9;
+        // channels use the *raw* kernel_size (3), not the dilated one: 3*3*3 = 27.
+        let shapes = shapes_of(&[("x", &["3", "7", "7"])]);
+        let kind = unfold("3", "1", "0", "2");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["27", "9"])));
+    }
+
+    #[test]
+    fn test_unfold_symbolic_spatial_dims_with_literal_geometry() {
+        let shapes = shapes_of(&[("x", &["c", "H", "W"])]);
+        let kind = unfold("3", "1", "0", "1");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["c*3*3", "H-2*W-2"])));
+    }
+
+    #[test]
+    fn test_unfold_non_unit_dilation_with_symbolic_kernel_is_unknown() {
+        // dilation != 1 and kernel_size isn't a literal int: the effective
+        // (dilated) kernel size isn't foldable.
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = unfold("k", "1", "0", "2");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_unfold_rank_too_low_errors() {
+        let shapes = shapes_of(&[("x", &["8"])]);
+        let kind = unfold("2", "1", "0", "1");
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 3 dims"));
+    }
+
+    #[test]
+    fn test_unfold_bad_tuple_arity_is_unknown() {
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = unfold("(1, 2, 3)", "1", "0", "1");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    // --- Fold ---
+
+    fn fold(output_size: &str, kernel_size: &str) -> LayerKind {
+        LayerKind::Fold {
+            output_size: output_size.to_string(),
+            kernel_size: kernel_size.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_fold_concrete_divisible_channels() {
+        // 12 / (2*2) = 3.
+        let shapes = shapes_of(&[("x", &["12", "20"])]);
+        let kind = fold("(6, 6)", "2");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["3", "6", "6"])));
+    }
+
+    #[test]
+    fn test_fold_batched_input_preserves_leading_batch_dim() {
+        let shapes = shapes_of(&[("x", &["8", "12", "20"])]);
+        let kind = fold("(6, 6)", "2");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["8", "3", "6", "6"])));
+    }
+
+    #[test]
+    fn test_fold_per_axis_tuple_kernel_size() {
+        // 18 / (2*3) = 3.
+        let shapes = shapes_of(&[("x", &["18", "35"])]);
+        let kind = fold("(5, 7)", "(2, 3)");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["3", "5", "7"])));
+    }
+
+    #[test]
+    fn test_fold_not_evenly_divisible_errors() {
+        let shapes = shapes_of(&[("x", &["10", "20"])]);
+        let kind = fold("(4, 4)", "3");
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("not evenly divisible by 9"));
+    }
+
+    #[test]
+    fn test_fold_symbolic_channels_and_kernel_produce_symbolic_quotient() {
+        let shapes = shapes_of(&[("x", &["c", "L"])]);
+        let kind = fold("(H, W)", "k");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["c/(k*k)", "H", "W"])));
+    }
+
+    #[test]
+    fn test_fold_rank_too_low_errors() {
+        let shapes = shapes_of(&[("x", &[])]);
+        let kind = fold("(4, 4)", "2");
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 2 dims"));
+    }
+
+    #[test]
+    fn test_fold_bad_output_size_arity_is_unknown() {
+        let shapes = shapes_of(&[("x", &["12", "20"])]);
+        let kind = fold("(4, 5, 6)", "2");
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
     }
 }
