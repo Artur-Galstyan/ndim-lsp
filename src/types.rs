@@ -696,6 +696,11 @@ pub struct ShapeError {
     pub message: String,
     pub range: Range,
     pub kind: ShapeErrorKind,
+    /// Optional related-information location: a second range (e.g. the
+    /// *other* operand's node in a binary-op mismatch) plus a short message,
+    /// surfaced as LSP `DiagnosticRelatedInformation` by `main.rs`. `None`
+    /// for errors that don't have a natural second location.
+    pub related: Option<(Range, String)>,
 }
 
 impl ShapeError {
@@ -706,6 +711,7 @@ impl ShapeError {
             message: message.into(),
             range,
             kind: ShapeErrorKind::Mismatch,
+            related: None,
         }
     }
 
@@ -722,7 +728,16 @@ impl ShapeError {
             message: message.into(),
             range,
             kind: ShapeErrorKind::Approximation,
+            related: None,
         }
+    }
+
+    /// Attach a related-information location/message, e.g. the *other*
+    /// operand's node range in a two-operand shape mismatch. Builder-style:
+    /// chain after `mismatch`/`approximation`.
+    pub fn with_related(mut self, range: Range, message: impl Into<String>) -> Self {
+        self.related = Some((range, message.into()));
+        self
     }
 }
 

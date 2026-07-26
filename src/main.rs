@@ -7,10 +7,11 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
-    InlayHintLabel, InlayHintParams, MarkupContent, MarkupKind, MessageType, OneOf,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, InlayHintTooltip, Location,
+    MarkupContent, MarkupKind, MessageType, OneOf,
     Position, PositionEncodingKind, Range, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncKind, Url,
     WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
@@ -359,7 +360,7 @@ impl Backend {
             .errors
             .iter()
             .cloned()
-            .map(|e| shape_error_to_diagnostic(e, mismatch_severity, approximation_severity))
+            .map(|e| shape_error_to_diagnostic(e, uri, mismatch_severity, approximation_severity))
             .collect();
 
         self.client
@@ -420,6 +421,9 @@ impl Backend {
                 format!(": [{}]", rec.shape.join(", "))
             };
             let char_pos = line_lens.get(&line).copied().unwrap_or(0);
+            // Same text hover shows for this variable (e.g. `x: Float[Array,
+            // "batch features"]"`), so both surfaces stay consistent.
+            let tooltip = InlayHintTooltip::String(format_hover(&rec.name, &rec.shape));
 
             hints.push(InlayHint {
                 position: Position {
@@ -429,7 +433,7 @@ impl Backend {
                 label: InlayHintLabel::String(label),
                 kind: Some(InlayHintKind::TYPE),
                 text_edits: None,
-                tooltip: None,
+                tooltip: Some(tooltip),
                 padding_left: None,
                 padding_right: Some(true),
                 data: None,
@@ -622,8 +626,13 @@ fn parse_severity(
 /// `Mismatch` uses `mismatch_severity` (`initializationOptions.diagnostic_severity`,
 /// defaults to ERROR); `Approximation` uses `approximation_severity`
 /// (`initializationOptions.approximation_severity`, defaults to WARNING).
+/// `error.related` (e.g. the other operand's node range in a binary-op
+/// mismatch) becomes a single-entry `related_information`, anchored at
+/// `uri` (the document the diagnostic itself belongs to — `ShapeError`'s
+/// range doesn't carry a URI of its own).
 fn shape_error_to_diagnostic(
     error: ShapeError,
+    uri: &Url,
     mismatch_severity: DiagnosticSeverity,
     approximation_severity: DiagnosticSeverity,
 ) -> Diagnostic {
@@ -631,6 +640,15 @@ fn shape_error_to_diagnostic(
         ShapeErrorKind::Mismatch => mismatch_severity,
         ShapeErrorKind::Approximation => approximation_severity,
     };
+    let related_information = error.related.map(|(range, message)| {
+        vec![DiagnosticRelatedInformation {
+            location: Location {
+                uri: uri.clone(),
+                range: ts_range_to_lsp_range(range),
+            },
+            message,
+        }]
+    });
     Diagnostic {
         range: ts_range_to_lsp_range(error.range),
         severity: Some(severity),
@@ -641,7 +659,7 @@ fn shape_error_to_diagnostic(
             format!("{}: {}", error.variable, error.message)
         },
         code: None,
-        related_information: None,
+        related_information,
         ..Default::default()
     }
 }
@@ -807,11 +825,13 @@ mod tests {
             start_byte: 0,
             end_byte: 1,
         };
+        let uri = Url::parse("file:///test.py").unwrap();
         let mismatch = ShapeError::mismatch("x", "bad shape", range);
         let approximation = ShapeError::approximation("y", "approx shape", range);
 
         let diag = shape_error_to_diagnostic(
             mismatch,
+            &uri,
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -819,6 +839,7 @@ mod tests {
 
         let diag = shape_error_to_diagnostic(
             approximation,
+            &uri,
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -828,10 +849,64 @@ mod tests {
         let approximation2 = ShapeError::approximation("z", "approx shape", range);
         let diag = shape_error_to_diagnostic(
             approximation2,
+            &uri,
             DiagnosticSeverity::HINT,
             DiagnosticSeverity::INFORMATION,
         );
         assert_eq!(diag.severity, Some(DiagnosticSeverity::INFORMATION));
+    }
+
+    #[test]
+    fn shape_error_to_diagnostic_maps_related_information() {
+        let range = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 1),
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let related_range = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(1, 2),
+            end_point: tree_sitter::Point::new(1, 5),
+            start_byte: 10,
+            end_byte: 13,
+        };
+        let uri = Url::parse("file:///test.py").unwrap();
+        let error = ShapeError::mismatch("y", "matmul dimension mismatch", range)
+            .with_related(related_range, "other operand `b`: shape [n, d]");
+
+        let diag = shape_error_to_diagnostic(
+            error,
+            &uri,
+            DiagnosticSeverity::ERROR,
+            DiagnosticSeverity::WARNING,
+        );
+
+        let related = diag.related_information.expect("related_information");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].location.uri, uri);
+        assert_eq!(related[0].location.range, ts_range_to_lsp_range(related_range));
+        assert_eq!(related[0].message, "other operand `b`: shape [n, d]");
+    }
+
+    #[test]
+    fn shape_error_to_diagnostic_no_related_when_absent() {
+        let range = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 1),
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let uri = Url::parse("file:///test.py").unwrap();
+        let error = ShapeError::mismatch("x", "bad shape", range);
+
+        let diag = shape_error_to_diagnostic(
+            error,
+            &uri,
+            DiagnosticSeverity::ERROR,
+            DiagnosticSeverity::WARNING,
+        );
+
+        assert!(diag.related_information.is_none());
     }
 
     #[test]

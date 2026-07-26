@@ -8312,3 +8312,143 @@ mod shape_error_kind_tests {
         assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Mismatch);
     }
 }
+
+/// RNN `(output, state)` tuple-LHS binding (`out, h = self.gru(x)`, `out,
+/// (h, c) = self.lstm(x)`) — extends `tuple_rhs_shapes` for `self.<attr>`
+/// calls resolving to `LayerKind::Rnn`. See the doc comment on that arm in
+/// `analysis.rs` for the exact approximation (batch_first=False,
+/// num_layers*num_directions == 1, seq axis dropped for the state).
+#[cfg(test)]
+mod rnn_tuple_unpacking_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_gru_tuple_unpacking_unbatched() {
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out, h = self.gru(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["20"])));
+    }
+
+    #[test]
+    fn test_gru_tuple_unpacking_batched_state_keeps_batch_axis() {
+        // Batched input (seq, batch, features): the sequence-invariant
+        // output keeps all dims (last -> hidden); the state drops only the
+        // leading seq axis (approximation — real torch's h_n also carries a
+        // leading num_layers*num_directions axis, not modelled here).
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq batch 10\"]):\n        out, h = self.gru(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(
+            find_shape(&analysis, "out"),
+            Some(&shape(&["seq", "batch", "20"]))
+        );
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["batch", "20"])));
+    }
+
+    #[test]
+    fn test_lstm_nested_h_c_state_pattern() {
+        // `out, (h, c) = self.lstm(x)` — one level of nested tuple-pattern
+        // support (`TupleTarget::Nested`): both `h` and `c` bind to the same
+        // approximated state shape.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out, (h, c) = self.lstm(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["20"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["20"])));
+    }
+
+    #[test]
+    fn test_rnn_tuple_wrong_arity_skips() {
+        // A plain RNN/GRU/LSTM call really returns a 2-tuple; unpacking into
+        // 3 targets isn't modelled.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        a, b, c = self.gru(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), None);
+    }
+}
+
+/// `ShapeError.related` population for two-operand binary-op mismatches
+/// (`shape_of_binary_operator` in `analysis.rs`): related range/message
+/// point at the right-hand operand ("the other operand" relative to the
+/// mismatch, which the primary message already names first as the left
+/// operand).
+#[cfg(test)]
+mod binary_op_related_information_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    #[test]
+    fn matmul_mismatch_related_info_points_at_right_operand() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"4 5\"]):\n    y = a @ b";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let err = &analysis.errors[0];
+        let (related_range, related_message) = err.related.as_ref().expect("related info");
+        assert_eq!(related_message, "other operand `b`: shape [4, 5]");
+        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "b");
+    }
+
+    #[test]
+    fn elementwise_mismatch_related_info_points_at_right_operand() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"4\"]):\n    y = a + b";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let err = &analysis.errors[0];
+        let (related_range, related_message) = err.related.as_ref().expect("related info");
+        assert_eq!(related_message, "other operand `b`: shape [4]");
+        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "b");
+    }
+
+    #[test]
+    fn non_binary_op_errors_have_no_related_info() {
+        // Sanity check: errors from a non-binary-op site (e.g. a
+        // known-function shape rule) don't get a spurious `related` value —
+        // only the binary-operator sites populate it.
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"5 6\"]):\n    y = jnp.matmul(a, b)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert!(analysis.errors[0].related.is_none());
+    }
+}

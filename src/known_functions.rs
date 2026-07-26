@@ -893,6 +893,7 @@ pub fn apply_known_function(
         KnownFunction::LaxBroadcastInDim => apply_known_lax_broadcast_in_dim(args),
         KnownFunction::LaxSlice => apply_known_lax_slice(args, shapes),
         KnownFunction::LaxDynamicSlice => apply_known_lax_dynamic_slice(args, shapes),
+        KnownFunction::LaxGather => apply_known_lax_gather(args, shapes),
         KnownFunction::Diagflat => apply_known_diagflat(args, shapes),
         KnownFunction::Tri => apply_known_tri(args),
         KnownFunction::Indices => apply_known_indices(args),
@@ -3484,6 +3485,162 @@ fn apply_known_lax_conv_general_dilated(
         output.push(out.to_string());
     }
     Ok(Some(output))
+}
+
+/// Extract the parenthesized/bracketed literal-int list that follows
+/// `keyword=` inside `text` (e.g. `"...offset_dims=(1, 2)..."` -> `Some([1,
+/// 2])`). Returns `None` if `keyword=` isn't found, or isn't immediately
+/// followed (after whitespace) by a balanced `(...)`/`[...]` group — a bare
+/// identifier/expression there means the value isn't a literal we can read
+/// statically. `keyword` must not be a substring of another accepted keyword
+/// in the same caller (true for `offset_dims`/`collapsed_slice_dims`/
+/// `start_index_map`), since this does a plain substring search.
+fn extract_paren_ints_after(text: &str, keyword: &str) -> Option<Vec<isize>> {
+    let marker = format!("{keyword}=");
+    let after = text.find(&marker)? + marker.len();
+    let rest = text[after..].trim_start();
+    let (open, close) = match rest.chars().next()? {
+        '(' => ('(', ')'),
+        '[' => ('[', ']'),
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, ch) in rest.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(i);
+                break;
+            }
+        }
+    }
+    Some(parse_ints(&rest[..=end?]))
+}
+
+/// Compute `jax.lax.gather`'s output shape per the XLA gather spec, for the
+/// common statically-derivable case: `offset_dims`, `collapsed_slice_dims`,
+/// and `slice_sizes` are known integer lists (from inline literal tuples at
+/// the call site — see `apply_known_lax_gather`). `start_index_map` doesn't
+/// affect the output *shape* (it only says which operand axis each index
+/// component targets), so it's required to be present as a literal (see the
+/// caller) but not threaded through here.
+///
+/// - `output_rank = len(offset_dims) + (start_indices.rank - 1)`: the batch
+///   rank is everything but `start_indices`' trailing "index vector" axis.
+/// - Output axes listed in `offset_dims` take, in order, the `slice_sizes`
+///   entries whose operand axis isn't in `collapsed_slice_dims`.
+/// - Every other output axis takes, in order, one of `start_indices`'
+///   leading (batch) dims.
+fn compute_lax_gather_shape(
+    operand_shape: &[String],
+    indices_shape: &[String],
+    offset_dims: &[isize],
+    collapsed_slice_dims: &[isize],
+    slice_sizes: &[String],
+) -> Option<Vec<String>> {
+    if slice_sizes.len() != operand_shape.len() {
+        return None;
+    }
+    let indices_rank = indices_shape.len();
+    if indices_rank == 0 {
+        return None;
+    }
+    let batch_rank = indices_rank - 1;
+    let output_rank = offset_dims.len() + batch_rank;
+
+    let kept_slice_sizes: Vec<String> = slice_sizes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !collapsed_slice_dims.contains(&(*i as isize)))
+        .map(|(_, s)| s.clone())
+        .collect();
+    if kept_slice_sizes.len() != offset_dims.len() {
+        return None;
+    }
+
+    let batch_dims_shape = &indices_shape[..batch_rank];
+    let mut output = Vec::with_capacity(output_rank);
+    let mut batch_cursor = 0usize;
+    for p in 0..output_rank {
+        if let Some(k) = offset_dims.iter().position(|&d| d == p as isize) {
+            output.push(kept_slice_sizes[k].clone());
+        } else {
+            output.push(batch_dims_shape.get(batch_cursor)?.clone());
+            batch_cursor += 1;
+        }
+    }
+    Some(output)
+}
+
+/// `jax.lax.gather(operand, start_indices, dimension_numbers, slice_sizes,
+/// ...)`. Only the case where `dimension_numbers` is an inline
+/// `jax.lax.GatherDimensionNumbers(offset_dims=(...),
+/// collapsed_slice_dims=(...), start_index_map=(...))` literal (all three
+/// fields literal int tuples) and `slice_sizes` is itself an inline literal
+/// int tuple is modelled; anything else (a variable, a partially-literal
+/// tuple, `operand_batching_dims`/`start_indices_batching_dims`) falls back
+/// to `Ok(None)`. See `compute_lax_gather_shape` for the shape formula.
+fn apply_known_lax_gather(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(operand_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(operand_shape) = shapes.shape(operand_name) else {
+        return Ok(None);
+    };
+    let Some(indices_name) = nth_positional_or_keyword(args, 1, &["start_indices"]) else {
+        return Ok(None);
+    };
+    let Some(indices_shape) = shapes.shape(indices_name) else {
+        return Ok(None);
+    };
+    let Some(dimension_numbers_raw) =
+        nth_positional_or_keyword(args, 2, &["dimension_numbers"])
+    else {
+        return Ok(None);
+    };
+    let Some(offset_dims) = extract_paren_ints_after(dimension_numbers_raw, "offset_dims") else {
+        return Ok(None);
+    };
+    let Some(collapsed_slice_dims) =
+        extract_paren_ints_after(dimension_numbers_raw, "collapsed_slice_dims")
+    else {
+        return Ok(None);
+    };
+    // Required to be present as an inline literal (part of the "fully
+    // statically-specified" gather form we accept) even though its values
+    // don't feed the shape formula.
+    if extract_paren_ints_after(dimension_numbers_raw, "start_index_map").is_none() {
+        return Ok(None);
+    }
+
+    let Some(slice_sizes_raw) = nth_positional_or_keyword(args, 3, &["slice_sizes"]) else {
+        return Ok(None);
+    };
+    let trimmed = slice_sizes_raw.trim();
+    if !((trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+    {
+        return Ok(None);
+    }
+    let slice_sizes_ints = parse_ints(slice_sizes_raw);
+    if slice_sizes_ints.len() != operand_shape.len() {
+        return Ok(None);
+    }
+    let slice_sizes: Vec<String> = slice_sizes_ints.iter().map(isize::to_string).collect();
+
+    Ok(compute_lax_gather_shape(
+        operand_shape,
+        indices_shape,
+        &offset_dims,
+        &collapsed_slice_dims,
+        &slice_sizes,
+    ))
 }
 
 /// `jnp.diagflat(v, k=0)` — flattens `v` then builds a square diagonal
@@ -7321,6 +7478,96 @@ mod known_function_shape_rule_tests {
         ]);
         let output =
             apply_known_function(&KnownFunction::LaxConvGeneralDilated, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_lax_gather_row_selection() {
+        // operand (2, 2), start_indices (2, 1): pick one row per index,
+        // keeping the row's 2 columns. offset_dims=(1,) (output axis 1 is
+        // the kept slice axis), collapsed_slice_dims=(0,) (the picked row
+        // axis is dropped), slice_sizes=(1, 2).
+        let args = vec![
+            pos("operand"),
+            pos("indices"),
+            pos(
+                "jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0,))",
+            ),
+            pos("(1, 2)"),
+        ];
+        let shapes = HashMap::from([
+            ("operand".to_string(), shape(&["2", "2"])),
+            ("indices".to_string(), shape(&["2", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LaxGather, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["2", "2"])));
+    }
+
+    #[test]
+    fn test_lax_gather_symbolic_batch_dim() {
+        // Batch dim comes from start_indices' leading (non-index-vector)
+        // axis and can be symbolic; the offset (kept slice) dim is literal.
+        let args = vec![
+            pos("operand"),
+            pos("indices"),
+            pos(
+                "jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0,))",
+            ),
+            pos("(1, 2)"),
+        ];
+        let shapes = HashMap::from([
+            ("operand".to_string(), shape(&["n", "2"])),
+            ("indices".to_string(), shape(&["batch", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LaxGather, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "2"])));
+    }
+
+    #[test]
+    fn test_lax_gather_keyword_dimension_numbers_and_slice_sizes() {
+        let args = vec![
+            pos("operand"),
+            pos("indices"),
+            kw(
+                "dimension_numbers",
+                "jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0,))",
+            ),
+            kw("slice_sizes", "(1, 2)"),
+        ];
+        let shapes = HashMap::from([
+            ("operand".to_string(), shape(&["2", "2"])),
+            ("indices".to_string(), shape(&["2", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LaxGather, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["2", "2"])));
+    }
+
+    #[test]
+    fn test_lax_gather_non_literal_dimension_numbers_skips() {
+        let args = vec![pos("operand"), pos("indices"), pos("dnums"), pos("(1, 2)")];
+        let shapes = HashMap::from([
+            ("operand".to_string(), shape(&["2", "2"])),
+            ("indices".to_string(), shape(&["2", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LaxGather, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_lax_gather_non_literal_slice_sizes_skips() {
+        let args = vec![
+            pos("operand"),
+            pos("indices"),
+            pos(
+                "jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0,))",
+            ),
+            pos("sizes"),
+        ];
+        let shapes = HashMap::from([
+            ("operand".to_string(), shape(&["2", "2"])),
+            ("indices".to_string(), shape(&["2", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LaxGather, &args, &shapes).unwrap();
         assert_eq!(output, None);
     }
 

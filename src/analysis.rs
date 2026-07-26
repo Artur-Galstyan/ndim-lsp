@@ -136,7 +136,11 @@ where
         }
         let names: Vec<String> = match lhs {
             Lhs::Single(name) | Lhs::Augmented(name) => vec![name],
-            Lhs::Tuple(names) => names.into_iter().flatten().collect(),
+            Lhs::Tuple(targets) => targets
+                .iter()
+                .flat_map(|t| t.names())
+                .map(str::to_string)
+                .collect(),
         };
         if names.is_empty() {
             continue; // all `_` targets
@@ -694,7 +698,18 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
             // We don't have a natural variable name here — use the full
             // expression text as the "variable" in the error.
             let var_text = node.utf8_text(ctx.text.as_bytes()).unwrap_or("?").to_string();
-            ctx.errors.push(ShapeError::mismatch(var_text, message, node.range()));
+            // Both operand nodes are in hand here, so attach the right-hand
+            // operand's own range as related information (convention: the
+            // right operand is "the other one" relative to the left, which
+            // the mismatch message already names first).
+            let related_message = format!(
+                "other operand `{}`: shape [{}]",
+                right_name,
+                right_shape.join(", ")
+            );
+            let error = ShapeError::mismatch(var_text, message, node.range())
+                .with_related(right_node.range(), related_message);
+            ctx.errors.push(error);
             None
         }
     }
@@ -1570,9 +1585,57 @@ enum Lhs {
     /// `x += ...` / `x @= ...` etc. — combines the existing LHS shape with
     /// the RHS shape instead of replacing it.
     Augmented(String),
-    /// `a, b = ...` / `(a, b) = ...` / `[a, b] = ...`. Each element is the
-    /// target name, or `None` for `_` and non-identifier elements (skipped).
-    Tuple(Vec<Option<String>>),
+    /// `a, b = ...` / `(a, b) = ...` / `[a, b] = ...`. Each element is a
+    /// `TupleTarget` (a plain name, or one level of nested tuple pattern).
+    Tuple(Vec<TupleTarget>),
+}
+
+/// One top-level element of a tuple-assignment LHS pattern. Supports one
+/// level of nesting (`out, (h, c) = self.lstm(x)`), needed for RNN
+/// `(output, state)` returns where `state` is itself an LSTM `(h, c)` pair
+/// (see `tuple_rhs_shapes`'s `LayerKind::Rnn` arm).
+#[derive(Debug, Clone)]
+enum TupleTarget {
+    /// A plain identifier target, or `None` for `_`/non-identifier elements
+    /// (skipped).
+    Name(Option<String>),
+    /// A nested `(a, b, ...)` pattern one level down. Every inner name is
+    /// bound to the *same* shape as this top-level element (`handle_tuple_
+    /// assignment` clones it per name) — correct for LSTM's `(h, c)`, which
+    /// share one shape under this analyzer's approximation.
+    Nested(Vec<Option<String>>),
+}
+
+impl TupleTarget {
+    /// All identifier names bound by this target (flattening one level of
+    /// nesting), for coverage accounting.
+    fn names(&self) -> Vec<&str> {
+        match self {
+            TupleTarget::Name(Some(n)) => vec![n.as_str()],
+            TupleTarget::Name(None) => vec![],
+            TupleTarget::Nested(inner) => inner.iter().flatten().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Parse one nested tuple/list pattern's identifier children (used for both
+/// the outer LHS pattern and, one level down, a nested `(h, c)` group).
+/// `_` and non-identifier elements map to `None` (skipped).
+fn parse_pattern_names(pattern: Node, text: &str) -> Vec<Option<String>> {
+    let mut names = Vec::new();
+    for k in 0..pattern.named_child_count() {
+        let el = pattern.named_child(k as u32).unwrap();
+        let name = if el.kind() == "identifier" {
+            match el.utf8_text(text.as_bytes()) {
+                Ok("_") | Err(_) => None,
+                Ok(t) => Some(t.to_string()),
+            }
+        } else {
+            None
+        };
+        names.push(name);
+    }
+    names
 }
 
 /// Collect all assignment statements (identifier and tuple-pattern LHS) in
@@ -1642,20 +1705,22 @@ fn push_assignment_item<'a>(
             }
         }
         "pattern_list" | "tuple_pattern" | "list_pattern" => {
-            let mut names = Vec::new();
+            let mut targets = Vec::new();
             for k in 0..lhs.named_child_count() {
                 let el = lhs.named_child(k as u32).unwrap();
-                let name = if el.kind() == "identifier" {
-                    match el.utf8_text(text.as_bytes()) {
+                let target = match el.kind() {
+                    "identifier" => TupleTarget::Name(match el.utf8_text(text.as_bytes()) {
                         Ok("_") | Err(_) => None,
                         Ok(t) => Some(t.to_string()),
+                    }),
+                    "tuple_pattern" | "pattern_list" | "list_pattern" => {
+                        TupleTarget::Nested(parse_pattern_names(el, text))
                     }
-                } else {
-                    None
+                    _ => TupleTarget::Name(None),
                 };
-                names.push(name);
+                targets.push(target);
             }
-            out.push((Lhs::Tuple(names), rhs, assignment));
+            out.push((Lhs::Tuple(targets), rhs, assignment));
         }
         _ => {}
     }
@@ -1705,7 +1770,7 @@ fn handle_augmented_assignment(
 
 /// Bind a tuple-pattern assignment's element shapes (issue #30).
 fn handle_tuple_assignment(
-    names: &[Option<String>],
+    targets: &[TupleTarget],
     rhs_node: Node,
     display_line: Option<u32>,
     ctx: &mut ShapeCtx,
@@ -1713,25 +1778,38 @@ fn handle_tuple_assignment(
     let Some(scope_idx) = scope_index_for_byte(ctx.scopes, rhs_node.start_byte()) else {
         return;
     };
-    let Some(elem_shapes) = tuple_rhs_shapes(rhs_node, names.len(), scope_idx, ctx) else {
+    let Some(elem_shapes) = tuple_rhs_shapes(rhs_node, targets.len(), scope_idx, ctx) else {
         // Unmodelled multi-output RHS: prior bindings for the targets are
         // stale now (issue #46).
-        for name in names.iter().flatten() {
+        for name in targets.iter().flat_map(TupleTarget::names) {
             ctx.evict_binding(scope_idx, name);
         }
         return;
     };
-    for (name, shape) in names.iter().zip(elem_shapes) {
-        if let Some(name) = name {
-            match shape {
-                Some(shape) => ctx.record_binding(
-                    scope_idx,
-                    name,
-                    shape,
-                    display_line,
-                    rhs_node.start_byte(),
-                ),
+    for (target, shape) in targets.iter().zip(elem_shapes) {
+        match target {
+            TupleTarget::Name(Some(name)) => match shape {
+                Some(shape) => {
+                    ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
+                }
                 None => ctx.evict_binding(scope_idx, name),
+            },
+            TupleTarget::Name(None) => {}
+            // Nested `(h, c)`-style group one level down: every inner name
+            // binds to the same element shape (see `TupleTarget::Nested`).
+            TupleTarget::Nested(inner) => {
+                for name in inner.iter().flatten() {
+                    match &shape {
+                        Some(shape) => ctx.record_binding(
+                            scope_idx,
+                            name,
+                            shape.clone(),
+                            display_line,
+                            rhs_node.start_byte(),
+                        ),
+                        None => ctx.evict_binding(scope_idx, name),
+                    }
+                }
             }
         }
     }
@@ -1849,6 +1927,57 @@ fn tuple_rhs_shapes(
                     Some(w)
                 });
                 return Some(vec![Some(query_shape), weights]);
+            }
+
+            // `out, h = self.gru(x)` / `out, (h, c) = self.lstm(x)` —
+            // self.<attr> resolves to an RNN full-sequence layer
+            // (`LayerKind::Rnn`) built in `__init__`. Element 0 (`out`) is
+            // the full sequence output: same rule as `apply_layer_kind`'s
+            // `Rnn` arm (last dim -> `hidden_size`, all other dims
+            // preserved). Element 1 is the final state — for LSTM's nested
+            // `(h, c)` pattern both members are bound to this same shape
+            // (see `handle_tuple_assignment`'s `TupleTarget::Nested` arm),
+            // which is exactly right for the *shape* (real torch `h`/`c` do
+            // share one shape) even though only `h` is truly "the state" for
+            // a GRU/RNN. The shape itself is approximated by dropping the
+            // leading (sequence) axis and replacing the last dim with
+            // `hidden_size` — this assumes `batch_first=False` (torch's
+            // default, not tracked by `LayerKind::Rnn`) and `num_layers *
+            // num_directions == 1` (also not tracked), so for a batched
+            // input it is missing the real leading `num_layers*num_
+            // directions` axis that torch's actual `h_n`/`c_n` carries.
+            // Documented as an approximation in TO_IMPLEMENT.md.
+            if let Some(attr) = target.strip_prefix("self.") {
+                let rnn_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
+                    Some(LayerKind::Rnn { hidden_size, .. }) => Some(hidden_size.clone()),
+                    _ => None,
+                };
+                if let Some(hidden_size) = rnn_hidden_size {
+                    if n_targets != 2 {
+                        return None;
+                    }
+                    let args_node = rhs.child_by_field_name("arguments")?;
+                    let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                    let input = args.iter().find_map(|a| match a {
+                        CallArgument::Positional { value } => Some(value.as_str()),
+                        _ => None,
+                    })?;
+                    let input_shape = ctx.resolve_shape(input, scope_idx)?;
+                    if input_shape.len() < 2 {
+                        return None;
+                    }
+
+                    let mut output = input_shape.clone();
+                    let last = output.len() - 1;
+                    output[last] = hidden_size.clone();
+
+                    let mut state = input_shape[1..].to_vec();
+                    if let Some(last_dim) = state.last_mut() {
+                        *last_dim = hidden_size;
+                    }
+
+                    return Some(vec![Some(output), Some(state)]);
+                }
             }
 
             let resolved = resolve_call_target(target, ctx.import_map);
@@ -3486,5 +3615,3 @@ def f(x: Float[Array, "3 5"]):
         );
     }
 }
-
-
