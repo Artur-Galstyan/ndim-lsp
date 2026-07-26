@@ -5064,6 +5064,209 @@ def caller(y: Float[Array, "batch"]) -> None:
             Some(&shape(&["batch", "k"]))
         );
     }
+
+    // ── Cross-file return-type tracing ──────────────────────────────────
+    // Same-file helpers are covered above via `apply_user_function`; these
+    // extend the coverage to helpers imported from another file on disk,
+    // resolved through `resolve_imported_function_shape` +
+    // `apply_imported_user_function`.
+
+    /// `from mylib.helpers import project` then `y = project(x)` — the
+    /// callee lives in a different file, found through the import map and
+    /// `resolve_implementation`. Its jaxtyping annotations bind exactly like
+    /// a same-file helper.
+    #[test]
+    fn test_cross_file_return_shape_bare_import_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let code = r#"
+from mylib.helpers import project
+
+def f(x: Float[Array, "batch 4"]) -> None:
+    y = project(x)
+"#;
+        let tree = parse(code);
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["batch", "d_out"]))
+        );
+    }
+
+    /// `import mylib.helpers as h` then `y = h.project(x)` — the qualified
+    /// (module-attribute) call form, resolved the same way via
+    /// `resolve_call_target` before the on-disk walk.
+    #[test]
+    fn test_cross_file_return_shape_qualified_import_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let code = r#"
+import mylib.helpers as h
+
+def f(x: Float[Array, "batch 4"]) -> None:
+    y = h.project(x)
+"#;
+        let tree = parse(code);
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(
+            analysis.errors.is_empty(),
+            "unexpected errors: {:?}",
+            analysis.errors
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["batch", "d_out"]))
+        );
+    }
+
+    /// Argument rank disagrees with the imported helper's declared param
+    /// rank — the mismatch must still surface as a `ShapeError`, same as a
+    /// same-file helper.
+    #[test]
+    fn test_cross_file_return_shape_mismatch_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"a b\"]) -> Float[Array, \"a\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let code = r#"
+from mylib.helpers import project
+
+def f(x: Float[Array, "batch"]) -> None:
+    y = project(x)
+"#;
+        let tree = parse(code);
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(
+            analysis.errors.len(),
+            1,
+            "expected one error: {:?}",
+            analysis.errors
+        );
+    }
+
+    /// `max_depth: 0` disables cross-file resolution entirely (mirrors
+    /// `resolve_implementation`'s own `max_depth` contract) — the call
+    /// silently goes unshaped rather than erroring.
+    #[test]
+    fn test_cross_file_return_shape_respects_max_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let code = r#"
+from mylib.helpers import project
+
+def f(x: Float[Array, "batch 4"]) -> None:
+    y = project(x)
+"#;
+        let tree = parse(code);
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 0, None).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape_in_scope(&analysis, "f", "y"), None);
+    }
+
+    /// The signature-extraction cache (`ResolutionCache::signatures`) avoids
+    /// re-parsing the callee's file on repeat calls to the same imported
+    /// helper, whether within one file or across two files sharing a
+    /// session-lifetime cache.
+    #[test]
+    fn test_cross_file_signature_cache_avoids_reparsing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let read_count = AtomicUsize::new(0);
+        let counting_read = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+
+        let cache = new_resolution_cache();
+
+        let a_py = r#"
+from mylib.helpers import project
+
+def f(x: Float[Array, "batch 4"]) -> None:
+    y = project(x)
+"#;
+        let tree_a = parse(a_py);
+        analyze_layer_shapes(tree_a.root_node(), a_py, &roots, counting_read, 5, Some(&cache))
+            .unwrap();
+        let reads_a = read_count.load(Ordering::Relaxed);
+        assert!(reads_a > 0, "first file should hit disk");
+
+        read_count.store(0, Ordering::Relaxed);
+
+        let b_py = r#"
+from mylib.helpers import project
+
+def g(x: Float[Array, "batch 4"]) -> None:
+    y = project(x)
+"#;
+        let tree_b = parse(b_py);
+        analyze_layer_shapes(tree_b.root_node(), b_py, &roots, counting_read, 5, Some(&cache))
+            .unwrap();
+        let reads_b = read_count.load(Ordering::Relaxed);
+
+        // The second file reuses both the `ResolutionCache::map` entry
+        // (implementation resolution) and the new `signatures` entry
+        // (jaxtyping extraction) for the shared `project` target, so it
+        // reads strictly less than the first — mirroring
+        // `test_resolution_cache_shared_across_files`'s assertion style. It
+        // isn't zero because `extract_layer_assignments_scoped` separately
+        // (and unconditionally) probes every assigned call as a possible
+        // layer constructor via `resolve_call_signature`, which has no
+        // signature cache of its own (a pre-existing, unrelated gap).
+        assert!(
+            reads_b < reads_a,
+            "second file should read less than the first (signature cache reuse): \
+             reads_a={reads_a} reads_b={reads_b}"
+        );
+        assert!(
+            cache.hits.load(Ordering::Relaxed) >= 1,
+            "expected at least one implementation-cache hit after analyzing the second file"
+        );
+    }
 }
 
 mod vmap_shape_inference_tests {
@@ -6132,6 +6335,83 @@ def f(x: Float[Array, "batch d"]):
     }
 
     #[test]
+    fn test_nested_vmap_of_self_attr_layer_via_analyze() {
+        // jax.vmap(jax.vmap(self.input_proj))(x): two leading batch axes
+        // (batch, seq) get peeled before applying the Linear layer to the
+        // per-element "features" axis, then both are re-prepended.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+import jax
+class M:
+    input_proj: eqx.nn.Linear
+
+    def __init__(self):
+        self.input_proj = eqx.nn.Linear(4, 7)
+
+    def __call__(self, x: Float[Array, "batch seq 4"]):
+        y = jax.vmap(jax.vmap(self.input_proj))(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "unexpected errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "__call__", "y"),
+            Some(&shape(&["batch", "seq", "7"]))
+        );
+    }
+
+    #[test]
+    fn test_nested_vmap_of_self_attr_layer_mismatch_via_analyze() {
+        // Same as above but the per-element last dim (5) disagrees with the
+        // Linear's in_features (4) — the mismatch must still surface after
+        // peeling both batch axes.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import equinox as eqx
+import jax
+class M:
+    input_proj: eqx.nn.Linear
+
+    def __init__(self):
+        self.input_proj = eqx.nn.Linear(4, 7)
+
+    def __call__(self, x: Float[Array, "batch seq 5"]):
+        y = jax.vmap(jax.vmap(self.input_proj))(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(analysis.errors.len(), 1, "expected one error: {:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_nested_vmap_of_bare_function_via_analyze() {
+        // jax.vmap(jax.vmap(g))(x) with g a user function — two batch axes
+        // peeled around g's single-example "d"-shaped input/output.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+def g(v: Float[Array, "d"]) -> Float[Array, "d"]:
+    return v
+
+def f(x: Float[Array, "batch seq d"]):
+    y = jax.vmap(jax.vmap(g))(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(
+            find_shape_in_scope(&analysis, "f", "y"),
+            Some(&shape(&["batch", "seq", "d"]))
+        );
+    }
+
+    #[test]
     fn test_binary_op_in_nested_call_via_analyze() {
         let tmp = tempfile::tempdir().unwrap();
         // z = jnp.exp(a @ b) — compatible matmul inside nested call
@@ -6904,6 +7184,24 @@ mod multihead_attention_tests {
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
+    }
+
+    #[test]
+    fn test_multihead_attention_vmap_single_lhs_binds_primary_output() {
+        // `out = jax.vmap(self.attn)(q, k, v)` — batched MHA applied via
+        // inline vmap with a single (non-tuple) LHS. Previously bound
+        // nothing: `apply_inline_vmap_layer`'s layer-application path
+        // returned `Ok(None)` for MultiheadAttention, same underlying cause
+        // as the direct-call case fixed above. The batch axis peeled by
+        // vmap must be restored on the query's shape.
+        let code = "import torch.nn as nn\nimport jax\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"batch seq 512\"], k: Float[Array, \"batch seq 512\"], v: Float[Array, \"batch seq 512\"]):\n        out = jax.vmap(self.attn)(q, k, v)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(
+            find_shape(&analysis, "out"),
+            Some(&shape(&["batch", "seq", "512"]))
+        );
     }
 
     #[test]

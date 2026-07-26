@@ -9,7 +9,8 @@ use std::{
 use tree_sitter::{Node, Parser};
 
 use crate::python_ast::{
-    extract_call_arguments, extract_callable_signature, find_top_level_symbol,
+    extract_call_arguments, extract_callable_signature, extract_jaxtyping_shapes,
+    find_top_level_symbol,
 };
 use crate::types::*;
 
@@ -30,6 +31,13 @@ use crate::types::*;
 /// imports, not intermediate re-export hops).
 pub struct ResolutionCache {
     pub map: std::sync::RwLock<HashMap<(Vec<String>, u64), ResolvedImplementation>>,
+    /// Session-lifetime cache for extracted jaxtyping `FunctionShapeScope`s of
+    /// cross-file helper functions (cross-file return-type tracing). Keyed by
+    /// the resolved implementation's file path plus function name, since one
+    /// file can define several functions. `None` caches a lookup that found
+    /// the function but no matching jaxtyping scope, so repeat calls to an
+    /// unannotated cross-file helper don't re-parse the file.
+    pub signatures: std::sync::RwLock<HashMap<(PathBuf, String), Option<FunctionShapeScope>>>,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
 }
@@ -48,6 +56,7 @@ pub fn search_roots_fingerprint(search_roots: &[PathBuf]) -> u64 {
 pub fn new_resolution_cache() -> Arc<ResolutionCache> {
     Arc::new(ResolutionCache {
         map: std::sync::RwLock::new(HashMap::new()),
+        signatures: std::sync::RwLock::new(HashMap::new()),
         hits: AtomicUsize::new(0),
         misses: AtomicUsize::new(0),
     })
@@ -57,6 +66,7 @@ pub fn new_resolution_cache() -> Arc<ResolutionCache> {
 /// folders change, since site-packages roots may shift.
 pub fn clear_resolution_cache(cache: &Arc<ResolutionCache>) {
     cache.map.write().unwrap().clear();
+    cache.signatures.write().unwrap().clear();
 }
 
 pub fn resolve_python_module_on_disk(
@@ -375,6 +385,76 @@ where
         arguments,
         bindings,
     }))
+}
+
+/// Resolve `target` as an imported free function and extract its jaxtyping
+/// parameter + return shape annotations (cross-file return-type tracing).
+///
+/// Mirrors `resolve_call_signature`'s import-resolution walk, but pulls the
+/// callee's `FunctionShapeScope` (via `extract_jaxtyping_shapes`) instead of
+/// its bare parameter names, so the caller can feed the result straight into
+/// the same `bind_and_substitute` logic already used for same-file helpers.
+///
+/// Returns `Ok(None)` when the target isn't found on disk, resolves to
+/// something other than a function (e.g. a class), or the function has no
+/// jaxtyping annotations at all.
+pub fn resolve_imported_function_shape<F>(
+    target: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<FunctionShapeScope>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let resolved_target = resolve_call_target(target, import_map);
+    let Some(implementation) =
+        resolve_implementation(resolved_target, search_roots, &read_file, max_depth, cache)?
+    else {
+        return Ok(None);
+    };
+    let Some(PythonSymbol::Function { name }) = &implementation.symbol else {
+        return Ok(None);
+    };
+
+    let cache_key = (implementation.target.file_path.clone(), name.clone());
+    if let Some(cache) = cache
+        && let Some(cached) = cache.signatures.read().unwrap().get(&cache_key)
+    {
+        return Ok(cached.clone());
+    }
+
+    let Some(text) = read_file(&implementation.target.file_path) else {
+        return Ok(None);
+    };
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let Some(tree) = parser.parse(&text, None) else {
+        return Err("failed to parse implementation file".to_string());
+    };
+
+    let scopes = extract_jaxtyping_shapes(tree.root_node(), &text)?;
+    let found = scopes
+        .iter()
+        .enumerate()
+        .filter(|(i, scope)| *i != 0 && scope.function_name.as_deref() == Some(name.as_str()))
+        .min_by_key(|(_, scope)| scope.end_byte - scope.start_byte)
+        .map(|(_, scope)| scope.clone());
+
+    if let Some(cache) = cache {
+        cache
+            .signatures
+            .write()
+            .unwrap()
+            .insert(cache_key, found.clone());
+    }
+
+    Ok(found)
 }
 
 pub fn bind_call_arguments(
@@ -1596,6 +1676,159 @@ mod resolution_cache_tests {
         assert_ne!(
             search_roots_fingerprint(&roots1),
             search_roots_fingerprint(&roots2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_imported_function_shape_tests {
+    use super::*;
+    use std::fs;
+
+    fn ip(dots: usize, module: &[&str], name: &str) -> ImportPath {
+        ImportPath {
+            dots,
+            module: module.iter().map(|p| p.to_string()).collect(),
+            name: name.to_string(),
+        }
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|d| d.to_string()).collect()
+    }
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    #[test]
+    fn test_resolves_function_shape_from_another_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map =
+            HashMap::from([("project".to_string(), ip(0, &["mylib", "helpers"], "project"))]);
+
+        let found =
+            resolve_imported_function_shape("project", &import_map, &roots, read, 5, None)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(found.function_name.as_deref(), Some("project"));
+        assert_eq!(
+            found.shapes.get("x"),
+            Some(&shape(&["batch", "d_in"]))
+        );
+        assert_eq!(found.return_shape, Some(shape(&["batch", "d_out"])));
+    }
+
+    #[test]
+    fn test_resolves_to_class_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("mylib.py"), "class Linear: pass").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map = HashMap::from([("Linear".to_string(), ip(0, &["mylib"], "Linear"))]);
+
+        let found = resolve_imported_function_shape("Linear", &import_map, &roots, read, 5, None)
+            .unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_missing_module_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map =
+            HashMap::from([("project".to_string(), ip(0, &["mylib", "helpers"], "project"))]);
+
+        let found =
+            resolve_imported_function_shape("project", &import_map, &roots, read, 5, None)
+                .unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_function_without_annotations_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x):\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map =
+            HashMap::from([("project".to_string(), ip(0, &["mylib", "helpers"], "project"))]);
+
+        let found =
+            resolve_imported_function_shape("project", &import_map, &roots, read, 5, None)
+                .unwrap()
+                .unwrap();
+
+        // The scope is still returned (a function was found); it just has
+        // no annotations for the caller to bind against.
+        assert!(found.shapes.is_empty());
+        assert_eq!(found.return_shape, None);
+    }
+
+    #[test]
+    fn test_caches_signature_across_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def project(x: Float[Array, \"a\"]) -> Float[Array, \"b\"]:\n    pass",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map =
+            HashMap::from([("project".to_string(), ip(0, &["mylib", "helpers"], "project"))]);
+
+        let read_count = AtomicUsize::new(0);
+        let counting_read = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+
+        let cache = new_resolution_cache();
+
+        let found1 = resolve_imported_function_shape(
+            "project",
+            &import_map,
+            &roots,
+            counting_read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(read_count.load(Ordering::Relaxed) > 0);
+
+        read_count.store(0, Ordering::Relaxed);
+
+        let found2 = resolve_imported_function_shape(
+            "project",
+            &import_map,
+            &roots,
+            counting_read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(found2, found1);
+        assert_eq!(
+            read_count.load(Ordering::Relaxed),
+            0,
+            "second lookup should hit both the implementation and signature caches"
         );
     }
 }

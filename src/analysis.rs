@@ -18,7 +18,7 @@ use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_jaxtyping_shapes,
     extract_self_attr_aliases_by_class,
 };
-use crate::resolution::{ResolutionCache, resolve_call_target};
+use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
 
 use crate::types::*;
 
@@ -62,6 +62,10 @@ where
         &layer_records,
         &self_attr_layers,
         &self_attr_aliases,
+        search_roots,
+        &read_file,
+        max_depth,
+        cache,
         &mut scopes,
     )?;
 
@@ -237,6 +241,12 @@ struct ShapeCtx<'a> {
     /// dims (`self.dt_rank` ≡ `dt_rank`) before storage, resolved by the
     /// call-site byte via `self_attr_alias_at` — mirrors `self_attr_layers`.
     aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    /// Workspace/site-packages search roots, for resolving imported helper
+    /// functions on disk (cross-file return-type tracing).
+    search_roots: &'a [PathBuf],
+    read_file: &'a dyn Fn(&PathBuf) -> Option<String>,
+    max_depth: usize,
+    cache: Option<&'a ResolutionCache>,
     scopes: &'a mut [FunctionShapeScope],
     vmap_targets: &'a mut HashMap<String, VmapInfo>,
     applications: &'a mut Vec<LayerApplication>,
@@ -812,7 +822,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             if let Some(receiver_shape) = shape_of_expression(obj_node, ctx) {
                 let receiver_name =
                     ctx.bind_synthetic(receiver_shape, scope_idx, obj_node.start_byte());
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
                 if let Some(known) = classify_method_call(&method_name) {
                     let result = apply_method_call(&known, &receiver_name, &args, &ctx.scope_shapes(scope_idx));
@@ -850,7 +861,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             // If the receiver is an import alias (like jnp), this is a
             // qualified free function — fall through.
             if !ctx.import_map.contains_key(&receiver_name) {
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
                 if let Some(known) = classify_method_call(&method_name) {
                     let result = apply_method_call(
@@ -1069,6 +1081,37 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             return None;
         };
         return ctx.resolve_shape(value, scope_idx);
+    }
+
+    // 7. Cross-file user-defined function propagation. Same-file helpers are
+    // handled in step 3 above; this extends the same bind-and-substitute
+    // logic to helpers imported from another file on disk, e.g.
+    // `from mylib.helpers import project` then `y = project(x)`. Tried last
+    // (after known-function/elementwise) so the common case — calls into
+    // jax/numpy/torch, which never resolve on disk — doesn't pay for a
+    // filesystem walk on every call.
+    if let Some(result) = apply_imported_user_function(
+        &target,
+        &args,
+        &ctx.scope_shapes(scope_idx),
+        ctx.import_map,
+        ctx.search_roots,
+        ctx.read_file,
+        ctx.max_depth,
+        ctx.cache,
+    ) {
+        return match result {
+            Ok(Some(shape)) => Some(shape),
+            Ok(None) => None,
+            Err(message) => {
+                ctx.errors.push(ShapeError {
+                    variable: target,
+                    message,
+                    range: args_node.range(),
+                });
+                None
+            }
+        };
     }
 
     None
@@ -1328,6 +1371,7 @@ fn prepend_batch_dim(mut shape: Vec<String>, axis: isize, dim: String) -> Vec<St
 /// per-assignment shape records used for inlay hints.
 type PropagateOutput = (Vec<LayerApplication>, Vec<ShapeError>, Vec<AssignmentShape>);
 
+#[allow(clippy::too_many_arguments)]
 fn propagate_calls(
     node: Node,
     text: &str,
@@ -1335,6 +1379,10 @@ fn propagate_calls(
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    search_roots: &[PathBuf],
+    read_file: &dyn Fn(&PathBuf) -> Option<String>,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
     scopes: &mut [FunctionShapeScope],
 ) -> Result<PropagateOutput, String> {
     let mut applications = Vec::new();
@@ -1351,6 +1399,10 @@ fn propagate_calls(
         layer_records,
         self_attr_layers,
         aliases,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
         scopes,
         vmap_targets: &mut vmap_targets,
         applications: &mut applications,
@@ -2361,11 +2413,30 @@ fn apply_vmap_call(
     caller_shapes: &dyn ShapeLookup,
     scopes: &[FunctionShapeScope],
 ) -> Result<Option<Vec<String>>, String> {
-    // a. Resolve each positional arg's shape from caller_shapes.
-    //    Peel the batch dim from each.
-    let mut peeled_arg_shapes: Vec<(&str, Vec<String>)> = Vec::new(); // (arg_name, peeled_shape)
-    let mut batch_dim: Option<String> = None;
+    apply_vmap_call_chain(
+        &[(info.in_axes, info.out_axes)],
+        &info.wrapped,
+        args,
+        caller_shapes,
+        scopes,
+    )
+}
 
+/// Generalized form of `apply_vmap_call` for nested vmaps, e.g.
+/// `jax.vmap(jax.vmap(f))(x)`. `axes` holds `(in_axes, out_axes)` pairs
+/// ordered outermost-to-innermost — one entry per vmap layer wrapping `f`.
+/// Peels one leading batch dim per level (checking cross-argument agreement
+/// at each level independently), resolves `f`'s shape on the fully-peeled
+/// per-example inputs, then re-prepends the batch dims outward-to-inward
+/// in reverse.
+fn apply_vmap_call_chain(
+    axes: &[(isize, isize)],
+    wrapped: &str,
+    args: &[CallArgument],
+    caller_shapes: &dyn ShapeLookup,
+    scopes: &[FunctionShapeScope],
+) -> Result<Option<Vec<String>>, String> {
+    let mut current: Vec<(&str, Vec<String>)> = Vec::new();
     for arg in args {
         let CallArgument::Positional { value } = arg else {
             // Skip non-positional args silently (v1 doesn't pass kwargs through vmap).
@@ -2375,33 +2446,48 @@ fn apply_vmap_call(
             // Arg has no known shape — skip silently.
             return Ok(None);
         };
-        // b. Peel the batch dim at in_axes.
-        match peel_batch_dim(shape, info.in_axes) {
-            Ok((peeled, dim)) => {
-                // d. All peeled batch dims must match.
-                if let Some(ref existing) = batch_dim {
-                    if existing != &dim {
-                        return Err(format!(
-                            "vmap input batch dims disagree: '{}' vs '{}'",
-                            existing, dim
-                        ));
-                    }
-                } else {
-                    batch_dim = Some(dim);
-                }
-                peeled_arg_shapes.push((value.as_str(), peeled));
-            }
-            Err(msg) => {
-                return Err(format!(
-                    "vmap: argument '{}' rank insufficient for in_axes={}: {}",
-                    value, info.in_axes, msg
-                ));
-            }
-        }
+        current.push((value.as_str(), shape.clone()));
+    }
+    if current.is_empty() {
+        // No positional args at all — can't determine batch dims.
+        return Ok(None);
     }
 
-    // e. Find the wrapped function's FunctionShapeScope.
-    let callee = match find_callee_scope(&info.wrapped, None, scopes) {
+    let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
+    for &(in_axes, _) in axes {
+        let mut level_dim: Option<String> = None;
+        let mut next = Vec::with_capacity(current.len());
+        for (name, shape) in &current {
+            match peel_batch_dim(shape, in_axes) {
+                Ok((peeled, dim)) => {
+                    if let Some(ref existing) = level_dim {
+                        if existing != &dim {
+                            return Err(format!(
+                                "vmap input batch dims disagree: '{}' vs '{}'",
+                                existing, dim
+                            ));
+                        }
+                    } else {
+                        level_dim = Some(dim);
+                    }
+                    next.push((*name, peeled));
+                }
+                Err(msg) => {
+                    return Err(format!(
+                        "vmap: argument '{}' rank insufficient for in_axes={}: {}",
+                        name, in_axes, msg
+                    ));
+                }
+            }
+        }
+        current = next;
+        // `current` is non-empty (checked above and preserved per level), so
+        // `level_dim` is always `Some` here.
+        batch_dims.push(level_dim.unwrap());
+    }
+
+    // Find the wrapped function's FunctionShapeScope.
+    let callee = match find_callee_scope(wrapped, None, scopes) {
         Some(idx) => &scopes[idx],
         None => return Ok(None), // wrapped function not found — skip silently
     };
@@ -2411,60 +2497,45 @@ fn apply_vmap_call(
         return Ok(None);
     }
 
-    // f. Map positional arg shapes to param names (using param_order),
-    //    then bind and substitute.
+    // Map positional arg shapes to param names (using param_order),
+    // then bind and substitute.
     let param_names = &callee.param_order;
-    let arg_shapes: Vec<(&str, Vec<String>)> = peeled_arg_shapes
+    let arg_shapes: Vec<(&str, Vec<String>)> = current
         .iter()
         .enumerate()
         .filter_map(|(idx, (_, shape))| param_names.get(idx).map(|p| (p.as_str(), shape.clone())))
         .collect();
 
-    let result = bind_and_substitute(callee, &info.wrapped, &arg_shapes)?;
+    let result = bind_and_substitute(callee, wrapped, &arg_shapes)?;
 
-    // g. If return_shape is None after substitution, no output to propagate.
+    // If return_shape is None after substitution, no output to propagate.
     let Some(substituted) = result else {
         return Ok(None);
     };
 
-    // h. Prepend the batch dim at out_axes.
-    let Some(ref dim) = batch_dim else {
-        // No positional args at all — can't determine batch dim.
-        return Ok(None);
-    };
+    // Re-prepend the batch dims, innermost level first.
+    let mut output = substituted;
+    for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
+        output = prepend_batch_dim(output, out_axes, dim);
+    }
 
-    let output = prepend_batch_dim(substituted, info.out_axes, dim.clone());
-
-    // i. Store result — done by caller.
     Ok(Some(output))
 }
 
-/// Resolve an inline vmap application `vmap(callable)(args)` (issue #35).
+/// Resolve an inline vmap application `vmap(callable)(args)` (issue #35),
+/// including nested `vmap(vmap(callable))(args)` chains.
 ///
-/// `inner_call` is the `vmap(callable)` call; `outer_args_node` holds the
-/// arguments applied to it. Returns the batched output shape, or `None` if
-/// the inner call isn't a vmap we can model.
+/// `inner_call` is the outermost `vmap(...)` call; `outer_args_node` holds
+/// the arguments applied to it. Returns the batched output shape, or `None`
+/// if the inner call isn't a vmap chain we can model.
 fn shape_of_inline_vmap(
     inner_call: Node,
     outer_args_node: Node,
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let inner_func = inner_call.child_by_field_name("function")?;
-    let inner_target = inner_func.utf8_text(ctx.text.as_bytes()).ok()?;
-    let resolved = resolve_call_target(inner_target, ctx.import_map);
-    if !matches!(classify_known_function(&resolved), Some(KnownFunction::Vmap)) {
-        return None;
-    }
-
-    let inner_args_node = inner_call.child_by_field_name("arguments")?;
-    let inner_args = extract_call_arguments(inner_args_node, ctx.text).ok()?;
-    let callable = inner_args.iter().find_map(|a| match a {
-        CallArgument::Positional { value } => Some(value.clone()),
-        _ => None,
-    })?;
-    let in_axes = parse_int_keyword(&inner_args, "in_axes", 0)?;
-    let out_axes = parse_int_keyword(&inner_args, "out_axes", 0)?;
+    let (callable_node, axes) = collect_vmap_axes(inner_call, ctx)?;
+    let callable = callable_node.utf8_text(ctx.text.as_bytes()).ok()?.to_string();
 
     let outer_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
 
@@ -2474,11 +2545,10 @@ fn shape_of_inline_vmap(
             .self_attr_layer_at(attr, outer_args_node.start_byte())
             .cloned()
     {
-        return apply_inline_vmap_layer(
+        return apply_inline_vmap_layer_chain(
             &layer,
             &outer_args,
-            in_axes,
-            out_axes,
+            &axes,
             scope_idx,
             outer_args_node.range(),
             ctx,
@@ -2487,12 +2557,13 @@ fn shape_of_inline_vmap(
 
     // Case B: the callable is a bare identifier — a user function in this file.
     if !callable.contains('.') {
-        let info = VmapInfo {
-            wrapped: callable,
-            in_axes,
-            out_axes,
-        };
-        return match apply_vmap_call(&info, &outer_args, &ctx.scope_shapes(scope_idx), ctx.scopes) {
+        return match apply_vmap_call_chain(
+            &axes,
+            &callable,
+            &outer_args,
+            &ctx.scope_shapes(scope_idx),
+            ctx.scopes,
+        ) {
             Ok(shape) => shape,
             Err(message) => {
                 ctx.errors.push(ShapeError {
@@ -2506,6 +2577,43 @@ fn shape_of_inline_vmap(
     }
 
     None
+}
+
+/// Unwind a (possibly nested) `vmap(vmap(...(callable)))` call chain.
+///
+/// `node` must be a `call` node whose function resolves to `vmap`
+/// (`KnownFunction::Vmap`); its first positional argument is either the
+/// wrapped callable (base case) or another `vmap(...)` call (recursive
+/// case, e.g. `jax.vmap(jax.vmap(self.layer))`).
+///
+/// Returns the innermost callable node plus the `(in_axes, out_axes)` pairs
+/// for each vmap layer, ordered outermost-to-innermost, or `None` if `node`
+/// isn't a vmap call, or an inner positional-arg call isn't a recognized
+/// vmap either (in which case the whole chain is left unmodeled).
+fn collect_vmap_axes<'t>(
+    node: Node<'t>,
+    ctx: &ShapeCtx,
+) -> Option<(Node<'t>, Vec<(isize, isize)>)> {
+    let func_node = node.child_by_field_name("function")?;
+    let target = func_node.utf8_text(ctx.text.as_bytes()).ok()?;
+    let resolved = resolve_call_target(target, ctx.import_map);
+    if !matches!(classify_known_function(&resolved), Some(KnownFunction::Vmap)) {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+    let in_axes = parse_int_keyword(&raw_args, "in_axes", 0)?;
+    let out_axes = parse_int_keyword(&raw_args, "out_axes", 0)?;
+    let callable_node = find_positional_arg_node(args_node, 0)?;
+
+    if callable_node.kind() == "call" {
+        let (base, mut rest) = collect_vmap_axes(callable_node, ctx)?;
+        rest.insert(0, (in_axes, out_axes));
+        return Some((base, rest));
+    }
+
+    Some((callable_node, vec![(in_axes, out_axes)]))
 }
 
 /// Resolve `Layer(...)(x)` — a catalogued layer constructed and applied in
@@ -2560,14 +2668,52 @@ fn apply_inline_vmap_layer(
     range: tree_sitter::Range,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
+    apply_inline_vmap_layer_chain(layer, outer_args, &[(in_axes, out_axes)], scope_idx, range, ctx)
+}
+
+/// Generalized form of `apply_inline_vmap_layer` for nested vmaps, e.g.
+/// `jax.vmap(jax.vmap(self.layer))(x)`. `axes` holds `(in_axes, out_axes)`
+/// pairs ordered outermost-to-innermost. Peels one leading batch dim per
+/// level from the first positional arg's shape, runs the layer's normal
+/// shape rule on the fully-peeled per-example shape, then re-prepends the
+/// batch dims outward-to-inward in reverse.
+fn apply_inline_vmap_layer_chain(
+    layer: &LayerKind,
+    outer_args: &[CallArgument],
+    axes: &[(isize, isize)],
+    scope_idx: usize,
+    range: tree_sitter::Range,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
     let input_name = outer_args.iter().find_map(|a| match a {
         CallArgument::Positional { value } => Some(value.clone()),
         _ => None,
     })?;
-    let input_shape = ctx.resolve_shape(&input_name, scope_idx)?;
+    let mut shape = ctx.resolve_shape(&input_name, scope_idx)?;
 
-    let (peeled, batch_dim) = peel_batch_dim(&input_shape, in_axes).ok()?;
-    let synth = ctx.bind_synthetic(peeled, scope_idx, range.start_byte);
+    let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
+    for &(in_axes, _) in axes {
+        let (peeled, dim) = peel_batch_dim(&shape, in_axes).ok()?;
+        batch_dims.push(dim);
+        shape = peeled;
+    }
+
+    // MultiheadAttention's real return is an `(output, weights)` tuple;
+    // `apply_layer_application` can't express that and always returns
+    // `Ok(None)` for it. A single-assignment vmap'd call site
+    // (`out = jax.vmap(self.attn)(q, k, v)`) still wants *something* — the
+    // query's per-example shape is unchanged by attention (same rule as the
+    // direct-call MHA special case in `shape_of_call`), so just re-prepend
+    // the peeled batch dims onto it.
+    if matches!(layer, LayerKind::MultiheadAttention { .. }) {
+        let mut output = shape;
+        for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
+            output = prepend_batch_dim(output, out_axes, dim);
+        }
+        return Some(output);
+    }
+
+    let synth = ctx.bind_synthetic(shape, scope_idx, range.start_byte);
     let application = LayerApplication {
         variable: String::new(),
         layer: "vmap".to_string(),
@@ -2575,18 +2721,22 @@ fn apply_inline_vmap_layer(
         kind: layer.clone(),
         range,
     };
-    match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
-        Ok(Some(output)) => Some(prepend_batch_dim(output, out_axes, batch_dim)),
-        Ok(None) => None,
+    let mut output = match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
+        Ok(Some(output)) => output,
+        Ok(None) => return None,
         Err(message) => {
             ctx.errors.push(ShapeError {
                 variable: String::new(),
                 message,
                 range,
             });
-            None
+            return None;
         }
+    };
+    for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
+        output = prepend_batch_dim(output, out_axes, dim);
     }
+    Some(output)
 }
 
 /// Search for a `FunctionShapeScope` whose `function_name` matches `target`,
@@ -2732,8 +2882,32 @@ fn apply_user_function(
     scopes: &[FunctionShapeScope],
 ) -> Option<Result<Option<Vec<String>>, String>> {
     let scope_idx = find_callee_scope(target, Some(call_byte), scopes)?;
-    let callee = &scopes[scope_idx];
+    bind_user_function_args(&scopes[scope_idx], target, args, caller_shapes)
+}
 
+/// Bind a callee's declared parameter shapes to the caller's argument shapes
+/// and substitute into its return shape. Shared by `apply_user_function`
+/// (same-file helpers, callee found via `find_callee_scope`) and
+/// `apply_imported_user_function` (cross-file helpers, callee found by
+/// resolving the import and extracting its jaxtyping annotations on disk).
+///
+/// Returns `None` if the callee has no jaxtyping annotations at all (let the
+/// caller fall through to the known-function branch); `Some(Ok(None))` if
+/// annotations exist but an argument's shape couldn't be resolved (v1
+/// intentionally bails on the whole call rather than partially validating);
+/// `Some(Ok(Some(shape)))` / `Some(Err(msg))` otherwise.
+///
+/// v1 limitations (documented in PR #34, still true for the cross-file
+/// extension):
+/// - Only positional arguments are matched. Keyword args that match a param
+///   name are honoured; otherwise the call is skipped with Ok(None).
+/// - Fresh output dims (not in the binding) pass through unchanged.
+fn bind_user_function_args(
+    callee: &FunctionShapeScope,
+    target: &str,
+    args: &[CallArgument],
+    caller_shapes: &dyn ShapeLookup,
+) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
     if callee.shapes.is_empty() && callee.return_shape.is_none() {
@@ -2776,11 +2950,34 @@ fn apply_user_function(
     }
 
     // Delegate to the shared bind_and_substitute helper.
-    let result = bind_and_substitute(callee, target, &arg_shapes);
-    match result {
-        Ok(substituted) => Some(Ok(substituted)),
-        Err(msg) => Some(Err(msg)),
-    }
+    Some(bind_and_substitute(callee, target, &arg_shapes))
+}
+
+/// Cross-file counterpart of `apply_user_function`: resolve `target` through
+/// the import map to a function defined in another file on disk, extract its
+/// jaxtyping parameter + return shape annotations, and apply the same
+/// bind-and-substitute logic. `None` means "not an imported function we can
+/// resolve, or it has no jaxtyping annotations" — the caller falls through to
+/// the known-function branch, same contract as `apply_user_function`.
+#[allow(clippy::too_many_arguments)]
+fn apply_imported_user_function(
+    target: &str,
+    args: &[CallArgument],
+    caller_shapes: &dyn ShapeLookup,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: &dyn Fn(&PathBuf) -> Option<String>,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Option<Result<Option<Vec<String>>, String>> {
+    let callee = match resolve_imported_function_shape(
+        target, import_map, search_roots, read_file, max_depth, cache,
+    ) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return None,
+        Err(message) => return Some(Err(message)),
+    };
+    bind_user_function_args(&callee, target, args, caller_shapes)
 }
 
 fn apply_matmul_shape(
@@ -2993,6 +3190,8 @@ mod shape_of_expression_tests {
         let mut vmap_targets = HashMap::new();
         let self_attr_layers = HashMap::new();
         let aliases = HashMap::new();
+        let search_roots: Vec<PathBuf> = Vec::new();
+        let read_file: &dyn Fn(&PathBuf) -> Option<String> = &|_: &PathBuf| None;
 
         let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
 
@@ -3002,6 +3201,10 @@ mod shape_of_expression_tests {
             layer_records: &layer_records,
             self_attr_layers: &self_attr_layers,
             aliases: &aliases,
+            search_roots: &search_roots,
+            read_file,
+            max_depth: 5,
+            cache: None,
             scopes: &mut scopes,
             vmap_targets: &mut vmap_targets,
             applications: &mut applications,
