@@ -205,6 +205,22 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "tensor" => Some(KnownFunction::Array),
             "as_tensor" => Some(KnownFunction::AsArray),
             "cross" => Some(KnownFunction::Cross),
+            "gather" => Some(KnownFunction::Gather),
+            "scatter" | "scatter_add" => Some(KnownFunction::Scatter),
+            "take_along_dim" => Some(KnownFunction::TakeAlongAxis),
+            "topk" => Some(KnownFunction::TopK),
+            "unbind" => Some(KnownFunction::Unbind),
+            "chunk" => Some(KnownFunction::Chunk),
+            "narrow" => Some(KnownFunction::Narrow),
+            "select" => Some(KnownFunction::SelectDim),
+            "masked_select" => Some(KnownFunction::MaskedSelect),
+            "index_select" => Some(KnownFunction::IndexSelect),
+            "kthvalue" => Some(KnownFunction::KthValue),
+            "median" | "mode" => Some(KnownFunction::MedianDim),
+            "unique" => Some(KnownFunction::Unique),
+            "combinations" => Some(KnownFunction::Combinations),
+            "cartesian_prod" => Some(KnownFunction::CartesianProd),
+            "block_diag" => Some(KnownFunction::BlockDiag),
             _ => None,
         };
     }
@@ -217,6 +233,26 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     if is_torch_nn_functional {
         return match name.as_str() {
             "pad" => Some(KnownFunction::Pad),
+            "interpolate" => Some(KnownFunction::Interpolate),
+            "conv1d" => Some(KnownFunction::FunctionalConv1d),
+            "conv2d" => Some(KnownFunction::FunctionalConv2d),
+            "conv3d" => Some(KnownFunction::FunctionalConv3d),
+            "max_pool1d" => Some(KnownFunction::FunctionalMaxPool1d),
+            "max_pool2d" => Some(KnownFunction::FunctionalMaxPool2d),
+            "max_pool3d" => Some(KnownFunction::FunctionalMaxPool3d),
+            "avg_pool1d" => Some(KnownFunction::FunctionalAvgPool1d),
+            "avg_pool2d" => Some(KnownFunction::FunctionalAvgPool2d),
+            "avg_pool3d" => Some(KnownFunction::FunctionalAvgPool3d),
+            "softmax" | "log_softmax" | "normalize" => Some(KnownFunction::Copy),
+            "one_hot" => Some(KnownFunction::OneHot),
+            "embedding" => Some(KnownFunction::FunctionalEmbedding),
+            _ => None,
+        };
+    }
+
+    if module == ["torch", "nn", "utils", "rnn"] {
+        return match name.as_str() {
+            "pad_sequence" => Some(KnownFunction::PadSequence),
             _ => None,
         };
     }
@@ -643,6 +679,34 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
+        "gather" => Some(KnownFunction::Gather),
+        "scatter" => Some(KnownFunction::Scatter),
+        "masked_select" => Some(KnownFunction::MaskedSelect),
+        "masked_fill" => Some(KnownFunction::MaskedFill),
+        "index_select" => Some(KnownFunction::IndexSelect),
+        "narrow" => Some(KnownFunction::Narrow),
+        "select" => Some(KnownFunction::SelectDim),
+        "topk" => Some(KnownFunction::TopK),
+        "unfold" => Some(KnownFunction::Unfold),
+        "view_as" | "reshape_as" | "expand_as" => Some(KnownFunction::ShapeAs),
+        "flip" => Some(KnownFunction::Flip),
+        "roll" => Some(KnownFunction::Roll),
+        "item" => Some(KnownFunction::Item),
+        "new_zeros" | "new_ones" | "new_full" | "new_empty" => Some(KnownFunction::NewConstructor),
+        "clone" => Some(KnownFunction::Copy),
+        "cpu" | "cuda" => Some(KnownFunction::Copy),
+        "float" | "long" | "int" | "bool" | "double" | "half" => Some(KnownFunction::Copy),
+        "clamp" | "clip" => Some(KnownFunction::Copy),
+        "softmax" => Some(KnownFunction::Copy),
+        "norm" => Some(KnownFunction::Sum),
+        "diagonal" => Some(KnownFunction::Diagonal),
+        "tril" => Some(KnownFunction::Tril),
+        "triu" => Some(KnownFunction::Triu),
+        "chunk" => Some(KnownFunction::Chunk),
+        "unbind" => Some(KnownFunction::Unbind),
+        "split" => Some(KnownFunction::Split),
+        "kthvalue" => Some(KnownFunction::KthValue),
+        "median" | "mode" => Some(KnownFunction::MedianDim),
         _ => None,
     }
 }
@@ -839,6 +903,46 @@ pub fn apply_known_function(
         KnownFunction::LinalgMatrixRank => apply_known_linalg_matrix_rank(args, shapes),
         KnownFunction::OneHot => apply_known_one_hot(args, shapes),
         KnownFunction::DotProductAttention => apply_known_dot_product_attention(args, shapes),
+        KnownFunction::Gather => apply_known_gather(args, shapes),
+        KnownFunction::Scatter | KnownFunction::MaskedFill => {
+            apply_known_shape_preserving(args, shapes)
+        }
+        KnownFunction::IndexSelect => apply_known_index_select(args, shapes),
+        KnownFunction::Narrow => apply_known_narrow(args, shapes),
+        KnownFunction::SelectDim => apply_known_select_dim(args, shapes),
+        KnownFunction::MaskedSelect => Ok(None),
+        KnownFunction::Unfold => apply_known_unfold(args, shapes),
+        KnownFunction::ShapeAs => apply_known_shape_as(args, shapes),
+        KnownFunction::Item => Ok(Some(Vec::new())),
+        KnownFunction::NewConstructor => apply_known_new_constructor(args),
+        KnownFunction::Chunk => {
+            // Same "validate, but return None" reasoning as `Split`: the real
+            // return is a tuple of N tensors, not expressible as a single
+            // shape here — see `compute_chunk_shapes` (used from
+            // `analysis.rs`'s tuple-unpacking dispatch) for the real math.
+            let _ = compute_chunk_shapes(args, shapes)?;
+            Ok(None)
+        }
+        KnownFunction::TopK | KnownFunction::Unbind | KnownFunction::KthValue
+        | KnownFunction::MedianDim => Ok(None),
+        KnownFunction::Combinations => apply_known_combinations(args, shapes),
+        KnownFunction::CartesianProd => apply_known_cartesian_prod(args, shapes),
+        KnownFunction::BlockDiag => apply_known_block_diag(args, shapes),
+        KnownFunction::Interpolate => apply_known_interpolate(args, shapes),
+        KnownFunction::FunctionalConv1d => apply_known_functional_conv(args, shapes, 1),
+        KnownFunction::FunctionalConv2d => apply_known_functional_conv(args, shapes, 2),
+        KnownFunction::FunctionalConv3d => apply_known_functional_conv(args, shapes, 3),
+        KnownFunction::FunctionalMaxPool1d | KnownFunction::FunctionalAvgPool1d => {
+            apply_known_functional_pool(args, shapes, 1)
+        }
+        KnownFunction::FunctionalMaxPool2d | KnownFunction::FunctionalAvgPool2d => {
+            apply_known_functional_pool(args, shapes, 2)
+        }
+        KnownFunction::FunctionalMaxPool3d | KnownFunction::FunctionalAvgPool3d => {
+            apply_known_functional_pool(args, shapes, 3)
+        }
+        KnownFunction::FunctionalEmbedding => apply_known_functional_embedding(args, shapes),
+        KnownFunction::PadSequence => apply_known_pad_sequence(args, shapes),
         _ => Ok(None),
     }
 }
@@ -2456,7 +2560,7 @@ fn apply_known_where(
     Ok(Some(output))
 }
 
-fn apply_known_reduction(
+pub fn apply_known_reduction(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
@@ -3832,6 +3936,11 @@ fn apply_known_one_hot(
     let Some(num_classes) = nth_positional_or_keyword(args, 1, &["num_classes"]) else {
         return Ok(None);
     };
+    // torch.nn.functional.one_hot's default/sentinel `num_classes=-1` means
+    // "infer from the max index at runtime" — data-dependent, not a literal.
+    if num_classes.trim() == "-1" {
+        return Ok(None);
+    }
     let mut output = input_shape.clone();
     output.push(num_classes.to_string());
     Ok(Some(output))
@@ -3859,6 +3968,720 @@ fn apply_known_dot_product_attention(
     let mut output = query_shape.clone();
     let last = output.len() - 1;
     output[last] = value_shape.last().unwrap().clone();
+    Ok(Some(output))
+}
+
+// ── torch tensor indexing / selection methods ──────────────────────────
+
+/// `torch.gather(input, dim, index)` / `x.gather(dim, index)` — output
+/// shape matches `index` exactly (`index` is always the last positional
+/// argument in both the free-function and method forms).
+fn apply_known_gather(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    if let Some(idx) = args.iter().find_map(|a| match a {
+        CallArgument::Keyword { name, value } if name == "index" => Some(value.as_str()),
+        _ => None,
+    }) {
+        return Ok(shapes.shape(idx).cloned());
+    }
+    let positionals = positional_arg_values(args);
+    let Some(idx_name) = positionals.last() else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(idx_name).cloned())
+}
+
+/// `torch.index_select(input, dim, index)` / `x.index_select(dim, index)` —
+/// `dim`'s length becomes `len(index)` (`index` is always 1D).
+fn apply_known_index_select(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+        return Ok(None);
+    };
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "index_select")?;
+    let Some(index_name) = nth_positional_or_keyword(args, 2, &["index"]) else {
+        return Ok(None);
+    };
+    let Some(index_shape) = shapes.shape(index_name) else {
+        return Ok(None);
+    };
+    let Some(len) = index_shape.first() else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output[dim] = len.clone();
+    Ok(Some(output))
+}
+
+/// `torch.narrow(input, dim, start, length)` / `x.narrow(dim, start,
+/// length)` — slices `dim` down to `length`.
+fn apply_known_narrow(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+        return Ok(None);
+    };
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "narrow")?;
+    let Some(length) = nth_positional_or_keyword(args, 3, &["length"]) else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output[dim] = length.to_string();
+    Ok(Some(output))
+}
+
+/// `torch.select(input, dim, index)` / `x.select(dim, index)` — indexes into
+/// `dim` with a single integer, removing that axis. Distinct from
+/// `jnp.select`/`np.select` (`KnownFunction::Select`, choicelist-based).
+fn apply_known_select_dim(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+        return Ok(None);
+    };
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "select")?;
+    let mut output = input_shape.clone();
+    output.remove(dim);
+    Ok(Some(output))
+}
+
+/// `x.unfold(dimension, size, step)` — replaces `dimension`'s length with
+/// the number of windows and appends a new trailing axis of length `size`.
+/// Concrete integer dims only; symbolic geometry is unresolvable.
+fn apply_known_unfold(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dimension", "dim"]) else {
+        return Ok(None);
+    };
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "unfold")?;
+    let Some(size_raw) = nth_positional_or_keyword(args, 2, &["size"]) else {
+        return Ok(None);
+    };
+    let Some(step_raw) = nth_positional_or_keyword(args, 3, &["step"]) else {
+        return Ok(None);
+    };
+    let (Ok(d), Ok(sz), Ok(st)) = (
+        input_shape[dim].parse::<isize>(),
+        size_raw.trim().parse::<isize>(),
+        step_raw.trim().parse::<isize>(),
+    ) else {
+        return Ok(None);
+    };
+    if st <= 0 || sz <= 0 || d < sz {
+        return Err(format!(
+            "unfold: invalid size {} / step {} for dim {} of length {}",
+            sz, st, dim, d
+        ));
+    }
+    let mut output = input_shape.clone();
+    output[dim] = ((d - sz) / st + 1).to_string();
+    output.push(sz.to_string());
+    Ok(Some(output))
+}
+
+/// `x.view_as(other)` / `x.reshape_as(other)` / `x.expand_as(other)` — the
+/// output shape is simply `other`'s shape.
+fn apply_known_shape_as(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(other_name) = nth_positional_or_keyword(args, 1, &["other"]) else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(other_name).cloned())
+}
+
+/// `x.new_zeros(size)` / `x.new_ones(size)` / `x.new_full(size, value)` /
+/// `x.new_empty(size)` — output shape from `size` (the receiver is only a
+/// dtype/device template, positional[0] after synthesis; the shape spec is
+/// the next positional/keyword arg).
+fn apply_known_new_constructor(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    match nth_positional_or_keyword(args, 1, &["size", "shape"]) {
+        Some(v) => Ok(parse_shape_value(v)),
+        None => Ok(None),
+    }
+}
+
+// ── torch tuple-output methods ──────────────────────────────────────────
+
+/// `torch.topk(input, k, dim=-1, ...)` / `x.topk(k, dim=-1, ...)` — shared
+/// shape math for the `(values, indices)` tuple: both replace `dim` with
+/// `k`. Used from `analysis.rs`'s tuple-unpacking dispatch; the real return
+/// is always a 2-tuple, so `apply_known_function`'s single-shape dispatch
+/// for `KnownFunction::TopK` is conservatively `Ok(None)`.
+pub fn apply_known_topk_shape(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    if rank == 0 {
+        return Err("topk requires rank >= 1 input".to_string());
+    }
+    let Some(k) = nth_positional_or_keyword(args, 1, &["k"]) else {
+        return Ok(None);
+    };
+    let dim_raw = nth_positional_or_keyword(args, 2, &["dim"]).unwrap_or("-1");
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "topk")?;
+    let mut output = input_shape.clone();
+    output[dim] = k.to_string();
+    Ok(Some(output))
+}
+
+/// `torch.kthvalue(input, k, dim=-1, keepdim=False)` / `x.kthvalue(k,
+/// dim=-1, keepdim=False)` — `values`/`indices` share the shape of a plain
+/// single-axis reduction over `dim` (like `max`/`min`); `k` itself only
+/// picks *which* element, not the shape. Re-synthesizes `(input, dim=..,
+/// keepdim=..)` — dropping `k` — and reuses [`apply_known_reduction`],
+/// since `k` sits at the position a normal reduction call would expect the
+/// axis to be.
+pub fn apply_known_kthvalue_shape(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(input_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let mut synthesized = vec![CallArgument::Positional {
+        value: input_name.to_string(),
+    }];
+    if let Some(dim) = nth_positional_or_keyword(args, 2, &["dim"]) {
+        synthesized.push(CallArgument::Keyword {
+            name: "dim".to_string(),
+            value: dim.to_string(),
+        });
+    }
+    for arg in args {
+        if let CallArgument::Keyword { name, value } = arg
+            && (name == "keepdim" || name == "keepdims")
+        {
+            synthesized.push(CallArgument::Keyword {
+                name: name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    apply_known_reduction(&synthesized, shapes)
+}
+
+/// `torch.unbind(input, dim=0)` / `x.unbind(dim=0)` — removes `dim`,
+/// producing one output per element along that axis. `n_targets` is
+/// already fixed by the tuple-unpacking LHS; when the axis is a literal, it
+/// must agree with `n_targets` (mismatch is a genuine contradiction, hence
+/// `Err`). A symbolic axis size is conservatively unknown (`Ok(None)`).
+pub fn compute_unbind_shape(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    n_targets: usize,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    if rank == 0 {
+        return Err("unbind requires rank >= 1 input".to_string());
+    }
+    let dim_raw = nth_positional_or_keyword(args, 1, &["dim"]).unwrap_or("0");
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "unbind")?;
+    let Ok(size) = input_shape[dim].parse::<usize>() else {
+        return Ok(None);
+    };
+    if size != n_targets {
+        return Err(format!(
+            "unbind along dim {} produces {} outputs, but {} were unpacked",
+            dim, size, n_targets
+        ));
+    }
+    let mut out = input_shape.clone();
+    out.remove(dim);
+    Ok(Some(out))
+}
+
+/// `torch.chunk(input, chunks, dim=0)` / `x.chunk(chunks, dim=0)` — splits
+/// `dim` into at most `chunks` pieces of `ceil(size/chunks)` each (the last
+/// piece may be smaller); unlike `split`'s `N`-equal-sections semantics,
+/// `chunks` need not evenly divide the axis. A symbolic axis size falls
+/// back to `chunks` same-named synthetic pieces, mirroring `split`'s
+/// symbolic-axis convention.
+pub fn compute_chunk_shapes(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<Vec<String>>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.is_empty() {
+        return Err("chunk requires rank >= 1 input".to_string());
+    }
+    let rank = input_shape.len();
+    let Some(chunks_raw) = nth_positional_or_keyword(args, 1, &["chunks"]) else {
+        return Ok(None);
+    };
+    let Ok(n) = chunks_raw.trim().parse::<usize>() else {
+        return Ok(None);
+    };
+    if n == 0 {
+        return Err("chunk requires chunks > 0".to_string());
+    }
+    let dim_raw = nth_positional_or_keyword(args, 2, &["dim"]).unwrap_or("0");
+    let Some(dim) = parse_axis(dim_raw) else {
+        return Ok(None);
+    };
+    let dim = normalize_axis(dim, rank, "chunk")?;
+    let axis_dim = &input_shape[dim];
+
+    let Ok(axis_size) = axis_dim.parse::<usize>() else {
+        let chunk_dim = format!("chunk({}, {})", axis_dim, n);
+        let mut output_shapes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut out = input_shape.clone();
+            out[dim] = chunk_dim.clone();
+            output_shapes.push(out);
+        }
+        return Ok(Some(output_shapes));
+    };
+
+    let chunk_size = axis_size.div_ceil(n).max(1);
+    let mut output_shapes = Vec::new();
+    let mut remaining = axis_size;
+    for _ in 0..n {
+        if remaining == 0 {
+            break;
+        }
+        let this_size = remaining.min(chunk_size);
+        let mut out = input_shape.clone();
+        out[dim] = this_size.to_string();
+        output_shapes.push(out);
+        remaining -= this_size;
+    }
+    Ok(Some(output_shapes))
+}
+
+// ── torch combinatorics ──────────────────────────────────────────────────
+
+fn n_choose_r(n: u64, r: u64) -> u64 {
+    if r > n {
+        return 0;
+    }
+    let r = r.min(n - r);
+    let mut result: u64 = 1;
+    for i in 0..r {
+        result = result * (n - i) / (i + 1);
+    }
+    result
+}
+
+/// `torch.combinations(input, r=2, with_replacement=False)` — `input` is
+/// 1D of length `n`; output is `(nCr(n, r), r)`. `with_replacement` isn't
+/// modelled (changes the count formula but not this rule's structure).
+fn apply_known_combinations(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() != 1 {
+        return Ok(None);
+    }
+    let Ok(n) = input_shape[0].parse::<u64>() else {
+        return Ok(None);
+    };
+    let r = nth_positional_or_keyword(args, 1, &["r"])
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2);
+    Ok(Some(vec![n_choose_r(n, r).to_string(), r.to_string()]))
+}
+
+/// `torch.cartesian_prod(*tensors)` — each tensor is 1D; output is
+/// `(prod(lengths), num_tensors)`, or just the tensor itself when only one
+/// is given (torch's degenerate single-input case).
+fn apply_known_cartesian_prod(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let names = positional_arg_values(args);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    if names.len() == 1 {
+        return Ok(shapes.shape(&names[0]).cloned());
+    }
+    let mut lens = Vec::with_capacity(names.len());
+    for name in &names {
+        let Some(shape) = shapes.shape(name) else {
+            return Ok(None);
+        };
+        let [len] = shape.as_slice() else {
+            return Ok(None);
+        };
+        lens.push(len.clone());
+    }
+    let total = match lens
+        .iter()
+        .map(|s| s.parse::<usize>().ok())
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(values) => values.iter().product::<usize>().to_string(),
+        None => lens.join("*"),
+    };
+    Ok(Some(vec![total, names.len().to_string()]))
+}
+
+/// `torch.block_diag(*tensors)` — sums each block's row/col dims onto the
+/// diagonal: `(sum(rows), sum(cols))`. 1D tensors are treated as a single
+/// row (torch promotes them before block-diagonalizing); anything else
+/// (rank >= 3) isn't modelled.
+fn apply_known_block_diag(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let names = positional_arg_values(args);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut rows = Vec::with_capacity(names.len());
+    let mut cols = Vec::with_capacity(names.len());
+    for name in &names {
+        let Some(shape) = shapes.shape(name) else {
+            return Ok(None);
+        };
+        match shape.as_slice() {
+            [r, c] => {
+                rows.push(r.clone());
+                cols.push(c.clone());
+            }
+            [n] => {
+                rows.push("1".to_string());
+                cols.push(n.clone());
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(vec![concat_dim(&rows), concat_dim(&cols)]))
+}
+
+// ── torch.nn.functional ──────────────────────────────────────────────────
+
+/// Parse a `stride`/`padding`/`dilation`-style argument: a bare int
+/// (broadcast to every spatial axis) or an explicit per-axis tuple/list of
+/// length `rank`.
+fn parse_int_seq_arg(raw: Option<&str>, rank: usize, default: isize) -> Option<Vec<isize>> {
+    match raw {
+        None => Some(vec![default; rank]),
+        Some(v) => {
+            let trimmed = v.trim();
+            if let Ok(n) = trimmed.parse::<isize>() {
+                return Some(vec![n; rank]);
+            }
+            let list = parse_shape_value(trimmed)?;
+            let ints: Vec<isize> = list.iter().filter_map(|s| s.trim().parse().ok()).collect();
+            if ints.len() == rank { Some(ints) } else { None }
+        }
+    }
+}
+
+/// `torch.nn.functional.conv1d/2d/3d(input, weight, bias=None, stride=1,
+/// padding=0, dilation=1, groups=1)` — channels-first: `input` is `(N,
+/// C_in, *spatial)`, `weight` is `(C_out, C_in/groups, *kernel)`. Output is
+/// `(N, C_out, *spatial_out)` via the standard conv formula. Channel-count
+/// validation is skipped (grouped convs make `C_in/groups` legitimately
+/// differ from `C_in`), matching `jax.lax.conv_general_dilated`'s existing
+/// approximation. `'same'`/`'valid'` string padding and symbolic spatial
+/// dims aren't modelled.
+fn apply_known_functional_conv(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    spatial_rank: usize,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() != spatial_rank + 2 {
+        return Ok(None);
+    }
+    let Some(weight_name) = nth_positional_or_keyword(args, 1, &["weight"]) else {
+        return Ok(None);
+    };
+    let Some(weight_shape) = shapes.shape(weight_name) else {
+        return Ok(None);
+    };
+    if weight_shape.len() != spatial_rank + 2 {
+        return Ok(None);
+    }
+
+    let padding_raw = nth_positional_or_keyword(args, 4, &["padding"]);
+    if matches!(
+        padding_raw.map(str::trim),
+        Some("'same'") | Some("\"same\"") | Some("'valid'") | Some("\"valid\"")
+    ) {
+        return Ok(None);
+    }
+    let Some(stride) = parse_int_seq_arg(
+        nth_positional_or_keyword(args, 3, &["stride"]),
+        spatial_rank,
+        1,
+    ) else {
+        return Ok(None);
+    };
+    let Some(padding) = parse_int_seq_arg(padding_raw, spatial_rank, 0) else {
+        return Ok(None);
+    };
+    let Some(dilation) = parse_int_seq_arg(
+        nth_positional_or_keyword(args, 5, &["dilation"]),
+        spatial_rank,
+        1,
+    ) else {
+        return Ok(None);
+    };
+
+    let mut output = input_shape.clone();
+    output[1] = weight_shape[0].clone();
+    for i in 0..spatial_rank {
+        let idx = 2 + i;
+        let Ok(d) = input_shape[idx].parse::<isize>() else {
+            return Ok(None);
+        };
+        let Ok(k) = weight_shape[idx].parse::<isize>() else {
+            return Ok(None);
+        };
+        let s = stride[i].max(1);
+        let eff_k = (k - 1) * dilation[i] + 1;
+        output[idx] = ((d + 2 * padding[i] - eff_k) / s + 1).to_string();
+    }
+    Ok(Some(output))
+}
+
+/// `torch.nn.functional.max_pool1d/2d/3d` / `avg_pool1d/2d/3d(input,
+/// kernel_size, stride=None, padding=0, ...)` — channels-first; `stride`
+/// defaults to `kernel_size` (torch convention) when omitted. `dilation`
+/// (max_pool only) isn't modelled (assumed 1), matching the approximation
+/// already used for conv layers with `dilation != 1`.
+fn apply_known_functional_pool(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    spatial_rank: usize,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() != spatial_rank + 2 {
+        return Ok(None);
+    }
+    let stride_raw = nth_positional_or_keyword(args, 2, &["stride"]);
+    let Some(kernel) = nth_positional_or_keyword(args, 1, &["kernel_size"])
+        .and_then(|v| parse_int_seq_arg(Some(v), spatial_rank, 0))
+    else {
+        return Ok(None);
+    };
+    let stride = match stride_raw {
+        None => kernel.clone(),
+        Some(_) => match parse_int_seq_arg(stride_raw, spatial_rank, 1) {
+            Some(s) => s,
+            None => return Ok(None),
+        },
+    };
+    let Some(padding) = parse_int_seq_arg(
+        nth_positional_or_keyword(args, 3, &["padding"]),
+        spatial_rank,
+        0,
+    ) else {
+        return Ok(None);
+    };
+
+    let mut output = input_shape.clone();
+    for i in 0..spatial_rank {
+        let idx = 2 + i;
+        let Ok(d) = input_shape[idx].parse::<isize>() else {
+            return Ok(None);
+        };
+        let s = stride[i].max(1);
+        output[idx] = ((d + 2 * padding[i] - kernel[i]) / s + 1).to_string();
+    }
+    Ok(Some(output))
+}
+
+/// `torch.nn.functional.interpolate(input, size=None, scale_factor=None,
+/// ...)` — sets the trailing spatial dims (everything after the leading
+/// batch+channel pair) directly to `size`, or scales them by
+/// `scale_factor` (floor-rounded, matching torch's output-size formula).
+fn apply_known_interpolate(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() < 3 {
+        return Ok(None);
+    }
+    let spatial_rank = input_shape.len() - 2;
+    let mut output = input_shape.clone();
+
+    if let Some(size_raw) = nth_positional_or_keyword(args, 1, &["size"]) {
+        if let Ok(n) = size_raw.trim().parse::<i64>() {
+            for i in 0..spatial_rank {
+                output[2 + i] = n.to_string();
+            }
+            return Ok(Some(output));
+        }
+        let Some(list) = parse_shape_value(size_raw) else {
+            return Ok(None);
+        };
+        if list.len() != spatial_rank {
+            return Ok(None);
+        }
+        output[2..2 + spatial_rank].clone_from_slice(&list);
+        return Ok(Some(output));
+    }
+
+    if let Some(scale_raw) = nth_positional_or_keyword(args, 2, &["scale_factor"]) {
+        let factors: Vec<f64> = if let Ok(f) = scale_raw.trim().parse::<f64>() {
+            vec![f; spatial_rank]
+        } else {
+            let Some(list) = parse_shape_value(scale_raw) else {
+                return Ok(None);
+            };
+            let Some(parsed) = list
+                .iter()
+                .map(|s| s.trim().parse::<f64>().ok())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            if parsed.len() != spatial_rank {
+                return Ok(None);
+            }
+            parsed
+        };
+        for i in 0..spatial_rank {
+            let Ok(d) = input_shape[2 + i].parse::<f64>() else {
+                return Ok(None);
+            };
+            output[2 + i] = ((d * factors[i]).floor() as i64).to_string();
+        }
+        return Ok(Some(output));
+    }
+
+    Ok(None)
+}
+
+/// `torch.nn.functional.embedding(input, weight, ...)` — appends `weight`'s
+/// embedding-dim (its last axis) to `input`'s shape, same rule as
+/// `torch.nn.Embedding`/`equinox.nn.Embedding`.
+fn apply_known_functional_embedding(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(weight_name) = nth_positional_or_keyword(args, 1, &["weight"]) else {
+        return Ok(None);
+    };
+    let Some(weight_shape) = shapes.shape(weight_name) else {
+        return Ok(None);
+    };
+    let Some(embed_dim) = weight_shape.last() else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output.push(embed_dim.clone());
+    Ok(Some(output))
+}
+
+// ── torch.nn.utils.rnn ───────────────────────────────────────────────────
+
+/// `torch.nn.utils.rnn.pad_sequence(sequences, batch_first=False, ...)` —
+/// `sequences` must be a literal list of known-shape tensors; the batch
+/// count and trailing (non-length) dims are then known statically, but the
+/// padded sequence length is genuinely data-dependent (the max length
+/// across inputs), so it's emitted as an opaque symbolic dim.
+fn apply_known_pad_sequence(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(list_arg) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(names) = parse_simple_sequence_names(list_arg) else {
+        return Ok(None);
+    };
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut trailing: Option<Vec<String>> = None;
+    for name in &names {
+        let Some(shape) = shapes.shape(name) else {
+            return Ok(None);
+        };
+        if shape.is_empty() {
+            return Ok(None);
+        }
+        let t = shape[1..].to_vec();
+        match &trailing {
+            None => trailing = Some(t),
+            Some(existing) if *existing != t => {
+                return Err("pad_sequence: mismatched trailing dims across sequences".to_string());
+            }
+            _ => {}
+        }
+    }
+    let trailing = trailing.unwrap();
+    let batch_first = args.iter().any(|a| {
+        matches!(a, CallArgument::Keyword { name, value } if name == "batch_first" && value.trim() == "True")
+    });
+    let max_len = "pad_len".to_string();
+    let mut output = if batch_first {
+        vec![names.len().to_string(), max_len]
+    } else {
+        vec![max_len, names.len().to_string()]
+    };
+    output.extend(trailing);
     Ok(Some(output))
 }
 
@@ -8042,6 +8865,161 @@ mod known_function_tests {
         Some(KnownFunction::Sum)
     );
     known_case!(jax_nn_relu_not_classified, ["jax", "nn", "relu"], None);
+
+    known_case!(torch_gather, ["torch", "gather"], Some(KnownFunction::Gather));
+    known_case!(
+        torch_scatter,
+        ["torch", "scatter"],
+        Some(KnownFunction::Scatter)
+    );
+    known_case!(
+        torch_scatter_add,
+        ["torch", "scatter_add"],
+        Some(KnownFunction::Scatter)
+    );
+    known_case!(
+        torch_take_along_dim,
+        ["torch", "take_along_dim"],
+        Some(KnownFunction::TakeAlongAxis)
+    );
+    known_case!(torch_topk, ["torch", "topk"], Some(KnownFunction::TopK));
+    known_case!(
+        torch_unbind,
+        ["torch", "unbind"],
+        Some(KnownFunction::Unbind)
+    );
+    known_case!(torch_chunk, ["torch", "chunk"], Some(KnownFunction::Chunk));
+    known_case!(
+        torch_narrow,
+        ["torch", "narrow"],
+        Some(KnownFunction::Narrow)
+    );
+    known_case!(
+        torch_select,
+        ["torch", "select"],
+        Some(KnownFunction::SelectDim)
+    );
+    known_case!(
+        torch_masked_select,
+        ["torch", "masked_select"],
+        Some(KnownFunction::MaskedSelect)
+    );
+    known_case!(
+        torch_index_select,
+        ["torch", "index_select"],
+        Some(KnownFunction::IndexSelect)
+    );
+    known_case!(
+        torch_kthvalue,
+        ["torch", "kthvalue"],
+        Some(KnownFunction::KthValue)
+    );
+    known_case!(
+        torch_median,
+        ["torch", "median"],
+        Some(KnownFunction::MedianDim)
+    );
+    known_case!(
+        torch_mode,
+        ["torch", "mode"],
+        Some(KnownFunction::MedianDim)
+    );
+    known_case!(torch_unique, ["torch", "unique"], Some(KnownFunction::Unique));
+    known_case!(
+        torch_combinations,
+        ["torch", "combinations"],
+        Some(KnownFunction::Combinations)
+    );
+    known_case!(
+        torch_cartesian_prod,
+        ["torch", "cartesian_prod"],
+        Some(KnownFunction::CartesianProd)
+    );
+    known_case!(
+        torch_block_diag,
+        ["torch", "block_diag"],
+        Some(KnownFunction::BlockDiag)
+    );
+    known_case!(
+        torch_nn_functional_interpolate,
+        ["torch", "nn", "functional", "interpolate"],
+        Some(KnownFunction::Interpolate)
+    );
+    known_case!(
+        torch_nn_functional_conv1d,
+        ["torch", "nn", "functional", "conv1d"],
+        Some(KnownFunction::FunctionalConv1d)
+    );
+    known_case!(
+        torch_nn_functional_conv2d,
+        ["torch", "nn", "functional", "conv2d"],
+        Some(KnownFunction::FunctionalConv2d)
+    );
+    known_case!(
+        torch_nn_functional_conv3d,
+        ["torch", "nn", "functional", "conv3d"],
+        Some(KnownFunction::FunctionalConv3d)
+    );
+    known_case!(
+        torch_nn_functional_max_pool1d,
+        ["torch", "nn", "functional", "max_pool1d"],
+        Some(KnownFunction::FunctionalMaxPool1d)
+    );
+    known_case!(
+        torch_nn_functional_max_pool2d,
+        ["torch", "nn", "functional", "max_pool2d"],
+        Some(KnownFunction::FunctionalMaxPool2d)
+    );
+    known_case!(
+        torch_nn_functional_max_pool3d,
+        ["torch", "nn", "functional", "max_pool3d"],
+        Some(KnownFunction::FunctionalMaxPool3d)
+    );
+    known_case!(
+        torch_nn_functional_avg_pool1d,
+        ["torch", "nn", "functional", "avg_pool1d"],
+        Some(KnownFunction::FunctionalAvgPool1d)
+    );
+    known_case!(
+        torch_nn_functional_avg_pool2d,
+        ["torch", "nn", "functional", "avg_pool2d"],
+        Some(KnownFunction::FunctionalAvgPool2d)
+    );
+    known_case!(
+        torch_nn_functional_avg_pool3d,
+        ["torch", "nn", "functional", "avg_pool3d"],
+        Some(KnownFunction::FunctionalAvgPool3d)
+    );
+    known_case!(
+        torch_nn_functional_softmax,
+        ["torch", "nn", "functional", "softmax"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_log_softmax,
+        ["torch", "nn", "functional", "log_softmax"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_normalize,
+        ["torch", "nn", "functional", "normalize"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_one_hot,
+        ["torch", "nn", "functional", "one_hot"],
+        Some(KnownFunction::OneHot)
+    );
+    known_case!(
+        torch_nn_functional_embedding,
+        ["torch", "nn", "functional", "embedding"],
+        Some(KnownFunction::FunctionalEmbedding)
+    );
+    known_case!(
+        torch_nn_utils_rnn_pad_sequence,
+        ["torch", "nn", "utils", "rnn", "pad_sequence"],
+        Some(KnownFunction::PadSequence)
+    );
 }
 
 #[cfg(test)]
@@ -8096,7 +9074,7 @@ mod method_call_tests {
     #[test]
     fn test_classify_unknown_returns_none() {
         assert_eq!(classify_method_call("frobnicate"), None);
-        assert_eq!(classify_method_call("clone"), None);
+        assert_eq!(classify_method_call("backward"), None);
     }
 
     #[test]
@@ -8580,5 +9558,496 @@ mod method_call_tests {
         let output = apply_method_call(&KnownFunction::To, "unknown", &args, &shapes).unwrap();
 
         assert_eq!(output, None);
+    }
+
+    // ── new torch method classify wiring ────────────────────────────────
+
+    #[test]
+    fn test_classify_new_indexing_methods() {
+        assert_eq!(classify_method_call("gather"), Some(KnownFunction::Gather));
+        assert_eq!(classify_method_call("scatter"), Some(KnownFunction::Scatter));
+        assert_eq!(
+            classify_method_call("masked_select"),
+            Some(KnownFunction::MaskedSelect)
+        );
+        assert_eq!(
+            classify_method_call("masked_fill"),
+            Some(KnownFunction::MaskedFill)
+        );
+        assert_eq!(
+            classify_method_call("index_select"),
+            Some(KnownFunction::IndexSelect)
+        );
+        assert_eq!(classify_method_call("narrow"), Some(KnownFunction::Narrow));
+        assert_eq!(classify_method_call("select"), Some(KnownFunction::SelectDim));
+        assert_eq!(classify_method_call("topk"), Some(KnownFunction::TopK));
+        assert_eq!(classify_method_call("unfold"), Some(KnownFunction::Unfold));
+        assert_eq!(classify_method_call("view_as"), Some(KnownFunction::ShapeAs));
+        assert_eq!(
+            classify_method_call("reshape_as"),
+            Some(KnownFunction::ShapeAs)
+        );
+        assert_eq!(
+            classify_method_call("expand_as"),
+            Some(KnownFunction::ShapeAs)
+        );
+        assert_eq!(classify_method_call("flip"), Some(KnownFunction::Flip));
+        assert_eq!(classify_method_call("roll"), Some(KnownFunction::Roll));
+        assert_eq!(classify_method_call("chunk"), Some(KnownFunction::Chunk));
+        assert_eq!(classify_method_call("unbind"), Some(KnownFunction::Unbind));
+        assert_eq!(classify_method_call("split"), Some(KnownFunction::Split));
+        assert_eq!(
+            classify_method_call("kthvalue"),
+            Some(KnownFunction::KthValue)
+        );
+        assert_eq!(
+            classify_method_call("median"),
+            Some(KnownFunction::MedianDim)
+        );
+        assert_eq!(classify_method_call("mode"), Some(KnownFunction::MedianDim));
+    }
+
+    #[test]
+    fn test_classify_new_misc_methods() {
+        assert_eq!(classify_method_call("item"), Some(KnownFunction::Item));
+        assert_eq!(
+            classify_method_call("new_zeros"),
+            Some(KnownFunction::NewConstructor)
+        );
+        assert_eq!(
+            classify_method_call("new_ones"),
+            Some(KnownFunction::NewConstructor)
+        );
+        assert_eq!(
+            classify_method_call("new_full"),
+            Some(KnownFunction::NewConstructor)
+        );
+        assert_eq!(
+            classify_method_call("new_empty"),
+            Some(KnownFunction::NewConstructor)
+        );
+        assert_eq!(classify_method_call("clone"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("cpu"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("cuda"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("float"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("long"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("int"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("bool"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("double"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("half"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("clamp"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("clip"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("softmax"), Some(KnownFunction::Copy));
+        assert_eq!(classify_method_call("norm"), Some(KnownFunction::Sum));
+        assert_eq!(
+            classify_method_call("diagonal"),
+            Some(KnownFunction::Diagonal)
+        );
+        assert_eq!(classify_method_call("tril"), Some(KnownFunction::Tril));
+        assert_eq!(classify_method_call("triu"), Some(KnownFunction::Triu));
+    }
+
+    // ── new apply_method_call shape rules ────────────────────────────────
+
+    #[test]
+    fn test_apply_gather_matches_index_shape() {
+        let shapes = HashMap::from([("idx".to_string(), shape(&["4", "3"]))]);
+        let args = vec![pos("1"), pos("idx")];
+
+        let output = apply_method_call(&KnownFunction::Gather, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_apply_scatter_shape_preserving() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let args = vec![pos("1"), pos("idx"), pos("src")];
+
+        let output = apply_method_call(&KnownFunction::Scatter, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_apply_masked_select_is_conservatively_unknown() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let args = vec![pos("mask")];
+
+        let output =
+            apply_method_call(&KnownFunction::MaskedSelect, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_apply_masked_fill_shape_preserving() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let args = vec![pos("mask"), pos("0.0")];
+
+        let output = apply_method_call(&KnownFunction::MaskedFill, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_apply_index_select_dim_length_from_index() {
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["4", "3"])),
+            ("idx".to_string(), shape(&["2"])),
+        ]);
+        let args = vec![kw("dim", "1"), kw("index", "idx")];
+
+        let output = apply_method_call(&KnownFunction::IndexSelect, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "2"])));
+    }
+
+    #[test]
+    fn test_apply_narrow_replaces_dim_with_length() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("1"), pos("2"), pos("5")];
+
+        let output = apply_method_call(&KnownFunction::Narrow, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "5"])));
+    }
+
+    #[test]
+    fn test_apply_select_dim_removes_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10", "3"]))]);
+        let args = vec![pos("1"), pos("0")];
+
+        let output = apply_method_call(&KnownFunction::SelectDim, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_apply_unfold_appends_window_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["10"]))]);
+        // dimension=0, size=2, step=1 → (10-2)/1+1 = 9 windows of size 2
+        let args = vec![pos("0"), pos("2"), pos("1")];
+
+        let output = apply_method_call(&KnownFunction::Unfold, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["9", "2"])));
+    }
+
+    #[test]
+    fn test_apply_view_as_takes_other_shape() {
+        let shapes = HashMap::from([("other".to_string(), shape(&["2", "6"]))]);
+        let args = vec![pos("other")];
+
+        let output = apply_method_call(&KnownFunction::ShapeAs, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "6"])));
+    }
+
+    #[test]
+    fn test_apply_item_is_scalar() {
+        let shapes: HashMap<String, Vec<String>> = HashMap::new();
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Item, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_apply_new_zeros_shape_from_arg() {
+        let shapes: HashMap<String, Vec<String>> = HashMap::new();
+        let args = vec![pos("(3, 4)")];
+
+        let output = apply_method_call(&KnownFunction::NewConstructor, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_apply_clone_shape_preserving() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "n"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Copy, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "n"])));
+    }
+
+    #[test]
+    fn test_apply_norm_no_dim_reduces_to_scalar() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Sum, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_apply_norm_with_dim_reduces_one_axis() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let args = vec![kw("dim", "1")];
+
+        let output = apply_method_call(&KnownFunction::Sum, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4"])));
+    }
+
+    #[test]
+    fn test_apply_diagonal_method_form() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "4"]))]);
+        let args: Vec<CallArgument> = vec![];
+
+        let output = apply_method_call(&KnownFunction::Diagonal, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4"])));
+    }
+
+    #[test]
+    fn test_apply_triu_method_form_shape_preserving() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "4"]))]);
+        let args = vec![pos("1")];
+
+        let output = apply_method_call(&KnownFunction::Triu, "x", &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "4"])));
+    }
+
+    // ── torch tuple-output helper functions (used from analysis.rs) ─────
+
+    #[test]
+    fn test_apply_known_topk_shape_replaces_dim_with_k() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("x"), pos("3")];
+
+        let output = apply_known_topk_shape(&args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_apply_known_topk_shape_explicit_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let output = apply_known_topk_shape(&args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["3", "10"])));
+    }
+
+    #[test]
+    fn test_apply_known_kthvalue_shape_reduces_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("x"), pos("2"), kw("dim", "1")];
+
+        let output = apply_known_kthvalue_shape(&args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4"])));
+    }
+
+    #[test]
+    fn test_apply_known_kthvalue_shape_keepdim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("x"), pos("2"), kw("dim", "1"), kw("keepdim", "True")];
+
+        let output = apply_known_kthvalue_shape(&args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "1"])));
+    }
+
+    #[test]
+    fn test_compute_unbind_shape_removes_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["3", "4", "5"]))]);
+        let args = vec![pos("x"), kw("dim", "0")];
+
+        let output = compute_unbind_shape(&args, &shapes, 3).unwrap();
+
+        assert_eq!(output, Some(shape(&["4", "5"])));
+    }
+
+    #[test]
+    fn test_compute_unbind_shape_mismatched_count_errors() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["3", "4", "5"]))]);
+        let args = vec![pos("x"), kw("dim", "0")];
+
+        let result = compute_unbind_shape(&args, &shapes, 2);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compute_chunk_shapes_evenly_divisible() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["6", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_chunk_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![shape(&["2", "4"]), shape(&["2", "4"]), shape(&["2", "4"])])
+        );
+    }
+
+    #[test]
+    fn test_compute_chunk_shapes_uneven_last_chunk_smaller() {
+        // 7 split into at most 3 chunks of ceil(7/3)=3 → sizes [3, 3, 1]
+        let shapes = HashMap::from([("x".to_string(), shape(&["7"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_chunk_shapes(&args, &shapes).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![shape(&["3"]), shape(&["3"]), shape(&["1"])])
+        );
+    }
+
+    // ── torch combinatorics ──────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_combinations_n_choose_r() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["5"]))]);
+        let args = vec![pos("x")];
+
+        let output = apply_known_function(&KnownFunction::Combinations, &args, &shapes).unwrap();
+
+        // 5 choose 2 = 10
+        assert_eq!(output, Some(shape(&["10", "2"])));
+    }
+
+    #[test]
+    fn test_apply_cartesian_prod_multiplies_lengths() {
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2"])),
+            ("b".to_string(), shape(&["3"])),
+        ]);
+        let args = vec![pos("a"), pos("b")];
+
+        let output =
+            apply_known_function(&KnownFunction::CartesianProd, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["6", "2"])));
+    }
+
+    #[test]
+    fn test_apply_block_diag_sums_block_dims() {
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["4", "5"])),
+        ]);
+        let args = vec![pos("a"), pos("b")];
+
+        let output = apply_known_function(&KnownFunction::BlockDiag, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["6", "8"])));
+    }
+
+    // ── torch.nn.functional ──────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_functional_conv2d_output_shape() {
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["8", "3", "32", "32"])),
+            ("w".to_string(), shape(&["16", "3", "3", "3"])),
+        ]);
+        let args = vec![pos("x"), pos("w"), kw("padding", "1")];
+
+        let output =
+            apply_known_function(&KnownFunction::FunctionalConv2d, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "16", "32", "32"])));
+    }
+
+    #[test]
+    fn test_apply_functional_max_pool2d_default_stride_equals_kernel() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "3", "32", "32"]))]);
+        let args = vec![pos("x"), pos("2")];
+
+        let output =
+            apply_known_function(&KnownFunction::FunctionalMaxPool2d, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "3", "16", "16"])));
+    }
+
+    #[test]
+    fn test_apply_functional_avg_pool1d() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "3", "10"]))]);
+        let args = vec![pos("x"), pos("2"), pos("2")];
+
+        let output =
+            apply_known_function(&KnownFunction::FunctionalAvgPool1d, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "3", "5"])));
+    }
+
+    #[test]
+    fn test_apply_interpolate_scale_factor() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "3", "16", "16"]))]);
+        let args = vec![pos("x"), kw("scale_factor", "2")];
+
+        let output = apply_known_function(&KnownFunction::Interpolate, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "3", "32", "32"])));
+    }
+
+    #[test]
+    fn test_apply_interpolate_size() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "3", "16", "16"]))]);
+        let args = vec![pos("x"), kw("size", "(8, 8)")];
+
+        let output = apply_known_function(&KnownFunction::Interpolate, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "3", "8", "8"])));
+    }
+
+    #[test]
+    fn test_apply_functional_embedding_appends_embed_dim() {
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["batch", "seq"])),
+            ("weight".to_string(), shape(&["1000", "64"])),
+        ]);
+        let args = vec![pos("x"), pos("weight")];
+
+        let output =
+            apply_known_function(&KnownFunction::FunctionalEmbedding, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "seq", "64"])));
+    }
+
+    #[test]
+    fn test_apply_functional_one_hot_num_classes_minus_one_is_unknown() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch"]))]);
+        let args = vec![pos("x"), kw("num_classes", "-1")];
+
+        let output = apply_known_function(&KnownFunction::OneHot, &args, &shapes).unwrap();
+
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_apply_pad_sequence_batch_first() {
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["3", "8"])),
+            ("b".to_string(), shape(&["5", "8"])),
+        ]);
+        let args = vec![pos("[a, b]"), kw("batch_first", "True")];
+
+        let output = apply_known_function(&KnownFunction::PadSequence, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "pad_len", "8"])));
+    }
+
+    #[test]
+    fn test_apply_pad_sequence_default_seq_first() {
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["3", "8"])),
+            ("b".to_string(), shape(&["5", "8"])),
+        ]);
+        let args = vec![pos("[a, b]")];
+
+        let output = apply_known_function(&KnownFunction::PadSequence, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["pad_len", "2", "8"])));
     }
 }

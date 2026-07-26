@@ -7377,3 +7377,419 @@ mod jax_nn_extra_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "d"])));
     }
 }
+
+/// End-to-end coverage for the torch indexing/selection/tuple-output method
+/// and free-function additions, plus the `x.T` / `x.mT` properties and the
+/// new `torch.nn.functional` / `torch.nn.utils.rnn` free functions.
+#[cfg(test)]
+mod torch_new_builtin_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_x_t_reverses_all_dims() {
+        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.T";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["c", "b", "a"])));
+    }
+
+    #[test]
+    fn test_x_mt_swaps_last_two_dims() {
+        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.mT";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["a", "c", "b"])));
+    }
+
+    #[test]
+    fn test_x_mt_requires_rank_2() {
+        let code = "def f(x: Float[Array, \"a\"]):\n    y = x.mT";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_method_topk_tuple_unpacking() {
+        let code = "def f(x: Float[Array, \"b n\"]):\n    values, indices = x.topk(5)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["b", "5"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["b", "5"])));
+    }
+
+    #[test]
+    fn test_free_topk_tuple_unpacking_explicit_dim() {
+        let code = "import torch\ndef f(x: Float[Array, \"b n\"]):\n    values, indices = torch.topk(x, 3, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["3", "n"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["3", "n"])));
+    }
+
+    #[test]
+    fn test_method_chunk_tuple_unpacking() {
+        let code = "def f(x: Float[Array, \"6 4\"]):\n    a, b, c = x.chunk(3, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["2", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["2", "4"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["2", "4"])));
+    }
+
+    #[test]
+    fn test_free_chunk_uneven_last_piece_smaller() {
+        let code = "import torch\ndef f(x: Float[Array, \"7\"]):\n    a, b, c = torch.chunk(x, 3, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["1"])));
+    }
+
+    #[test]
+    fn test_method_unbind_tuple_unpacking() {
+        let code = "def f(x: Float[Array, \"3 4 5\"]):\n    a, b, c = x.unbind(0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["4", "5"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["4", "5"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["4", "5"])));
+    }
+
+    #[test]
+    fn test_unbind_mismatched_count_errors() {
+        let code = "def f(x: Float[Array, \"3 4 5\"]):\n    a, b = x.unbind(0)";
+        let analysis = analyze(code);
+
+        assert!(!analysis.errors.is_empty());
+    }
+
+    #[test]
+    fn test_method_split_tuple_unpacking() {
+        // `KnownFunction::Split`'s shared `compute_split_shapes` treats the
+        // 2nd arg as the number of equal sections (jnp/np.split semantics),
+        // same as the existing free-function `torch.split` mapping —
+        // 6 split into 2 sections → 3 each.
+        let code = "def f(x: Float[Array, \"6 4\"]):\n    a, b = x.split(2, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_method_kthvalue_tuple_unpacking() {
+        let code = "def f(x: Float[Array, \"b n\"]):\n    values, indices = x.kthvalue(2, dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["b"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_method_median_dim_tuple_unpacking() {
+        let code = "def f(x: Float[Array, \"b n\"]):\n    values, indices = x.median(dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["b"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_free_mode_dim_tuple_unpacking() {
+        let code = "import torch\ndef f(x: Float[Array, \"b n\"]):\n    values, indices = torch.mode(x, dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["b"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_method_gather_matches_index_shape() {
+        let code = "def f(x: Float[Array, \"b n\"], idx: Float[Array, \"b 3\"]):\n    y = x.gather(1, idx)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "3"])));
+    }
+
+    #[test]
+    fn test_method_index_select_dim_from_index_length() {
+        let code = "def f(x: Float[Array, \"4 10\"], idx: Float[Array, \"3\"]):\n    y = x.index_select(1, idx)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_method_narrow_replaces_dim_with_length() {
+        let code = "def f(x: Float[Array, \"4 10\"]):\n    y = x.narrow(1, 2, 5)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "5"])));
+    }
+
+    #[test]
+    fn test_method_select_removes_dim() {
+        let code = "def f(x: Float[Array, \"4 10 3\"]):\n    y = x.select(1, 0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_method_masked_select_conservatively_unknown() {
+        let code = "def f(x: Float[Array, \"4 10\"]):\n    y = x.masked_select(mask)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_method_masked_fill_shape_preserving() {
+        let code = "def f(x: Float[Array, \"4 10\"]):\n    y = x.masked_fill(mask, 0.0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "10"])));
+    }
+
+    #[test]
+    fn test_method_unfold_appends_window_dim() {
+        let code = "def f(x: Float[Array, \"10\"]):\n    y = x.unfold(0, 2, 1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["9", "2"])));
+    }
+
+    #[test]
+    fn test_method_view_as_reshape_as_expand_as() {
+        let code = "def f(x: Float[Array, \"12\"], other: Float[Array, \"3 4\"]):\n    y = x.view_as(other)\n    z = x.reshape_as(other)\n    w = x.expand_as(other)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_method_item_is_scalar() {
+        let code = "def f(x: Float[Array, \"1\"]):\n    y = x.item()";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn test_method_new_zeros_shape_from_arg() {
+        let code = "def f(x: Float[Array, \"4\"]):\n    y = x.new_zeros((3, 4))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_method_clone_and_dtype_casts_shape_preserving() {
+        let code = "def f(x: Float[Array, \"4 3\"]):\n    y = x.clone()\n    z = x.float()\n    w = x.cuda()";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "3"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["4", "3"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_method_norm_axis_reduction() {
+        let code = "def f(x: Float[Array, \"4 3\"]):\n    y = x.norm(dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4"])));
+    }
+
+    #[test]
+    fn test_method_diagonal_and_triu_tril() {
+        let code = "def f(x: Float[Array, \"4 4\"]):\n    y = x.diagonal()\n    z = x.triu()\n    w = x.tril()";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["4", "4"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["4", "4"])));
+    }
+
+    #[test]
+    fn test_free_take_along_dim_matches_indices() {
+        let code = "import torch\ndef f(a: Float[Array, \"4 8\"], idx: Float[Array, \"4 1\"]):\n    y = torch.take_along_dim(a, idx, dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "1"])));
+    }
+
+    #[test]
+    fn test_free_torch_unique_conservatively_unknown() {
+        let code = "import torch\ndef f(x: Float[Array, \"4 8\"]):\n    y = torch.unique(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert!(!has_shape(&analysis, "y"));
+    }
+
+    #[test]
+    fn test_free_combinations_n_choose_r() {
+        let code = "import torch\ndef f(x: Float[Array, \"5\"]):\n    y = torch.combinations(x, 2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["10", "2"])));
+    }
+
+    #[test]
+    fn test_free_cartesian_prod() {
+        let code = "import torch\ndef f(a: Float[Array, \"2\"], b: Float[Array, \"3\"]):\n    y = torch.cartesian_prod(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["6", "2"])));
+    }
+
+    #[test]
+    fn test_free_block_diag() {
+        let code = "import torch\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"4 5\"]):\n    y = torch.block_diag(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["6", "8"])));
+    }
+
+    #[test]
+    fn test_functional_conv2d_output_shape() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"8 3 32 32\"], w: Float[Array, \"16 3 3 3\"]):\n    y = F.conv2d(x, w, padding=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "16", "32", "32"]))
+        );
+    }
+
+    #[test]
+    fn test_functional_max_pool2d_output_shape() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"8 3 32 32\"]):\n    y = F.max_pool2d(x, 2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "3", "16", "16"]))
+        );
+    }
+
+    #[test]
+    fn test_functional_avg_pool2d_output_shape() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"8 3 32 32\"]):\n    y = F.avg_pool2d(x, 2, 2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "3", "16", "16"]))
+        );
+    }
+
+    #[test]
+    fn test_functional_softmax_shape_preserving() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"b d\"]):\n    y = F.softmax(x, dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_functional_one_hot_appends_num_classes() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"batch\"]):\n    y = F.one_hot(x, 10)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "10"])));
+    }
+
+    #[test]
+    fn test_functional_embedding_appends_embed_dim() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"batch seq\"], weight: Float[Array, \"1000 64\"]):\n    y = F.embedding(x, weight)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["batch", "seq", "64"]))
+        );
+    }
+
+    #[test]
+    fn test_functional_interpolate_scale_factor() {
+        let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"8 3 16 16\"]):\n    y = F.interpolate(x, scale_factor=2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["8", "3", "32", "32"]))
+        );
+    }
+
+    #[test]
+    fn test_pad_sequence_batch_first() {
+        let code = "import torch\ndef f(a: Float[Array, \"3 8\"], b: Float[Array, \"5 8\"]):\n    y = torch.nn.utils.rnn.pad_sequence([a, b], batch_first=True)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(
+            find_shape(&analysis, "y"),
+            Some(&shape(&["2", "pad_len", "8"]))
+        );
+    }
+}

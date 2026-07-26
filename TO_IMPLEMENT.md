@@ -251,28 +251,28 @@ Legend:
 | `torch.triu` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Triu` path with `jnp.triu`. |
 | `torch.tril` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Tril` path with `jnp.tril`. |
 | `torch.nn.functional.pad` | ✅ | ✅ | ✅ | Classified via `torch.nn.functional` deep module path; reuses `KnownFunction::Pad` and existing `apply_known_pad` pad-width parser. Note: `apply_known_pad` applies pad pairs in dimension order (dim 0 first), unlike PyTorch's reverse-axis convention; see `torch_nn_functional_pad_tests` in integration_tests.rs. |
-| `torch.gather` | ❌ | ❌ | ❌ | Priority: high. Output shape matches `index` tensor. |
-| `torch.scatter` / `torch.scatter_add` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving on `self`/`input`. |
-| `torch.take_along_dim` | ❌ | ❌ | ❌ | Priority: high. Output shape matches `indices`. |
-| `torch.topk` | ❌ | ❌ | ❌ | Priority: high. Tuple LHS; target dim becomes `k`. |
-| `torch.unbind` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs, removes one dim. |
-| `torch.chunk` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs, similar to `split`. |
-| `torch.narrow` | ❌ | ❌ | ❌ | Priority: high. Slices one dim to `length`. |
-| `torch.select` | ❌ | ❌ | ❌ | Priority: high. Removes one dim (index into it). |
-| `torch.masked_select` | ❌ | ❌ | ❌ | Priority: high. 1D output, data-dependent length. |
-| `torch.index_select` | ❌ | ❌ | ❌ | Priority: high. Dim length becomes `len(index)`. |
-| `torch.nn.functional.interpolate` | ❌ | ❌ | ❌ | Priority: high. Spatial dims → `size`/`scale_factor`. |
-| `torch.nn.functional.conv1d` / `conv2d` / `conv3d` | ❌ | ❌ | ❌ | Priority: high. Functional counterpart of `torch.nn.ConvNd`; same output formula, weight-derived channels. |
-| `torch.nn.functional.max_pool1d` / `max_pool2d` / `max_pool3d` | ❌ | ❌ | ❌ | Priority: high. Functional counterpart of pooling layers. |
-| `torch.nn.functional.avg_pool1d` / `avg_pool2d` / `avg_pool3d` | ❌ | ❌ | ❌ | Priority: high. Functional counterpart of pooling layers. |
-| `torch.nn.functional.softmax` / `log_softmax` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving; only `torch.nn.functional.pad` is classified today. |
-| `torch.nn.functional.one_hot` | ❌ | ❌ | ❌ | Priority: high. Appends `num_classes` dim. |
-| `torch.combinations` | ❌ | ❌ | ❌ | Priority: medium. `(N choose r, r)` shape. |
-| `torch.cartesian_prod` | ❌ | ❌ | ❌ | Priority: medium. Product of input lengths. |
-| `torch.block_diag` | ❌ | ❌ | ❌ | Priority: medium. Sums block dims on the diagonal. |
-| `torch.nn.functional.normalize` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `torch.nn.functional.embedding` | ❌ | ❌ | ❌ | Priority: medium. Appends embedding dim, like `torch.nn.Embedding`. |
-| `torch.nn.utils.rnn.pad_sequence` | ❌ | ❌ | ❌ | Priority: medium. Stacks variable-length sequences to `(max_len, batch, ...)` or `(batch, max_len, ...)`. |
+| `torch.gather` | ✅ | ✅ | ✅ | `KnownFunction::Gather`; output shape matches `index` (always the last positional arg in both the free-function and method forms). |
+| `torch.scatter` / `torch.scatter_add` | ✅ | ✅ | ✅ | `KnownFunction::Scatter`; shape-preserving on `self`/`input` via `apply_known_shape_preserving`. |
+| `torch.take_along_dim` | ✅ | ✅ | ✅ | Reuses `KnownFunction::TakeAlongAxis` directly — identical "output matches `indices`" rule as `jnp.take_along_axis`. |
+| `torch.topk` | ✅ | ✅ | ✅ | `KnownFunction::TopK`; tuple LHS via `apply_known_topk_shape` (extends `tuple_rhs_shapes`) — both outputs replace `dim` with `k`. Single-assignment dispatch is conservatively `Ok(None)` (real return is always a 2-tuple). |
+| `torch.unbind` | ✅ | ✅ | ✅ | `KnownFunction::Unbind`; tuple LHS via `compute_unbind_shape` — removes `dim`; `n_targets` must match the axis's literal size (mismatch → error), symbolic axis → unknown. |
+| `torch.chunk` | ✅ | ✅ | ✅ | `KnownFunction::Chunk`; tuple LHS via `compute_chunk_shapes` — at most `chunks` pieces of `ceil(size/chunks)` (last piece may be smaller), unlike `split`'s exact-division semantics. |
+| `torch.narrow` | ✅ | ✅ | ✅ | `KnownFunction::Narrow`; slices `dim` down to `length`. |
+| `torch.select` | ✅ | ✅ | ✅ | `KnownFunction::SelectDim` (distinct from `jnp.select`'s choicelist-based `KnownFunction::Select`); removes `dim`. |
+| `torch.masked_select` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |
+| `torch.index_select` | ✅ | ✅ | ✅ | `KnownFunction::IndexSelect`; `dim`'s length becomes `len(index)`. |
+| `torch.nn.functional.interpolate` | ✅ | ✅ | ✅ | `KnownFunction::Interpolate`; sets spatial dims from `size`, or scales by `scale_factor` (floor-rounded). |
+| `torch.nn.functional.conv1d` / `conv2d` / `conv3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalConv1d/2d/3d`; same conv formula as the layer forms, channels/kernel derived from the `weight` arg's shape (grouped-conv channel mismatch not validated, matching `jax.lax.conv_general_dilated`'s existing approximation). |
+| `torch.nn.functional.max_pool1d` / `max_pool2d` / `max_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalMaxPool1d/2d/3d`; `stride` defaults to `kernel_size` per torch convention; `dilation` not modelled. |
+| `torch.nn.functional.avg_pool1d` / `avg_pool2d` / `avg_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalAvgPool1d/2d/3d`; same pooling formula/helper as the max-pool functional forms. |
+| `torch.nn.functional.softmax` / `log_softmax` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `torch.nn.functional.one_hot` | ✅ | ✅ | ✅ | Reuses `KnownFunction::OneHot` directly; the `num_classes=-1` "infer at runtime" sentinel is now treated as unknown (harmless no-op for `jax.nn.one_hot`, which never passes `-1`). |
+| `torch.combinations` | ✅ | ✅ | ✅ | `KnownFunction::Combinations`; `(nCr(n, r), r)` from a literal 1D input length; `with_replacement` not modelled. |
+| `torch.cartesian_prod` | ✅ | ✅ | ✅ | `KnownFunction::CartesianProd`; `(prod(lengths), num_tensors)`, or the input itself when only one tensor given. |
+| `torch.block_diag` | ✅ | ✅ | ✅ | `KnownFunction::BlockDiag`; sums row/col dims onto the diagonal; 1D inputs treated as a single row; rank >= 3 unmodelled. |
+| `torch.nn.functional.normalize` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `torch.nn.functional.embedding` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalEmbedding`; appends `weight`'s last-axis (embedding) dim to `input`'s shape. |
+| `torch.nn.utils.rnn.pad_sequence` | ✅ | ✅ | ✅ | `KnownFunction::PadSequence`; batch count + trailing dims known from the literal sequence list, padded length emitted as opaque symbolic `pad_len` (data-dependent). |
 
 ## Torch reductions
 
@@ -291,9 +291,9 @@ Legend:
 | `torch.argmin` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `torch.cumsum` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `dim=None` flattening; always preserves input shape. |
 | `torch.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `dim=None` flattening; always preserves input shape. |
-| `torch.kthvalue` | ❌ | ❌ | ❌ | Priority: medium. Tuple LHS, reduces one dim (like `max`/`min`). |
-| `torch.median` (with `dim`) / `torch.mode` (with `dim`) | ❌ | ❌ | ❌ | Priority: medium. Tuple LHS, reduces one dim; distinct from the no-`dim` scalar form. |
-| `torch.unique` | ❌ | ❌ | ❌ | Priority: medium. 1D output, length data-dependent. |
+| `torch.kthvalue` | ✅ | ✅ | ✅ | `KnownFunction::KthValue`; tuple LHS via `apply_known_kthvalue_shape` — `values`/`indices` share a plain single-axis reduction over `dim` (re-synthesizes `(input, dim=.., keepdim=..)`, dropping `k`, and reuses `apply_known_reduction`). |
+| `torch.median` (with `dim`) / `torch.mode` (with `dim`) | ✅ | ✅ | ✅ | `KnownFunction::MedianDim`; tuple LHS reuses `apply_known_reduction` directly (same `(input, dim, keepdim)` layout as a plain reduction); the no-`dim` scalar form (2 targets but no `dim`/`axis` arg) is skipped as not a real 2-tuple. |
+| `torch.unique` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Unique` directly (classified for `torch` alongside the existing `jnp`/`np` mapping); conservatively `Ok(None)` — length is data-dependent. |
 
 ## Neural-network layers / modules
 
@@ -386,32 +386,32 @@ Legend:
 | `x.copy(...)` | ✅ | ✅ | ✅ | Shape-preserving; `KnownFunction::Copy`. |
 | `x.detach(...)` | ✅ | ✅ | ✅ | Shape-preserving; `KnownFunction::Detach`. |
 | `x.contiguous(...)` | ✅ | ✅ | ✅ | Shape-preserving; `KnownFunction::Contiguous`. |
-| `x.chunk(...)` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs, similar to `split`. |
-| `x.unbind(...)` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs, removes one dim. |
-| `x.split(...)` | ❌ | ❌ | ❌ | Priority: high. Torch method form of `torch.split`/`compute_split_shapes` not yet wired to `apply_method_call`. |
-| `x.gather(...)` | ❌ | ❌ | ❌ | Priority: high. Output shape matches `index`. |
-| `x.scatter(...)` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `x.masked_select(...)` | ❌ | ❌ | ❌ | Priority: high. 1D output, data-dependent length. |
-| `x.masked_fill(...)` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `x.index_select(...)` | ❌ | ❌ | ❌ | Priority: high. Dim length becomes `len(index)`. |
-| `x.narrow(...)` | ❌ | ❌ | ❌ | Priority: high. Slices one dim to `length`. |
-| `x.select(...)` | ❌ | ❌ | ❌ | Priority: high. Removes one dim. |
-| `x.topk(...)` | ❌ | ❌ | ❌ | Priority: high. Target dim becomes `k`; multiple outputs. |
-| `x.unfold(...)` | ❌ | ❌ | ❌ | Priority: high. Adds a new trailing window dim. |
-| `x.view_as(...)` / `x.reshape_as(...)` / `x.expand_as(...)` | ❌ | ❌ | ❌ | Priority: high. Shape taken from the other tensor argument. |
-| `x.flip(...)` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `x.roll(...)` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `x.T` / `x.mT` (properties) | ❌ | ❌ | ❌ | Priority: high. Reverse dims / swap last two dims; needs attribute (non-call) handling. |
-| `x.item()` | ❌ | ❌ | ❌ | Priority: high. Scalar (rank-0) output. |
-| `x.new_zeros(...)` / `new_ones(...)` / `new_full(...)` / `new_empty(...)` | ❌ | ❌ | ❌ | Priority: medium. Output shape from args, like `torch.zeros` family. |
-| `x.clone(...)` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `x.cpu(...)` / `x.cuda(...)` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving device moves. |
-| `x.float(...)` / `long(...)` / `int(...)` / `bool(...)` / `double(...)` / `half(...)` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving dtype casts. |
-| `x.clamp(...)` / `x.clip(...)` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving; not yet in `classify_method_call` (unlike the free-function `torch.clip`/`jnp.clip`, which are already handled generically). |
-| `x.softmax(...)` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `x.norm(...)` | ❌ | ❌ | ❌ | Priority: medium. Axis-dependent reduction. |
-| `x.diagonal(...)` | ❌ | ❌ | ❌ | Priority: medium. Method form of `torch.diagonal`, not yet wired to `apply_method_call`. |
-| `x.tril(...)` / `x.triu(...)` | ❌ | ❌ | ❌ | Priority: medium. Method form of `torch.tril`/`torch.triu`, not yet wired to `apply_method_call`. |
+| `x.chunk(...)` | ✅ | ✅ | ✅ | `KnownFunction::Chunk`; method form of `torch.chunk` — see `compute_chunk_shapes`. |
+| `x.unbind(...)` | ✅ | ✅ | ✅ | `KnownFunction::Unbind`; method form of `torch.unbind` — see `compute_unbind_shape`. |
+| `x.split(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Split`/`compute_split_shapes` (receiver prepended as positional[0]); same "N equal sections" approximation as the existing free-function `torch.split` mapping (real torch `split` semantics take a `split_size`, not a section count — pre-existing limitation, not introduced here). |
+| `x.gather(...)` | ✅ | ✅ | ✅ | `KnownFunction::Gather`; output shape matches `index`. |
+| `x.scatter(...)` | ✅ | ✅ | ✅ | `KnownFunction::Scatter`; shape-preserving. |
+| `x.masked_select(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |
+| `x.masked_fill(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedFill`; shape-preserving. |
+| `x.index_select(...)` | ✅ | ✅ | ✅ | `KnownFunction::IndexSelect`; dim length becomes `len(index)`. |
+| `x.narrow(...)` | ✅ | ✅ | ✅ | `KnownFunction::Narrow`; slices one dim to `length`. |
+| `x.select(...)` | ✅ | ✅ | ✅ | `KnownFunction::SelectDim`; removes one dim. |
+| `x.topk(...)` | ✅ | ✅ | ✅ | `KnownFunction::TopK`; target dim becomes `k`; tuple LHS via `apply_known_topk_shape`. |
+| `x.unfold(...)` | ✅ | ✅ | ✅ | `KnownFunction::Unfold`; adds a new trailing window dim of length `size`; concrete dims only. |
+| `x.view_as(...)` / `x.reshape_as(...)` / `x.expand_as(...)` | ✅ | ✅ | ✅ | `KnownFunction::ShapeAs`; shape taken from the other tensor argument. |
+| `x.flip(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Flip`'s shape-preserving rule. |
+| `x.roll(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Roll`'s shape-preserving rule. |
+| `x.T` / `x.mT` (properties) | ✅ | ✅ | ✅ | Handled in `shape_of_attribute` (not a call): `x.T` reverses every dim (rank >= 1); `x.mT` swaps the last two dims (rank >= 2). |
+| `x.item()` | ✅ | ✅ | ✅ | `KnownFunction::Item`; always scalar (rank-0) output, independent of the receiver's shape. |
+| `x.new_zeros(...)` / `new_ones(...)` / `new_full(...)` / `new_empty(...)` | ✅ | ✅ | ✅ | `KnownFunction::NewConstructor`; shape from the `size` arg (receiver is only a dtype/device template), like the `torch.zeros` family. |
+| `x.clone(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.cpu(...)` / `x.cuda(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.float(...)` / `long(...)` / `int(...)` / `bool(...)` / `double(...)` / `half(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.clamp(...)` / `x.clip(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.softmax(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.norm(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (same convention as `jnp.linalg.norm`/`torch.linalg.norm`); no `dim` → scalar. |
+| `x.diagonal(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Diagonal`'s rule (method form of `torch.diagonal`). |
+| `x.tril(...)` / `x.triu(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Tril`/`KnownFunction::Triu`'s shape-preserving rules. |
 
 ## Open targets (current)
 

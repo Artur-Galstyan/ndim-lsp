@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use tree_sitter::Node;
 
 use crate::known_functions::{
-    apply_known_function, apply_known_linalg_lstsq_solution, apply_method_call,
-    classify_known_function, classify_method_call, compute_einops_pack_shape,
-    compute_fixed_axis_split_shapes, compute_split_shapes,
+    apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
+    apply_known_reduction, apply_known_topk_shape, apply_method_call, classify_known_function,
+    classify_method_call, compute_chunk_shapes, compute_einops_pack_shape,
+    compute_fixed_axis_split_shapes, compute_split_shapes, compute_unbind_shape,
 };
 use crate::layers::{
     apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
@@ -417,19 +418,44 @@ fn shape_of_identifier(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 ///
 /// Other attribute chains like `x.reshape(3,4).sum(axis=1)` are handled in
 /// `shape_of_call`, where the parse produces a `call` whose `function` is the
-/// attribute. A non-`self` attribute (e.g. `obj.field`) has no shape rule.
+/// attribute. A non-`self` attribute (e.g. `obj.field`) has no shape rule,
+/// except the `x.T` / `x.mT` torch tensor properties (see below).
 fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let obj = node.child_by_field_name("object")?;
-    if obj.kind() != "identifier" || obj.utf8_text(ctx.text.as_bytes()).ok()? != "self" {
-        return None;
-    }
     let field = node
         .child_by_field_name("attribute")?
         .utf8_text(ctx.text.as_bytes())
         .ok()?;
-    // ponytail: class fields land flat in module scope (scope 0); two classes
-    // with a same-named field resolve last-wins. Add per-class scoping if bitten.
-    ctx.resolve_shape(field, 0)
+
+    if obj.kind() == "identifier" && obj.utf8_text(ctx.text.as_bytes()).ok()? == "self" {
+        // ponytail: class fields land flat in module scope (scope 0); two
+        // classes with a same-named field resolve last-wins. Add per-class
+        // scoping if bitten.
+        return ctx.resolve_shape(field, 0);
+    }
+
+    // `x.T` (torch): reverses every dim (deprecated for rank > 2 but still
+    // defined that way). `x.mT`: swaps only the last two dims, requires
+    // rank >= 2.
+    if field == "T" {
+        let mut shape = shape_of_expression(obj, ctx)?;
+        if shape.is_empty() {
+            return None;
+        }
+        shape.reverse();
+        return Some(shape);
+    }
+    if field == "mT" {
+        let mut shape = shape_of_expression(obj, ctx)?;
+        if shape.len() < 2 {
+            return None;
+        }
+        let len = shape.len();
+        shape.swap(len - 1, len - 2);
+        return Some(shape);
+    }
+
+    None
 }
 
 /// Unary operator: propagate the operand's shape unchanged.
@@ -1640,6 +1666,50 @@ fn tuple_rhs_shapes(
             let func = rhs.child_by_field_name("function")?;
             let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
 
+            // Method-call tuple forms on a plain local receiver: `values,
+            // indices = x.topk(k)`, `a, b, c = x.chunk(3)`, `a, b =
+            // x.unbind(0)`, `a, b = x.split(2)`, `values, indices =
+            // x.kthvalue(k)` / `x.median(dim=1)` / `x.mode(dim=1)`.
+            // Distinguished from a qualified free-function path (receiver is
+            // an import alias like `jnp`) and from the `self.<attr>` layer
+            // case below (handled separately) by requiring the receiver be a
+            // plain, non-`self`, non-imported identifier.
+            if func.kind() == "attribute"
+                && let Some(obj) = func.child_by_field_name("object")
+                && obj.kind() == "identifier"
+                && let Ok(receiver) = obj.utf8_text(ctx.text.as_bytes())
+                && receiver != "self"
+                && !ctx.import_map.contains_key(receiver)
+                && let Some(method_name_node) = func.child_by_field_name("attribute")
+                && let Ok(method_name) = method_name_node.utf8_text(ctx.text.as_bytes())
+                && let Some(known) = classify_method_call(method_name)
+                && matches!(
+                    known,
+                    KnownFunction::TopK
+                        | KnownFunction::Chunk
+                        | KnownFunction::Unbind
+                        | KnownFunction::Split
+                        | KnownFunction::KthValue
+                        | KnownFunction::MedianDim
+                )
+            {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut method_args = Vec::with_capacity(raw_args.len() + 1);
+                method_args.push(CallArgument::Positional {
+                    value: receiver.to_string(),
+                });
+                method_args.extend(raw_args);
+                return tuple_multi_output_shapes(
+                    &known,
+                    &method_args,
+                    args_node,
+                    n_targets,
+                    scope_idx,
+                    ctx,
+                );
+            }
+
             // `attn_out, attn_weights = self.attn(q, k, v)` where self.attn
             // is a MultiheadAttention built in __init__: output has the
             // query's shape; weights are (..., L, S) with default
@@ -1872,6 +1942,26 @@ fn tuple_rhs_shapes(
                 return linalg_tuple_shapes(&known?, &args, n_targets, scope_idx, ctx);
             }
 
+            // `values, indices = torch.topk(x, 3)` / `torch.chunk(x, 3)` /
+            // `torch.unbind(x)` / `torch.kthvalue(x, 2)` /
+            // `torch.median(x, dim=1)` / `torch.mode(x, dim=1)` — the
+            // qualified free-function forms of the method-call dispatch
+            // handled at the top of this arm.
+            if matches!(
+                known,
+                Some(
+                    KnownFunction::TopK
+                        | KnownFunction::Chunk
+                        | KnownFunction::Unbind
+                        | KnownFunction::KthValue
+                        | KnownFunction::MedianDim
+                )
+            ) {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                return tuple_multi_output_shapes(&known?, &args, args_node, n_targets, scope_idx, ctx);
+            }
+
             if !matches!(known, Some(KnownFunction::Split)) {
                 return None;
             }
@@ -1894,6 +1984,126 @@ fn tuple_rhs_shapes(
     }
 }
 
+/// Shared math for tuple-unpacked `topk`/`chunk`/`unbind`/`kthvalue`/
+/// `median`/`mode` calls, in either their free-function form (`args[0]` is
+/// the input) or their method-call form (`args[0]` is the receiver,
+/// prepended by the caller) — the argument layout is identical either way.
+fn tuple_multi_output_shapes(
+    known: &KnownFunction,
+    args: &[CallArgument],
+    args_node: Node,
+    n_targets: usize,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<Option<Vec<String>>>> {
+    match known {
+        KnownFunction::TopK => {
+            if n_targets != 2 {
+                return None;
+            }
+            match apply_known_topk_shape(args, &ctx.scope_shapes(scope_idx)) {
+                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            }
+        }
+        KnownFunction::KthValue => {
+            if n_targets != 2 {
+                return None;
+            }
+            match apply_known_kthvalue_shape(args, &ctx.scope_shapes(scope_idx)) {
+                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            }
+        }
+        KnownFunction::MedianDim => {
+            if n_targets != 2 {
+                return None;
+            }
+            let positional_count = args
+                .iter()
+                .filter(|a| matches!(a, CallArgument::Positional { .. }))
+                .count();
+            let has_dim = positional_count >= 2
+                || args
+                    .iter()
+                    .any(|a| matches!(a, CallArgument::Keyword { name, .. } if name == "dim" || name == "axis"));
+            if !has_dim {
+                // No-dim scalar form (`torch.median(x)`) isn't a 2-tuple.
+                return None;
+            }
+            match apply_known_reduction(args, &ctx.scope_shapes(scope_idx)) {
+                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            }
+        }
+        KnownFunction::Unbind => {
+            if n_targets == 0 {
+                return None;
+            }
+            match compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets) {
+                Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
+            }
+        }
+        KnownFunction::Chunk => match compute_chunk_shapes(args, &ctx.scope_shapes(scope_idx)) {
+            Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
+            Ok(None) => None,
+            Err(message) => {
+                ctx.errors.push(ShapeError {
+                    variable: String::new(),
+                    message,
+                    range: args_node.range(),
+                });
+                None
+            }
+        },
+        KnownFunction::Split => match compute_split_shapes(args, &ctx.scope_shapes(scope_idx)) {
+            Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
+            Ok(None) => None,
+            Err(message) => {
+                ctx.errors.push(ShapeError {
+                    variable: String::new(),
+                    message,
+                    range: args_node.range(),
+                });
+                None
+            }
+        },
+        _ => None,
+    }
+}
 
 /// `min(a, b)` as a dim: computed when both concrete, `a` when they match
 /// textually, an opaque `min(a,b)` symbol otherwise.

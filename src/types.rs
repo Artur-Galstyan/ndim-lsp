@@ -435,6 +435,42 @@ pub enum KnownFunction {
     // jax.nn
     OneHot,
     DotProductAttention,
+    // torch tensor indexing / selection methods
+    Gather,
+    Scatter,
+    IndexSelect,
+    Narrow,
+    SelectDim,
+    MaskedSelect,
+    MaskedFill,
+    Unfold,
+    ShapeAs,
+    Item,
+    NewConstructor,
+    // torch tuple-output methods
+    TopK,
+    Chunk,
+    Unbind,
+    KthValue,
+    MedianDim,
+    // torch combinatorics
+    Combinations,
+    CartesianProd,
+    BlockDiag,
+    // torch.nn.functional
+    Interpolate,
+    FunctionalConv1d,
+    FunctionalConv2d,
+    FunctionalConv3d,
+    FunctionalMaxPool1d,
+    FunctionalMaxPool2d,
+    FunctionalMaxPool3d,
+    FunctionalAvgPool1d,
+    FunctionalAvgPool2d,
+    FunctionalAvgPool3d,
+    FunctionalEmbedding,
+    // torch.nn.utils.rnn
+    PadSequence,
 }
 
 #[derive(Debug, Clone)]
