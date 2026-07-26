@@ -833,17 +833,67 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
 /// "store the constructor arg" pattern); expression RHS is skipped.
 /// The map is file-global; cross-class collisions on the same attribute
 /// name resolve last-wins.
+/// Resolve `self.<attr> = <ident>` assignments (typically in `__init__`) to a
+/// map of bare attribute name → aliased identifier. Flat last-wins view of
+/// `extract_self_attr_aliases_by_class`. Cross-class same-named attrs
+/// collide (last one wins); use the by-class version to avoid that.
 pub fn extract_self_attr_aliases(
     node: Node,
     text: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let mut aliases = HashMap::new();
+    let by_class = extract_self_attr_aliases_by_class(node, text)?;
+    Ok(by_class
+        .into_iter()
+        .filter_map(|(attr, mut entries)| entries.pop().map(|e| (attr, e.value)))
+        .collect())
+}
+
+/// Byte ranges of every `class_definition` in the tree (DFS, includes
+/// nested). Mirrors `layers.rs`'s private `class_ranges` helper.
+fn class_ranges(node: Node) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "class_definition" {
+            ranges.push((n.start_byte(), n.end_byte()));
+        }
+        for i in (0..n.child_count()).rev() {
+            if let Some(c) = n.child(i as u32) {
+                stack.push(c);
+            }
+        }
+    }
+    ranges
+}
+
+/// Innermost class range containing `byte`; whole file if none. Mirrors
+/// `layers.rs`'s private `enclosing_class_range` helper.
+fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> (usize, usize) {
+    classes
+        .iter()
+        .filter(|(s, e)| *s <= byte && byte < *e)
+        .min_by_key(|(s, e)| e - s)
+        .copied()
+        .unwrap_or((0, usize::MAX))
+}
+
+/// Like `extract_self_attr_aliases`, but each binding keeps the byte range of
+/// its enclosing `class_definition` (issue: the alias map was file-global,
+/// so same-named `self.<attr>` aliases in different classes collided
+/// last-wins) — mirrors `extract_self_attr_layers_by_class` in `layers.rs`.
+/// Lookup goes through `ShapeCtx::self_attr_alias_at` (innermost class
+/// containing the use-site byte; lone-binding fallback).
+pub fn extract_self_attr_aliases_by_class(
+    node: Node,
+    text: &str,
+) -> Result<HashMap<String, Vec<ScopedSelfAttrAlias>>, String> {
+    let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
     const QUERY_STRING: &str = r#"
         (assignment
           left: (attribute
             object: (identifier) @obj
             attribute: (identifier) @attr)
-          right: (identifier) @val)
+          right: (identifier) @val) @assign
     "#;
 
     static QUERY: LazyLock<Query> = LazyLock::new(|| {
@@ -853,7 +903,11 @@ pub fn extract_self_attr_aliases(
     let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
     let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
     let val_idx = query.capture_index_for_name("val").ok_or("val not found")?;
+    let assign_idx = query
+        .capture_index_for_name("assign")
+        .ok_or("assign not found")?;
 
+    let classes = class_ranges(node);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, node, text.as_bytes());
 
@@ -861,7 +915,12 @@ pub fn extract_self_attr_aliases(
         let mut is_self = false;
         let mut attr = String::new();
         let mut val = String::new();
+        let mut assign_byte = 0usize;
         for capture in match_.captures {
+            if capture.index == assign_idx {
+                assign_byte = capture.node.start_byte();
+                continue;
+            }
             let t = node_text(capture.node, text)?;
             if capture.index == obj_idx {
                 is_self = t == "self";
@@ -872,11 +931,78 @@ pub fn extract_self_attr_aliases(
             }
         }
         if is_self && !attr.is_empty() {
-            aliases.insert(attr, val);
+            let (class_start, class_end) = enclosing_class_range(&classes, assign_byte);
+            aliases.entry(attr).or_default().push(ScopedSelfAttrAlias {
+                class_start,
+                class_end,
+                value: val,
+            });
         }
     }
 
     Ok(aliases)
+}
+
+#[cfg(test)]
+mod self_attr_alias_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser.set_language(&language.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    #[test]
+    fn test_flat_wrapper_single_class() {
+        let code = "class A:\n    def __init__(self):\n        self.dt_rank = dt_rank\n";
+        let tree = parse(code);
+
+        let aliases = extract_self_attr_aliases(tree.root_node(), code).unwrap();
+
+        assert_eq!(aliases.get("dt_rank").map(String::as_str), Some("dt_rank"));
+    }
+
+    #[test]
+    fn test_by_class_keeps_each_class_own_range() {
+        let code = "class A:\n    def __init__(self):\n        self.rank = dt_rank\n\nclass B:\n    def __init__(self):\n        self.rank = other_rank\n";
+        let tree = parse(code);
+
+        let by_class = extract_self_attr_aliases_by_class(tree.root_node(), code).unwrap();
+
+        let entries = by_class.get("rank").expect("rank alias recorded");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].value, "dt_rank");
+        assert_eq!(entries[1].value, "other_rank");
+        // Each entry's class range is disjoint (class A's range ends where
+        // class B's starts, or earlier).
+        assert!(entries[0].class_end <= entries[1].class_start);
+    }
+
+    #[test]
+    fn test_flat_wrapper_last_wins_on_cross_class_collision() {
+        // Documents the pre-existing (still-supported) flat wrapper's
+        // last-wins behavior for callers that haven't moved to class-scoped
+        // lookup — same convention as `extract_self_attr_layers`.
+        let code = "class A:\n    def __init__(self):\n        self.rank = dt_rank\n\nclass B:\n    def __init__(self):\n        self.rank = other_rank\n";
+        let tree = parse(code);
+
+        let aliases = extract_self_attr_aliases(tree.root_node(), code).unwrap();
+
+        assert_eq!(aliases.get("rank").map(String::as_str), Some("other_rank"));
+    }
+
+    #[test]
+    fn test_no_aliases_returns_empty_map() {
+        let code = "class A:\n    def __init__(self):\n        self.linear = Linear(3, 5)\n";
+        let tree = parse(code);
+
+        let by_class = extract_self_attr_aliases_by_class(tree.root_node(), code).unwrap();
+
+        assert!(by_class.is_empty());
+    }
 }
 
 #[cfg(test)]

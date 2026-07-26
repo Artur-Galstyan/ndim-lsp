@@ -118,7 +118,7 @@ Legend:
 | `jnp.row_stack` / `np.row_stack` | ✅ | ✅ | ✅ | Alias-ish for vstack. |
 | `jnp.block` / `np.block` | ✅ | ✅ | ✅ | Recursively parses the nested-list literal; concatenates the innermost level along the last axis, each level up along the next axis (numpy semantics: axis = `rank - nesting_depth`). |
 | `jnp.split` / `np.split` | ✅ | ✅ | ✅ | Per-element shapes via `compute_split_shapes`; `a, b = split(...)` LHS bound in `analyze`. |
-| `jnp.array_split` / `np.array_split` / `torch.tensor_split` | ✅ | ✅ | ✅ | Shares `compute_split_shapes` (CASE 1/2). |
+| `jnp.array_split` / `np.array_split` / `torch.tensor_split` | ✅ | ✅ | ✅ | Shares `compute_split_shapes` (CASE 1/2), section-*count* semantics. `torch.tensor_split` verified against torch docs to use the same section-count semantics as `jnp`/`np` (unlike `torch.split`, which is a distinct `KnownFunction::TorchSplit` — see the Torch section below). |
 | `jnp.hsplit` / `np.hsplit` | ✅ | ✅ | ✅ | Tuple LHS via `compute_fixed_axis_split_shapes` (forces axis=1, or axis=0 for rank-1 input) delegating to `compute_split_shapes`. |
 | `jnp.vsplit` / `np.vsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=0. |
 | `jnp.dsplit` / `np.dsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=2; errors if rank < 3. |
@@ -257,6 +257,7 @@ Legend:
 | `torch.topk` | ✅ | ✅ | ✅ | `KnownFunction::TopK`; tuple LHS via `apply_known_topk_shape` (extends `tuple_rhs_shapes`) — both outputs replace `dim` with `k`. Single-assignment dispatch is conservatively `Ok(None)` (real return is always a 2-tuple). |
 | `torch.unbind` | ✅ | ✅ | ✅ | `KnownFunction::Unbind`; tuple LHS via `compute_unbind_shape` — removes `dim`; `n_targets` must match the axis's literal size (mismatch → error), symbolic axis → unknown. |
 | `torch.chunk` | ✅ | ✅ | ✅ | `KnownFunction::Chunk`; tuple LHS via `compute_chunk_shapes` — at most `chunks` pieces of `ceil(size/chunks)` (last piece may be smaller), unlike `split`'s exact-division semantics. |
+| `torch.split` | ✅ | ✅ | ✅ | `KnownFunction::TorchSplit` (distinct from `KnownFunction::Split`, which `torch.tensor_split` still uses); real semantics via `compute_torch_split_shapes` — the 2nd arg is a chunk **size**, not a section count: `ceil(axis_dim / size)` chunks, last one a smaller remainder when it doesn't divide evenly (mirrors `compute_chunk_shapes` with size/count roles swapped). Also accepts a literal list of explicit per-chunk sizes (at most one `-1` entry infers the remainder). Literal axis dim + literal size → exact chunk list. Symbolic axis dim + literal size → count is derived from the LHS tuple arity when known (`a, b, c = x.split(n)`); with no arity hint (single-LHS validate path) → `Ok(None)`. Non-literal, non-list size → always `Ok(None)` (per-chunk size itself unknown). |
 | `torch.narrow` | ✅ | ✅ | ✅ | `KnownFunction::Narrow`; slices `dim` down to `length`. |
 | `torch.select` | ✅ | ✅ | ✅ | `KnownFunction::SelectDim` (distinct from `jnp.select`'s choicelist-based `KnownFunction::Select`); removes `dim`. |
 | `torch.masked_select` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |
@@ -316,7 +317,7 @@ Legend:
 | `GroupNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; GroupNorm enforces min rank 1. |
 | activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; activations accept any rank. |
 | pooling layers | ✅ | ✅ | ✅ | Max/Avg/Adaptive{Max,Avg}Pool 1d/2d/3d, channels-first; conv output formula (adaptive sets spatial dims to output_size). Torch stride default (= kernel_size). |
-| `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Tuple LHS: output = query shape, weights = (…, L, S); default average_attn_weights. Other attention layers still ❌. |
+| `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Tuple LHS: output = query shape, weights = (…, L, S); default average_attn_weights. Single-assignment LHS (`out = self.attn(q, k, v)`, no tuple unpacking) also binds — `apply_layer_application` still returns `Ok(None)` for this kind (its `(output, weights)` return can't be expressed as one shape), so `shape_of_call`'s direct self-attr layer-call path special-cases `MultiheadAttention` to bind the primary output (query's shape) directly, bypassing `apply_layer_application`. Other attention layers still ❌. |
 | `flax.linen.avg_pool` | ✅ | ✅ | ✅ | `KnownFunction::FlaxPool`; channels-last, VALID padding, concrete dims only (`apply_known_flax_pool`). |
 | `flax.linen.max_pool` | ✅ | ✅ | ⚠️ | Same `KnownFunction::FlaxPool` code path and rule as `avg_pool`; only `avg_pool` has a dedicated integration test today. |
 | `jax.nn.relu` / `sigmoid` / `gelu` / `silu` / `swish` / `elu` / `leaky_relu` / `selu` / `softmax` / `log_softmax` / `standardize` (free functions) | ✅ | ✅ | ⚠️ | Not a `LayerKind`/`KnownFunction` — handled generically as shape-preserving elementwise via `is_shape_preserving_call` (module `["jax", "nn"]`); same code path also covers `flax.linen.<activation>` free functions. Only `jax.nn.softplus` has a dedicated test (`test_jax_nn_softplus_shape_preserving`), exercising the shared match arm; `test_relu_still_shape_preserving` (in `jax_nn_extra_tests`) is a regression check that carving `one_hot` out below didn't disturb this arm. |
@@ -388,7 +389,7 @@ Legend:
 | `x.contiguous(...)` | ✅ | ✅ | ✅ | Shape-preserving; `KnownFunction::Contiguous`. |
 | `x.chunk(...)` | ✅ | ✅ | ✅ | `KnownFunction::Chunk`; method form of `torch.chunk` — see `compute_chunk_shapes`. |
 | `x.unbind(...)` | ✅ | ✅ | ✅ | `KnownFunction::Unbind`; method form of `torch.unbind` — see `compute_unbind_shape`. |
-| `x.split(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Split`/`compute_split_shapes` (receiver prepended as positional[0]); same "N equal sections" approximation as the existing free-function `torch.split` mapping (real torch `split` semantics take a `split_size`, not a section count — pre-existing limitation, not introduced here). |
+| `x.split(...)` | ✅ | ✅ | ✅ | Method form of real `torch.split` — `KnownFunction::TorchSplit`/`compute_torch_split_shapes` (receiver prepended as positional[0]). Fixed: previously reused `KnownFunction::Split`'s "N equal sections" (jnp) approximation; now uses the real chunk-*size* semantics (see the `torch.split` row above). |
 | `x.gather(...)` | ✅ | ✅ | ✅ | `KnownFunction::Gather`; output shape matches `index`. |
 | `x.scatter(...)` | ✅ | ✅ | ✅ | `KnownFunction::Scatter`; shape-preserving. |
 | `x.masked_select(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |

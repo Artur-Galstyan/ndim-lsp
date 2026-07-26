@@ -5785,6 +5785,59 @@ class M(eqx.Module):
     }
 
     #[test]
+    fn test_symbolic_dim_normalization_class_scoped_no_cross_class_collision() {
+        // Two classes both alias `self.rank` (to different identifiers).
+        // With a file-global (last-wins) alias map, class A's `self.rank`
+        // would incorrectly resolve using class B's alias (whichever class
+        // is parsed last), normalizing `delta` in A to the wrong identifier.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+class A(eqx.Module):
+    proj: eqx.nn.Linear
+    rank: int
+
+    def __init__(self, dt_rank, key):
+        self.proj = eqx.nn.Linear(dt_rank, 8, key=key)
+        self.rank = dt_rank
+
+    def run_a(self, x: Float[Array, "seq combined"]):
+        delta, rest = jnp.split(x, [self.rank], axis=-1)
+        y = jax.vmap(self.proj)(delta)
+
+class B(eqx.Module):
+    proj: eqx.nn.Linear
+    rank: int
+
+    def __init__(self, other_rank, key):
+        self.proj = eqx.nn.Linear(other_rank, 8, key=key)
+        self.rank = other_rank
+
+    def run_b(self, x: Float[Array, "seq combined"]):
+        delta, rest = jnp.split(x, [self.rank], axis=-1)
+        y = jax.vmap(self.proj)(delta)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "errors: {:?}", analysis.errors);
+
+        // Each class's `delta` normalizes to its OWN class's alias, not the
+        // other class's.
+        assert_eq!(
+            find_shape_in_scope(&analysis, "run_a", "delta"),
+            Some(&shape(&["seq", "dt_rank"]))
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "run_b", "delta"),
+            Some(&shape(&["seq", "other_rank"]))
+        );
+    }
+
+    #[test]
     fn test_subscript_integer_drops_axis() {
         let tmp = tempfile::tempdir().unwrap();
         let code = "def f(x: Float[Array, \"seq d\"]):\n    y = x[0]\n";
@@ -6827,6 +6880,54 @@ mod multihead_attention_tests {
         assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
         assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["tgt", "src"])));
     }
+
+    #[test]
+    fn test_multihead_attention_single_lhs_binds_primary_output() {
+        // `out = self.attn(x, x, x)` (no tuple unpacking) previously bound
+        // nothing (`apply_layer_application`'s `MultiheadAttention` arm
+        // always returns `Ok(None)`, since the real return is a 2-tuple).
+        // Single-assignment call sites now bind the primary output — the
+        // query's shape, same rule as `attn_out` in the tuple-LHS case.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, x: Float[Array, \"seq 512\"]):\n        out = self.attn(x, x, x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "512"])));
+    }
+
+    #[test]
+    fn test_multihead_attention_single_lhs_cross_attention_uses_query_shape() {
+        // Query and key/value have different sequence lengths — the primary
+        // output still follows the query's shape, not the key/value's.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out = self.attn(q, kv, kv)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
+    }
+
+    #[test]
+    fn test_lstm_single_lhs_binds_primary_output() {
+        // `out = self.lstm(x)` (no tuple unpacking): `apply_layer_application`'s
+        // `LayerKind::Rnn` arm already approximates the real `(output,
+        // final_state)` tuple return as just the primary output tensor
+        // (last dim replaced by `hidden_size`) — regression-covered here
+        // alongside the MultiheadAttention fix above.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+    }
+
+    #[test]
+    fn test_gru_single_lhs_binds_primary_output() {
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.gru(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+    }
 }
 
 /// Timing harness over `bench/benchmark_large.py` (regenerate with
@@ -7493,16 +7594,70 @@ mod torch_new_builtin_tests {
 
     #[test]
     fn test_method_split_tuple_unpacking() {
-        // `KnownFunction::Split`'s shared `compute_split_shapes` treats the
-        // 2nd arg as the number of equal sections (jnp/np.split semantics),
-        // same as the existing free-function `torch.split` mapping —
-        // 6 split into 2 sections → 3 each.
-        let code = "def f(x: Float[Array, \"6 4\"]):\n    a, b = x.split(2, dim=0)";
+        // Real torch `Tensor.split` semantics (`KnownFunction::TorchSplit`):
+        // the 2nd arg is a chunk *size*, not a section count — splitting
+        // axis size 6 into chunks of size 3 yields 2 outputs of size 3 each.
+        let code = "def f(x: Float[Array, \"6 4\"]):\n    a, b = x.split(3, dim=0)";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
         assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_method_split_tuple_unpacking_uneven_remainder() {
+        // Real torch semantics: split_size=3 on axis size 10 → ceil(10/3)=4
+        // chunks, the last being the smaller remainder (1), not 3 equal
+        // sections like jnp/np.split.
+        let code = "def f(x: Float[Array, \"10 4\"]):\n    a, b, c, d = x.split(3, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["1", "4"])));
+    }
+
+    #[test]
+    fn test_free_function_torch_split_uneven_remainder() {
+        let code =
+            "import torch\ndef f(x: Float[Array, \"10 4\"]):\n    a, b, c, d = torch.split(x, 3, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["1", "4"])));
+    }
+
+    #[test]
+    fn test_torch_tensor_split_keeps_section_count_semantics() {
+        // `torch.tensor_split` keeps jnp/np section-*count* semantics (it
+        // does NOT get real `torch.split`'s chunk-size treatment) — 6 split
+        // into 2 sections → 3 each.
+        let code =
+            "import torch\ndef f(x: Float[Array, \"6 4\"]):\n    a, b = torch.tensor_split(x, 2, dim=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_matmul_operator_commutative_symbolic_dims_no_false_error() {
+        // Regression: dims were compared as raw strings, so `d*2` and `2*d`
+        // (same dim, different spelling) produced a false "matmul dimension
+        // mismatch" through the `@` operator's `apply_matmul_shape`.
+        let code = concat!(
+            "def f(a: Float[Array, \"m d*2\"], b: Float[Array, \"2*d n\"]):\n",
+            "    out = a @ b\n",
+        );
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["m", "n"])));
     }
 
     #[test]

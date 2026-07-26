@@ -15,6 +15,136 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
     }
 }
 
+/// Canonicalize a symbolic-dim expression for equality comparison.
+///
+/// Dims are bare strings (`"d_state*2"`, `"2*d_state"`, `"batch"`, `"3"`, …)
+/// compared across independent call sites (constructor args, jaxtyping
+/// annotations, other assignments). Two spellings of the same product/sum
+/// commute, but plain `==` treats them as different, producing false
+/// mismatches. This is **not** a CAS: it only understands a flat sum of
+/// `+`-separated terms, each a flat product of `*`-separated integer
+/// literals and identifiers. It:
+///
+/// * strips whitespace;
+/// * folds each term's literal factors into one coefficient (`2*3*d` →
+///   `6*d`, `d*1` → `d`);
+/// * sorts each term's identifier factors, and sorts the terms themselves,
+///   so commutative reorderings compare equal (`d*2` ≡ `2*d`, `a+b*2` ≡
+///   `2*b+a`);
+/// * drops additive-identity `0` terms (`d+0` → `d`), unless every term is
+///   zero.
+///
+/// Anything containing parens, subtraction, or division is returned
+/// unchanged (whitespace-stripped only) — those aren't provably commutative
+/// under this simple a token shuffle, so we don't risk a false "equal".
+pub fn canonicalize_dim(dim: &str) -> String {
+    let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.is_empty() || stripped.contains(['(', ')', '-', '/']) {
+        return stripped;
+    }
+
+    let mut terms: Vec<String> = stripped.split('+').map(canonicalize_product_term).collect();
+    terms.retain(|t| t != "0");
+    if terms.is_empty() {
+        terms.push("0".to_string());
+    }
+    terms.sort_unstable();
+    terms.join("+")
+}
+
+/// Canonicalize one `+`-separated term: a flat product of int literals and
+/// identifiers (`"d_state*2"` → `"2*d_state"`, `"d*1"` → `"d"`).
+fn canonicalize_product_term(term: &str) -> String {
+    if term.is_empty() {
+        return term.to_string();
+    }
+    let mut literal: i64 = 1;
+    let mut idents: Vec<&str> = Vec::new();
+    for factor in term.split('*') {
+        if let Ok(n) = factor.parse::<i64>() {
+            literal = literal.saturating_mul(n);
+        } else {
+            idents.push(factor);
+        }
+    }
+    idents.sort_unstable();
+    if idents.is_empty() {
+        return literal.to_string();
+    }
+    if literal == 1 {
+        idents.join("*")
+    } else {
+        let mut parts = vec![literal.to_string()];
+        parts.extend(idents.iter().map(|s| s.to_string()));
+        parts.join("*")
+    }
+}
+
+/// Dim equality under [`canonicalize_dim`] — the shared comparison boundary
+/// for every mismatch/broadcast check across `known_functions.rs` and
+/// `analysis.rs` (and, via `layers.rs`'s own `canonical_dim`, layer ctor-arg
+/// validation).
+pub fn dims_canonically_equal(a: &str, b: &str) -> bool {
+    canonicalize_dim(a) == canonicalize_dim(b)
+}
+
+#[cfg(test)]
+mod canonicalize_dim_tests {
+    use super::*;
+
+    #[test]
+    fn test_commutative_product_matches() {
+        assert_eq!(canonicalize_dim("d*2"), canonicalize_dim("2*d"));
+        assert_eq!(
+            canonicalize_dim("d_state*2"),
+            canonicalize_dim("2*d_state")
+        );
+    }
+
+    #[test]
+    fn test_literal_folding() {
+        assert_eq!(canonicalize_dim("2*3*d"), "6*d");
+        assert_eq!(canonicalize_dim("d*1"), "d");
+        assert_eq!(canonicalize_dim("d+0"), "d");
+    }
+
+    #[test]
+    fn test_commutative_sum_matches() {
+        assert_eq!(canonicalize_dim("a+b*2"), canonicalize_dim("2*b+a"));
+    }
+
+    #[test]
+    fn test_all_zero_sum_collapses_to_zero() {
+        assert_eq!(canonicalize_dim("0+0"), "0");
+    }
+
+    #[test]
+    fn test_plain_identifier_and_literal_unchanged() {
+        assert_eq!(canonicalize_dim("batch"), "batch");
+        assert_eq!(canonicalize_dim("3"), "3");
+    }
+
+    #[test]
+    fn test_whitespace_stripped() {
+        assert_eq!(canonicalize_dim(" d * 2 "), "2*d");
+    }
+
+    #[test]
+    fn test_non_commutative_forms_returned_unchanged() {
+        // Parens, subtraction, division: not a CAS, returned as-is
+        // (whitespace-stripped) rather than risking a false "equal".
+        assert_eq!(canonicalize_dim("(d)"), "(d)");
+        assert_eq!(canonicalize_dim("d-1"), "d-1");
+        assert_eq!(canonicalize_dim("d/2"), "d/2");
+    }
+
+    #[test]
+    fn test_dims_canonically_equal() {
+        assert!(dims_canonically_equal("d*2", "2*d"));
+        assert!(!dims_canonically_equal("d*2", "d*3"));
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ImportPath {
     pub dots: usize,
@@ -302,6 +432,10 @@ pub enum KnownFunction {
     Dot,
     Einsum,
     Split,
+    /// Real torch `split`/`Tensor.split` semantics: the 2nd arg is a
+    /// `split_size` (or list of sizes), not a section *count* like
+    /// `jnp.split`/`np.split`/`torch.tensor_split` (see [`KnownFunction::Split`]).
+    TorchSplit,
     Tile,
     Repeat,
     Flatten,
@@ -506,6 +640,16 @@ pub struct ScopedSelfAttrLayer {
     pub class_start: usize,
     pub class_end: usize,
     pub kind: LayerKind,
+}
+
+/// A `self.<attr> = <ident>` alias binding together with the byte range of
+/// the class it was defined in, so same-named attrs in different classes
+/// don't collide at lookup time. Mirrors `ScopedSelfAttrLayer`.
+#[derive(Debug, PartialEq, Clone)]
+pub struct ScopedSelfAttrAlias {
+    pub class_start: usize,
+    pub class_end: usize,
+    pub value: String,
 }
 
 #[derive(Debug, PartialEq, Clone)]

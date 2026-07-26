@@ -157,7 +157,11 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "outer" => Some(KnownFunction::Outer),
             "inner" => Some(KnownFunction::Inner),
             "einsum" => Some(KnownFunction::Einsum),
-            "split" | "tensor_split" => Some(KnownFunction::Split),
+            // Real torch `split` semantics: 2nd arg is a chunk *size*, not a
+            // section count. `tensor_split` keeps numpy/jnp section-count
+            // semantics (verified against torch docs), so it shares `Split`.
+            "split" => Some(KnownFunction::TorchSplit),
+            "tensor_split" => Some(KnownFunction::Split),
             "tile" => Some(KnownFunction::Tile),
             "repeat" => Some(KnownFunction::Repeat),
             "flatten" => Some(KnownFunction::Flatten),
@@ -610,7 +614,7 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
             .map(String::as_str)
             .unwrap_or("1");
 
-        let dim = if left_dim == right_dim {
+        let dim = if dims_canonically_equal(left_dim, right_dim) {
             left_dim.to_string()
         } else if left_dim == "1" {
             right_dim.to_string()
@@ -704,7 +708,9 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "triu" => Some(KnownFunction::Triu),
         "chunk" => Some(KnownFunction::Chunk),
         "unbind" => Some(KnownFunction::Unbind),
-        "split" => Some(KnownFunction::Split),
+        // Tensor method form: `x.split(size, dim=0)` — real torch semantics
+        // (chunk size, not section count); see `KnownFunction::TorchSplit`.
+        "split" => Some(KnownFunction::TorchSplit),
         "kthvalue" => Some(KnownFunction::KthValue),
         "median" | "mode" => Some(KnownFunction::MedianDim),
         _ => None,
@@ -857,6 +863,12 @@ pub fn apply_known_function(
         KnownFunction::LinalgDet => apply_known_linalg_det(args, shapes),
         KnownFunction::Einsum => apply_known_einsum(args, shapes),
         KnownFunction::Split => apply_known_split(args, shapes),
+        KnownFunction::TorchSplit => {
+            // Same "validate, but return None" reasoning as `Split`: a single
+            // (non-tuple) LHS can't hold the real tuple-of-chunks return.
+            let _ = compute_torch_split_shapes(args, shapes, None)?;
+            Ok(None)
+        }
         KnownFunction::FlaxPool => apply_known_flax_pool(args, shapes),
         KnownFunction::EinopsRearrange | KnownFunction::EinopsReduce
         | KnownFunction::EinopsRepeat => apply_known_einops(args, shapes),
@@ -1377,7 +1389,7 @@ fn apply_known_concatenate(
             if dim_idx == axis {
                 continue;
             }
-            if shape[dim_idx] != first_shape[dim_idx] {
+            if !dims_canonically_equal(&shape[dim_idx], &first_shape[dim_idx]) {
                 return Err(format!(
                     "concatenate dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, first_shape[dim_idx], shape[dim_idx]
@@ -1428,7 +1440,7 @@ fn apply_known_stack(
             ));
         }
         for (dim_idx, (expected, got)) in first_shape.iter().zip(shape.iter()).enumerate() {
-            if expected != got {
+            if !dims_canonically_equal(expected, got) {
                 return Err(format!(
                     "stack dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, expected, got
@@ -1875,7 +1887,7 @@ fn require_square_matrix(shape: &[String], context: &str) -> Result<(), String> 
 }
 
 fn check_dim_match(left: &str, right: &str, context: &str) -> Result<(), String> {
-    if left == right {
+    if dims_canonically_equal(left, right) {
         Ok(())
     } else {
         Err(format!(
@@ -2386,7 +2398,7 @@ fn concat_shapes_along_axis(
             if dim_idx == axis {
                 continue;
             }
-            if shape[dim_idx] != first_shape[dim_idx] {
+            if !dims_canonically_equal(&shape[dim_idx], &first_shape[dim_idx]) {
                 return Err(format!(
                     "concat dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, first_shape[dim_idx], shape[dim_idx]
@@ -2926,6 +2938,169 @@ pub fn compute_split_shapes(
     }
 
     // ── CASE 3: non-literal → out of scope ───────────────────────────
+    Ok(None)
+}
+
+/// Apply real torch `split`/`Tensor.split` semantics — see
+/// [`KnownFunction::TorchSplit`]. Unlike [`compute_split_shapes`] (jnp/np
+/// section-*count* semantics, also used by `torch.tensor_split`), torch's
+/// `split_size_or_sections` is either:
+///
+/// * an integer literal `size`: the axis is cut into `ceil(axis_dim / size)`
+///   chunks of `size`, with a smaller trailing remainder chunk when it
+///   doesn't divide evenly (mirrors [`compute_chunk_shapes`]'s remainder
+///   handling, just with the roles of "count" and "size" swapped); or
+/// * a list literal of explicit per-chunk sizes (torch allows at most one
+///   `-1` entry meaning "infer the remainder").
+///
+/// `n_targets` is the LHS tuple arity when known (`Some(k)` from `a, b, c =
+/// x.split(...)`). It's only consulted for the literal-size /
+/// symbolic-axis-dim combination: the chunk *count* can't be derived from an
+/// unknown axis size, but it *is* implied by how many names the caller
+/// unpacked into. Without that hint (`None`, e.g. the single-LHS validate
+/// path), a symbolic axis dim with a literal size returns `Ok(None)`
+/// (unknown count). A non-literal, non-list split spec is always `Ok(None)`
+/// regardless of `n_targets` — the per-chunk size itself is unknown, so
+/// nothing can be bound.
+pub fn compute_torch_split_shapes(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    n_targets: Option<usize>,
+) -> Result<Option<Vec<Vec<String>>>, String> {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.is_empty() {
+        return Err("split requires rank >= 1 input".to_string());
+    }
+    let rank = input_shape.len();
+
+    // torch's real signature is `(input, split_size_or_sections, dim=0)` —
+    // unlike `axis_arg` (shared by functions where the *only* other
+    // positional slot is the axis), split has a meaningful positional at
+    // index 1 (the size spec) before `dim`, so we look for `dim` starting
+    // after position 2, not position 0.
+    let axis_raw = nth_positional_or_keyword(args, 2, &["dim"]).unwrap_or("0");
+    let Some(axis) = parse_axis(axis_raw) else {
+        return Ok(None);
+    };
+    let axis = normalize_axis(axis, rank, "split")?;
+    let axis_dim = &input_shape[axis];
+
+    let Some(split_spec) =
+        nth_positional_or_keyword(args, 1, &["split_size_or_sections", "split_size"])
+    else {
+        return Ok(None);
+    };
+    let trimmed_spec = split_spec.trim();
+
+    // ── literal integer size ─────────────────────────────────────────
+    if let Ok(size) = trimmed_spec.parse::<usize>() {
+        if size == 0 {
+            return Err("split requires split_size > 0".to_string());
+        }
+
+        if let Ok(axis_size) = axis_dim.parse::<usize>() {
+            let count = axis_size.div_ceil(size).max(1);
+            let mut output_shapes = Vec::with_capacity(count);
+            let mut remaining = axis_size;
+            for _ in 0..count {
+                let this_size = remaining.min(size);
+                let mut out = input_shape.clone();
+                out[axis] = this_size.to_string();
+                output_shapes.push(out);
+                remaining -= this_size;
+            }
+            return Ok(Some(output_shapes));
+        }
+
+        // Symbolic axis dim: the chunk count can't be derived from the
+        // shape alone — fall back to the LHS tuple arity, if known.
+        let Some(k) = n_targets.filter(|k| *k > 0) else {
+            return Ok(None);
+        };
+        let mut output_shapes = Vec::with_capacity(k);
+        for _ in 0..k.saturating_sub(1) {
+            let mut out = input_shape.clone();
+            out[axis] = size.to_string();
+            output_shapes.push(out);
+        }
+        let consumed = size * (k - 1);
+        let mut last = input_shape.clone();
+        last[axis] = if consumed == 0 {
+            axis_dim.clone()
+        } else {
+            format!("{}-{}", axis_dim, consumed)
+        };
+        output_shapes.push(last);
+        return Ok(Some(output_shapes));
+    }
+
+    // ── list literal of explicit per-chunk sizes ─────────────────────
+    // Guarded by an explicit bracket check (unlike `compute_split_shapes`'s
+    // CASE 2): `parse_simple_sequence_names` treats any comma-free string as
+    // a one-element list, which would otherwise swallow a bare symbolic
+    // split-size identifier (e.g. `x.split(k, dim=0)`) that should fall
+    // through to "unknown" instead.
+    let looks_like_sequence =
+        trimmed_spec.starts_with('[') || trimmed_spec.starts_with('(');
+    if looks_like_sequence
+        && let Some(size_names) = parse_simple_sequence_names(trimmed_spec)
+    {
+        if size_names.is_empty() {
+            return Ok(Some(vec![input_shape.clone()]));
+        }
+
+        let parsed: Vec<Option<isize>> = size_names
+            .iter()
+            .map(|s| s.trim().parse::<isize>().ok())
+            .collect();
+        let neg_one_count = parsed.iter().filter(|v| **v == Some(-1)).count();
+        if neg_one_count > 1 {
+            return Err("split accepts at most one -1 size entry".to_string());
+        }
+
+        let axis_total: Option<usize> = axis_dim.parse().ok();
+        let known_sum: Option<usize> = if neg_one_count == 1 {
+            parsed.iter().filter(|v| **v != Some(-1)).try_fold(
+                0usize,
+                |acc, v| -> Option<usize> { Some(acc + usize::try_from((*v)?).ok()?) },
+            )
+        } else {
+            None
+        };
+
+        let mut output_shapes = Vec::with_capacity(size_names.len());
+        for (name, value) in size_names.iter().zip(parsed.iter()) {
+            let mut out = input_shape.clone();
+            out[axis] = match *value {
+                Some(-1) => match (axis_total, known_sum) {
+                    (Some(total), Some(sum)) if total >= sum => (total - sum).to_string(),
+                    _ => format!("remainder({})", axis_dim),
+                },
+                Some(v) if v >= 0 => v.to_string(),
+                _ => name.trim().to_string(),
+            };
+            output_shapes.push(out);
+        }
+
+        if neg_one_count == 0
+            && let Some(total) = axis_total
+            && parsed.iter().all(|v| v.is_some())
+        {
+            let sum: isize = parsed.iter().filter_map(|v| *v).sum();
+            if sum != total as isize {
+                return Err(format!(
+                    "split sizes {:?} sum to {} but axis size is {}",
+                    size_names, sum, total
+                ));
+            }
+        }
+
+        return Ok(Some(output_shapes));
+    }
+
+    // ── non-literal, non-list → out of scope ──────────────────────────
     Ok(None)
 }
 
@@ -4855,6 +5030,22 @@ mod known_function_shape_rule_tests {
     }
 
     #[test]
+    fn test_concatenate_commutative_symbolic_dims_do_not_mismatch() {
+        // "d*2" and "2*d" are the same dim under canonicalization — must not
+        // be a false "dimension mismatch" (issue: dims were compared as raw
+        // strings).
+        let args = vec![pos("[a, b]"), kw("axis", "1")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["d*2", "3"])),
+            ("b".to_string(), shape(&["2*d", "5"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Concatenate, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["d*2", "8"])));
+    }
+
+    #[test]
     fn test_concatenate_axis_out_of_bounds_errors() {
         let args = vec![pos("[a, b]"), kw("axis", "2")];
         let shapes = HashMap::from([
@@ -5014,6 +5205,19 @@ mod known_function_shape_rule_tests {
         assert!(error.contains("dimension mismatch"));
         assert!(error.contains("expected features"));
         assert!(error.contains("got other"));
+    }
+
+    #[test]
+    fn test_stack_commutative_symbolic_dims_do_not_mismatch() {
+        let args = vec![pos("[a, b]")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["batch", "d_state*2"])),
+            ("b".to_string(), shape(&["batch", "2*d_state"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Stack, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "batch", "d_state*2"])));
     }
 
     #[test]
@@ -5402,6 +5606,33 @@ mod known_function_shape_rule_tests {
         let error = apply_known_function(&KnownFunction::Matmul, &args, &shapes).unwrap_err();
 
         assert!(error.contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_matmul_commutative_symbolic_inner_dim_does_not_mismatch() {
+        // "k*2" and "2*k" are the same contracted dim under canonicalization.
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "k*2"])),
+            ("b".to_string(), shape(&["2*k", "n"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Matmul, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["m", "n"])));
+    }
+
+    #[test]
+    fn test_matmul_commutative_symbolic_batch_dims_broadcast() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["b_state*2", "m", "k"])),
+            ("b".to_string(), shape(&["2*b_state", "k", "n"])),
+        ]);
+
+        let output = apply_known_function(&KnownFunction::Matmul, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["b_state*2", "m", "n"])));
     }
 
     #[test]
@@ -8048,7 +8279,16 @@ mod known_function_tests {
         ["torch", "einsum"],
         Some(KnownFunction::Einsum)
     );
-    known_case!(torch_split, ["torch", "split"], Some(KnownFunction::Split));
+    known_case!(
+        torch_split,
+        ["torch", "split"],
+        Some(KnownFunction::TorchSplit)
+    );
+    known_case!(
+        torch_tensor_split,
+        ["torch", "tensor_split"],
+        Some(KnownFunction::Split)
+    );
     known_case!(torch_tile, ["torch", "tile"], Some(KnownFunction::Tile));
     known_case!(
         torch_repeat,
@@ -9426,6 +9666,173 @@ mod method_call_tests {
         assert!(result.is_err());
     }
 
+    // ── real torch `split` semantics (KnownFunction::TorchSplit) ───────────
+    // Unlike `Split` (jnp/np/tensor_split: 2nd arg is a section *count*),
+    // torch's `split_size_or_sections` is a chunk *size* — count is derived
+    // as `ceil(axis_size / size)`, with a smaller remainder chunk when it
+    // doesn't divide evenly.
+
+    #[test]
+    fn test_torch_split_size_divides_evenly() {
+        // [6, 4] split_size=3, dim=0 → ceil(6/3)=2 chunks of size 3.
+        let shapes = HashMap::from([("x".to_string(), shape(&["6", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(result, Some(vec![shape(&["3", "4"]), shape(&["3", "4"])]));
+    }
+
+    #[test]
+    fn test_torch_split_size_leaves_remainder_chunk() {
+        // [10] split_size=3 → ceil(10/3)=4 chunks: 3, 3, 3, 1.
+        let shapes = HashMap::from([("x".to_string(), shape(&["10"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![
+                shape(&["3"]),
+                shape(&["3"]),
+                shape(&["3"]),
+                shape(&["1"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_torch_split_size_larger_than_axis_yields_one_chunk() {
+        // [4] split_size=10 → ceil(4/10)=1 chunk of size 4 (the whole axis).
+        let shapes = HashMap::from([("x".to_string(), shape(&["4"]))]);
+        let args = vec![pos("x"), pos("10"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(result, Some(vec![shape(&["4"])]));
+    }
+
+    #[test]
+    fn test_torch_split_symbolic_axis_literal_size_unknown_without_arity() {
+        // Symbolic axis dim + literal size, no LHS arity hint → count is
+        // genuinely unknown.
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_torch_split_symbolic_axis_literal_size_uses_lhs_arity() {
+        // Symbolic axis dim + literal size, LHS arity k=3 known → first k-1
+        // chunks get the literal size, last gets the symbolic remainder.
+        let shapes = HashMap::from([("x".to_string(), shape(&["n", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, Some(3)).unwrap();
+
+        assert_eq!(
+            result,
+            Some(vec![
+                shape(&["3", "4"]),
+                shape(&["3", "4"]),
+                shape(&["n-6", "4"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_torch_split_symbolic_axis_literal_size_single_target_arity() {
+        // k=1: the single chunk is just the whole (symbolic) axis, no
+        // subtraction needed.
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, Some(1)).unwrap();
+
+        assert_eq!(result, Some(vec![shape(&["n"])]));
+    }
+
+    #[test]
+    fn test_torch_split_non_literal_size_always_unknown() {
+        // Non-literal, non-list split spec (a variable) is out of scope
+        // regardless of arity — the per-chunk size itself is unknown.
+        let shapes = HashMap::from([("x".to_string(), shape(&["n"]))]);
+        let args = vec![pos("x"), pos("k"), kw("dim", "0")];
+
+        assert_eq!(
+            compute_torch_split_shapes(&args, &shapes, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            compute_torch_split_shapes(&args, &shapes, Some(3)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_torch_split_list_of_sizes() {
+        // [6] split into explicit sizes [2, 3, 1].
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let args = vec![pos("x"), pos("[2, 3, 1]"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(result, Some(vec![shape(&["2"]), shape(&["3"]), shape(&["1"])]));
+    }
+
+    #[test]
+    fn test_torch_split_list_of_sizes_infers_negative_one() {
+        // [6] split into [2, -1] → second chunk infers the remainder (4).
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let args = vec![pos("x"), pos("[2, -1]"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None).unwrap();
+
+        assert_eq!(result, Some(vec![shape(&["2"]), shape(&["4"])]));
+    }
+
+    #[test]
+    fn test_torch_split_list_of_sizes_mismatched_sum_errors() {
+        // [6] split into [2, 5] → sums to 7, not 6 → Err.
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let args = vec![pos("x"), pos("[2, 5]"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_torch_split_size_zero_errors() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let args = vec![pos("x"), pos("0"), kw("dim", "0")];
+
+        let result = compute_torch_split_shapes(&args, &shapes, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_torch_split_dispatch_returns_none_for_single_lhs() {
+        // Same "validate, no single shape to store" reasoning as `Split`.
+        let shapes = HashMap::from([("x".to_string(), shape(&["6", "4"]))]);
+        let args = vec![pos("x"), pos("3"), kw("dim", "0")];
+
+        let output = apply_known_function(&KnownFunction::TorchSplit, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_torch_split_dispatch_surfaces_validation_errors() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let args = vec![pos("x"), pos("0"), kw("dim", "0")];
+
+        let result = apply_known_function(&KnownFunction::TorchSplit, &args, &shapes);
+        assert!(result.is_err());
+    }
+
     // ── shape passthrough method tests (astype/copy/detach/contiguous/to) ──
 
     #[test]
@@ -9595,7 +10002,10 @@ mod method_call_tests {
         assert_eq!(classify_method_call("roll"), Some(KnownFunction::Roll));
         assert_eq!(classify_method_call("chunk"), Some(KnownFunction::Chunk));
         assert_eq!(classify_method_call("unbind"), Some(KnownFunction::Unbind));
-        assert_eq!(classify_method_call("split"), Some(KnownFunction::Split));
+        assert_eq!(
+            classify_method_call("split"),
+            Some(KnownFunction::TorchSplit)
+        );
         assert_eq!(
             classify_method_call("kthvalue"),
             Some(KnownFunction::KthValue)

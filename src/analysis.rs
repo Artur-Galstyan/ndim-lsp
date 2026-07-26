@@ -7,14 +7,16 @@ use crate::known_functions::{
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
     apply_known_reduction, apply_known_topk_shape, apply_method_call, classify_known_function,
     classify_method_call, compute_chunk_shapes, compute_einops_pack_shape,
-    compute_fixed_axis_split_shapes, compute_split_shapes, compute_unbind_shape,
+    compute_fixed_axis_split_shapes, compute_split_shapes, compute_torch_split_shapes,
+    compute_unbind_shape,
 };
 use crate::layers::{
     apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
     extract_self_attr_layers_by_class,
 };
 use crate::python_ast::{
-    build_import_map, extract_call_arguments, extract_jaxtyping_shapes, extract_self_attr_aliases,
+    build_import_map, extract_call_arguments, extract_jaxtyping_shapes,
+    extract_self_attr_aliases_by_class,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target};
 
@@ -51,7 +53,7 @@ where
         max_depth,
         cache,
     )?;
-    let self_attr_aliases = extract_self_attr_aliases(node, text)?;
+    let self_attr_aliases = extract_self_attr_aliases_by_class(node, text)?;
 
     let (applications, errors, assignment_shapes) = propagate_calls(
         node,
@@ -230,9 +232,11 @@ struct ShapeCtx<'a> {
     /// constructor assignments in `__init__`. Used to resolve
     /// `jax.vmap(self.<attr>)(x)` (issue #35) and direct `self.<attr>(x)` calls.
     self_attr_layers: &'a HashMap<String, Vec<ScopedSelfAttrLayer>>,
-    /// `<attr>` → identifier, from `self.<attr> = <ident>` assignments. Used to
-    /// canonicalize symbolic dims (`self.dt_rank` ≡ `dt_rank`) before storage.
-    aliases: &'a HashMap<String, String>,
+    /// `<attr>` → identifier bindings keyed by defining class range, from
+    /// `self.<attr> = <ident>` assignments. Used to canonicalize symbolic
+    /// dims (`self.dt_rank` ≡ `dt_rank`) before storage, resolved by the
+    /// call-site byte via `self_attr_alias_at` — mirrors `self_attr_layers`.
+    aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
     scopes: &'a mut [FunctionShapeScope],
     vmap_targets: &'a mut HashMap<String, VmapInfo>,
     applications: &'a mut Vec<LayerApplication>,
@@ -268,18 +272,45 @@ impl ShapeLookup for ScopeShapes<'_> {
 
 /// Canonicalize every dim of a shape through the `self.<attr> = <ident>`
 /// alias map (no-op when the map is empty or no dim mentions `self.`).
-fn normalize_shape(shape: Vec<String>, aliases: &HashMap<String, String>) -> Vec<String> {
+/// `byte` is the call/assignment site used to pick the enclosing class's
+/// alias binding when the same attr is aliased differently across classes.
+fn normalize_shape(
+    shape: Vec<String>,
+    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    byte: usize,
+) -> Vec<String> {
     if aliases.is_empty() {
         return shape;
     }
-    shape.into_iter().map(|d| normalize_dim(&d, aliases)).collect()
+    shape
+        .into_iter()
+        .map(|d| normalize_dim(&d, aliases, byte))
+        .collect()
+}
+
+/// Resolve `self.<attr>`'s aliased identifier in the class enclosing `byte`.
+/// Falls back to a lone binding when the use site sits outside any class
+/// that defines the attr; ambiguous cross-class matches return `None`.
+/// Mirrors `ShapeCtx::self_attr_layer_at`.
+fn resolve_alias_at<'a>(
+    aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    attr: &str,
+    byte: usize,
+) -> Option<&'a str> {
+    let entries = aliases.get(attr)?;
+    entries
+        .iter()
+        .filter(|e| e.class_start <= byte && byte < e.class_end)
+        .min_by_key(|e| e.class_end - e.class_start)
+        .or_else(|| (entries.len() == 1).then(|| &entries[0]))
+        .map(|e| e.value.as_str())
 }
 
 /// Replace each `self.<attr>` token in a dim expression with its aliased value
 /// (e.g. `self.dt_rank + self.d_state` → `dt_rank + d_state` when both attrs
 /// were assigned from same-named identifiers). Tokens whose attribute has no
-/// alias are left untouched.
-fn normalize_dim(dim: &str, aliases: &HashMap<String, String>) -> String {
+/// alias (in the class enclosing `byte`) are left untouched.
+fn normalize_dim(dim: &str, aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>, byte: usize) -> String {
     if !dim.contains("self.") {
         return dim.to_string();
     }
@@ -293,7 +324,7 @@ fn normalize_dim(dim: &str, aliases: &HashMap<String, String>) -> String {
             while j < dim.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
-            if let Some(val) = aliases.get(&dim[attr_start..j]) {
+            if let Some(val) = resolve_alias_at(aliases, &dim[attr_start..j], byte) {
                 result.push_str(val);
                 i = j;
                 continue;
@@ -324,11 +355,12 @@ impl<'a> ShapeCtx<'a> {
     /// Used when an inline expression (e.g. a nested call) produces a shape
     /// but has no variable binding of its own. The helpers in
     /// `known_functions` look up arguments by name in `shapes`, so we need
-    /// a name.
-    fn bind_synthetic(&mut self, shape: Vec<String>, scope_idx: usize) -> String {
+    /// a name. `byte` is the originating expression's byte position, used to
+    /// resolve `self.<attr>` aliases against the enclosing class.
+    fn bind_synthetic(&mut self, shape: Vec<String>, scope_idx: usize, byte: usize) -> String {
         let name = format!("__synth_{}", self.synthetic_counter);
         self.synthetic_counter += 1;
-        let shape = normalize_shape(shape, self.aliases);
+        let shape = normalize_shape(shape, self.aliases, byte);
         self.synthetics
             .entry(scope_idx)
             .or_default()
@@ -338,14 +370,17 @@ impl<'a> ShapeCtx<'a> {
 
     /// Bind a user-visible shape and, when `line` is `Some` (a non-annotated
     /// assignment), record it for per-reassignment inlay hints (issue #28).
+    /// `byte` is the assignment's byte position, used to resolve
+    /// `self.<attr>` aliases against the enclosing class.
     fn record_binding(
         &mut self,
         scope_idx: usize,
         name: &str,
         shape: Vec<String>,
         line: Option<u32>,
+        byte: usize,
     ) {
-        let shape = normalize_shape(shape, self.aliases);
+        let shape = normalize_shape(shape, self.aliases, byte);
         if let Some(line) = line {
             self.assignment_shapes.push(AssignmentShape {
                 line,
@@ -716,6 +751,21 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         {
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
             let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+
+            // MultiheadAttention's real return is an `(output, weights)`
+            // tuple; `apply_layer_application` can't express that and
+            // always returns `Ok(None)` for it (tuple LHS is handled
+            // separately in `tuple_rhs_shapes`). A single-assignment call
+            // site (`out = self.attn(q, k, v)`) still wants *something* —
+            // bind the primary output, which has the query's shape (same
+            // rule as `tuple_rhs_shapes`'s `attn_out`).
+            if matches!(layer, LayerKind::MultiheadAttention { .. }) {
+                let CallArgument::Positional { value: query } = args.first()?.clone() else {
+                    return None;
+                };
+                return ctx.resolve_shape(&query, scope_idx);
+            }
+
             let CallArgument::Positional { value: input } = args.first()?.clone() else {
                 return None;
             };
@@ -760,7 +810,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         //     outer call as a method call on the result.
         if obj_node.kind() == "call" || obj_node.kind() == "attribute" {
             if let Some(receiver_shape) = shape_of_expression(obj_node, ctx) {
-                let receiver_name = ctx.bind_synthetic(receiver_shape, scope_idx);
+                let receiver_name =
+                    ctx.bind_synthetic(receiver_shape, scope_idx, obj_node.start_byte());
                 let args = extract_call_arguments(args_node, ctx.text).ok()?;
 
                 if let Some(known) = classify_method_call(&method_name) {
@@ -1060,7 +1111,8 @@ fn resolve_call_args(
                     let child_node = find_positional_arg_node(args_node, i)?;
                     let shape = shape_of_expression(child_node, ctx);
                     if let Some(shape) = shape {
-                        let synth_name = ctx.bind_synthetic(shape, scope_idx);
+                        let synth_name =
+                            ctx.bind_synthetic(shape, scope_idx, child_node.start_byte());
                         resolved.push(CallArgument::Positional {
                             value: synth_name,
                         });
@@ -1085,7 +1137,8 @@ fn resolve_call_args(
                     let value_node = kw_node.child_by_field_name("value")?;
                     let shape = shape_of_expression(value_node, ctx);
                     if let Some(shape) = shape {
-                        let synth_name = ctx.bind_synthetic(shape, scope_idx);
+                        let synth_name =
+                            ctx.bind_synthetic(shape, scope_idx, value_node.start_byte());
                         resolved.push(CallArgument::Keyword {
                             name,
                             value: synth_name,
@@ -1281,7 +1334,7 @@ fn propagate_calls(
     import_map: &HashMap<String, ImportPath>,
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
     scopes: &mut [FunctionShapeScope],
 ) -> Result<PropagateOutput, String> {
     let mut applications = Vec::new();
@@ -1401,6 +1454,7 @@ fn propagate_calls(
                                             &lhs_name,
                                             output,
                                             display_line,
+                                            call_byte,
                                         );
                                     }
                                     Ok(None) => {
@@ -1434,7 +1488,7 @@ fn propagate_calls(
         }
 
         if let Some(shape) = result {
-            ctx.record_binding(scope_idx, &lhs_name, shape, display_line);
+            ctx.record_binding(scope_idx, &lhs_name, shape, display_line, rhs_node.start_byte());
         } else if display_line.is_some() {
             // Non-annotated reassignment with an unshapeable RHS: the old
             // binding is stale now (issue #46). Annotated assignments keep
@@ -1593,7 +1647,9 @@ fn handle_augmented_assignment(
         _ => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Add),
     };
     match result {
-        Ok(Some(shape)) => ctx.record_binding(scope_idx, name, shape, display_line),
+        Ok(Some(shape)) => {
+            ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
+        }
         Ok(None) => {}
         Err(message) => ctx.errors.push(ShapeError {
             variable: name.to_string(),
@@ -1624,7 +1680,13 @@ fn handle_tuple_assignment(
     for (name, shape) in names.iter().zip(elem_shapes) {
         if let Some(name) = name {
             match shape {
-                Some(shape) => ctx.record_binding(scope_idx, name, shape, display_line),
+                Some(shape) => ctx.record_binding(
+                    scope_idx,
+                    name,
+                    shape,
+                    display_line,
+                    rhs_node.start_byte(),
+                ),
                 None => ctx.evict_binding(scope_idx, name),
             }
         }
@@ -1688,7 +1750,7 @@ fn tuple_rhs_shapes(
                     KnownFunction::TopK
                         | KnownFunction::Chunk
                         | KnownFunction::Unbind
-                        | KnownFunction::Split
+                        | KnownFunction::TorchSplit
                         | KnownFunction::KthValue
                         | KnownFunction::MedianDim
                 )
@@ -1944,9 +2006,9 @@ fn tuple_rhs_shapes(
 
             // `values, indices = torch.topk(x, 3)` / `torch.chunk(x, 3)` /
             // `torch.unbind(x)` / `torch.kthvalue(x, 2)` /
-            // `torch.median(x, dim=1)` / `torch.mode(x, dim=1)` — the
-            // qualified free-function forms of the method-call dispatch
-            // handled at the top of this arm.
+            // `torch.median(x, dim=1)` / `torch.mode(x, dim=1)` /
+            // `torch.split(x, 3, dim=0)` — the qualified free-function forms
+            // of the method-call dispatch handled at the top of this arm.
             if matches!(
                 known,
                 Some(
@@ -1955,6 +2017,7 @@ fn tuple_rhs_shapes(
                         | KnownFunction::Unbind
                         | KnownFunction::KthValue
                         | KnownFunction::MedianDim
+                        | KnownFunction::TorchSplit
                 )
             ) {
                 let args_node = rhs.child_by_field_name("arguments")?;
@@ -2089,18 +2152,24 @@ fn tuple_multi_output_shapes(
                 None
             }
         },
-        KnownFunction::Split => match compute_split_shapes(args, &ctx.scope_shapes(scope_idx)) {
-            Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
-            Ok(None) => None,
-            Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: String::new(),
-                    message,
-                    range: args_node.range(),
-                });
-                None
+        // Real torch semantics (chunk *size*, not section count) — covers
+        // both `torch.split(x, ...)` (free function) and `x.split(...)`
+        // (method, receiver prepended by the caller). `n_targets` lets the
+        // literal-size / symbolic-axis-dim case still bind a chunk list.
+        KnownFunction::TorchSplit => {
+            match compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), Some(n_targets)) {
+                Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
+                Ok(None) => None,
+                Err(message) => {
+                    ctx.errors.push(ShapeError {
+                        variable: String::new(),
+                        message,
+                        range: args_node.range(),
+                    });
+                    None
+                }
             }
-        },
+        }
         _ => None,
     }
 }
@@ -2498,7 +2567,7 @@ fn apply_inline_vmap_layer(
     let input_shape = ctx.resolve_shape(&input_name, scope_idx)?;
 
     let (peeled, batch_dim) = peel_batch_dim(&input_shape, in_axes).ok()?;
-    let synth = ctx.bind_synthetic(peeled, scope_idx);
+    let synth = ctx.bind_synthetic(peeled, scope_idx, range.start_byte);
     let application = LayerApplication {
         variable: String::new(),
         layer: "vmap".to_string(),
@@ -2612,7 +2681,7 @@ fn bind_and_substitute(
                     ));
                 }
             } else if let Some(existing) = binding.get(param_dim) {
-                if existing != arg_dim {
+                if !dims_canonically_equal(existing, arg_dim) {
                     return Err(format!(
                         "call to {}: dim '{}' cannot be both '{}' and '{}'",
                         target_name, param_dim, existing, arg_dim
@@ -2735,7 +2804,7 @@ fn apply_matmul_shape(
         let l = left_batch.len().checked_sub(k).map(|i| &left_batch[i]);
         let r = right_batch.len().checked_sub(k).map(|i| &right_batch[i]);
         match (l, r) {
-            (Some(l), Some(r)) if l == r => batch.push(l.clone()),
+            (Some(l), Some(r)) if dims_canonically_equal(l, r) => batch.push(l.clone()),
             (Some(l), Some(r)) if l == "1" => batch.push(r.clone()),
             (Some(l), Some(r)) if r == "1" => batch.push(l.clone()),
             (Some(l), Some(r)) => {
@@ -2756,7 +2825,7 @@ fn apply_matmul_shape(
         .expect("invariant: left.len() >= 2 checked above");
     let rhs_second_last = &right[right.len() - 2];
 
-    if lhs_last != rhs_second_last {
+    if !dims_canonically_equal(lhs_last, rhs_second_last) {
         return Err(format!(
             "matmul dimension mismatch: {} last dim {} != {} second-to-last dim {}",
             left_name, lhs_last, right_name, rhs_second_last
@@ -2802,7 +2871,7 @@ fn apply_elementwise_shape(
             (Some(a), None) => a.clone(),
             (None, Some(b)) => b.clone(),
             (Some(a), Some(b)) => {
-                if a == b || b == "1" {
+                if dims_canonically_equal(a, b) || b == "1" {
                     a.clone()
                 } else if a == "1" {
                     b.clone()
@@ -3094,24 +3163,63 @@ def f(x: Float[Array, "3 5"]):
         );
     }
 
+    /// A lone (single-entry, whole-file-range) scoped alias binding, for
+    /// tests that don't care about class scoping.
+    fn lone_alias(value: &str) -> Vec<ScopedSelfAttrAlias> {
+        vec![ScopedSelfAttrAlias {
+            class_start: 0,
+            class_end: usize::MAX,
+            value: value.to_string(),
+        }]
+    }
+
     #[test]
     fn test_normalize_dim_self_attr_alias() {
-        let mut aliases = HashMap::new();
-        aliases.insert("dt_rank".to_string(), "dt_rank".to_string());
-        aliases.insert("d_state".to_string(), "d_state".to_string());
+        let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
+        aliases.insert("dt_rank".to_string(), lone_alias("dt_rank"));
+        aliases.insert("d_state".to_string(), lone_alias("d_state"));
         // single token
-        assert_eq!(normalize_dim("self.dt_rank", &aliases), "dt_rank");
+        assert_eq!(normalize_dim("self.dt_rank", &aliases, 0), "dt_rank");
         // inside an expression, multiple tokens
         assert_eq!(
-            normalize_dim("self.dt_rank + self.d_state", &aliases),
+            normalize_dim("self.dt_rank + self.d_state", &aliases, 0),
             "dt_rank + d_state"
         );
         // unaliased self.attr is left untouched
-        assert_eq!(normalize_dim("self.unknown", &aliases), "self.unknown");
+        assert_eq!(normalize_dim("self.unknown", &aliases, 0), "self.unknown");
         // prefix collision: self.dt_rank must not match self.dt_rank2
-        assert_eq!(normalize_dim("self.dt_rank2", &aliases), "self.dt_rank2");
+        assert_eq!(normalize_dim("self.dt_rank2", &aliases, 0), "self.dt_rank2");
         // no self. → unchanged
-        assert_eq!(normalize_dim("seq_length", &aliases), "seq_length");
+        assert_eq!(normalize_dim("seq_length", &aliases, 0), "seq_length");
+    }
+
+    #[test]
+    fn test_normalize_dim_class_scoped_alias_no_cross_class_collision() {
+        // Two classes both alias `self.rank`, to different identifiers.
+        // `resolve_alias_at` must pick the binding whose class range
+        // contains the use-site byte, not silently take whichever was
+        // inserted last (the bug the file-global alias map had).
+        let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
+        aliases.insert(
+            "rank".to_string(),
+            vec![
+                ScopedSelfAttrAlias {
+                    class_start: 0,
+                    class_end: 100,
+                    value: "dt_rank".to_string(),
+                },
+                ScopedSelfAttrAlias {
+                    class_start: 100,
+                    class_end: 200,
+                    value: "other_rank".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(normalize_dim("self.rank", &aliases, 50), "dt_rank");
+        assert_eq!(normalize_dim("self.rank", &aliases, 150), "other_rank");
+        // Outside every class range and not a lone binding: left untouched.
+        assert_eq!(normalize_dim("self.rank", &aliases, 250), "self.rank");
     }
 
     #[test]

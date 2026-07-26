@@ -1037,25 +1037,12 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
 /// Canonicalize a dim expression for comparison: strip whitespace and sort
 /// commutative `+` terms / `*` factors so `a + b` matches `b+a`. Expressions
 /// with parens or non-commutative operators are only whitespace-stripped.
-fn canonical_dim(dim: &str) -> String {
-    let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
-    if stripped.contains(['(', '-', '/']) {
-        return stripped;
-    }
-    let mut terms: Vec<String> = stripped
-        .split('+')
-        .map(|term| {
-            let mut factors: Vec<&str> = term.split('*').collect();
-            factors.sort_unstable();
-            factors.join("*")
-        })
-        .collect();
-    terms.sort_unstable();
-    terms.join("+")
-}
-
+// `dims_match` used to duplicate a sort-only canonicalization in-place; it
+// now delegates to the shared `canonicalize_dim` (which also folds literal
+// arithmetic, e.g. `2*3*d` → `6*d`) so every dim-equality boundary in the
+// crate agrees on one canonical form.
 fn dims_match(a: &str, b: &str) -> bool {
-    canonical_dim(a) == canonical_dim(b)
+    crate::types::dims_canonically_equal(a, b)
 }
 
 /// A layer's expected dim comes from constructor-argument text, a different
