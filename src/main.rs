@@ -19,8 +19,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Parser, Tree};
 
 use ndim_lsp::{
-    LayerShapeAnalysis, ResolutionCache, ShapeError, analyze_layer_shapes, clear_resolution_cache,
-    new_resolution_cache,
+    LayerShapeAnalysis, ResolutionCache, ShapeError, ShapeErrorKind, analyze_layer_shapes,
+    clear_resolution_cache, new_resolution_cache,
 };
 
 /// Analysis plus the exact text/tree it was computed from, so hover and
@@ -45,8 +45,13 @@ pub struct Backend {
     /// Keyed on (import-path-segments, search-roots-fingerprint).
     /// Invalidated when workspace folders change.
     pub resolution_cache: Arc<ResolutionCache>,
-    /// Severity for published diagnostics, set from `initializationOptions`.
+    /// Severity for `ShapeErrorKind::Mismatch` diagnostics, set from
+    /// `initializationOptions.diagnostic_severity`.
     pub diagnostic_severity: RwLock<DiagnosticSeverity>,
+    /// Severity for `ShapeErrorKind::Approximation` diagnostics, set from
+    /// `initializationOptions.approximation_severity` (defaults to WARNING,
+    /// independent of `diagnostic_severity`).
+    pub approximation_severity: RwLock<DiagnosticSeverity>,
 }
 
 #[tower_lsp::async_trait]
@@ -63,7 +68,10 @@ impl LanguageServer for Backend {
         }
 
         if let Some(opts) = params.initialization_options.as_ref() {
-            *self.diagnostic_severity.write().await = parse_severity(opts);
+            *self.diagnostic_severity.write().await =
+                parse_severity(opts, "diagnostic_severity", DiagnosticSeverity::ERROR);
+            *self.approximation_severity.write().await =
+                parse_severity(opts, "approximation_severity", DiagnosticSeverity::WARNING);
         }
 
         Ok(InitializeResult {
@@ -344,13 +352,14 @@ impl Backend {
             return;
         };
 
-        let severity = *self.diagnostic_severity.read().await;
+        let mismatch_severity = *self.diagnostic_severity.read().await;
+        let approximation_severity = *self.approximation_severity.read().await;
         let diagnostics: Vec<Diagnostic> = cached
             .analysis
             .errors
             .iter()
             .cloned()
-            .map(|e| shape_error_to_diagnostic(e, severity))
+            .map(|e| shape_error_to_diagnostic(e, mismatch_severity, approximation_severity))
             .collect();
 
         self.client
@@ -585,24 +594,43 @@ fn line_lengths_in_range(text: &str, start: u32, end: u32) -> HashMap<u32, u32> 
         .collect()
 }
 
-/// Map an `initializationOptions` value to a diagnostic severity.
-/// Unknown / missing / malformed -> ERROR.
-fn parse_severity(opts: &serde_json::Value) -> DiagnosticSeverity {
+/// Map an `initializationOptions` value at `key` to a diagnostic severity.
+/// Unknown / missing / malformed -> `default`. Used for both
+/// `diagnostic_severity` (Mismatch errors, defaults to ERROR) and
+/// `approximation_severity` (Approximation errors, defaults to WARNING) —
+/// the two are independent settings, not one derived from the other.
+fn parse_severity(
+    opts: &serde_json::Value,
+    key: &str,
+    default: DiagnosticSeverity,
+) -> DiagnosticSeverity {
     match opts
-        .get("diagnostic_severity")
+        .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
+        Some("error") => DiagnosticSeverity::ERROR,
         Some("warning") => DiagnosticSeverity::WARNING,
         Some("information") => DiagnosticSeverity::INFORMATION,
         Some("hint") => DiagnosticSeverity::HINT,
-        // ponytail: unknown value falls back to ERROR (also covers "error")
-        _ => DiagnosticSeverity::ERROR,
+        _ => default,
     }
 }
 
-fn shape_error_to_diagnostic(error: ShapeError, severity: DiagnosticSeverity) -> Diagnostic {
+/// Resolve a `ShapeError` to a diagnostic, picking severity by `error.kind`:
+/// `Mismatch` uses `mismatch_severity` (`initializationOptions.diagnostic_severity`,
+/// defaults to ERROR); `Approximation` uses `approximation_severity`
+/// (`initializationOptions.approximation_severity`, defaults to WARNING).
+fn shape_error_to_diagnostic(
+    error: ShapeError,
+    mismatch_severity: DiagnosticSeverity,
+    approximation_severity: DiagnosticSeverity,
+) -> Diagnostic {
+    let severity = match error.kind {
+        ShapeErrorKind::Mismatch => mismatch_severity,
+        ShapeErrorKind::Approximation => approximation_severity,
+    };
     Diagnostic {
         range: ts_range_to_lsp_range(error.range),
         severity: Some(severity),
@@ -706,6 +734,7 @@ async fn main() {
         document_version: Default::default(),
         resolution_cache: new_resolution_cache(),
         diagnostic_severity: RwLock::new(DiagnosticSeverity::ERROR),
+        approximation_severity: RwLock::new(DiagnosticSeverity::WARNING),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -718,27 +747,91 @@ mod tests {
     #[test]
     fn parse_severity_maps_values() {
         use serde_json::json;
+        let key = "diagnostic_severity";
+        let default = DiagnosticSeverity::ERROR;
         assert_eq!(
-            parse_severity(&json!({"diagnostic_severity": "warning"})),
+            parse_severity(&json!({"diagnostic_severity": "warning"}), key, default),
             DiagnosticSeverity::WARNING
         );
         assert_eq!(
-            parse_severity(&json!({"diagnostic_severity": "ERROR"})),
+            parse_severity(&json!({"diagnostic_severity": "ERROR"}), key, default),
             DiagnosticSeverity::ERROR
         );
         assert_eq!(
-            parse_severity(&json!({"diagnostic_severity": "information"})),
+            parse_severity(&json!({"diagnostic_severity": "information"}), key, default),
             DiagnosticSeverity::INFORMATION
         );
         assert_eq!(
-            parse_severity(&json!({"diagnostic_severity": "hint"})),
+            parse_severity(&json!({"diagnostic_severity": "hint"}), key, default),
             DiagnosticSeverity::HINT
         );
-        assert_eq!(parse_severity(&json!({})), DiagnosticSeverity::ERROR);
+        assert_eq!(parse_severity(&json!({}), key, default), DiagnosticSeverity::ERROR);
         assert_eq!(
-            parse_severity(&json!({"diagnostic_severity": "garbage"})),
+            parse_severity(&json!({"diagnostic_severity": "garbage"}), key, default),
             DiagnosticSeverity::ERROR
         );
+    }
+
+    #[test]
+    fn parse_severity_reads_approximation_key_with_its_own_default() {
+        use serde_json::json;
+        let key = "approximation_severity";
+        let default = DiagnosticSeverity::WARNING;
+        // Missing/malformed falls back to the *approximation* default
+        // (WARNING), independent of the mismatch default (ERROR).
+        assert_eq!(parse_severity(&json!({}), key, default), DiagnosticSeverity::WARNING);
+        assert_eq!(
+            parse_severity(&json!({"approximation_severity": "hint"}), key, default),
+            DiagnosticSeverity::HINT
+        );
+        assert_eq!(
+            parse_severity(&json!({"approximation_severity": "error"}), key, default),
+            DiagnosticSeverity::ERROR
+        );
+        // A `diagnostic_severity` key present alongside doesn't leak in.
+        assert_eq!(
+            parse_severity(
+                &json!({"diagnostic_severity": "error", "approximation_severity": "information"}),
+                key,
+                default
+            ),
+            DiagnosticSeverity::INFORMATION
+        );
+    }
+
+    #[test]
+    fn shape_error_to_diagnostic_uses_kind_specific_severity() {
+        let range = tree_sitter::Range {
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 1),
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let mismatch = ShapeError::mismatch("x", "bad shape", range);
+        let approximation = ShapeError::approximation("y", "approx shape", range);
+
+        let diag = shape_error_to_diagnostic(
+            mismatch,
+            DiagnosticSeverity::ERROR,
+            DiagnosticSeverity::WARNING,
+        );
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+
+        let diag = shape_error_to_diagnostic(
+            approximation,
+            DiagnosticSeverity::ERROR,
+            DiagnosticSeverity::WARNING,
+        );
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+
+        // Approximation severity is independent of a custom mismatch severity.
+        let approximation2 = ShapeError::approximation("z", "approx shape", range);
+        let diag = shape_error_to_diagnostic(
+            approximation2,
+            DiagnosticSeverity::HINT,
+            DiagnosticSeverity::INFORMATION,
+        );
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::INFORMATION));
     }
 
     #[test]

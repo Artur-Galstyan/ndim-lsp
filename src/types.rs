@@ -677,11 +677,53 @@ pub struct ScopedSelfAttrAlias {
     pub value: String,
 }
 
+/// Classifies a `ShapeError` by how confident the rule that raised it is.
+///
+/// `Mismatch`: a genuine shape contradiction under the rule's modeled
+/// semantics. `Approximation`: raised by a rule that is documented (see
+/// `llm.txt`/`TO_IMPLEMENT.md`) as an approximation of the real op, so the
+/// "error" may be a false positive rather than an actual bug in the analyzed
+/// code. Drives diagnostic severity in `main.rs`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ShapeErrorKind {
+    Mismatch,
+    Approximation,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ShapeError {
     pub variable: String,
     pub message: String,
     pub range: Range,
+    pub kind: ShapeErrorKind,
+}
+
+impl ShapeError {
+    /// A genuine shape contradiction under the rule's modeled semantics.
+    pub fn mismatch(variable: impl Into<String>, message: impl Into<String>, range: Range) -> Self {
+        ShapeError {
+            variable: variable.into(),
+            message: message.into(),
+            range,
+            kind: ShapeErrorKind::Mismatch,
+        }
+    }
+
+    /// Raised by a rule that is a documented approximation of the real op
+    /// (e.g. `jax.lax.dot_general` modeled as matmul), so the error may be a
+    /// false positive rather than an actual bug in the analyzed code.
+    pub fn approximation(
+        variable: impl Into<String>,
+        message: impl Into<String>,
+        range: Range,
+    ) -> Self {
+        ShapeError {
+            variable: variable.into(),
+            message: message.into(),
+            range,
+            kind: ShapeErrorKind::Approximation,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
