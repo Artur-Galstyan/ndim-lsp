@@ -281,6 +281,31 @@ pub enum LayerKind {
         in_size: String,
         out_size: String,
     },
+    /// `torch.nn.Sequential` / `equinox.nn.Sequential`: a composite container
+    /// wrapping an ordered list of child layers (torch: variadic positional
+    /// ctor args; equinox: a single list-literal positional arg — both forms
+    /// are unwrapped into `children` at classification time). Application
+    /// threads the input shape through each child's own apply rule in order,
+    /// via the shared `apply_layer_kind` helper; a mid-chain error reports as
+    /// that child's own error message, and an unknown (`Ok(None)`) child
+    /// makes the whole chain unknown. Classification itself is honest: if any
+    /// ctor argument isn't itself a resolvable layer-constructor call
+    /// (arbitrary callable, `*args` unpacking, etc.), the whole `Sequential`
+    /// is left unclassified.
+    Sequential { children: Vec<LayerKind> },
+    /// `einops.layers.torch.Rearrange` / `Reduce` (and the flax equivalents)
+    /// — the layer-object form of the free-function einops pattern algebra.
+    /// `name` is `"Rearrange"`/`"Reduce"` (cosmetic only: the reduction op
+    /// itself isn't shape-relevant, same as the free-function form).
+    /// `pattern` is the raw (still-quoted) ctor pattern string; `kwargs` are
+    /// axis-length keyword bindings from the ctor (e.g. `h=14`). Both are fed
+    /// verbatim into `known_functions::apply_known_einops`'s existing pattern
+    /// engine at apply time.
+    EinopsPattern {
+        name: String,
+        pattern: String,
+        kwargs: HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]

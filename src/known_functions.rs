@@ -1002,7 +1002,7 @@ fn parse_einops_groups(side: &str) -> Option<Vec<Vec<String>>> {
 /// named groups are accounted for, and passes them through unchanged and
 /// in order on the output side. Ellipsis nested inside a composite group
 /// (e.g. `(... h)`), or appearing on only one side, isn't modelled.
-fn apply_known_einops(
+pub(crate) fn apply_known_einops(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
