@@ -162,8 +162,17 @@ pub enum LayerKind {
     /// torch.nn.MultiheadAttention — returns an (output, weights) tuple:
     /// output has the query's shape, weights are (..., L, S) with L/S the
     /// query/key sequence lengths. Only tuple-unpacking LHS is modelled.
+    ///
+    /// `feature_dim` is the ctor's per-token model dimension: `embed_dim`
+    /// for `torch.nn.MultiheadAttention(embed_dim, num_heads)`, or
+    /// `query_size` for `equinox.nn.MultiheadAttention(num_heads,
+    /// query_size, ...)` — equinox's real positional order is reversed and
+    /// uses a different name, so `classify_layer_call` must branch on the
+    /// resolved module path rather than reusing one binding key for both
+    /// frameworks (previously it always read torch's `embed_dim` key, so
+    /// equinox ctors were silently unclassified/misbound).
     MultiheadAttention {
-        embed_dim: String,
+        feature_dim: String,
     },
     /// Index lookup table: appends `embedding_size` to the input shape
     /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
@@ -172,6 +181,105 @@ pub enum LayerKind {
     },
     ShapePreserving {
         name: String,
+    },
+    /// torch.nn.Flatten — collapses dims `[start_dim, end_dim]` (Python
+    /// negative indices resolved against the input rank at apply time) into
+    /// a single dim: product of literal ints when all concrete, otherwise a
+    /// symbolic `d0*d1*...` string.
+    Flatten {
+        start_dim: String,
+        end_dim: String,
+    },
+    /// torch.nn.Unflatten(dim, sizes) — expands `dim` into the components of
+    /// `sizes` (raw ctor tuple/list text, split at apply time).
+    Unflatten {
+        dim: String,
+        sizes: String,
+    },
+    /// torch.nn.Upsample — scales the trailing spatial dims (all dims after
+    /// the leading batch+channel dims, determined at apply time from the
+    /// input rank since `Upsample` itself is rank-agnostic) by
+    /// `scale_factor`, or sets them directly to `size`. Exactly one of the
+    /// two is expected to be usable; anything else is treated as unknown
+    /// (`Ok(None)`).
+    Upsample {
+        scale_factor: Option<String>,
+        size: Option<String>,
+    },
+    /// ConvTranspose1d/2d/3d (torch + equinox): inverse of the conv output
+    /// formula: `out = (in-1)*stride - 2*padding + kernel`. Channels-first
+    /// layout, same convention as `Conv1d`/`Conv2d`/`Conv3d`. `output_padding`
+    /// and `dilation` are not modelled (assumed 0 / 1).
+    ConvTranspose {
+        spatial_rank: usize,
+        in_channels: String,
+        out_channels: String,
+        kernel_size: String,
+        stride: String,
+        padding: String,
+    },
+    /// torch.nn.RNN/LSTM/GRU full-sequence modules. Models only the primary
+    /// output tensor (last dim replaced by `hidden_size`, all other dims
+    /// preserved); the true return value is an `(output, final_state)`
+    /// tuple, which this analyzer can't express without tuple-unpacking
+    /// support in the layer-application pipeline (that lives in
+    /// `analysis.rs`, outside this module's scope), so direct/non-tuple
+    /// application is an approximation. `batch_first` doesn't change the
+    /// formula: the feature dim is always trailing regardless of (seq,
+    /// batch) ordering, so it isn't tracked. `bidirectional`/`num_layers`
+    /// are not modelled (hidden_size is used as-is).
+    Rnn {
+        name: String,
+        input_size: String,
+        hidden_size: String,
+    },
+    /// torch.nn.RNNCell/GRUCell/LSTMCell and equinox.nn.LSTMCell/GRUCell —
+    /// single-step cells. RNNCell/GRUCell genuinely return one tensor of
+    /// shape `hidden_size`; LSTMCell returns `(h, c)` — modelled as just the
+    /// `h` component (same shape as GRUCell's output), an approximation for
+    /// the same tuple-output reason as `Rnn`.
+    RnnCell {
+        name: String,
+        input_size: String,
+        hidden_size: String,
+    },
+    /// torch.nn.PixelShuffle(upscale_factor): `(*, C*r^2, H, W) -> (*, C, H*r, W*r)`.
+    PixelShuffle {
+        upscale_factor: String,
+    },
+    /// torch.nn.PixelUnshuffle(downscale_factor): `(*, C, H*r, W*r) -> (*, C*r^2, H, W)`.
+    PixelUnshuffle {
+        downscale_factor: String,
+    },
+    /// Constant/Zero/Reflection/Replication Pad Nd: pads the trailing
+    /// `spatial_rank` dims. `padding` is the raw ctor arg text: a single int
+    /// means uniform padding on every side of every spatial dim; an explicit
+    /// `2*spatial_rank`-length tuple follows torch's reverse-axis pad-pair
+    /// convention (last spatial dim's (left,right) first).
+    Pad {
+        name: String,
+        spatial_rank: usize,
+        padding: String,
+    },
+    /// torch.nn.Bilinear(in1_features, in2_features, out_features): this
+    /// analyzer only tracks the first positional input per layer call (see
+    /// `extract_layer_applications`), so this only validates/transforms
+    /// against `x1`; `x2` and its broadcasting are not modelled.
+    Bilinear {
+        in1_features: String,
+        in2_features: String,
+        out_features: String,
+    },
+    /// torch.nn.CosineSimilarity(dim): removes the reduced axis from `x1`'s
+    /// shape (same single-tracked-input limitation as `Bilinear`).
+    CosineSimilarity {
+        dim: String,
+    },
+    /// equinox.nn.MLP: last-dim transform `in_size -> out_size`, same rule as
+    /// `Linear`.
+    Mlp {
+        in_size: String,
+        out_size: String,
     },
 }
 
