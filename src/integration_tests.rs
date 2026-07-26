@@ -6436,6 +6436,120 @@ def f(a: Float[Array, "3 5"], b: Float[Array, "5 2"]):
     }
 }
 
+#[cfg(test)]
+mod scan_tuple_carry_corpus_mirror_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    /// End-to-end mirror of corpus/lax_scan_ema.py's `running_ema`: a
+    /// homogeneous `(mean, var)` tuple carry threaded through
+    /// `jax.lax.scan` via an aliased variable (`init = (mean0, var0)`),
+    /// then re-destructured from the flat scan-result binding
+    /// (`final_mean, final_var = final_carry`). `ema_step`'s internal body
+    /// (`mean, var = carry`) stays unshaped — the body function's own
+    /// scope has no annotation for `carry` and isn't seeded from the scan
+    /// call site (a structural gap, not fixed here).
+    #[test]
+    fn test_running_ema_tuple_carry_mirror() {
+        let code = "\
+import jax
+import jax.numpy as jnp
+
+def ema_step(carry, x: Float[Array, \"features\"], decay: float = 0.9):
+    mean, var = carry
+    delta = x - mean
+    new_mean = mean + (1 - decay) * delta
+    new_var = decay * var + (1 - decay) * delta * delta
+    return (new_mean, new_var), new_mean
+
+def running_ema(
+    xs: Float[Array, \"seq features\"],
+    mean0: Float[Array, \"features\"],
+    var0: Float[Array, \"features\"],
+):
+    init = (mean0, var0)
+    final_carry, means = jax.lax.scan(ema_step, init, xs)
+    final_mean, final_var = final_carry
+";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "init"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
+        // `means` (ys) needs per-step body-output tracing — unmodelled.
+        assert_eq!(find_shape(&analysis, "means"), None);
+        // Un-annotated, un-seeded carry inside the body stays dark.
+        assert_eq!(find_shape(&analysis, "mean"), None);
+    }
+
+    /// End-to-end mirror of corpus/eqx_lstm_gru_scan.py's `LSTMEncoder`:
+    /// an inline `(h0, c0)` tuple carry through `jax.lax.scan`, plus the
+    /// direct single-step `self.lstm(x, (h0, c0))` call outside the scan
+    /// (already worked before this change). The scan body's internal
+    /// `h, c = carry` stays unshaped for the same structural reason as
+    /// `ema_step` above.
+    #[test]
+    fn test_lstm_encoder_tuple_carry_mirror() {
+        let code = "\
+import jax
+import equinox as eqx
+
+class LSTMEncoder(eqx.Module):
+    encoder: eqx.nn.MLP
+    lstm: eqx.nn.LSTMCell
+
+    def __init__(self, in_size, hidden, key):
+        self.encoder = eqx.nn.MLP(in_size, hidden, width_size=hidden, depth=2, key=key)
+        self.lstm = eqx.nn.LSTMCell(hidden, hidden, key=key)
+
+    def __call__(
+        self,
+        xs: Float[Array, \"seq in_size\"],
+        h0: Float[Array, \"hidden\"],
+        c0: Float[Array, \"hidden\"],
+    ):
+        encoded = jax.vmap(self.encoder)(xs)
+        step_h = self.lstm(encoded[0], (h0, c0))
+
+        def body(carry, x):
+            h, c = carry
+            h_new = self.lstm(x, (h, c))
+            return (h_new, c), h_new
+
+        carry_final, hs = jax.lax.scan(body, (h0, c0), encoded)
+        h_final, c_final = carry_final
+";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "step_h"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "carry_final"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "c_final"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "hs"), None);
+        // Un-annotated, un-seeded carry inside the nested `body` stays dark.
+        assert_eq!(find_shape(&analysis, "h"), None);
+    }
+}
+
 /// Corpus-driven shape-coverage harness. Runs the analyzer over real model
 /// files in `corpus/` and ranks the assignments it cannot shape ("dark
 /// spots") by frequency, so the highest-impact gaps prioritize themselves.
@@ -6521,7 +6635,7 @@ mod coverage_harness {
 
         // Regression floor: coverage shouldn't silently drop. Tighten as gaps close.
         assert!(
-            pct(shaped, total) >= 75.0,
+            pct(shaped, total) >= 85.0,
             "corpus coverage regressed to {:.0}%",
             pct(shaped, total)
         );
@@ -6817,6 +6931,52 @@ mod literal_binop_scan_method_tests {
     }
 
     #[test]
+    fn test_scan_inline_tuple_carry_homogeneous_shape() {
+        // `(h0, c0)` inline at the call site — both same shape, so the
+        // carry is representable as that one shape (`shape_of_tuple`).
+        let code = "import jax\ndef f(h0: Float[Array, \"hidden\"], c0: Float[Array, \"hidden\"], xs: Float[Array, \"seq hidden\"]):\n    def body(carry, x):\n        return carry, x\n    final_carry, ys = jax.lax.scan(body, (h0, c0), xs)";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["hidden"])));
+    }
+
+    #[test]
+    fn test_scan_aliased_tuple_literal_carry() {
+        // `init = (mean0, var0)` bound earlier, then passed by name —
+        // resolves the same way as the inline form since `init`'s own
+        // assignment already stored the homogeneous shape.
+        let code = "import jax.numpy as jnp\nimport jax\ndef f(xs: Float[Array, \"seq features\"], mean0: Float[Array, \"features\"], var0: Float[Array, \"features\"]):\n    def step(carry, x):\n        return carry, x\n    init = (mean0, var0)\n    final_carry, means = jax.lax.scan(step, init, xs)\n    final_mean, final_var = final_carry";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "init"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "means"), None);
+    }
+
+    #[test]
+    fn test_scan_heterogeneous_tuple_carry_stays_unshaped() {
+        // `(a, b)` with DIFFERENT shapes isn't representable as one shape —
+        // must stay `None`, not silently pick one element's shape.
+        let code = "import jax\ndef f(a: Float[Array, \"m\"], b: Float[Array, \"n\"], xs: Float[Array, \"seq k\"]):\n    def body(carry, x):\n        return carry, x\n    final_carry, ys = jax.lax.scan(body, (a, b), xs)";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "final_carry"), None);
+    }
+
+    #[test]
+    fn test_rnn_cell_tuple_lhs_binds_both_hidden_sized() {
+        let code = "import equinox as eqx\nclass M:\n    def __init__(self, key):\n        self.lstm = eqx.nn.LSTMCell(3, 5, key=key)\n\n    def __call__(self, x: Float[Array, \"in_size\"], h0: Float[Array, \"hidden\"], c0: Float[Array, \"hidden\"]):\n        h, c = self.lstm(x, (h0, c0))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["5"])));
+    }
+
+    #[test]
     fn test_self_method_call_propagates_return_shape() {
         let code = "class M:\n    def step(self, h: Float[Array, \"hidden\"], x: Float[Array, \"features\"]) -> Float[Array, \"hidden\"]:\n        return h\n\n    def run(self, a: Float[Array, \"hidden\"], b: Float[Array, \"features\"]):\n        out = self.step(a, b)";
         let analysis = analyze(code);
@@ -6832,6 +6992,74 @@ mod literal_binop_scan_method_tests {
 
         assert_eq!(analysis.errors.len(), 1);
         assert!(analysis.errors[0].message.contains("expected rank 1"));
+    }
+
+    #[test]
+    fn test_self_method_call_traces_return_without_annotation() {
+        // `forward` has no `-> ReturnType` annotation — its return shape is
+        // traced from the bare `return logits` statement using `forward`'s
+        // own already-computed body shapes (methods are analyzed in one
+        // global source-order pass, so `forward`, defined first, has
+        // already had `logits` shaped by the time `loss` calls it).
+        let code = "import torch.nn as nn\nclass M:\n    def __init__(self, in_features, hidden, n_classes):\n        self.fc1 = nn.Linear(in_features, hidden)\n        self.fc2 = nn.Linear(hidden, n_classes)\n\n    def forward(self, x: Float[Array, \"batch in_features\"]):\n        h = self.fc1(x)\n        logits = self.fc2(h)\n        return logits\n\n    def loss(self, x: Float[Array, \"batch in_features\"]):\n        out = self.forward(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "logits"), Some(&shape(&["batch", "n_classes"])));
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["batch", "n_classes"])));
+    }
+
+    #[test]
+    fn test_self_method_call_traced_return_substitutes_dims() {
+        // Same as above, but the caller passes a DIFFERENT batch dim name —
+        // confirms real substitution, not just a name coincidence.
+        let code = "import torch.nn as nn\nclass M:\n    def __init__(self, in_features, hidden):\n        self.fc1 = nn.Linear(in_features, hidden)\n\n    def forward(self, x: Float[Array, \"batch in_features\"]):\n        h = self.fc1(x)\n        return h\n\n    def run(self, y: Float[Array, \"n in_features\"]):\n        out = self.forward(y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["n", "hidden"])));
+    }
+
+    #[test]
+    fn test_self_method_call_non_identifier_return_not_traced() {
+        // `return h + 1` isn't a bare identifier — v1 doesn't trace inline
+        // expressions, so the call stays unshaped rather than guessing.
+        let code = "class M:\n    def forward(self, h: Float[Array, \"d\"]):\n        return h + 1\n\n    def run(self, a: Float[Array, \"d\"]):\n        out = self.forward(a)";
+        let analysis = analyze(code);
+
+        assert_eq!(find_shape(&analysis, "out"), None);
+    }
+
+    #[test]
+    fn test_chained_reshape_neg_one_then_astype_with_known_receiver() {
+        // Mirrors corpus/scope_soup.py:31's `h.reshape(-1).astype(jnp.float32)`
+        // chain, but with a receiver whose shape IS known — confirms the
+        // chain itself (single `-1` reshape + `.astype`) resolves fine, so
+        // the corpus dark spot is solely about the receiver's shape being
+        // unknown (an un-annotated nested-closure param), not an
+        // arg-parsing or chained-receiver gap in `reshape`/`astype`.
+        let code = "import jax.numpy as jnp\ndef f(h: Float[Array, \"6 4\"]):\n    y = h.reshape(-1).astype(jnp.float32)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["24"])));
+    }
+
+    #[test]
+    fn test_nested_closure_call_with_annotated_param_resolves() {
+        // A locally-defined (nested) function called by bare name, with its
+        // OWN param annotated — resolves via the same `apply_user_function`
+        // path as a top-level helper or a `self.<method>` call. Confirms
+        // nested-function scopes ARE reachable by call resolution; the
+        // corpus/scope_soup.py `inner(h)` dark spot (item 5) is instead
+        // because `inner`'s param has NO annotation and isn't seeded from
+        // this call site (same structural gap as the un-annotated `scan`/
+        // cell body params in items 2-3).
+        let code = "def outer(x: Float[Array, \"6 4\"]):\n    def inner(h: Float[Array, \"6 4\"]):\n        y = h.reshape(-1)\n        return y\n    out = inner(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["24"])));
     }
 }
 

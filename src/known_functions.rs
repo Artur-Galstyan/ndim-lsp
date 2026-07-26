@@ -250,6 +250,16 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "softmax" | "log_softmax" | "normalize" => Some(KnownFunction::Copy),
             "one_hot" => Some(KnownFunction::OneHot),
             "embedding" => Some(KnownFunction::FunctionalEmbedding),
+            // Full activation family: all shape-preserving (elementwise),
+            // same rule as `softmax`/`log_softmax`/`normalize` above.
+            "relu" | "relu6" | "gelu" | "silu" | "sigmoid" | "tanh" | "softplus"
+            | "softsign" | "selu" | "celu" | "elu" | "leaky_relu" | "hardtanh"
+            | "hardswish" | "hardsigmoid" | "mish" => Some(KnownFunction::Copy),
+            // Dropout family: shape-preserving (a no-op at inference / same
+            // rule as `torch.nn.Dropout*` layers).
+            "dropout" | "dropout2d" | "dropout3d" => Some(KnownFunction::Copy),
+            // `glu` halves a dim rather than preserving shape.
+            "glu" => Some(KnownFunction::FunctionalGlu),
             _ => None,
         };
     }
@@ -869,6 +879,7 @@ pub fn apply_known_function(
             let _ = compute_torch_split_shapes(args, shapes, None)?;
             Ok(None)
         }
+        KnownFunction::FunctionalGlu => apply_known_functional_glu(args, shapes),
         KnownFunction::FlaxPool => apply_known_flax_pool(args, shapes),
         KnownFunction::EinopsRearrange | KnownFunction::EinopsReduce
         | KnownFunction::EinopsRepeat => apply_known_einops(args, shapes),
@@ -4966,6 +4977,40 @@ fn apply_known_functional_embedding(
     Ok(Some(output))
 }
 
+/// `torch.nn.functional.glu(input, dim=-1)` — splits `input` in half along
+/// `dim` and gates one half with the other (`a * sigmoid(b)`); the halved
+/// dim is the only shape change. Same numeric/factor-cancellation/opaque
+/// naming convention as `compute_split_shapes`'s literal-`N` case.
+fn apply_known_functional_glu(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.is_empty() {
+        return Err("glu requires rank >= 1 input".to_string());
+    }
+    let rank = input_shape.len();
+    let axis = normalize_axis(axis_arg(args, -1), rank, "glu")?;
+
+    let axis_dim = &input_shape[axis];
+    let half_dim = if let Ok(axis_size) = axis_dim.parse::<usize>() {
+        if axis_size % 2 != 0 {
+            return Err(format!("glu requires an even-sized dim, got {}", axis_size));
+        }
+        (axis_size / 2).to_string()
+    } else if let Some(simplified) = cancel_product_factor(axis_dim, 2) {
+        simplified
+    } else {
+        format!("glu({})", axis_dim)
+    };
+
+    let mut output = input_shape.clone();
+    output[axis] = half_dim;
+    Ok(Some(output))
+}
+
 // ── torch.nn.utils.rnn ───────────────────────────────────────────────────
 
 /// `torch.nn.utils.rnn.pad_sequence(sequences, batch_first=False, ...)` —
@@ -8678,10 +8723,110 @@ mod known_function_tests {
         ["torch", "nn", "functional", "pad"],
         Some(KnownFunction::Pad)
     );
+    // Was a locking test for an unclassified gap (`F.relu` fell through to
+    // `None`); the full activation family is now classified as
+    // shape-preserving (`KnownFunction::Copy`), same rule as
+    // `softmax`/`log_softmax`/`normalize` right above.
     known_case!(
-        torch_nn_functional_relu_not_classified,
+        torch_nn_functional_relu_classified_shape_preserving,
         ["torch", "nn", "functional", "relu"],
-        None
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_gelu_classified_shape_preserving,
+        ["torch", "nn", "functional", "gelu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_silu_classified_shape_preserving,
+        ["torch", "nn", "functional", "silu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_sigmoid_classified_shape_preserving,
+        ["torch", "nn", "functional", "sigmoid"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_tanh_classified_shape_preserving,
+        ["torch", "nn", "functional", "tanh"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_softplus_classified_shape_preserving,
+        ["torch", "nn", "functional", "softplus"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_softsign_classified_shape_preserving,
+        ["torch", "nn", "functional", "softsign"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_selu_classified_shape_preserving,
+        ["torch", "nn", "functional", "selu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_celu_classified_shape_preserving,
+        ["torch", "nn", "functional", "celu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_elu_classified_shape_preserving,
+        ["torch", "nn", "functional", "elu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_leaky_relu_classified_shape_preserving,
+        ["torch", "nn", "functional", "leaky_relu"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_hardtanh_classified_shape_preserving,
+        ["torch", "nn", "functional", "hardtanh"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_hardswish_classified_shape_preserving,
+        ["torch", "nn", "functional", "hardswish"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_hardsigmoid_classified_shape_preserving,
+        ["torch", "nn", "functional", "hardsigmoid"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_mish_classified_shape_preserving,
+        ["torch", "nn", "functional", "mish"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_relu6_classified_shape_preserving,
+        ["torch", "nn", "functional", "relu6"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_dropout_classified_shape_preserving,
+        ["torch", "nn", "functional", "dropout"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_dropout2d_classified_shape_preserving,
+        ["torch", "nn", "functional", "dropout2d"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_nn_functional_dropout3d_classified_shape_preserving,
+        ["torch", "nn", "functional", "dropout3d"],
+        Some(KnownFunction::Copy)
+    );
+    // `glu` halves a dim rather than preserving shape — not `Copy`.
+    known_case!(
+        torch_nn_functional_glu_classified,
+        ["torch", "nn", "functional", "glu"],
+        Some(KnownFunction::FunctionalGlu)
     );
     known_case!(
         torch_nn_functional_unknown_not_classified,
@@ -9035,10 +9180,10 @@ mod known_function_tests {
         Some(KnownFunction::Pad)
     );
     alias_case!(
-        alias_torch_nn_functional_imported_as_f_relu_not_classified,
+        alias_torch_nn_functional_imported_as_f_relu_classified_shape_preserving,
         "import torch.nn.functional as F",
         "F.relu",
-        None
+        Some(KnownFunction::Copy)
     );
 
     // ── jax.lax higher-order / structured op classification ──
@@ -10670,6 +10815,56 @@ mod method_call_tests {
             apply_known_function(&KnownFunction::FunctionalEmbedding, &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["batch", "seq", "64"])));
+    }
+
+    #[test]
+    fn test_apply_functional_glu_numeric_last_axis() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "16"]))]);
+        let args = vec![pos("x")];
+
+        let output = apply_known_function(&KnownFunction::FunctionalGlu, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["8", "8"])));
+    }
+
+    #[test]
+    fn test_apply_functional_glu_explicit_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "10"]))]);
+        let args = vec![pos("x"), kw("dim", "0")];
+
+        let output = apply_known_function(&KnownFunction::FunctionalGlu, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["2", "10"])));
+    }
+
+    #[test]
+    fn test_apply_functional_glu_symbolic_factor_cancels() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "d_model * 2"]))]);
+        let args = vec![pos("x")];
+
+        let output = apply_known_function(&KnownFunction::FunctionalGlu, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "d_model"])));
+    }
+
+    #[test]
+    fn test_apply_functional_glu_opaque_symbolic_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "hidden"]))]);
+        let args = vec![pos("x")];
+
+        let output = apply_known_function(&KnownFunction::FunctionalGlu, &args, &shapes).unwrap();
+
+        assert_eq!(output, Some(shape(&["batch", "glu(hidden)"])));
+    }
+
+    #[test]
+    fn test_apply_functional_glu_odd_numeric_dim_errors() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "5"]))]);
+        let args = vec![pos("x")];
+
+        let err = apply_known_function(&KnownFunction::FunctionalGlu, &args, &shapes).unwrap_err();
+
+        assert!(err.contains("even"));
     }
 
     #[test]

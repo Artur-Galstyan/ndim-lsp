@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser};
 
 use crate::known_functions::{
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
@@ -446,7 +446,31 @@ fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         }
         "subscript" => shape_of_subscript(node, ctx),
         "binary_operator" => shape_of_binary_operator(node, ctx),
+        "tuple" => shape_of_tuple(node, ctx),
         _ => None,
+    }
+}
+
+/// A bare tuple literal (e.g. `(mean0, var0)`, whether inline in a call's
+/// argument list or the RHS of a plain single-name assignment like
+/// `init = (mean0, var0)`). Representable as a single `Vec<String>` shape
+/// only when every element resolves to the *same* shape — the common case
+/// for a homogeneous `scan` carry (e.g. per-feature EMA `(mean, var)`
+/// stats, or an LSTM `(h, c)` pair with equal hidden sizes). Mirrors the
+/// existing approximation for RNN `(h, c)` state in `tuple_rhs_shapes`'s
+/// `Rnn`/`RnnCell` arms, where every nested name shares one shape.
+/// Heterogeneous tuples aren't representable this way and stay `Ok(None)`.
+fn shape_of_tuple(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let mut elems = Vec::with_capacity(node.named_child_count());
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i as u32)?;
+        elems.push(shape_of_expression(child, ctx)?);
+    }
+    let (first, rest) = elems.split_first()?;
+    if rest.iter().all(|s| s == first) {
+        Some(first.clone())
+    } else {
+        None
     }
 }
 
@@ -1027,7 +1051,10 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 3. User-defined function propagation. `self.<method>(...)` resolves
     // to the method's function scope by bare name — methods are function
-    // definitions like any other.
+    // definitions like any other. When the callee has no `-> ReturnType`
+    // annotation (e.g. a typical `forward(self, x: Float[Array, "..."])`),
+    // `apply_user_function` falls back to tracing a bare `return <name>`
+    // statement against the callee's own already-computed body shapes.
     let user_target = target.strip_prefix("self.").unwrap_or(&target);
     if !user_target.contains('.')
         && let Some(result) = apply_user_function(
@@ -1036,6 +1063,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             &args,
             &ctx.scope_shapes(scope_idx),
             ctx.scopes,
+            ctx.text,
         ) {
             return match result {
                 Ok(Some(shape)) => Some(shape),
@@ -1846,6 +1874,18 @@ fn tuple_rhs_shapes(
             // Each unpacked dim is an integer scalar (zero-rank).
             Some(obj_shape.iter().map(|_| Some(Vec::new())).collect())
         }
+        // `final_mean, final_var = final_carry` / `h_final, c_final =
+        // carry_final` — unpacking a plain variable that itself holds a
+        // homogeneous-shape tuple carry (bound via `shape_of_tuple`'s
+        // same-shape rule, e.g. from a preceding `final_carry, _ =
+        // jax.lax.scan(...)`, or a `Rnn`/`RnnCell` state tuple). Every
+        // unpacked name gets that one shape, same convention as
+        // `TupleTarget::Nested` for a single-statement `(h, c)` pattern.
+        "identifier" => {
+            let name = rhs.utf8_text(ctx.text.as_bytes()).ok()?;
+            let shape = ctx.resolve_shape(name, scope_idx)?;
+            Some((0..n_targets).map(|_| Some(shape.clone())).collect())
+        }
         "call" => {
             let func = rhs.child_by_field_name("function")?;
             let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
@@ -1980,32 +2020,60 @@ fn tuple_rhs_shapes(
                 }
             }
 
+            // `h, c = self.lstm(x, (h0, c0))` — self.<attr> resolves to a
+            // single-step RNN cell (`LayerKind::RnnCell`: LSTMCell/GRUCell/
+            // RNNCell) built in `__init__`. Same "both share one shape"
+            // approximation as the `Rnn` arm's `(h, c)` state above, applied
+            // to the single-step rule (`apply_layer_kind`'s `RnnCell` arm:
+            // last dim -> `hidden_size`, rank preserved, min rank 1 for the
+            // unbatched convention).
+            if let Some(attr) = target.strip_prefix("self.") {
+                let cell_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
+                    Some(LayerKind::RnnCell { hidden_size, .. }) => Some(hidden_size.clone()),
+                    _ => None,
+                };
+                if let Some(hidden_size) = cell_hidden_size {
+                    if n_targets != 2 {
+                        return None;
+                    }
+                    let args_node = rhs.child_by_field_name("arguments")?;
+                    let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                    let input = args.iter().find_map(|a| match a {
+                        CallArgument::Positional { value } => Some(value.as_str()),
+                        _ => None,
+                    })?;
+                    let input_shape = ctx.resolve_shape(input, scope_idx)?;
+                    if input_shape.is_empty() {
+                        return None;
+                    }
+                    let mut output = input_shape.clone();
+                    let last = output.len() - 1;
+                    output[last] = hidden_size;
+                    return Some(vec![Some(output.clone()), Some(output)]);
+                }
+            }
+
             let resolved = resolve_call_target(target, ctx.import_map);
             let known = classify_known_function(&resolved);
 
             // `final_carry, ys = jax.lax.scan(body, init, xs)` — the carry is
-            // invariant, so final_carry gets init's shape. ys would need the
-            // body's per-step output shape; skipped (evicts any stale binding).
+            // invariant, so final_carry gets init's shape. `init` is
+            // evaluated as a real node (not just an identifier lookup) so an
+            // inline tuple carry (`scan(body, (h0, c0), xs)`) or a
+            // previously-bound tuple-literal variable (`init = (mean0,
+            // var0)`) both resolve via `shape_of_tuple`'s homogeneous-shape
+            // rule, same as a plain single-array carry. `ys` would need the
+            // body's per-step output shape; skipped (evicts any stale
+            // binding).
             if matches!(known, Some(KnownFunction::Scan)) {
                 if n_targets != 2 {
                     return None;
                 }
                 let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let mut positionals = args.iter().filter_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                });
-                let init = args
-                    .iter()
-                    .find_map(|a| match a {
-                        CallArgument::Keyword { name, value } if name == "init" => {
-                            Some(value.as_str())
-                        }
-                        _ => None,
-                    })
-                    .or_else(|| positionals.nth(1))?;
-                let init_shape = ctx.resolve_shape(init, scope_idx)?;
+                let init_node = find_keyword_arg_node(args_node, "init", ctx.text.as_bytes())
+                    .and_then(|kw| kw.child_by_field_name("value"))
+                    .or_else(|| find_positional_arg_node(args_node, 1))?;
+                let init_shape = shape_of_expression(init_node, ctx)?;
                 return Some(vec![Some(init_shape), None]);
             }
 
@@ -2875,7 +2943,26 @@ fn bind_and_substitute(
         return Ok(None);
     }
 
-    // Build a binding: declared dim name → resolved dim from the caller's arg.
+    let binding = build_dim_binding(callee, target_name, positional_arg_shapes)?;
+
+    // Substitute into return_shape.
+    let Some(ref return_shape) = callee.return_shape else {
+        return Ok(None);
+    };
+
+    Ok(Some(substitute_dims(return_shape, &binding)))
+}
+
+/// Build a binding of declared param-dim-name → resolved arg dim from the
+/// caller's arg shapes, validating rank/dim compatibility along the way.
+/// Extracted from `bind_and_substitute` so the traced-return fallback (see
+/// `trace_user_function_return`) can reuse the same binding without also
+/// requiring a `-> ReturnType` annotation.
+fn build_dim_binding(
+    callee: &FunctionShapeScope,
+    target_name: &str,
+    positional_arg_shapes: &[(&str, Vec<String>)],
+) -> Result<HashMap<String, String>, String> {
     let mut binding: HashMap<String, String> = HashMap::new();
     for (param_name, arg_shape) in positional_arg_shapes {
         let Some(param_shape) = callee.shapes.get(*param_name) else {
@@ -2915,28 +3002,111 @@ fn bind_and_substitute(
             }
         }
     }
+    Ok(binding)
+}
 
-    // Substitute into return_shape.
-    let Some(ref return_shape) = callee.return_shape else {
-        return Ok(None);
-    };
-
-    let substituted: Vec<String> = return_shape
+fn substitute_dims(shape: &[String], binding: &HashMap<String, String>) -> Vec<String> {
+    shape
         .iter()
         .map(|dim| binding.get(dim).cloned().unwrap_or_else(|| dim.clone()))
-        .collect();
+        .collect()
+}
 
-    Ok(Some(substituted))
+/// Fallback for a same-file `self.<method>(...)` call whose callee has no
+/// `-> ReturnType` annotation (the common `forward(self, x: Float[Array,
+/// "..."])` style with only param annotations): trace the callee's body for
+/// a single, non-nested `return <name>` statement and use `<name>`'s shape
+/// as already computed in the callee's *own* function scope.
+///
+/// This works without any cross-function seeding because methods are
+/// analyzed in one global source-order pass — a callee defined earlier in
+/// the same class (like `forward` before a later `loss` that calls it) has
+/// already had its own body's assignments shaped using its own param
+/// annotations by the time any call site is reached. Only a bare-identifier
+/// return is traced; anything else (an inline expression, a tuple, no
+/// `return`, or more than one distinct `return` target) stays `None` —
+/// matching the project's "approximate, not exhaustive" convention rather
+/// than building a general expression re-evaluator across scopes.
+fn trace_user_function_return(
+    callee: &FunctionShapeScope,
+    target_name: &str,
+    positional_arg_shapes: &[(&str, Vec<String>)],
+    text: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let binding = build_dim_binding(callee, target_name, positional_arg_shapes)?;
+    let Some(return_name) = trace_bare_return_identifier(text, callee.start_byte, callee.end_byte)
+    else {
+        return Ok(None);
+    };
+    let Some(return_shape) = callee.shapes.get(&return_name) else {
+        return Ok(None);
+    };
+    Ok(Some(substitute_dims(return_shape, &binding)))
+}
+
+/// Re-parse `text[start_byte..end_byte]` (a single function definition's own
+/// byte range, from `FunctionShapeScope`) as a standalone snippet and find
+/// its one `return <identifier>` statement, not descending into nested
+/// function/class definitions (a `return` there belongs to a different
+/// scope). Returns `None` for zero, multiple distinct, or non-identifier
+/// return targets — deliberately conservative (v1).
+fn trace_bare_return_identifier(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
+    let snippet = text.get(start_byte..end_byte)?;
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(snippet, None)?;
+    let func_node = tree.root_node().named_child(0)?;
+    if func_node.kind() != "function_definition" {
+        return None;
+    }
+    let body = func_node.child_by_field_name("body")?;
+    let mut found: Option<String> = None;
+    collect_bare_return_identifiers(body, snippet, &mut found)?;
+    found
+}
+
+/// Walk a function body collecting `return <identifier>` targets. Returns
+/// `None` (via the `?` at call sites) as soon as a non-identifier or a
+/// second, differently-named return target is seen, signalling "not
+/// traceable" to the caller.
+fn collect_bare_return_identifiers(
+    block: Node,
+    text: &str,
+    found: &mut Option<String>,
+) -> Option<()> {
+    for i in 0..block.named_child_count() {
+        let child = block.named_child(i as u32)?;
+        match child.kind() {
+            "return_statement" => {
+                let value = child.named_child(0)?;
+                if value.kind() != "identifier" {
+                    return None;
+                }
+                let name = value.utf8_text(text.as_bytes()).ok()?.to_string();
+                match found {
+                    Some(existing) if *existing != name => return None,
+                    _ => *found = Some(name),
+                }
+            }
+            "function_definition" | "class_definition" | "lambda" => continue,
+            _ => collect_bare_return_identifiers(child, text, found)?,
+        }
+    }
+    Some(())
 }
 
 /// Attempt to resolve `target` as a user-defined function in the same file
-/// and propagate its declared return shape to the call site.
+/// and propagate its declared (or traced) return shape to the call site.
 ///
 /// Returns:
 /// - `Some(Ok(Some(shape)))` if a matching function was found and its
-///   return shape could be computed after binding param dims to arg dims.
-/// - `Some(Ok(None))` if a matching function was found but has no return
-///   annotation — argument validation still ran but nothing to propagate.
+///   return shape could be computed after binding param dims to arg dims —
+///   either from a `-> ReturnType` annotation, or (when absent) traced from
+///   a bare `return <name>` statement against the callee's own body shapes
+///   (see `trace_user_function_return`).
+/// - `Some(Ok(None))` if a matching function was found but no shape could
+///   be produced (no annotation and no traceable bare-identifier return) —
+///   argument validation still ran but nothing to propagate.
 /// - `Some(Err(msg))` if argument shapes don't unify with declared param shapes.
 /// - `None` if no matching user-defined function was found (fall through to
 ///   the known-function branch).
@@ -2944,7 +3114,8 @@ fn bind_and_substitute(
 /// v1 limitations (documented in PR):
 /// - Only positional arguments are matched. Keyword args that match a param
 ///   name are honoured; otherwise the call is skipped with Ok(None).
-/// - No cross-file resolution.
+/// - No cross-file resolution (the tracing fallback is same-file only —
+///   `apply_imported_user_function` passes `text: None`, disabling it).
 /// - Qualified names ("module.func") are excluded at the call site.
 /// - Fresh output dims (not in the binding) pass through unchanged.
 fn apply_user_function(
@@ -2953,9 +3124,10 @@ fn apply_user_function(
     args: &[CallArgument],
     caller_shapes: &dyn ShapeLookup,
     scopes: &[FunctionShapeScope],
+    text: &str,
 ) -> Option<Result<Option<Vec<String>>, String>> {
     let scope_idx = find_callee_scope(target, Some(call_byte), scopes)?;
-    bind_user_function_args(&scopes[scope_idx], target, args, caller_shapes)
+    bind_user_function_args(&scopes[scope_idx], target, args, caller_shapes, Some(text))
 }
 
 /// Bind a callee's declared parameter shapes to the caller's argument shapes
@@ -2980,6 +3152,10 @@ fn bind_user_function_args(
     target: &str,
     args: &[CallArgument],
     caller_shapes: &dyn ShapeLookup,
+    // `Some(source_text)` for the same-file path (enables the no-return-
+    // annotation tracing fallback); `None` for the cross-file path
+    // (`apply_imported_user_function`), where tracing isn't supported yet.
+    text: Option<&str>,
 ) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
@@ -3022,8 +3198,17 @@ fn bind_user_function_args(
         }
     }
 
-    // Delegate to the shared bind_and_substitute helper.
-    Some(bind_and_substitute(callee, target, &arg_shapes))
+    // Delegate to the shared bind_and_substitute helper — or, when the
+    // callee has no `-> ReturnType` annotation and source text is available
+    // (same-file path), the body-tracing fallback (see
+    // `trace_user_function_return`).
+    if callee.return_shape.is_some() {
+        Some(bind_and_substitute(callee, target, &arg_shapes))
+    } else if let Some(text) = text {
+        Some(trace_user_function_return(callee, target, &arg_shapes, text))
+    } else {
+        Some(Ok(None))
+    }
 }
 
 /// Cross-file counterpart of `apply_user_function`: resolve `target` through
@@ -3050,7 +3235,7 @@ fn apply_imported_user_function(
         Ok(None) => return None,
         Err(message) => return Some(Err(message)),
     };
-    bind_user_function_args(&callee, target, args, caller_shapes)
+    bind_user_function_args(&callee, target, args, caller_shapes, None)
 }
 
 fn apply_matmul_shape(
@@ -3410,6 +3595,36 @@ def f(x: Float[Array, "3 5"]):
             find_shape(&analysis, "y"),
             Some(&shape(&["3", "5"]))
         );
+    }
+
+    #[test]
+    fn test_tuple_literal_homogeneous_shape() {
+        let code = r#"
+def f(a: Float[Array, "features"], b: Float[Array, "features"]):
+    pair = (a, b)
+"#;
+        let analysis = analyze_simple(code);
+        assert_eq!(find_shape(&analysis, "pair"), Some(&shape(&["features"])));
+    }
+
+    #[test]
+    fn test_tuple_literal_heterogeneous_shape_stays_unshaped() {
+        let code = r#"
+def f(a: Float[Array, "m"], b: Float[Array, "n"]):
+    pair = (a, b)
+"#;
+        let analysis = analyze_simple(code);
+        assert_eq!(find_shape(&analysis, "pair"), None);
+    }
+
+    #[test]
+    fn test_tuple_literal_unresolvable_element_stays_unshaped() {
+        let code = r#"
+def f(a: Float[Array, "features"], b):
+    pair = (a, b)
+"#;
+        let analysis = analyze_simple(code);
+        assert_eq!(find_shape(&analysis, "pair"), None);
     }
 
     #[test]

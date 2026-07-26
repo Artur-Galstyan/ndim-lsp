@@ -22,7 +22,7 @@ Legend:
 | `jax.jacrev` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad`. |
 | `jax.hessian` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (two derivative dimension groups). |
 | `jax.pmap` | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics, not statically derivable with the current design. |
-| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant); stacked ys skipped (needs body output inference). |
+| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant). `init` is evaluated as a real expression node, so a homogeneous-shape tuple carry (`(a, b)` with equal element shapes, inline at the call site or via a previously-bound tuple-literal variable — `shape_of_tuple`) resolves the same way as a plain single-array carry; heterogeneous-shape tuple carries stay `Ok(None)`. Stacked `ys` still skipped (needs per-step body-output inference) — same for the body function's *internal* un-annotated carry destructuring (no cross-function seeding from the call site into the body's own scope; see `scan_tuple_carry_corpus_mirror_tests` in integration_tests.rs for the documented gap). |
 | `jax.lax.map` | ✅ | ✅ | ✅ | Maps over the leading axis like `vmap(f)(xs)` with `in_axes=out_axes=0`; reuses `apply_vmap_call`/`apply_inline_vmap_layer` (bare user function or `self.<attr>` layer). Special-cased in `shape_of_call` (needs the callee-scope lookup machinery, not just `args`+`shapes`). |
 | `jax.lax.cond` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — branch output shape isn't derivable without analyzing both branch functions (out of scope for now). |
 | `jax.lax.switch` | ✅ | ❌ | ✅ | Same as `cond` — classified, conservatively `Ok(None)`. |
@@ -273,6 +273,9 @@ Legend:
 | `torch.block_diag` | ✅ | ✅ | ✅ | `KnownFunction::BlockDiag`; sums row/col dims onto the diagonal; 1D inputs treated as a single row; rank >= 3 unmodelled. |
 | `torch.nn.functional.normalize` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `torch.nn.functional.embedding` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalEmbedding`; appends `weight`'s last-axis (embedding) dim to `input`'s shape. |
+| `torch.nn.functional.relu` / `relu6` / `gelu` / `silu` / `sigmoid` / `tanh` / `softplus` / `softsign` / `selu` / `celu` / `elu` / `leaky_relu` / `hardtanh` / `hardswish` / `hardsigmoid` / `mish` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule, same as `softmax`/`log_softmax`/`normalize` above. |
+| `torch.nn.functional.dropout` / `dropout2d` / `dropout3d` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `torch.nn.functional.glu` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalGlu`; halves `dim` (default last axis, must be even-sized): numeric divide-by-2, symbolic `x*2` factor cancellation (via `cancel_product_factor`, shared with `Split`), else opaque `glu(<dim>)` name. Not shape-preserving, unlike the rest of the activation family. |
 | `torch.nn.utils.rnn.pad_sequence` | ✅ | ✅ | ✅ | `KnownFunction::PadSequence`; batch count + trailing dims known from the literal sequence list, padded length emitted as opaque symbolic `pad_len` (data-dependent). |
 
 ## Torch reductions
@@ -331,7 +334,7 @@ Legend:
 | `torch.nn.Upsample` | ✅ | ✅ | ✅ | Rank-agnostic ctor: spatial dims are whatever trails the leading (batch, channel) pair, determined from the actual input rank at apply time. Scales by `scale_factor` (scalar or per-axis tuple) or sets `size` directly; anything unparseable/mismatched-arity is unknown. Requires rank ≥ 3. |
 | `equinox.nn.ConvTranspose1d/2d/3d` / `torch.nn.ConvTranspose1d/2d/3d` | ✅ | ✅ | ✅ | Shared `LayerKind::ConvTranspose`; channels-first, inverse of the conv formula: `out = (in-1)*stride - 2*padding + kernel`. `output_padding`/`dilation` not modelled (assumed 0/1); per-axis tuple kernel/stride/padding refused like Conv. |
 | `torch.nn.RNN` / `torch.nn.LSTM` / `torch.nn.GRU` | ✅ | ✅ | ✅ | `LayerKind::Rnn`. Direct/non-tuple application (`out = self.rnn(x)`) approximates the real `(output, final_state)` return as just the primary output (last dim → `hidden_size`). Tuple LHS (`out, h = self.gru(x)`, `out, (h, c) = self.lstm(x)`) is now modelled in `analysis.rs`'s `tuple_rhs_shapes` (the `self.<attr>` → `LayerKind::Rnn` arm): element 0 is the same primary-output rule; element 1 (the state — LSTM's nested `(h, c)` binds both names to this one shape via one level of LHS tuple-pattern nesting, `TupleTarget::Nested`) approximates torch's `h_n`/`c_n` by dropping the leading (sequence) axis and replacing the last dim with `hidden_size`. This assumes `batch_first=False` (torch's default; not tracked) and `num_layers * num_directions == 1` (not tracked), so for a batched input it's missing the real leading `num_layers*num_directions` axis torch's actual state carries — a stated simplification, not the exact torch shape. `batch_first` doesn't change the *output* formula (the feature dim is always trailing). `bidirectional`/`num_layers` not modelled anywhere. |
-| `torch.nn.RNNCell` / `torch.nn.GRUCell` / `torch.nn.LSTMCell` / `equinox.nn.LSTMCell` / `equinox.nn.GRUCell` | ✅ | ✅ | ✅ | `LayerKind::RnnCell`: last dim → `hidden_size`, min rank 1 (single step, optionally unbatched). `LSTMCell` genuinely returns `(h, c)`; modelled as just `h` (same approximation reasoning as `Rnn`). |
+| `torch.nn.RNNCell` / `torch.nn.GRUCell` / `torch.nn.LSTMCell` / `equinox.nn.LSTMCell` / `equinox.nn.GRUCell` | ✅ | ✅ | ✅ | `LayerKind::RnnCell`: last dim → `hidden_size`, min rank 1 (single step, optionally unbatched). Single-LHS form models just the primary output (`h`, same approximation reasoning as `Rnn`); a tuple LHS (`h, c = self.lstm(x, (h0, c0))`) extends `tuple_rhs_shapes` to bind *both* elements to that same `hidden_size`-last-dim shape (mirrors the `Rnn` arm's `(h, c)` state handling). |
 | `torch.nn.InstanceNorm1d/2d/3d` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank enforced like `BatchNorm1d/2d/3d` (channels-first, no batch dim required). |
 | `equinox.nn.RMSNorm` / `torch.nn.RMSNorm` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank 1, same convention as `LayerNorm`. |
 | `torch.nn.PixelShuffle` | ✅ | ✅ | ✅ | `(*, C*r^2, H, W) -> (*, C, H*r, W*r)`; concrete integer `upscale_factor` required (else unknown), errors if channels aren't evenly divisible by `r^2`. |
@@ -423,7 +426,17 @@ method-call equivalents, Linear/Conv layers) are all done. So are: `split`
 tuple-unpacking + `L, _ = x.shape` (#30), `self.<field>` lookup (#31), nested/
 chained calls (#40), vmap of attribute callables + inline vmap (#35), diagnostic
 severity config (#45), and same-file cross-function tracing via `-> Float[...]`
-return annotations.
+return annotations — plus, for same-file `self.<method>(...)` callees with
+*no* return annotation (the common `forward(self, x: Float[Array, "..."])`
+style), a body-tracing fallback: a single, non-nested bare `return <name>`
+statement's shape is read from the callee's own already-computed body
+shapes (methods are analyzed in one global source-order pass, so an
+earlier-defined callee like `forward` has already shaped its locals by the
+time a later sibling method calls it) — see `trace_user_function_return` /
+`trace_bare_return_identifier` in `analysis.rs`. Cross-*file* callees still
+need an explicit annotation (tracing isn't wired through
+`apply_imported_user_function` yet); an inline-expression or tuple return
+isn't traced either (v1, deliberately conservative).
 
 **Prioritization is harness-driven** — run `cargo test corpus_coverage_report
 -- --nocapture` (analyzes `corpus/*.py`, ranks un-shapeable assignments by

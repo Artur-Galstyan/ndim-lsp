@@ -9,8 +9,11 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with ~1673 tests across the lib + integration suites (plus 1 ignored benchmark).
-- Corpus coverage is 100% (125/125) over 18 files in `corpus/`.
+- `cargo test --quiet` passes with ~1755 tests across the lib + integration suites (plus 1 ignored benchmark).
+- Corpus coverage is 95% (167/176) over 24 files in `corpus/`; the floor
+  assert in the harness is 85%. The 9 remaining dark spots all share ONE
+  root cause (see "Known architectural limit" below) — they are documented,
+  regression-tested, and deliberately not papered over.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
   timing harness over `bench/benchmark_large.py` (~4.5k lines, regenerate with
@@ -289,6 +292,22 @@ What works now
    - `ResolutionCache` keyed on `(import-path-segments, roots-fingerprint)` is
      shared across `analyze_layer_shapes` calls. Caches `ResolvedImplementation`
      (not signature extraction). See `corpus`/cross-file integration tests.
+
+Known architectural limit (the next big thing)
+----------------------------------------------
+The evaluator walks every function scope exactly once, in whole-file source
+order, seeding shapes only from that function's own jaxtyping annotations.
+Consequence: a callee whose parameters are UN-annotated can never be shaped,
+even when every call site passes fully-shaped arguments — `lax.scan` body
+functions destructuring their carry, nested closures, and helper functions
+relying on inference all go dark (see lax_scan_ema.py / eqx_lstm_gru_scan.py
+/ scope_soup.py dark spots, each with a corpus-mirror regression test).
+Fixing this means call-site parameter seeding: a pass ordering (topological
+by call graph, or simply "evaluate callee scopes lazily at first call with
+the caller's argument shapes") — a real architecture extension to
+`propagate_calls`/`FunctionShapeScope`, not a local rule. Wave-6 notes in
+TO_IMPLEMENT.md and `scan_tuple_carry_corpus_mirror_tests` pin the exact
+behaviors that must light up when this lands.
 
 Known limitations / important caveats
 -------------------------------------

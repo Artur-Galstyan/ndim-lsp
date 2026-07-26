@@ -738,6 +738,10 @@ pub enum KnownFunction {
     FunctionalAvgPool2d,
     FunctionalAvgPool3d,
     FunctionalEmbedding,
+    /// `torch.nn.functional.glu(input, dim=-1)` — halves `dim` (must be
+    /// even-sized): `(*, 2*n, *) -> (*, n, *)`. Not shape-preserving, unlike
+    /// the rest of the `torch.nn.functional` activation family.
+    FunctionalGlu,
     // torch.nn.utils.rnn
     PadSequence,
 }
