@@ -323,32 +323,29 @@ Legend:
 | `jax.nn.one_hot` | ✅ | ✅ | ✅ | Carved out of the generic shape-preserving arm above (it is **not** shape-preserving — it appends `num_classes`): `KnownFunction::OneHot`, `x.shape + [num_classes]` (literal or symbolic `num_classes`). |
 | `jax.nn.dot_product_attention` | ✅ | ✅ | ✅ | `KnownFunction::DotProductAttention` — output = `query`'s shape with the last (head) dim replaced by `value`'s head dim. |
 | `jax.nn.logsumexp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis/keepdims mechanics). |
-| `equinox.nn.MultiheadAttention` | ⚠️ | ⚠️ | ❌ | Priority: high. `classify_layer_call`/`known_layer_signature` dispatch on class name only, so `equinox.nn.MultiheadAttention` structurally matches the same `LayerKind::MultiheadAttention` arm as torch's — but the built-in binding contract assumes torch's positional order `(embed_dim, num_heads, ...)`, while equinox's real constructor is `(num_heads, query_size, ...)`. Untested; likely mis-binds `embed_dim` for real equinox code. Corpus/tests only use torch's `nn.MultiheadAttention`. |
-| `equinox.nn.LSTMCell` / `GRUCell` | ❌ | ❌ | ❌ | Priority: high. Output is a new carry matching hidden size. |
-| `equinox.nn.MLP` | ❌ | ❌ | ❌ | Priority: high. Last dim → `out_size`. |
-| `equinox.nn.Sequential` | ❌ | ❌ | ❌ | Priority: high. Compose child layer shape rules in order. |
-| `equinox.nn.ConvTranspose1d` / `ConvTranspose2d` / `ConvTranspose3d` | ❌ | ❌ | ❌ | Priority: high. Transposed-conv output formula (upsamples spatial dims). |
-| `equinox.nn.RMSNorm` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `equinox.nn.SpectralNorm` / `WeightNorm` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving wrappers. |
-| `equinox.nn.Identity` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `equinox.nn.Lambda` | ❌ | ❌ | ❌ | Priority: medium. Shape depends on wrapped function; usually unresolvable statically. |
-| `torch.nn.RNN` / `LSTM` / `GRU` | ❌ | ❌ | ❌ | Priority: high. Sequence output plus hidden/cell state tuple. |
-| `torch.nn.LSTMCell` / `GRUCell` / `RNNCell` | ❌ | ❌ | ❌ | Priority: high. Output is a new carry matching hidden size. |
-| `torch.nn.ConvTranspose1d` / `ConvTranspose2d` / `ConvTranspose3d` | ❌ | ❌ | ❌ | Priority: high. Transposed-conv output formula (upsamples spatial dims). |
-| `torch.nn.Flatten` / `Unflatten` | ❌ | ❌ | ❌ | Priority: high. Flatten a dim range / split one dim into many. |
-| `torch.nn.Upsample` | ❌ | ❌ | ❌ | Priority: high. Spatial dims scaled by `scale_factor`/`size`. |
-| `torch.nn.Identity` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `torch.nn.Sequential` | ❌ | ❌ | ❌ | Priority: high. Compose child layer shape rules in order. |
-| `torch.nn.TransformerEncoderLayer` / `TransformerDecoderLayer` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving on the sequence input. |
-| `torch.nn.InstanceNorm1d` / `InstanceNorm2d` / `InstanceNorm3d` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `torch.nn.RMSNorm` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `torch.nn.PixelShuffle` / `PixelUnshuffle` | ❌ | ❌ | ❌ | Priority: medium. Trades channel dim for spatial resolution (factor `r`). |
-| `torch.nn.ConstantPad*` / `ZeroPad*` / `ReflectionPad*` / `ReplicationPad*` | ❌ | ❌ | ❌ | Priority: medium. Same shape math as `torch.nn.functional.pad`. |
-| `torch.nn.Bilinear` | ❌ | ❌ | ❌ | Priority: medium. Two inputs → last dim becomes `out_features`. |
-| `torch.nn.CosineSimilarity` | ❌ | ❌ | ❌ | Priority: medium. Removes the reduced dim. |
-| `torch.nn.Fold` / `Unfold` | ❌ | ❌ | ❌ | Priority: low. Inverse-of-conv patch (un)folding shape math. |
-| `torch.nn.LocalResponseNorm` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving. |
-| `torch.nn.AlphaDropout` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving (same family as other `Dropout` variants, not yet added to that match arm). |
+| `equinox.nn.MultiheadAttention` | ✅ | ✅ | ✅ | **Bug fix**: `classify_layer_call` previously always read the torch `embed_dim` binding, so equinox ctors (real order `(num_heads, query_size, ...)`) silently failed to classify. `known_layer_signature` now branches on the resolved module path so equinox binds `query_size` (stored in the same `LayerKind::MultiheadAttention.feature_dim` field, renamed from `embed_dim`); torch's `(embed_dim, num_heads)` binding is unchanged — verified against the pre-existing torch MHA tests and `corpus/torch_attention.py`'s `nn.MultiheadAttention(512, 8)` shape, none of which changed. |
+| `torch.nn.Flatten` | ✅ | ✅ | ✅ | Collapses `[start_dim, end_dim]` (negative indices resolved at apply time) into one dim; literal product when concrete, else `d0*d1*...`. Defaults `start_dim=1`, `end_dim=-1`. |
+| `torch.nn.Unflatten` | ✅ | ✅ | ✅ | Expands `dim` into the parsed components of the `sizes` ctor tuple/list. Non-literal `dim` or unparseable `sizes` → unknown. |
+| `equinox.nn.Identity` / `torch.nn.Identity` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`, any rank. |
+| `torch.nn.Upsample` | ✅ | ✅ | ✅ | Rank-agnostic ctor: spatial dims are whatever trails the leading (batch, channel) pair, determined from the actual input rank at apply time. Scales by `scale_factor` (scalar or per-axis tuple) or sets `size` directly; anything unparseable/mismatched-arity is unknown. Requires rank ≥ 3. |
+| `equinox.nn.ConvTranspose1d/2d/3d` / `torch.nn.ConvTranspose1d/2d/3d` | ✅ | ✅ | ✅ | Shared `LayerKind::ConvTranspose`; channels-first, inverse of the conv formula: `out = (in-1)*stride - 2*padding + kernel`. `output_padding`/`dilation` not modelled (assumed 0/1); per-axis tuple kernel/stride/padding refused like Conv. |
+| `torch.nn.RNN` / `torch.nn.LSTM` / `torch.nn.GRU` | ✅ | ✅ | ✅ | `LayerKind::Rnn`: models only the primary output tensor (last dim → `hidden_size`); the real return value is an `(output, final_state)` tuple, which needs tuple-unpacking support in `analysis.rs`'s `tuple_rhs_shapes` (outside this module's scope) to express — direct/non-tuple application is an approximation. `batch_first` isn't tracked: it doesn't change the formula since the feature dim is always trailing regardless of (seq, batch) order. `bidirectional`/`num_layers` not modelled. |
+| `torch.nn.RNNCell` / `torch.nn.GRUCell` / `torch.nn.LSTMCell` / `equinox.nn.LSTMCell` / `equinox.nn.GRUCell` | ✅ | ✅ | ✅ | `LayerKind::RnnCell`: last dim → `hidden_size`, min rank 1 (single step, optionally unbatched). `LSTMCell` genuinely returns `(h, c)`; modelled as just `h` (same approximation reasoning as `Rnn`). |
+| `torch.nn.InstanceNorm1d/2d/3d` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank enforced like `BatchNorm1d/2d/3d` (channels-first, no batch dim required). |
+| `equinox.nn.RMSNorm` / `torch.nn.RMSNorm` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank 1, same convention as `LayerNorm`. |
+| `torch.nn.PixelShuffle` | ✅ | ✅ | ✅ | `(*, C*r^2, H, W) -> (*, C, H*r, W*r)`; concrete integer `upscale_factor` required (else unknown), errors if channels aren't evenly divisible by `r^2`. |
+| `torch.nn.PixelUnshuffle` | ✅ | ✅ | ✅ | Inverse of `PixelShuffle`: `(*, C, H*r, W*r) -> (*, C*r^2, H, W)`. |
+| `torch.nn.ConstantPad1d/2d/3d` / `ZeroPad1d/2d/3d` / `ReflectionPad1d/2d/3d` / `ReplicationPad1d/2d/3d` | ✅ | ✅ | ✅ | `LayerKind::Pad`: pads the trailing `spatial_rank` dims. Models a concrete uniform int (every side of every spatial dim) or a fully-literal `2*spatial_rank`-length tuple (torch's reverse-axis pad-pair convention, last spatial dim first); symbolic padding is unknown. |
+| `torch.nn.Bilinear` | ✅ | ✅ | ✅ | Only the first tracked positional input (`x1`) is validated/transformed (last dim vs. `in1_features` → `out_features`); `x2`/broadcasting not modelled — this analyzer only ever tracks one positional input per layer call (see `extract_layer_applications`). |
+| `torch.nn.CosineSimilarity` | ✅ | ✅ | ✅ | Removes the reduced `dim` axis from `x1`'s shape (default `dim=1`); same single-tracked-input limitation as `Bilinear`. Non-literal `dim` → unknown. |
+| `torch.nn.TransformerEncoderLayer` / `torch.nn.TransformerDecoderLayer` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving` (`d_model` unchanged on the primary input). `TransformerDecoderLayer`'s second (`memory`) input isn't tracked (same single-input limitation as `Bilinear`). |
+| `torch.nn.AlphaDropout` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`, any rank — trivial, same family as `Dropout`. |
+| `equinox.nn.MLP` | ✅ | ✅ | ✅ | `LayerKind::Mlp`: last-dim transform `in_size -> out_size`, same rule as `Linear`. |
+| `torch.nn.Sequential` | ❌ | ❌ | ❌ | Composite container; needs sub-module propagation (walk the wrapped layer list and thread the shape through each). Not attempted. |
+| `torch.nn.Fold` / `torch.nn.Unfold` | ❌ | ❌ | ❌ | im2col-style windowing transform; needs real shape reasoning about window/stride geometry, deliberately skipped. |
+| `torch.nn.LocalResponseNorm` | ❌ | ❌ | ❌ | Actually shape-preserving in practice, but left unclassified per this task's explicit scope (conservative — only `AlphaDropout` was called out as the trivial one to do from that group). |
+| `equinox.nn.Lambda` | ❌ | ❌ | ❌ | Wraps an arbitrary user callable; no static shape info available, so it's simply left unclassified (unclassified ≡ always-unknown, no behavioral difference from classifying-then-always-returning `Ok(None)`). |
+| `equinox.nn.SpectralNorm` / `equinox.nn.WeightNorm` | ❌ | ❌ | ❌ | Wrapper modules around an inner layer; would need recursive sub-layer resolution (resolve the wrapped layer's `LayerKind` and delegate), out of scope here. |
 
 ## Method calls
 

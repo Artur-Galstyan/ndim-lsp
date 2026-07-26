@@ -160,9 +160,22 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 output_size,
             })
         }
-        "MultiheadAttention" => Some(LayerKind::MultiheadAttention {
-            embed_dim: call.bindings.get("embed_dim")?.clone(),
-        }),
+        // torch: MultiheadAttention(embed_dim, num_heads). equinox's real
+        // signature is MultiheadAttention(num_heads, query_size, ...) — a
+        // different positional order *and* a different name for the
+        // per-token dimension, so it must bind `query_size`, not `embed_dim`
+        // (previously both frameworks read `embed_dim`, which silently
+        // failed to classify equinox ctors that only bind positionally).
+        "MultiheadAttention" => {
+            let feature_dim = if is_equinox_module {
+                call.bindings.get("query_size")?
+            } else {
+                call.bindings.get("embed_dim")?
+            };
+            Some(LayerKind::MultiheadAttention {
+                feature_dim: feature_dim.clone(),
+            })
+        }
         // equinox names it `embedding_size`, torch `embedding_dim`.
         "Embedding" => Some(LayerKind::Embedding {
             embedding_size: call
@@ -171,11 +184,114 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .or_else(|| call.bindings.get("embedding_dim"))?
                 .clone(),
         }),
-        // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations)
+        // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations,
+        // Identity, InstanceNorm, RMSNorm, AlphaDropout, and the two Transformer*Layer
+        // modules — TransformerEncoderLayer/TransformerDecoderLayer preserve d_model on
+        // their primary input; TransformerDecoderLayer's second (`memory`) input isn't
+        // tracked, same single-input limitation as Bilinear/CosineSimilarity below).
         "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
         | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
-        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" => Some(LayerKind::ShapePreserving {
+        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
+        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout"
+        | "TransformerEncoderLayer" | "TransformerDecoderLayer" => {
+            Some(LayerKind::ShapePreserving {
+                name: owner.to_string(),
+            })
+        }
+        "Flatten" => {
+            let start_dim = call
+                .bindings
+                .get("start_dim")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string());
+            let end_dim = call
+                .bindings
+                .get("end_dim")
+                .cloned()
+                .unwrap_or_else(|| "-1".to_string());
+            Some(LayerKind::Flatten { start_dim, end_dim })
+        }
+        "Unflatten" => Some(LayerKind::Unflatten {
+            dim: call.bindings.get("dim")?.clone(),
+            sizes: call.bindings.get("sizes")?.clone(),
+        }),
+        "Upsample" => {
+            let scale_factor = call.bindings.get("scale_factor").cloned();
+            let size = call.bindings.get("size").cloned();
+            Some(LayerKind::Upsample { scale_factor, size })
+        }
+        "ConvTranspose1d" | "ConvTranspose2d" | "ConvTranspose3d" => {
+            let spatial_rank = pool_spatial_rank(owner)?;
+            let kernel_size = call.bindings.get("kernel_size")?.clone();
+            if kernel_size.starts_with('(') {
+                return None;
+            }
+            let stride = call
+                .bindings
+                .get("stride")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string());
+            if stride.starts_with('(') {
+                return None;
+            }
+            let padding = call
+                .bindings
+                .get("padding")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string());
+            if padding.starts_with('(') {
+                return None;
+            }
+            Some(LayerKind::ConvTranspose {
+                spatial_rank,
+                in_channels: call.bindings.get("in_channels")?.clone(),
+                out_channels: call.bindings.get("out_channels")?.clone(),
+                kernel_size,
+                stride,
+                padding,
+            })
+        }
+        "RNN" | "LSTM" | "GRU" => Some(LayerKind::Rnn {
             name: owner.to_string(),
+            input_size: call.bindings.get("input_size")?.clone(),
+            hidden_size: call.bindings.get("hidden_size")?.clone(),
+        }),
+        "RNNCell" | "LSTMCell" | "GRUCell" => Some(LayerKind::RnnCell {
+            name: owner.to_string(),
+            input_size: call.bindings.get("input_size")?.clone(),
+            hidden_size: call.bindings.get("hidden_size")?.clone(),
+        }),
+        "PixelShuffle" => Some(LayerKind::PixelShuffle {
+            upscale_factor: call.bindings.get("upscale_factor")?.clone(),
+        }),
+        "PixelUnshuffle" => Some(LayerKind::PixelUnshuffle {
+            downscale_factor: call.bindings.get("downscale_factor")?.clone(),
+        }),
+        "ConstantPad1d" | "ConstantPad2d" | "ConstantPad3d" | "ZeroPad1d" | "ZeroPad2d"
+        | "ZeroPad3d" | "ReflectionPad1d" | "ReflectionPad2d" | "ReflectionPad3d"
+        | "ReplicationPad1d" | "ReplicationPad2d" | "ReplicationPad3d" => {
+            let spatial_rank = pool_spatial_rank(owner)?;
+            Some(LayerKind::Pad {
+                name: owner.to_string(),
+                spatial_rank,
+                padding: call.bindings.get("padding")?.clone(),
+            })
+        }
+        "Bilinear" => Some(LayerKind::Bilinear {
+            in1_features: call.bindings.get("in1_features")?.clone(),
+            in2_features: call.bindings.get("in2_features")?.clone(),
+            out_features: call.bindings.get("out_features")?.clone(),
+        }),
+        "CosineSimilarity" => Some(LayerKind::CosineSimilarity {
+            dim: call
+                .bindings
+                .get("dim")
+                .cloned()
+                .unwrap_or_else(|| "1".to_string()),
+        }),
+        "MLP" if is_equinox_module => Some(LayerKind::Mlp {
+            in_size: call.bindings.get("in_size")?.clone(),
+            out_size: call.bindings.get("out_size")?.clone(),
         }),
         _ => None,
     }
@@ -237,6 +353,17 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         }
         "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
         | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => &["self", "output_size"],
+        // equinox.nn.MultiheadAttention(num_heads, query_size, key_size=None,
+        // value_size=None, output_size=None, ...) — reversed order and
+        // different names vs. torch's (embed_dim, num_heads).
+        "MultiheadAttention" if framework == "equinox" => &[
+            "self",
+            "num_heads",
+            "query_size",
+            "key_size",
+            "value_size",
+            "output_size",
+        ],
         "MultiheadAttention" => &["self", "embed_dim", "num_heads"],
         "Conv1d" | "Conv2d" | "Conv3d" => &[
             "self",
@@ -251,7 +378,52 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         ],
         "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
         | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
-        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" => &["self"],
+        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
+        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout"
+        | "TransformerEncoderLayer" | "TransformerDecoderLayer" => &["self"],
+        "Flatten" => &["self", "start_dim", "end_dim"],
+        "Unflatten" => &["self", "dim", "sizes"],
+        "Upsample" => &["self", "size", "scale_factor", "mode", "align_corners"],
+        // Shares the first 5 positions (in/out channels, kernel_size, stride,
+        // padding) with Conv1d/2d/3d; torch and equinox diverge on the order
+        // of `groups`/`dilation`/`bias` afterwards, which we don't read, so
+        // the trailing placeholder names only need to absorb positions.
+        "ConvTranspose1d" | "ConvTranspose2d" | "ConvTranspose3d" => &[
+            "self",
+            "in_channels",
+            "out_channels",
+            "kernel_size",
+            "stride",
+            "padding",
+            "output_padding",
+            "groups_or_dilation",
+            "dilation_or_groups",
+            "use_bias",
+        ],
+        // torch/equinox agree on (input_size, hidden_size, ...) for all six
+        // of these; only the first two are ever read.
+        "RNN" | "LSTM" | "GRU" | "RNNCell" | "LSTMCell" | "GRUCell" => &[
+            "self",
+            "input_size",
+            "hidden_size",
+            "num_layers_or_bias",
+        ],
+        "PixelShuffle" => &["self", "upscale_factor"],
+        "PixelUnshuffle" => &["self", "downscale_factor"],
+        "ConstantPad1d" | "ConstantPad2d" | "ConstantPad3d" => &["self", "padding", "value"],
+        "ZeroPad1d" | "ZeroPad2d" | "ZeroPad3d" | "ReflectionPad1d" | "ReflectionPad2d"
+        | "ReflectionPad3d" | "ReplicationPad1d" | "ReplicationPad2d" | "ReplicationPad3d" => {
+            &["self", "padding"]
+        }
+        "Bilinear" => &["self", "in1_features", "in2_features", "out_features", "use_bias"],
+        "CosineSimilarity" => &["self", "dim", "eps"],
+        "MLP" if framework == "equinox" => &[
+            "self",
+            "in_size",
+            "out_size",
+            "width_size",
+            "depth",
+        ],
         _ => return None,
     };
 
@@ -658,23 +830,142 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
 /// This is the *opposite* of Flax/JAX-NN channel-last layout. When
 /// `flax.linen.Conv` is added, a separate variant or layout field will be
 /// needed.
-/// Validate that `input_shape` has at least `min_rank` dims for a layer
-/// application, erroring with a message naming the layer kind, the layer's
-/// variable name, and the input's variable name.
+/// Inverse of `conv_spatial_dim` for transposed/deconvolutions.
+/// Formula: `out = (in-1)*stride - 2*padding + kernel` (`output_padding` and
+/// `dilation` are not modelled and assumed 0 / 1).
+///
+/// Fully concrete when every input is a literal int; otherwise built
+/// symbolically with constant-folding where possible, mirroring
+/// `conv_spatial_dim`'s approach.
+fn conv_transpose_spatial_dim(
+    spatial_dim: &str,
+    kernel_size: &str,
+    stride: &str,
+    padding: &str,
+) -> String {
+    if let (Ok(l), Ok(k), Ok(s), Ok(p)) = (
+        spatial_dim.parse::<isize>(),
+        kernel_size.parse::<isize>(),
+        stride.parse::<isize>(),
+        padding.parse::<isize>(),
+    ) {
+        let l_out = (l - 1) * s - 2 * p + k;
+        return l_out.to_string();
+    }
+
+    // Symbolic: (L-1)*stride - 2*padding + kernel
+    let stride_val: Option<isize> = stride.parse::<isize>().ok();
+    let scaled = match stride_val {
+        Some(1) => apply_offset(spatial_dim, -1),
+        Some(s) => format!("({}-1)*{}", spatial_dim, s),
+        None => format!("({}-1)*{}", spatial_dim, stride),
+    };
+
+    let mut result = scaled;
+    if let Ok(p) = padding.parse::<isize>() {
+        result = apply_offset(&result, -2 * p);
+    } else {
+        result = format!("{}-2*{}", result, padding);
+    }
+    if let Ok(k) = kernel_size.parse::<isize>() {
+        apply_offset(&result, k)
+    } else {
+        format!("{}+{}", result, kernel_size)
+    }
+}
+
+/// Multiply a dim by a literal factor: exact when the dim is a literal int,
+/// otherwise a symbolic `dim*factor` string.
+fn mul_dim(dim: &str, factor: u64) -> String {
+    if let Ok(v) = dim.parse::<u64>() {
+        (v * factor).to_string()
+    } else {
+        format!("{}*{}", dim, factor)
+    }
+}
+
+/// Divide a dim by a literal factor. Errs when the dim is a literal int that
+/// isn't evenly divisible (a provable contradiction); otherwise a symbolic
+/// `dim/factor` string (unprovable, trusted as-is).
+fn div_dim(dim: &str, factor: u64) -> Result<String, String> {
+    if let Ok(v) = dim.parse::<u64>() {
+        if v % factor == 0 {
+            Ok((v / factor).to_string())
+        } else {
+            Err(format!("{} is not evenly divisible by {}", v, factor))
+        }
+    } else {
+        Ok(format!("{}/{}", dim, factor))
+    }
+}
+
+/// Product of a list of dims: exact integer product when every dim is a
+/// literal int, otherwise a symbolic `d0*d1*...` string.
+fn product_dims(dims: &[String]) -> String {
+    if dims.is_empty() {
+        return "1".to_string();
+    }
+    if let Some(values) = dims
+        .iter()
+        .map(|d| d.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()
+    {
+        values.iter().product::<u64>().to_string()
+    } else {
+        dims.join("*")
+    }
+}
+
+/// Resolve a Python-style (possibly negative) axis literal against a known
+/// rank. Returns `None` if the literal isn't a concrete integer or is out of
+/// bounds after resolution.
+fn resolve_axis(axis: &str, rank: usize) -> Option<usize> {
+    let i: isize = axis.trim().parse().ok()?;
+    let r = rank as isize;
+    let resolved = if i < 0 { i + r } else { i };
+    if resolved < 0 || resolved >= r {
+        None
+    } else {
+        Some(resolved as usize)
+    }
+}
+
+/// Split a tuple/list ctor-argument literal's raw text (e.g. `"(2, 3)"` or
+/// `"[2, 3]"`) into its comma-separated component strings. Returns `None` if
+/// the text doesn't look like a bracketed sequence.
+fn parse_dim_sequence(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .or_else(|| trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')))?;
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(
+        inner
+            .trim_end_matches(',')
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect(),
+    )
+}
+
+/// Shared minimum-rank guard used by every layer whose validity depends on
+/// input rank (Conv/Pool/ConvTranspose/shape-preserving families). Returns
+/// the standard "requires input with at least N dims" error when the input
+/// is too low-rank.
 fn check_min_rank(
-    name: &str,
+    layer_name: &str,
     app: &LayerApplication,
-    input_shape: &[String],
+    input_rank: usize,
     min_rank: usize,
 ) -> Result<(), String> {
-    if input_shape.len() < min_rank {
+    if input_rank < min_rank {
         return Err(format!(
             "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-            name,
-            app.layer,
-            min_rank,
-            input_shape.len(),
-            app.input
+            layer_name, app.layer, min_rank, input_rank, app.input
         ));
     }
     Ok(())
@@ -693,7 +984,7 @@ fn apply_conv_layer(
     padding: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let min_rank = spatial_rank + 1;
-    check_min_rank(layer_name, app, input_shape, min_rank)?;
+    check_min_rank(layer_name, app, input_shape.len(), min_rank)?;
 
     let channels_idx = input_shape.len() - spatial_rank - 1;
     let channels_dim = &input_shape[channels_idx];
@@ -730,14 +1021,15 @@ fn apply_conv_layer(
 /// Equinox `BatchNorm` and activations (`ReLU`, `GELU`, etc.) accept any rank.
 fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
     match name {
-        "BatchNorm1d" | "Dropout1d" => Some(2),
+        "BatchNorm1d" | "Dropout1d" | "InstanceNorm1d" => Some(2),
         // Same convention as Conv layers: channels-first without requiring
         // a batch dimension. Conv2d min_rank = 3 (C, H, W), Conv3d = 4.
-        "BatchNorm2d" | "Dropout2d" => Some(3),
-        "BatchNorm3d" | "Dropout3d" => Some(4),
-        "LayerNorm" | "GroupNorm" => Some(1),
-        // Dropout, BatchNorm (equinox), ReLU, GELU, Sigmoid, Tanh, Softmax, PReLU
-        // accept any rank including scalars.
+        "BatchNorm2d" | "Dropout2d" | "InstanceNorm2d" => Some(3),
+        "BatchNorm3d" | "Dropout3d" | "InstanceNorm3d" => Some(4),
+        "LayerNorm" | "GroupNorm" | "RMSNorm" => Some(1),
+        // Dropout, BatchNorm (equinox), ReLU, GELU, Sigmoid, Tanh, Softmax,
+        // PReLU, Identity, AlphaDropout, TransformerEncoderLayer,
+        // TransformerDecoderLayer accept any rank including scalars.
         _ => None,
     }
 }
@@ -884,8 +1176,7 @@ pub fn apply_layer_application(
             features,
             spatial_rank,
         } => {
-            let min_rank = spatial_rank + 1;
-            check_min_rank("Conv", app, input_shape, min_rank)?;
+            check_min_rank("Conv", app, input_shape.len(), spatial_rank + 1)?;
             // Stride-1 / SAME padding: spatial dims unchanged.
             let mut output_shape = input_shape.clone();
             let last = output_shape.len() - 1;
@@ -901,8 +1192,7 @@ pub fn apply_layer_application(
             stride,
             padding,
         } => {
-            let min_rank = spatial_rank + 1;
-            check_min_rank(name, app, input_shape, min_rank)?;
+            check_min_rank(name, app, input_shape.len(), spatial_rank + 1)?;
             let mut output_shape = input_shape.clone();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
@@ -915,8 +1205,7 @@ pub fn apply_layer_application(
             spatial_rank,
             output_size,
         } => {
-            let min_rank = spatial_rank + 1;
-            check_min_rank(name, app, input_shape, min_rank)?;
+            check_min_rank(name, app, input_shape.len(), spatial_rank + 1)?;
             let mut output_shape = input_shape.clone();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
@@ -930,11 +1219,273 @@ pub fn apply_layer_application(
             output_shape.push(embedding_size.clone());
             Ok(Some(output_shape))
         }
+        // ConvTranspose1d/2d/3d: same channels-first layout as Conv, inverse
+        // spatial formula.
+        LayerKind::ConvTranspose {
+            spatial_rank,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+        } => {
+            let layer_name = format!("ConvTranspose{}d", spatial_rank);
+            check_min_rank(&layer_name, app, input_shape.len(), spatial_rank + 1)?;
+            let channels_idx = input_shape.len() - spatial_rank - 1;
+            let channels_dim = &input_shape[channels_idx];
+            if dims_provably_mismatch(in_channels, channels_dim) {
+                return Err(format!(
+                    "{} layer '{}' expected {} input channels, got {} for '{}'",
+                    layer_name, app.layer, in_channels, channels_dim, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            output_shape[channels_idx] = out_channels.clone();
+            for i in 0..*spatial_rank {
+                let spatial_idx = channels_idx + 1 + i;
+                output_shape[spatial_idx] = conv_transpose_spatial_dim(
+                    &input_shape[spatial_idx],
+                    kernel_size,
+                    stride,
+                    padding,
+                );
+            }
+            Ok(Some(output_shape))
+        }
+        // torch.nn.Flatten(start_dim, end_dim): collapse the resolved range
+        // into one dim. Unresolvable (non-literal) indices are unknown.
+        LayerKind::Flatten { start_dim, end_dim } => {
+            let rank = input_shape.len();
+            let (Some(start), Some(end)) =
+                (resolve_axis(start_dim, rank), resolve_axis(end_dim, rank))
+            else {
+                return Ok(None);
+            };
+            if start > end {
+                return Ok(None);
+            }
+            let mut output_shape = input_shape[..start].to_vec();
+            output_shape.push(product_dims(&input_shape[start..=end]));
+            output_shape.extend_from_slice(&input_shape[end + 1..]);
+            Ok(Some(output_shape))
+        }
+        // torch.nn.Unflatten(dim, sizes): expand one dim into the parsed
+        // components of `sizes`.
+        LayerKind::Unflatten { dim, sizes } => {
+            let rank = input_shape.len();
+            let Some(axis) = resolve_axis(dim, rank) else {
+                return Ok(None);
+            };
+            let Some(components) = parse_dim_sequence(sizes) else {
+                return Ok(None);
+            };
+            let mut output_shape = input_shape[..axis].to_vec();
+            output_shape.extend(components);
+            output_shape.extend_from_slice(&input_shape[axis + 1..]);
+            Ok(Some(output_shape))
+        }
+        // torch.nn.Upsample: rank-agnostic — spatial dims are whatever
+        // trails the leading (batch, channel) pair, determined here from
+        // the actual input rank.
+        LayerKind::Upsample { scale_factor, size } => {
+            check_min_rank("Upsample", app, input_shape.len(), 3)?;
+            let spatial_count = input_shape.len() - 2;
+            let mut output_shape = input_shape.clone();
+            if let Some(size) = size {
+                let sizes = parse_dim_sequence(size).unwrap_or_else(|| vec![size.clone()]);
+                if sizes.len() != spatial_count {
+                    return Ok(None);
+                }
+                output_shape[2..].clone_from_slice(&sizes);
+            } else if let Some(scale_factor) = scale_factor {
+                let factors =
+                    parse_dim_sequence(scale_factor).unwrap_or_else(|| vec![scale_factor.clone()]);
+                if factors.len() == spatial_count {
+                    for (dim, factor) in output_shape[2..].iter_mut().zip(&factors) {
+                        let Ok(f) = factor.trim().parse::<u64>() else {
+                            return Ok(None);
+                        };
+                        *dim = mul_dim(dim, f);
+                    }
+                } else if factors.len() == 1 {
+                    let Ok(f) = factors[0].trim().parse::<u64>() else {
+                        return Ok(None);
+                    };
+                    for dim in &mut output_shape[2..] {
+                        *dim = mul_dim(dim, f);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+            Ok(Some(output_shape))
+        }
+        // torch.nn.RNN/LSTM/GRU: approximated as the primary output tensor
+        // only (see LayerKind::Rnn doc comment).
+        LayerKind::Rnn {
+            name,
+            input_size,
+            hidden_size,
+        } => {
+            check_min_rank(name, app, input_shape.len(), 2)?;
+            let last_dim = input_shape.last().unwrap();
+            if dims_provably_mismatch(input_size, last_dim) {
+                return Err(format!(
+                    "{} layer '{}' expected input last dim {}, got {} for '{}'",
+                    name, app.layer, input_size, last_dim, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = hidden_size.clone();
+            Ok(Some(output_shape))
+        }
+        // RNNCell/GRUCell/LSTMCell: same last-dim transform, min_rank 1
+        // (single step, optionally unbatched).
+        LayerKind::RnnCell {
+            name,
+            input_size,
+            hidden_size,
+        } => {
+            check_min_rank(name, app, input_shape.len(), 1)?;
+            let last_dim = input_shape.last().unwrap();
+            if dims_provably_mismatch(input_size, last_dim) {
+                return Err(format!(
+                    "{} layer '{}' expected input last dim {}, got {} for '{}'",
+                    name, app.layer, input_size, last_dim, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = hidden_size.clone();
+            Ok(Some(output_shape))
+        }
+        // torch.nn.PixelShuffle(r): (*, C*r^2, H, W) -> (*, C, H*r, W*r).
+        LayerKind::PixelShuffle { upscale_factor } => {
+            check_min_rank("PixelShuffle", app, input_shape.len(), 3)?;
+            let Ok(r) = upscale_factor.trim().parse::<u64>() else {
+                return Ok(None);
+            };
+            let mut output_shape = input_shape.clone();
+            let len = output_shape.len();
+            let channels_idx = len - 3;
+            output_shape[channels_idx] = div_dim(&input_shape[channels_idx], r * r)
+                .map_err(|e| format!("PixelShuffle layer '{}': {}", app.layer, e))?;
+            output_shape[len - 2] = mul_dim(&input_shape[len - 2], r);
+            output_shape[len - 1] = mul_dim(&input_shape[len - 1], r);
+            Ok(Some(output_shape))
+        }
+        // torch.nn.PixelUnshuffle(r): (*, C, H*r, W*r) -> (*, C*r^2, H, W).
+        LayerKind::PixelUnshuffle { downscale_factor } => {
+            check_min_rank("PixelUnshuffle", app, input_shape.len(), 3)?;
+            let Ok(r) = downscale_factor.trim().parse::<u64>() else {
+                return Ok(None);
+            };
+            let mut output_shape = input_shape.clone();
+            let len = output_shape.len();
+            let channels_idx = len - 3;
+            output_shape[channels_idx] = mul_dim(&input_shape[channels_idx], r * r);
+            output_shape[len - 2] = div_dim(&input_shape[len - 2], r)
+                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", app.layer, e))?;
+            output_shape[len - 1] = div_dim(&input_shape[len - 1], r)
+                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", app.layer, e))?;
+            Ok(Some(output_shape))
+        }
+        // Constant/Zero/Reflection/ReplicationPad Nd: only a concrete
+        // uniform-int or fully-literal 2*spatial_rank tuple is modelled;
+        // anything else is unknown.
+        LayerKind::Pad {
+            name,
+            spatial_rank,
+            padding,
+        } => {
+            check_min_rank(name, app, input_shape.len(), *spatial_rank)?;
+            let mut output_shape = input_shape.clone();
+            let start = input_shape.len() - spatial_rank;
+            if let Ok(p) = padding.trim().parse::<isize>() {
+                for dim in &mut output_shape[start..] {
+                    *dim = apply_offset(dim, 2 * p);
+                }
+                Ok(Some(output_shape))
+            } else if let Some(pairs) = parse_dim_sequence(padding)
+                && pairs.len() == 2 * spatial_rank
+                && let Some(values) = pairs
+                    .iter()
+                    .map(|p| p.trim().parse::<isize>().ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                // torch's reverse-axis convention: the first pair pads the
+                // *last* spatial dim.
+                for (i, dim) in output_shape[start..].iter_mut().rev().enumerate() {
+                    let (left, right) = (values[2 * i], values[2 * i + 1]);
+                    *dim = apply_offset(dim, left + right);
+                }
+                Ok(Some(output_shape))
+            } else {
+                Ok(None)
+            }
+        }
+        // torch.nn.Bilinear: only the first tracked input (x1) is checked/
+        // transformed; x2/broadcasting are not modelled (see doc comment).
+        LayerKind::Bilinear {
+            in1_features,
+            out_features,
+            ..
+        } => {
+            let Some(last_dim) = input_shape.last() else {
+                return Err(format!(
+                    "Cannot apply Bilinear layer '{}' to scalar input '{}'",
+                    app.layer, app.input
+                ));
+            };
+            if dims_provably_mismatch(in1_features, last_dim) {
+                return Err(format!(
+                    "Bilinear layer '{}' expected input last dim {}, got {} for '{}'",
+                    app.layer, in1_features, last_dim, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = out_features.clone();
+            Ok(Some(output_shape))
+        }
+        // torch.nn.CosineSimilarity(dim): drops the reduced axis from x1's
+        // shape (same single-tracked-input limitation as Bilinear).
+        LayerKind::CosineSimilarity { dim } => {
+            let rank = input_shape.len();
+            let Some(axis) = resolve_axis(dim, rank) else {
+                return Ok(None);
+            };
+            let mut output_shape = input_shape.clone();
+            output_shape.remove(axis);
+            Ok(Some(output_shape))
+        }
+        // equinox.nn.MLP: last-dim transform, same rule as Linear.
+        LayerKind::Mlp { in_size, out_size } => {
+            let Some(last_dim) = input_shape.last() else {
+                return Err(format!(
+                    "Cannot apply MLP layer '{}' to scalar input '{}'",
+                    app.layer, app.input
+                ));
+            };
+            if dims_provably_mismatch(in_size, last_dim) {
+                return Err(format!(
+                    "MLP layer '{}' expected input last dim {}, got {} for '{}'",
+                    app.layer, in_size, last_dim, app.input
+                ));
+            }
+            let mut output_shape = input_shape.clone();
+            let last = output_shape.len() - 1;
+            output_shape[last] = out_size.clone();
+            Ok(Some(output_shape))
+        }
         // Shape-preserving layers: output shape equals input shape, but some
         // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
         LayerKind::ShapePreserving { name } => {
             if let Some(min_rank) = min_rank_for_shape_preserving(name) {
-                check_min_rank(name, app, input_shape, min_rank)?;
+                check_min_rank(name, app, input_shape.len(), min_rank)?;
             }
             Ok(Some(input_shape.clone()))
         }
@@ -2246,6 +2797,70 @@ mod classify_layer_call_tests {
 
         assert_eq!(classify_layer_call(&call), None);
     }
+
+    // --- MultiheadAttention bug fix: equinox and torch bind different ctor
+    // positions to the tracked feature dim. ---
+
+    #[test]
+    fn test_classifies_torch_multihead_attention_via_embed_dim() {
+        let call = call(
+            &["torch", "nn"],
+            Some("MultiheadAttention"),
+            "__init__",
+            &[("embed_dim", "512"), ("num_heads", "8")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::MultiheadAttention {
+                feature_dim: "512".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_classifies_equinox_multihead_attention_via_query_size() {
+        // equinox.nn.MultiheadAttention(num_heads, query_size, ...) — reversed
+        // order vs. torch. Before the fix, classify_layer_call always read
+        // the `embed_dim` binding key, which equinox ctors never populate, so
+        // this returned None.
+        let call = call(
+            &["equinox", "nn"],
+            Some("MultiheadAttention"),
+            "__init__",
+            &[("num_heads", "8"), ("query_size", "512")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::MultiheadAttention {
+                feature_dim: "512".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_equinox_multihead_attention_ignores_embed_dim_binding() {
+        // Even if an `embed_dim` binding happened to be present (e.g. stale
+        // data), the equinox path must read `query_size`, not `embed_dim`.
+        let call = call(
+            &["equinox", "nn"],
+            Some("MultiheadAttention"),
+            "__init__",
+            &[
+                ("embed_dim", "8"),
+                ("num_heads", "8"),
+                ("query_size", "512"),
+            ],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::MultiheadAttention {
+                feature_dim: "512".to_string()
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2359,6 +2974,130 @@ mod known_layer_signature_tests {
         // equinox.experimental.Linear should not match
         assert!(known_layer_signature(&parts(&["equinox", "experimental", "Linear"])).is_none());
         assert!(known_layer_signature(&parts(&["torch", "functional", "Linear"])).is_none());
+    }
+
+    #[test]
+    fn test_torch_multihead_attention_signature_order() {
+        let sig = known_layer_signature(&parts(&["torch", "nn", "MultiheadAttention"])).unwrap();
+        assert_eq!(&sig.params[..3], &["self", "embed_dim", "num_heads"]);
+    }
+
+    #[test]
+    fn test_equinox_multihead_attention_signature_order() {
+        // Reversed vs. torch: num_heads first, then query_size.
+        let sig = known_layer_signature(&parts(&["equinox", "nn", "MultiheadAttention"])).unwrap();
+        assert_eq!(&sig.params[..3], &["self", "num_heads", "query_size"]);
+    }
+
+    #[test]
+    fn test_flatten_unflatten_upsample_signatures() {
+        let flatten =
+            known_layer_signature(&parts(&["torch", "nn", "Flatten"])).unwrap();
+        assert_eq!(flatten.params, vec!["self", "start_dim", "end_dim"]);
+
+        let unflatten =
+            known_layer_signature(&parts(&["torch", "nn", "Unflatten"])).unwrap();
+        assert_eq!(unflatten.params, vec!["self", "dim", "sizes"]);
+
+        let upsample =
+            known_layer_signature(&parts(&["torch", "nn", "Upsample"])).unwrap();
+        assert!(upsample.params.contains(&"scale_factor".to_string()));
+        assert!(upsample.params.contains(&"size".to_string()));
+    }
+
+    #[test]
+    fn test_conv_transpose_variants_share_conv_prefix() {
+        for framework in ["equinox", "torch"] {
+            for class in ["ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d"] {
+                let sig = known_layer_signature(&parts(&[framework, "nn", class])).unwrap();
+                assert_eq!(
+                    &sig.params[..5],
+                    &["self", "in_channels", "out_channels", "kernel_size", "stride"]
+                );
+                assert!(sig.params.iter().any(|p| p == "padding"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_rnn_family_signatures() {
+        for class in ["RNN", "LSTM", "GRU", "RNNCell", "LSTMCell", "GRUCell"] {
+            let sig = known_layer_signature(&parts(&["torch", "nn", class]))
+                .unwrap_or_else(|| panic!("no signature for torch.nn.{}", class));
+            assert_eq!(&sig.params[..3], &["self", "input_size", "hidden_size"]);
+        }
+        for class in ["LSTMCell", "GRUCell"] {
+            let sig = known_layer_signature(&parts(&["equinox", "nn", class]))
+                .unwrap_or_else(|| panic!("no signature for equinox.nn.{}", class));
+            assert_eq!(&sig.params[..3], &["self", "input_size", "hidden_size"]);
+        }
+    }
+
+    #[test]
+    fn test_pixel_shuffle_signatures() {
+        let shuffle = known_layer_signature(&parts(&["torch", "nn", "PixelShuffle"])).unwrap();
+        assert_eq!(shuffle.params, vec!["self", "upscale_factor"]);
+        let unshuffle =
+            known_layer_signature(&parts(&["torch", "nn", "PixelUnshuffle"])).unwrap();
+        assert_eq!(unshuffle.params, vec!["self", "downscale_factor"]);
+    }
+
+    #[test]
+    fn test_pad_family_signatures() {
+        let constant = known_layer_signature(&parts(&["torch", "nn", "ConstantPad2d"])).unwrap();
+        assert_eq!(constant.params, vec!["self", "padding", "value"]);
+
+        for class in ["ZeroPad2d", "ReflectionPad1d", "ReplicationPad3d"] {
+            let sig = known_layer_signature(&parts(&["torch", "nn", class]))
+                .unwrap_or_else(|| panic!("no signature for torch.nn.{}", class));
+            assert_eq!(sig.params, vec!["self", "padding"]);
+        }
+    }
+
+    #[test]
+    fn test_bilinear_cosine_similarity_signatures() {
+        let bilinear = known_layer_signature(&parts(&["torch", "nn", "Bilinear"])).unwrap();
+        assert_eq!(
+            &bilinear.params[..4],
+            &["self", "in1_features", "in2_features", "out_features"]
+        );
+
+        let cosine =
+            known_layer_signature(&parts(&["torch", "nn", "CosineSimilarity"])).unwrap();
+        assert_eq!(cosine.params, vec!["self", "dim", "eps"]);
+    }
+
+    #[test]
+    fn test_equinox_mlp_signature() {
+        let sig = known_layer_signature(&parts(&["equinox", "nn", "MLP"])).unwrap();
+        assert_eq!(&sig.params[..3], &["self", "in_size", "out_size"]);
+    }
+
+    #[test]
+    fn test_torch_mlp_is_not_in_catalog() {
+        // MLP is an equinox.nn concept; torch has no torch.nn.MLP.
+        assert!(known_layer_signature(&parts(&["torch", "nn", "MLP"])).is_none());
+    }
+
+    #[test]
+    fn test_new_shape_preserving_layer_signatures() {
+        let names = [
+            "Identity",
+            "InstanceNorm1d",
+            "InstanceNorm2d",
+            "InstanceNorm3d",
+            "RMSNorm",
+            "AlphaDropout",
+            "TransformerEncoderLayer",
+            "TransformerDecoderLayer",
+        ];
+        for framework in ["equinox", "torch"] {
+            for name in names {
+                let sig = known_layer_signature(&parts(&[framework, "nn", name]))
+                    .unwrap_or_else(|| panic!("no signature for {}.nn.{}", framework, name));
+                assert_eq!(sig.owner.as_deref(), Some(name));
+            }
+        }
     }
 }
 
@@ -2706,5 +3445,532 @@ mod catalog_first_extract_layer_assignments_tests {
         let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
 
         assert!(layers.is_empty());
+    }
+
+    // --- MultiheadAttention bug fix, exercised end-to-end through real
+    // parsed positional-arg constructor calls (not just direct
+    // ResolvedCallSignature construction). ---
+
+    #[test]
+    fn test_catalog_resolves_torch_multihead_attention_unchanged() {
+        // Matches corpus/torch_attention.py's `nn.MultiheadAttention(512, 8)`.
+        let code = "import torch.nn as nn\nattn = nn.MultiheadAttention(512, 8)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("attn"),
+            Some(&LayerKind::MultiheadAttention {
+                feature_dim: "512".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_equinox_multihead_attention_via_query_size() {
+        // Before the fix this returned None: classify_layer_call always
+        // looked up the `embed_dim` binding, which the equinox positional
+        // order (num_heads, query_size) never populates.
+        let code = "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(8, 512)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("attn"),
+            Some(&LayerKind::MultiheadAttention {
+                feature_dim: "512".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_equinox_multihead_attention_with_keywords() {
+        let code =
+            "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(num_heads=4, query_size=256)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("attn"),
+            Some(&LayerKind::MultiheadAttention {
+                feature_dim: "256".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_flatten_without_disk() {
+        let code = "import torch\nlayer = torch.nn.Flatten(1, 2)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Flatten {
+                start_dim: "1".to_string(),
+                end_dim: "2".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_catalog_resolves_torch_conv_transpose2d_without_disk() {
+        let code = "import torch\nlayer = torch.nn.ConvTranspose2d(3, 16, 4, stride=2, padding=1)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::ConvTranspose {
+                spatial_rank: 2,
+                in_channels: "3".to_string(),
+                out_channels: "16".to_string(),
+                kernel_size: "4".to_string(),
+                stride: "2".to_string(),
+                padding: "1".to_string(),
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod new_layer_kind_apply_tests {
+    use super::*;
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|d| d.to_string()).collect()
+    }
+
+    fn app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: "y".to_string(),
+            layer: "layer".to_string(),
+            input: input.to_string(),
+            kind,
+            range: tree_sitter::Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+        }
+    }
+
+    fn shapes_of(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(name, dims)| (name.to_string(), shape(dims)))
+            .collect()
+    }
+
+    // --- Flatten ---
+
+    #[test]
+    fn test_flatten_collapses_middle_dims() {
+        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
+        let kind = LayerKind::Flatten {
+            start_dim: "1".to_string(),
+            end_dim: "2".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "12", "5"])));
+    }
+
+    #[test]
+    fn test_flatten_symbolic_product_and_negative_end_dim() {
+        let shapes = shapes_of(&[("x", &["batch", "c", "d"])]);
+        let kind = LayerKind::Flatten {
+            start_dim: "1".to_string(),
+            end_dim: "-1".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "c*d"])));
+    }
+
+    #[test]
+    fn test_flatten_unresolvable_start_dim_is_unknown() {
+        let shapes = shapes_of(&[("x", &["2", "3", "4"])]);
+        let kind = LayerKind::Flatten {
+            start_dim: "axis".to_string(),
+            end_dim: "-1".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    // --- Unflatten ---
+
+    #[test]
+    fn test_unflatten_expands_dim_into_components() {
+        let shapes = shapes_of(&[("x", &["batch", "6", "feat"])]);
+        let kind = LayerKind::Unflatten {
+            dim: "1".to_string(),
+            sizes: "(2, 3)".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "2", "3", "feat"])));
+    }
+
+    #[test]
+    fn test_unflatten_non_literal_dim_is_unknown() {
+        let shapes = shapes_of(&[("x", &["batch", "6", "feat"])]);
+        let kind = LayerKind::Unflatten {
+            dim: "axis".to_string(),
+            sizes: "(2, 3)".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    // --- Upsample ---
+
+    #[test]
+    fn test_upsample_scalar_scale_factor_doubles_spatial_dims() {
+        let shapes = shapes_of(&[("x", &["1", "3", "8", "8"])]);
+        let kind = LayerKind::Upsample {
+            scale_factor: Some("2".to_string()),
+            size: None,
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["1", "3", "16", "16"])));
+    }
+
+    #[test]
+    fn test_upsample_explicit_size_tuple() {
+        let shapes = shapes_of(&[("x", &["1", "3", "8", "8"])]);
+        let kind = LayerKind::Upsample {
+            scale_factor: None,
+            size: Some("(20, 20)".to_string()),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["1", "3", "20", "20"])));
+    }
+
+    #[test]
+    fn test_upsample_rank_too_low_errors() {
+        let shapes = shapes_of(&[("x", &["3", "8"])]);
+        let kind = LayerKind::Upsample {
+            scale_factor: Some("2".to_string()),
+            size: None,
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 3 dims"));
+    }
+
+    // --- ConvTranspose ---
+
+    #[test]
+    fn test_conv_transpose2d_inverts_conv_output_formula() {
+        // conv_spatial_dim(8, k=4, s=2, p=1) == 4; the transpose must invert
+        // that back to 8.
+        let shapes = shapes_of(&[("x", &["3", "4", "4"])]);
+        let kind = LayerKind::ConvTranspose {
+            spatial_rank: 2,
+            in_channels: "3".to_string(),
+            out_channels: "16".to_string(),
+            kernel_size: "4".to_string(),
+            stride: "2".to_string(),
+            padding: "1".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["16", "8", "8"])));
+    }
+
+    #[test]
+    fn test_conv_transpose2d_channel_mismatch_errors() {
+        let shapes = shapes_of(&[("x", &["5", "4", "4"])]);
+        let kind = LayerKind::ConvTranspose {
+            spatial_rank: 2,
+            in_channels: "3".to_string(),
+            out_channels: "16".to_string(),
+            kernel_size: "4".to_string(),
+            stride: "2".to_string(),
+            padding: "1".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("expected 3 input channels"));
+    }
+
+    // --- Rnn / RnnCell ---
+
+    #[test]
+    fn test_rnn_replaces_last_dim_with_hidden_size() {
+        let shapes = shapes_of(&[("x", &["seq", "10"])]);
+        let kind = LayerKind::Rnn {
+            name: "GRU".to_string(),
+            input_size: "10".to_string(),
+            hidden_size: "20".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["seq", "20"])));
+    }
+
+    #[test]
+    fn test_rnn_input_size_mismatch_errors() {
+        let shapes = shapes_of(&[("x", &["seq", "9"])]);
+        let kind = LayerKind::Rnn {
+            name: "GRU".to_string(),
+            input_size: "10".to_string(),
+            hidden_size: "20".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("expected input last dim 10"));
+    }
+
+    #[test]
+    fn test_rnn_cell_applies_to_unbatched_input() {
+        let shapes = shapes_of(&[("x", &["10"])]);
+        let kind = LayerKind::RnnCell {
+            name: "LSTMCell".to_string(),
+            input_size: "10".to_string(),
+            hidden_size: "20".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["20"])));
+    }
+
+    // --- PixelShuffle / PixelUnshuffle ---
+
+    #[test]
+    fn test_pixel_shuffle_trades_channels_for_spatial_resolution() {
+        let shapes = shapes_of(&[("x", &["8", "4", "4"])]);
+        let kind = LayerKind::PixelShuffle {
+            upscale_factor: "2".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "8", "8"])));
+    }
+
+    #[test]
+    fn test_pixel_shuffle_indivisible_channels_errors() {
+        let shapes = shapes_of(&[("x", &["9", "4", "4"])]);
+        let kind = LayerKind::PixelShuffle {
+            upscale_factor: "2".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("not evenly divisible"));
+    }
+
+    #[test]
+    fn test_pixel_unshuffle_is_inverse_of_shuffle() {
+        let shapes = shapes_of(&[("x", &["2", "8", "8"])]);
+        let kind = LayerKind::PixelUnshuffle {
+            downscale_factor: "2".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["8", "4", "4"])));
+    }
+
+    // --- Pad family ---
+
+    #[test]
+    fn test_pad_uniform_int_pads_every_spatial_dim() {
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = LayerKind::Pad {
+            name: "ConstantPad2d".to_string(),
+            spatial_rank: 2,
+            padding: "1".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["3", "10", "10"])));
+    }
+
+    #[test]
+    fn test_pad_tuple_uses_reverse_axis_convention() {
+        // padding=(left, right, top, bottom): last spatial dim (W) gets the
+        // first pair, second-to-last (H) gets the second pair.
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = LayerKind::Pad {
+            name: "ConstantPad2d".to_string(),
+            spatial_rank: 2,
+            padding: "(1, 1, 2, 2)".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["3", "12", "10"])));
+    }
+
+    #[test]
+    fn test_pad_symbolic_padding_is_unknown() {
+        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
+        let kind = LayerKind::Pad {
+            name: "ConstantPad2d".to_string(),
+            spatial_rank: 2,
+            padding: "p".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    // --- Bilinear / CosineSimilarity ---
+
+    #[test]
+    fn test_bilinear_transforms_first_input_last_dim() {
+        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
+        let kind = LayerKind::Bilinear {
+            in1_features: "10".to_string(),
+            in2_features: "20".to_string(),
+            out_features: "30".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "30"])));
+    }
+
+    #[test]
+    fn test_bilinear_in1_features_mismatch_errors() {
+        let shapes = shapes_of(&[("x1", &["batch", "9"])]);
+        let kind = LayerKind::Bilinear {
+            in1_features: "10".to_string(),
+            in2_features: "20".to_string(),
+            out_features: "30".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x1", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("expected input last dim 10"));
+    }
+
+    #[test]
+    fn test_cosine_similarity_removes_reduced_axis() {
+        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
+        let kind = LayerKind::CosineSimilarity {
+            dim: "1".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch"])));
+    }
+
+    #[test]
+    fn test_cosine_similarity_non_literal_dim_is_unknown() {
+        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
+        let kind = LayerKind::CosineSimilarity {
+            dim: "axis".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    // --- equinox MLP ---
+
+    #[test]
+    fn test_mlp_transforms_last_dim() {
+        let shapes = shapes_of(&[("x", &["10"])]);
+        let kind = LayerKind::Mlp {
+            in_size: "10".to_string(),
+            out_size: "5".to_string(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn test_mlp_in_size_mismatch_errors() {
+        let shapes = shapes_of(&[("x", &["9"])]);
+        let kind = LayerKind::Mlp {
+            in_size: "10".to_string(),
+            out_size: "5".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("expected input last dim 10"));
+    }
+
+    // --- New ShapePreserving names: min-rank vs. any-rank ---
+
+    #[test]
+    fn test_instance_norm2d_requires_min_rank() {
+        let shapes = shapes_of(&[("x", &["8"])]);
+        let kind = LayerKind::ShapePreserving {
+            name: "InstanceNorm2d".to_string(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 3 dims"));
+    }
+
+    #[test]
+    fn test_identity_alpha_dropout_and_transformer_layers_accept_any_rank() {
+        let shapes = shapes_of(&[("scalar", &[])]);
+        for name in [
+            "Identity",
+            "AlphaDropout",
+            "TransformerEncoderLayer",
+            "TransformerDecoderLayer",
+        ] {
+            let kind = LayerKind::ShapePreserving {
+                name: name.to_string(),
+            };
+            let out = apply_layer_application(&app("scalar", kind), &shapes).unwrap();
+            assert_eq!(out, Some(Vec::new()), "layer {} should accept rank 0", name);
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_requires_at_least_rank_1() {
+        let shapes = shapes_of(&[("scalar", &[])]);
+        let kind = LayerKind::ShapePreserving {
+            name: "RMSNorm".to_string(),
+        };
+
+        let err = apply_layer_application(&app("scalar", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("requires input with at least 1 dims"));
     }
 }
