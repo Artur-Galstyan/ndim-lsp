@@ -15,34 +15,34 @@ Legend:
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
 | `jax.vmap` / `equinox.filter_vmap` | ✅ | ✅ | ✅ | Free (`vf = vmap(f); vf(x)`), inline (`vmap(f)(x)`), and attribute (`vmap(self.layer)(x)`) forms; scalar `in_axes`/`out_axes` only. |
-| `jax.jit` | ❌ | ❌ | ❌ | Usually shape-preserving wrapper. |
-| `jax.grad` | ❌ | ❌ | ❌ | Higher-order; output shape depends on differentiated arg. |
-| `jax.value_and_grad` | ❌ | ❌ | ❌ | Returns value plus gradient tree. |
-| `jax.jacfwd` | ❌ | ❌ | ❌ | Adds Jacobian dimensions. |
-| `jax.jacrev` | ❌ | ❌ | ❌ | Adds Jacobian dimensions. |
-| `jax.hessian` | ❌ | ❌ | ❌ | Adds two derivative dimension groups. |
-| `jax.pmap` | ❌ | ❌ | ❌ | Similar to `vmap`, device axis semantics. |
+| `jax.jit` | ❌ | ❌ | ❌ | Out of scope: output depends on the wrapped function, not statically derivable with the current design. |
+| `jax.grad` | ❌ | ❌ | ❌ | Out of scope: higher-order; output shape depends on the differentiated function, not statically derivable. |
+| `jax.value_and_grad` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (returns value + gradient tree). |
+| `jax.jacfwd` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (adds Jacobian dims from the wrapped function). |
+| `jax.jacrev` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad`. |
+| `jax.hessian` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (two derivative dimension groups). |
+| `jax.pmap` | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics, not statically derivable with the current design. |
 | `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant); stacked ys skipped (needs body output inference). |
-| `jax.lax.map` | ❌ | ❌ | ❌ | Map over leading axis. |
-| `jax.lax.cond` | ❌ | ❌ | ❌ | Branch output shape agreement. |
-| `jax.lax.switch` | ❌ | ❌ | ❌ | Branch output shape agreement. |
-| `jax.lax.while_loop` | ❌ | ❌ | ❌ | Carry shape invariant. |
-| `jax.lax.fori_loop` | ❌ | ❌ | ❌ | Carry shape invariant. |
-| `jax.lax.conv_general_dilated` | ❌ | ❌ | ❌ | Priority: high. Conv output-shape formula, generic dimension_numbers. |
-| `jax.lax.gather` | ❌ | ❌ | ❌ | Priority: high. Output shape from `dimension_numbers`/`slice_sizes`. |
-| `jax.lax.scatter` (and `scatter_add`/`scatter_mul`/etc.) | ❌ | ❌ | ❌ | Priority: high. Shape-preserving on the operand. |
-| `jax.lax.reduce_window` | ❌ | ❌ | ❌ | Priority: high. Pooling-style output shape from window/strides/padding. |
-| `jax.lax.top_k` | ❌ | ❌ | ❌ | Priority: high. Tuple LHS, last-axis size becomes `k`. |
-| `jax.lax.sort` / `jax.lax.sort_key_val` | ❌ | ❌ | ❌ | Priority: high. Shape-preserving. |
-| `jax.lax.pad` | ❌ | ❌ | ❌ | Priority: medium. Explicit padding config per axis. |
-| `jax.lax.broadcast` / `jax.lax.broadcast_in_dim` | ❌ | ❌ | ❌ | Priority: medium. Explicit target shape. |
-| `jax.lax.slice` / `jax.lax.dynamic_slice` / `jax.lax.dynamic_update_slice` | ❌ | ❌ | ❌ | Priority: medium. Explicit slice sizes. |
-| `jax.lax.concatenate` | ❌ | ❌ | ❌ | Priority: medium. Same semantics as `jnp.concatenate`. |
-| `jax.lax.rev` | ❌ | ❌ | ❌ | Priority: medium. Shape-preserving. |
-| `jax.lax.squeeze` / `jax.lax.expand_dims` | ❌ | ❌ | ❌ | Priority: medium. Same semantics as `jnp` equivalents. |
-| `jax.lax.transpose` | ❌ | ❌ | ❌ | Priority: medium. Permute axes. |
-| `jax.lax.associative_scan` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving scan variant. |
-| `jax.lax.psum` / `jax.lax.pmean` / `jax.lax.all_gather` (collectives) | ❌ | ❌ | ❌ | Priority: low. Device-axis semantics under `pmap`/`shard_map`. |
+| `jax.lax.map` | ✅ | ✅ | ✅ | Maps over the leading axis like `vmap(f)(xs)` with `in_axes=out_axes=0`; reuses `apply_vmap_call`/`apply_inline_vmap_layer` (bare user function or `self.<attr>` layer). Special-cased in `shape_of_call` (needs the callee-scope lookup machinery, not just `args`+`shapes`). |
+| `jax.lax.cond` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — branch output shape isn't derivable without analyzing both branch functions (out of scope for now). |
+| `jax.lax.switch` | ✅ | ❌ | ✅ | Same as `cond` — classified, conservatively `Ok(None)`. |
+| `jax.lax.while_loop` | ✅ | ✅ | ✅ | Carry invariant: output = `init_val`'s shape (3rd positional / `init_val` keyword). |
+| `jax.lax.fori_loop` | ✅ | ✅ | ✅ | Carry invariant: output = `init_val`'s shape (4th positional / `init_val` keyword). |
+| `jax.lax.conv_general_dilated` | ✅ | ✅ | ✅ | Default `dimension_numbers` only (`(batch, in_ch, *spatial)` / `(out_ch, in_ch, *spatial)`); supports `rhs_dilation`, `'SAME'`/`'VALID'`/explicit padding pairs, concrete dims. Any explicit `dimension_numbers`, non-trivial `lhs_dilation`, or symbolic spatial dims → `Ok(None)`. |
+| `jax.lax.gather` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — full `GatherDimensionNumbers`/`slice_sizes` modelling is out of scope for now (too large, like full einsum-path algebra). |
+| `jax.lax.scatter` (and `scatter_add`/`scatter_mul`/`scatter_min`/`scatter_max`/`scatter_apply`) | ✅ | ✅ | ✅ | Shape-preserving on the `operand` (first arg). |
+| `jax.lax.reduce_window` | ✅ | ✅ | ✅ | Pooling-style output shape from concrete `window_dimensions`/`window_strides`/`padding` (`'VALID'`, explicit `(low, high)` pairs, or omitted); `'SAME'` string and symbolic dims → `Ok(None)`. |
+| `jax.lax.top_k` | ✅ | ✅ | ✅ | Tuple LHS (`values, indices`): both get `operand`'s shape with the last axis replaced by `k`. Extends `tuple_rhs_shapes`. |
+| `jax.lax.sort` / `jax.lax.sort_key_val` | ✅ | ✅ | ✅ | `sort` (single operand): shape-preserving. `sort_key_val`: tuple LHS, each output preserves its own operand's shape (extends `tuple_rhs_shapes`). Multi-operand `sort` with tuple LHS isn't modelled. |
+| `jax.lax.pad` | ✅ | ✅ | ✅ | Explicit per-axis `(low, high, interior)` padding_config triples; numeric dims support `interior != 0`, symbolic dims only when `interior == 0`. |
+| `jax.lax.broadcast` / `jax.lax.broadcast_in_dim` | ✅ | ✅ | ✅ | `broadcast`: prepends `sizes` as leading dims. `broadcast_in_dim`: output is the explicit target `shape` arg. |
+| `jax.lax.slice` / `jax.lax.dynamic_slice` / `jax.lax.dynamic_update_slice` | ✅ | ✅ | ✅ | `slice`: concrete `start_indices`/`limit_indices`/`strides`. `dynamic_slice`: output = `slice_sizes`. `dynamic_update_slice`: shape-preserving on `operand`. |
+| `jax.lax.concatenate` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Concatenate` / `apply_known_concatenate` directly — same `(operands, dimension)` positional shape as `jnp.concatenate(arrays, axis)`. |
+| `jax.lax.rev` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Flip`'s shape-preserving rule. |
+| `jax.lax.squeeze` / `jax.lax.expand_dims` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Squeeze`/`ExpandDims`; both now also accept the `dimensions` keyword and (for `expand_dims`) a *sequence* of axes, not just one. |
+| `jax.lax.transpose` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Transpose`; `permutation` added as an accepted keyword alongside `axes`/`axis`/`dims`. |
+| `jax.lax.associative_scan` | ✅ | ✅ | ✅ | Shape-preserving: output = `elems`'s shape (2nd positional / `elems` keyword). |
+| `jax.lax.psum` / `jax.lax.pmean` / `jax.lax.all_gather` (collectives) | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics under `pmap`/`shard_map`, not statically derivable with the current design. |
 
 ## JAX NumPy / NumPy array creation
 
@@ -64,15 +64,15 @@ Legend:
 | `jnp.eye` / `np.eye` | ✅ | ✅ | ✅ | Matrix shape `(N, M?)`. |
 | `jnp.identity` / `np.identity` | ✅ | ✅ | ✅ | Matrix shape `(n, n)`. |
 | `jnp.diag` / `np.diag` | ✅ | ✅ | ✅ | 1D→2D or 2D→1D. |
-| `jnp.diagflat` / `np.diagflat` | ❌ | ❌ | ❌ | Priority: medium. Flatten then diagonal matrix. |
-| `jnp.tri` / `np.tri` | ❌ | ❌ | ❌ | Priority: medium. Matrix shape `(N, M?)`. |
+| `jnp.diagflat` / `np.diagflat` | ✅ | ✅ | ✅ | Flattens then builds a square `(n, n)` diagonal matrix; `k` offset ignored (v1). |
+| `jnp.tri` / `np.tri` | ✅ | ✅ | ✅ | Matrix shape `(N, M or N)`. |
 | `jnp.tril` / `np.tril` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.triu` / `np.triu` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.meshgrid` / `np.meshgrid` | ✅ | ✅ | ✅ | Tuple LHS, default 'xy' indexing; keyword args skip. |
-| `jnp.indices` / `np.indices` | ❌ | ❌ | ❌ | Priority: medium. Prepends rank dimension. |
-| `jnp.bincount` / `np.bincount` | ❌ | ❌ | ❌ | Priority: high. 1D output, length from `minlength`/max value (usually unresolvable statically). |
-| `jnp.unique` / `np.unique` | ❌ | ❌ | ❌ | Priority: high. 1D output, length data-dependent. |
-| `jnp.select` / `np.select` | ❌ | ❌ | ❌ | Priority: high. Broadcast of `condlist`/`choicelist`. |
+| `jnp.indices` / `np.indices` | ✅ | ✅ | ✅ | Prepends rank dimension: `indices((2, 3)).shape == (2, 2, 3)`. |
+| `jnp.bincount` / `np.bincount` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — length is data-dependent (max value / `minlength`), per the "unknown → `Ok(None)`" convention. |
+| `jnp.unique` / `np.unique` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — length is data-dependent. |
+| `jnp.select` / `np.select` | ✅ | ✅ | ✅ | Approximated as the shape of `choicelist`'s first array. |
 
 ## JAX NumPy / NumPy shape transforms
 
@@ -91,18 +91,18 @@ Legend:
 | `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ✅ | ✅ | Promote to rank 3. |
 | `jnp.broadcast_to` / `np.broadcast_to` | ✅ | ✅ | ✅ | Output explicit target shape. |
 | `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ✅ | ✅ | Common broadcasted shape for all args. |
-| `jnp.broadcast_shapes` / `np.broadcast_shapes` | ❌ | ❌ | ❌ | Priority: medium. Returns shape tuple, not array. |
+| `jnp.broadcast_shapes` / `np.broadcast_shapes` | ❌ | ❌ | ❌ | Genuinely out of scope: returns a plain shape *tuple*, not an array — not applicable to this analyzer's "shape of an array" model. |
 | `jnp.pad` / `np.pad` | ✅ | ✅ | ✅ | Modifies dimensions by pad widths. |
 | `jnp.roll` / `np.roll` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.flip` / `np.flip` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.fliplr` / `np.fliplr` | ✅ | ✅ | ✅ | Shape-preserving, rank >= 2. |
 | `jnp.flipud` / `np.flipud` | ✅ | ✅ | ✅ | Shape-preserving, rank >= 1. |
 | `jnp.rot90` / `np.rot90` | ✅ | ✅ | ✅ | Usually swaps two axis lengths when odd `k`. |
-| `jnp.rollaxis` / `np.rollaxis` | ❌ | ❌ | ❌ | Priority: medium. Axis movement. |
-| `jnp.resize` / `np.resize` | ❌ | ❌ | ❌ | Priority: medium. Output explicit shape. |
-| `jnp.insert` / `np.insert` | ❌ | ❌ | ❌ | Priority: medium. Axis length increases by number of inserted values. |
-| `jnp.delete` / `np.delete` | ❌ | ❌ | ❌ | Priority: medium. Axis length decreases; data-dependent when mask-based. |
-| `jnp.append` / `np.append` | ❌ | ❌ | ❌ | Priority: medium. Like `concatenate`, or flattens when `axis=None`. |
+| `jnp.rollaxis` / `np.rollaxis` | ✅ | ✅ | ✅ | Rolls `axis` backward until it lies before position `start` (numpy semantics). |
+| `jnp.resize` / `np.resize` | ✅ | ✅ | ✅ | Output is exactly the explicit `new_shape` arg. |
+| `jnp.insert` / `np.insert` | ✅ | ✅ | ✅ | `axis` given + concrete insertion count (scalar literal → 1, literal list → its length, or a known array's own axis-length); `axis=None` (flattening) → `Ok(None)`. |
+| `jnp.delete` / `np.delete` | ✅ | ✅ | ✅ | `axis` given + a single-int or literal-list `obj` (removes 1 / `len(obj)`); mask-based / `axis=None` deletion → `Ok(None)` (data-dependent). |
+| `jnp.append` / `np.append` | ✅ | ✅ | ✅ | Like `concatenate` when `axis` given; flattens both operands to 1D and sums lengths when `axis=None`. |
 
 ## JAX NumPy / NumPy joining and splitting
 
@@ -116,34 +116,34 @@ Legend:
 | `jnp.dstack` / `np.dstack` | ✅ | ✅ | ✅ | Stack along depth axis. |
 | `jnp.column_stack` / `np.column_stack` | ✅ | ✅ | ✅ | Stack 1D as columns. |
 | `jnp.row_stack` / `np.row_stack` | ✅ | ✅ | ✅ | Alias-ish for vstack. |
-| `jnp.block` / `np.block` | ✅ | ❌ | ❌ | Nested block assembly. |
+| `jnp.block` / `np.block` | ✅ | ✅ | ✅ | Recursively parses the nested-list literal; concatenates the innermost level along the last axis, each level up along the next axis (numpy semantics: axis = `rank - nesting_depth`). |
 | `jnp.split` / `np.split` | ✅ | ✅ | ✅ | Per-element shapes via `compute_split_shapes`; `a, b = split(...)` LHS bound in `analyze`. |
 | `jnp.array_split` / `np.array_split` / `torch.tensor_split` | ✅ | ✅ | ✅ | Shares `compute_split_shapes` (CASE 1/2). |
-| `jnp.hsplit` / `np.hsplit` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs. |
-| `jnp.vsplit` / `np.vsplit` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs. |
-| `jnp.dsplit` / `np.dsplit` | ❌ | ❌ | ❌ | Priority: high. Multiple outputs. |
+| `jnp.hsplit` / `np.hsplit` | ✅ | ✅ | ✅ | Tuple LHS via `compute_fixed_axis_split_shapes` (forces axis=1, or axis=0 for rank-1 input) delegating to `compute_split_shapes`. |
+| `jnp.vsplit` / `np.vsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=0. |
+| `jnp.dsplit` / `np.dsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=2; errors if rank < 3. |
 | `jnp.tile` / `np.tile` | ✅ | ✅ | ✅ | Repeats dimensions. |
 | `jnp.repeat` / `np.repeat` | ✅ | ✅ | ✅ | Repeats along axis or flattened. |
-| `jnp.kron` / `np.kron` | ❌ | ❌ | ❌ | Priority: medium. Kronecker product; output dims are elementwise products of the two operands' dims. |
+| `jnp.kron` / `np.kron` | ✅ | ✅ | ✅ | Kronecker product; elementwise product of dims after left-padding the shorter shape's rank with 1s. |
 
 ## JAX NumPy / NumPy indexing and selection
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
 | `jnp.take` / `np.take` | ✅ | ✅ | ✅ | Shape based on indices and axis. |
-| `jnp.take_along_axis` / `np.take_along_axis` | ❌ | ❌ | ❌ | Priority: high. Output shape matches indices. |
-| `jnp.put_along_axis` / `np.put_along_axis` | ❌ | ❌ | ❌ | Priority: high. Mutating-ish; shape-preserving input. |
+| `jnp.take_along_axis` / `np.take_along_axis` | ✅ | ✅ | ✅ | Output shape matches `indices` exactly (2nd positional). |
+| `jnp.put_along_axis` / `np.put_along_axis` | ✅ | ✅ | ✅ | Shape-preserving on `arr` (first arg). |
 | `jnp.where` / `np.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
-| `jnp.nonzero` / `np.nonzero` | ❌ | ❌ | ❌ | Priority: high. Tuple of index arrays. |
-| `jnp.argwhere` / `np.argwhere` | ❌ | ❌ | ❌ | Priority: high. Shape `(N, ndim)`. |
+| `jnp.nonzero` / `np.nonzero` | ✅ | ✅ | ✅ | Tuple LHS: one output per input dimension, all sharing an opaque `nonzero(<name>)` symbolic length (count is data-dependent; extends `tuple_rhs_shapes`). |
+| `jnp.argwhere` / `np.argwhere` | ✅ | ✅ | ✅ | Shape `(nonzero(<name>), ndim)` — `ndim` is known statically from the input's rank; the element count is an opaque symbolic dim (data-dependent). |
 | `jnp.argmax` / `np.argmax` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.argmin` / `np.argmin` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.argsort` / `np.argsort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.sort` / `np.sort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
-| `jnp.searchsorted` / `np.searchsorted` | ❌ | ❌ | ❌ | Priority: high. Shape follows values. |
-| `jnp.extract` / `np.extract` | ❌ | ❌ | ❌ | Priority: medium. 1D unknown length. |
-| `jnp.compress` / `np.compress` | ❌ | ❌ | ❌ | Priority: medium. Axis length unknown unless condition concrete. |
-| `jnp.histogram` / `np.histogram` (and `histogram2d`/`histogramdd`) | ❌ | ❌ | ❌ | Priority: medium. Output length from `bins`. |
+| `jnp.searchsorted` / `np.searchsorted` | ✅ | ✅ | ✅ | Shape follows `v` (the values arg, 2nd positional), not `a`. |
+| `jnp.extract` / `np.extract` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — 1D length is data-dependent. |
+| `jnp.compress` / `np.compress` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — axis length is data-dependent. |
+| `jnp.histogram` / `np.histogram` (and `histogram2d`/`histogramdd`) | ✅ | ✅ | ✅ | Output length = `bins` (int literal), `len(edges) - 1` (literal edge list), or the numpy/jax default (10) when omitted; non-literal `bins` → `Ok(None)`. `histogram2d`/`histogramdd` not classified. |
 
 ## JAX NumPy / NumPy reductions
 
@@ -160,17 +160,17 @@ Legend:
 | `jnp.var` / `np.var` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.all` / `np.all` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.any` / `np.any` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
-| `jnp.median` / `np.median` | ❌ | ❌ | ❌ | Priority: medium. Same axis semantics. |
-| `jnp.quantile` / `np.quantile` | ❌ | ❌ | ❌ | Priority: medium. Adds quantile dims maybe. |
-| `jnp.percentile` / `np.percentile` | ❌ | ❌ | ❌ | Priority: medium. Similar to quantile. |
+| `jnp.median` / `np.median` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Mean`'s axis/keepdims reduction rule directly (identical shape mechanics). |
+| `jnp.quantile` / `np.quantile` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Mean`'s reduction rule (approximation: doesn't model the extra leading dim when `q` is itself an array, only the scalar-`q` case). |
+| `jnp.percentile` / `np.percentile` | ✅ | ✅ | ✅ | Same as `quantile` (reuses `Mean`). |
 | `jnp.cumsum` / `np.cumsum` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
 | `jnp.cumprod` / `np.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
 | `jnp.trace` / `np.trace` | ✅ | ✅ | ✅ | Removes two axes, optional offset. |
-| `jnp.count_nonzero` / `np.count_nonzero` | ❌ | ❌ | ❌ | Priority: low. Same axis semantics as `sum`. |
-| `jnp.ptp` / `np.ptp` | ❌ | ❌ | ❌ | Priority: low. Same axis semantics as `max`/`min`. |
+| `jnp.count_nonzero` / `np.count_nonzero` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis semantics). |
+| `jnp.ptp` / `np.ptp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Max`'s reduction rule (identical axis semantics). |
 | `jnp.clip` / `np.clip` / `torch.clip` | ✅ | ✅ | — | Already shape-preserving via `is_shape_preserving_call` (elementwise, not a `KnownFunction` table entry). Audit note: do not re-add as a gap. |
-| `jnp.nan_to_num` / `np.nan_to_num` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving elementwise, but not yet in `is_shape_preserving_call`'s match list. |
-| `jnp.fft.*` / `np.fft.*` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving for most 1D/2D/nd transforms (`fft`, `ifft`, `fft2`, `fftn`, `rfft` changes last-axis length). |
+| `jnp.nan_to_num` / `np.nan_to_num` | ✅ | ✅ | — | Added to `is_shape_preserving_call`'s numpy elementwise match list (shape-preserving, same path as `clip`). |
+| `jnp.fft.*` / `np.fft.*` | ✅ | ✅ | ✅ | `fft`/`ifft`/`fft2`/`ifft2`/`fftn`/`ifftn`/`fftshift`/`ifftshift` classified as shape-preserving (module-path check in `classify_known_function`, reuses the `Copy` shape-preserving arm). `rfft`/`irfft`/`hfft` variants (which change the last-axis length) are intentionally left unclassified. |
 
 ## Linear algebra
 
@@ -185,32 +185,32 @@ Legend:
 | `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ✅ | ✅ | ✅ | Contract axes. Only int-axes form supported; tuple-of-lists form is a follow-up. |
 | `jnp.outer` / `np.outer` / `torch.outer` | ✅ | ✅ | ✅ | Output `(a, b)`. |
 | `jnp.inner` / `np.inner` | ✅ | ✅ | ✅ | Last-axis contraction. |
-| `jnp.cross` / `np.cross` / `torch.cross` | ❌ | ❌ | ❌ | Priority: high (torch), medium (jnp/np). Vector axis length 2/3. |
-| `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ❌ | ❌ | ❌ | Priority: low. Axis-dependent. |
+| `jnp.cross` / `np.cross` / `torch.cross` | ✅ | ✅ | ✅ | Broadcasts like an elementwise binary op (reuses `broadcast_two_shapes`); the cross-product axis length (2 or 3) is unaffected. |
+| `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule — axis/keepdims mechanics are identical to a plain reduction. |
 | `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ✅ | ✅ | ✅ | Square matrix -> batch shape; validates last two dims. |
 | `jnp.linalg.inv` / `np.linalg.inv` / `torch.linalg.inv` | ✅ | ✅ | ✅ | Shape-preserving for square matrices; validates last two dims. |
-| `jnp.linalg.solve` / `np.linalg.solve` / `torch.linalg.solve` | ❌ | ❌ | ❌ | Priority: medium. Matrix solve shape rules. |
+| `jnp.linalg.solve` / `np.linalg.solve` / `torch.linalg.solve` | ✅ | ✅ | ✅ | Output shape = `b`'s shape (the right-hand side); `a` validated as square. |
 | `jnp.linalg.eig` / `np.linalg.eig` / `torch.linalg.eig` | ✅ | ✅ | ✅ | Tuple LHS: (n,), (n, n). `eigh` too. |
 | `jnp.linalg.qr` / `np.linalg.qr` / `torch.linalg.qr` | ✅ | ✅ | ✅ | Tuple LHS, reduced mode: (m, min(m,n)), (min(m,n), n). |
 | `jnp.linalg.svd` / `np.linalg.svd` / `torch.linalg.svd` | ✅ | ✅ | ✅ | Tuple LHS, full_matrices default: (m, m), (min(m,n),), (n, n); keyword args skip. |
-| `jnp.linalg.cholesky` / `np.linalg.cholesky` / `torch.linalg.cholesky` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving square matrix. |
-| `torch.linalg.lstsq` | ❌ | ❌ | ❌ | Priority: low. Tuple LHS; solution shape depends on `A`/`B`. |
-| `torch.linalg.pinv` | ❌ | ❌ | ❌ | Priority: low. Transposed last-two-dims shape. |
-| `torch.linalg.matrix_rank` | ❌ | ❌ | ❌ | Priority: low. Reduces last two dims to scalar (batched). |
-| `torch.fft.*` | ❌ | ❌ | ❌ | Priority: low. Shape-preserving for most transforms; `rfft` changes last-axis length. |
+| `jnp.linalg.cholesky` / `np.linalg.cholesky` / `torch.linalg.cholesky` | ✅ | ✅ | ✅ | Reuses `KnownFunction::LinalgInv`'s rule directly — same square-preserving shape (Cholesky just requires SPD, which isn't shape-checkable, but the shape rule is identical). |
+| `torch.linalg.lstsq` | ✅ | ✅ | ✅ | Tuple LHS (any prefix of `solution, residuals, rank, sv`): `solution` = `A`'s batch dims + `[n, k]` (matrix rhs) or `+ [n]` (vector rhs); the rest are algorithm/data-dependent → `None`. Extends `tuple_rhs_shapes`. |
+| `torch.linalg.pinv` | ✅ | ✅ | ✅ | Swaps the last two dims: `(..., m, n) -> (..., n, m)`. |
+| `torch.linalg.matrix_rank` | ✅ | ✅ | ✅ | Reduces last two dims to scalar (batched); no square requirement. |
+| `torch.fft.*` | ✅ | ✅ | ✅ | Same module-path check as `jnp`/`np` `fft.*` — `fft`/`ifft`/`fft2`/`ifft2`/`fftn`/`ifftn`/`fftshift`/`ifftshift` shape-preserving; `rfft`/`irfft` (last-axis length change) intentionally unclassified. |
 
 ## einops
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `einops.rearrange` | ✅ | ✅ | ✅ | `apply_known_einops`; LHS groups bind axis names, RHS groups recompose them (composite groups solve one unknown factor by division). Patterns containing `...` (ellipsis) are explicitly rejected (`if pattern.contains("...") { return Ok(None); }`) — no ellipsis support yet. |
-| `einops.reduce` | ✅ | ✅ | ✅ | Same pattern engine as `rearrange`; reduction op string (`"mean"`/`"sum"`/etc.) isn't shape-relevant. Ellipsis patterns rejected, same as `rearrange`. |
-| `einops.repeat` | ✅ | ✅ | ✅ | Same pattern engine; new axes on the RHS sized from keyword args. Ellipsis patterns rejected, same as `rearrange`. |
-| `einops.einsum` | ❌ | ❌ | ❌ | Priority: medium. Same equation-based semantics as `torch.einsum`/`jnp.einsum`, different call signature (pattern string is the *last* positional arg). |
-| `einops.pack` / `einops.unpack` | ❌ | ❌ | ❌ | Priority: medium. `pack` concatenates along a new axis per pattern; `unpack` is the multi-output inverse. |
-| `einops.parse_shape` | ❌ | ❌ | ❌ | Priority: low. Returns a dict of axis-name → size, not an array shape. |
-| `einops.layers.torch.Rearrange` / `einops.layers.torch.Reduce` (and flax/equinox equivalents) | ❌ | ❌ | ❌ | Priority: medium. Layer-wrapper form of `rearrange`/`reduce` used inside `nn.Sequential`; would reuse `apply_known_einops`'s pattern engine once layer dispatch exists. |
-| ellipsis (`...`) pattern support for `rearrange`/`reduce`/`repeat` | ❌ | ❌ | ❌ | Priority: medium. Currently rejected outright and covered by `test_ellipsis_pattern_skips` (asserts no shape is inferred, not that one is correctly computed); would need to bind `...` to the unnamed leading/trailing dims. |
+| `einops.rearrange` | ✅ | ✅ | ✅ | `apply_known_einops`; LHS groups bind axis names, RHS groups recompose them (composite groups solve one unknown factor by division). `...` (ellipsis) now supported as a standalone group on both sides — see the ellipsis row below. |
+| `einops.reduce` | ✅ | ✅ | ✅ | Same pattern engine as `rearrange`; reduction op string (`"mean"`/`"sum"`/etc.) isn't shape-relevant. Ellipsis supported, same as `rearrange`. |
+| `einops.repeat` | ✅ | ✅ | ✅ | Same pattern engine; new axes on the RHS sized from keyword args. Ellipsis supported, same as `rearrange`. |
+| `einops.einsum` | ✅ | ✅ | ✅ | Own token-based engine (`apply_known_einops_einsum`) — einops equations use *space-separated* (possibly multi-char) axis names per operand, unlike `torch.einsum`/`jnp.einsum`'s single-char-per-axis notation, so it does not delegate to `apply_known_einsum`. Pattern string is the *last* positional arg. |
+| `einops.pack` / `einops.unpack` | ✅ | ✅ | ✅ | `pack`: tuple LHS `(packed, ps)`; restricted to patterns where `*` stands for exactly one axis per tensor (the common single-batch-axis case), under which packing is exactly `concatenate` along the `*` position (`compute_einops_pack_shape`); `ps` is always `None` (a list of shape-tuples, not an array). Patterns with more than one `*`, or a variable-rank `*`, aren't modelled → `Ok(None)`. `unpack`: classified but genuinely dynamic (depends on the runtime `ps` value) — conservatively `None` for every unpacked target. |
+| `einops.parse_shape` | ✅ | ✅ | ✅ | Classified; always `Ok(None)` — returns a dict of axis-name → size, not an array shape, so no shape is ever correctly inferable for the assigned variable (this *is* the correct rule, not a gap). |
+| `einops.layers.torch.Rearrange` / `einops.layers.torch.Reduce` (and flax/equinox equivalents) | ❌ | ❌ | ❌ | Priority: medium. Layer-wrapper form of `rearrange`/`reduce` used inside `nn.Sequential`; would reuse `apply_known_einops`'s pattern engine once layer dispatch exists. Out of scope for this pass (layer dispatch lives in `src/layers.rs`, owned by a different task). |
+| ellipsis (`...`) pattern support for `rearrange`/`reduce`/`repeat` | ✅ | ✅ | ✅ | `...` is parsed as a standalone group (`parse_einops_groups`) and, when present on both LHS and RHS, expands to `N` synthetic per-dim bindings (`__ellipsisK__`) seeded from the input's unmatched leading dims — passed through unchanged and in original order on the output side. Ellipsis on only one side, or nested inside a composite group (e.g. `(... h)`), isn't modelled (`Ok(None)`). `test_ellipsis_pattern_skips` now documents the one-sided case; full support is covered by `einops_ellipsis_tests` in `integration_tests.rs`. |
 
 ## Torch array creation / transforms
 
@@ -319,7 +319,10 @@ Legend:
 | `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Tuple LHS: output = query shape, weights = (…, L, S); default average_attn_weights. Other attention layers still ❌. |
 | `flax.linen.avg_pool` | ✅ | ✅ | ✅ | `KnownFunction::FlaxPool`; channels-last, VALID padding, concrete dims only (`apply_known_flax_pool`). |
 | `flax.linen.max_pool` | ✅ | ✅ | ⚠️ | Same `KnownFunction::FlaxPool` code path and rule as `avg_pool`; only `avg_pool` has a dedicated integration test today. |
-| `jax.nn.relu` / `sigmoid` / `gelu` / `silu` / `swish` / `elu` / `leaky_relu` / `selu` / `softmax` / `log_softmax` / `one_hot` / `standardize` (free functions) | ✅ | ✅ | ⚠️ | Not a `LayerKind`/`KnownFunction` — handled generically as shape-preserving elementwise via `is_shape_preserving_call` (module `["jax", "nn"]`); same code path also covers `flax.linen.<activation>` free functions. Only `jax.nn.softplus` has a dedicated test (`test_jax_nn_softplus_shape_preserving`), exercising the shared match arm. |
+| `jax.nn.relu` / `sigmoid` / `gelu` / `silu` / `swish` / `elu` / `leaky_relu` / `selu` / `softmax` / `log_softmax` / `standardize` (free functions) | ✅ | ✅ | ⚠️ | Not a `LayerKind`/`KnownFunction` — handled generically as shape-preserving elementwise via `is_shape_preserving_call` (module `["jax", "nn"]`); same code path also covers `flax.linen.<activation>` free functions. Only `jax.nn.softplus` has a dedicated test (`test_jax_nn_softplus_shape_preserving`), exercising the shared match arm; `test_relu_still_shape_preserving` (in `jax_nn_extra_tests`) is a regression check that carving `one_hot` out below didn't disturb this arm. |
+| `jax.nn.one_hot` | ✅ | ✅ | ✅ | Carved out of the generic shape-preserving arm above (it is **not** shape-preserving — it appends `num_classes`): `KnownFunction::OneHot`, `x.shape + [num_classes]` (literal or symbolic `num_classes`). |
+| `jax.nn.dot_product_attention` | ✅ | ✅ | ✅ | `KnownFunction::DotProductAttention` — output = `query`'s shape with the last (head) dim replaced by `value`'s head dim. |
+| `jax.nn.logsumexp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis/keepdims mechanics). |
 | `equinox.nn.MultiheadAttention` | ⚠️ | ⚠️ | ❌ | Priority: high. `classify_layer_call`/`known_layer_signature` dispatch on class name only, so `equinox.nn.MultiheadAttention` structurally matches the same `LayerKind::MultiheadAttention` arm as torch's — but the built-in binding contract assumes torch's positional order `(embed_dim, num_heads, ...)`, while equinox's real constructor is `(num_heads, query_size, ...)`. Untested; likely mis-binds `embed_dim` for real equinox code. Corpus/tests only use torch's `nn.MultiheadAttention`. |
 | `equinox.nn.LSTMCell` / `GRUCell` | ❌ | ❌ | ❌ | Priority: high. Output is a new carry matching hidden size. |
 | `equinox.nn.MLP` | ❌ | ❌ | ❌ | Priority: high. Last dim → `out_size`. |

@@ -103,6 +103,35 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "block" => Some(KnownFunction::Block),
             "array" => Some(KnownFunction::Array),
             "asarray" => Some(KnownFunction::AsArray),
+            "diagflat" => Some(KnownFunction::Diagflat),
+            "tri" => Some(KnownFunction::Tri),
+            "indices" => Some(KnownFunction::Indices),
+            "bincount" => Some(KnownFunction::BinCount),
+            "unique" => Some(KnownFunction::Unique),
+            "select" => Some(KnownFunction::Select),
+            "rollaxis" => Some(KnownFunction::RollAxis),
+            "resize" => Some(KnownFunction::Resize),
+            "insert" => Some(KnownFunction::Insert),
+            "delete" => Some(KnownFunction::Delete),
+            "append" => Some(KnownFunction::Append),
+            "hsplit" => Some(KnownFunction::HSplit),
+            "vsplit" => Some(KnownFunction::VSplit),
+            "dsplit" => Some(KnownFunction::DSplit),
+            "kron" => Some(KnownFunction::Kron),
+            "take_along_axis" => Some(KnownFunction::TakeAlongAxis),
+            "put_along_axis" => Some(KnownFunction::PutAlongAxis),
+            "nonzero" => Some(KnownFunction::Nonzero),
+            "argwhere" => Some(KnownFunction::Argwhere),
+            "searchsorted" => Some(KnownFunction::SearchSorted),
+            "extract" => Some(KnownFunction::Extract),
+            "compress" => Some(KnownFunction::Compress),
+            "histogram" => Some(KnownFunction::Histogram),
+            // Same axis/keepdims mechanics as the reduction they alias to —
+            // reused directly rather than adding near-duplicate variants.
+            "median" | "quantile" | "percentile" => Some(KnownFunction::Mean),
+            "count_nonzero" => Some(KnownFunction::Sum),
+            "ptp" => Some(KnownFunction::Max),
+            "cross" => Some(KnownFunction::Cross),
             _ => None,
         };
     }
@@ -175,6 +204,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "permute" => Some(KnownFunction::Permute),
             "tensor" => Some(KnownFunction::Array),
             "as_tensor" => Some(KnownFunction::AsArray),
+            "cross" => Some(KnownFunction::Cross),
             _ => None,
         };
     }
@@ -198,6 +228,24 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "svd" => Some(KnownFunction::LinalgSvd),
             "qr" => Some(KnownFunction::LinalgQr),
             "eig" | "eigh" => Some(KnownFunction::LinalgEig),
+            // Axis/keepdims mechanics identical to a plain reduction.
+            "norm" => Some(KnownFunction::Sum),
+            "solve" => Some(KnownFunction::LinalgSolve),
+            // Shape-preserving on a square matrix — same rule as `inv`.
+            "cholesky" => Some(KnownFunction::LinalgInv),
+            "lstsq" => Some(KnownFunction::LinalgLstsq),
+            "pinv" => Some(KnownFunction::LinalgPinv),
+            "matrix_rank" => Some(KnownFunction::LinalgMatrixRank),
+            _ => None,
+        };
+    }
+
+    if module == ["jax", "numpy", "fft"] || module == ["numpy", "fft"] || module == ["torch", "fft"]
+    {
+        return match name.as_str() {
+            "fft" | "ifft" | "fft2" | "ifft2" | "fftn" | "ifftn" | "fftshift" | "ifftshift" => {
+                Some(KnownFunction::Copy) // shape-preserving; reuse the generic pass-through rule
+            }
             _ => None,
         };
     }
@@ -207,6 +255,31 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "dot" => Some(KnownFunction::Dot),
             "dot_general" => Some(KnownFunction::Matmul),
             "scan" => Some(KnownFunction::Scan),
+            "map" => Some(KnownFunction::LaxMap),
+            "cond" => Some(KnownFunction::LaxCond),
+            "switch" => Some(KnownFunction::LaxSwitch),
+            "while_loop" => Some(KnownFunction::LaxWhileLoop),
+            "fori_loop" => Some(KnownFunction::LaxForiLoop),
+            "conv_general_dilated" => Some(KnownFunction::LaxConvGeneralDilated),
+            "gather" => Some(KnownFunction::LaxGather),
+            "scatter" | "scatter_add" | "scatter_mul" | "scatter_min" | "scatter_max"
+            | "scatter_apply" => Some(KnownFunction::LaxScatter),
+            "reduce_window" => Some(KnownFunction::LaxReduceWindow),
+            "top_k" => Some(KnownFunction::LaxTopK),
+            "sort" => Some(KnownFunction::LaxSort),
+            "sort_key_val" => Some(KnownFunction::LaxSortKeyVal),
+            "pad" => Some(KnownFunction::LaxPad),
+            "broadcast" => Some(KnownFunction::LaxBroadcast),
+            "broadcast_in_dim" => Some(KnownFunction::LaxBroadcastInDim),
+            "slice" => Some(KnownFunction::LaxSlice),
+            "dynamic_slice" => Some(KnownFunction::LaxDynamicSlice),
+            "dynamic_update_slice" => Some(KnownFunction::LaxDynamicUpdateSlice),
+            "concatenate" => Some(KnownFunction::Concatenate),
+            "rev" => Some(KnownFunction::Flip),
+            "squeeze" => Some(KnownFunction::Squeeze),
+            "expand_dims" => Some(KnownFunction::ExpandDims),
+            "transpose" => Some(KnownFunction::Transpose),
+            "associative_scan" => Some(KnownFunction::LaxAssociativeScan),
             _ => None,
         };
     }
@@ -218,11 +291,25 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         };
     }
 
+    if module == ["jax", "nn"] {
+        return match name.as_str() {
+            "one_hot" => Some(KnownFunction::OneHot),
+            "dot_product_attention" => Some(KnownFunction::DotProductAttention),
+            // Same axis/keepdims mechanics as a plain sum reduction.
+            "logsumexp" => Some(KnownFunction::Sum),
+            _ => None,
+        };
+    }
+
     if module == ["einops"] {
         return match name.as_str() {
             "rearrange" => Some(KnownFunction::EinopsRearrange),
             "reduce" => Some(KnownFunction::EinopsReduce),
             "repeat" => Some(KnownFunction::EinopsRepeat),
+            "einsum" => Some(KnownFunction::EinopsEinsum),
+            "pack" => Some(KnownFunction::EinopsPack),
+            "unpack" => Some(KnownFunction::EinopsUnpack),
+            "parse_shape" => Some(KnownFunction::EinopsParseShape),
             _ => None,
         };
     }
@@ -709,6 +796,49 @@ pub fn apply_known_function(
         KnownFunction::FlaxPool => apply_known_flax_pool(args, shapes),
         KnownFunction::EinopsRearrange | KnownFunction::EinopsReduce
         | KnownFunction::EinopsRepeat => apply_known_einops(args, shapes),
+        KnownFunction::EinopsEinsum => apply_known_einops_einsum(args, shapes),
+        KnownFunction::EinopsParseShape => {
+            // Returns a dict of axis-name -> size, not an array shape — never
+            // meaningful to store as a tensor shape.
+            Ok(None)
+        }
+        KnownFunction::LaxScatter | KnownFunction::LaxDynamicUpdateSlice | KnownFunction::LaxSort => {
+            apply_known_shape_preserving(args, shapes)
+        }
+        KnownFunction::LaxWhileLoop => apply_known_lax_carry(args, shapes, 2, "init_val"),
+        KnownFunction::LaxForiLoop => apply_known_lax_carry(args, shapes, 3, "init_val"),
+        KnownFunction::LaxAssociativeScan => apply_known_lax_carry(args, shapes, 1, "elems"),
+        KnownFunction::LaxConvGeneralDilated => {
+            apply_known_lax_conv_general_dilated(args, shapes)
+        }
+        KnownFunction::LaxReduceWindow => apply_known_lax_reduce_window(args, shapes),
+        KnownFunction::LaxPad => apply_known_lax_pad(args, shapes),
+        KnownFunction::LaxBroadcast => apply_known_lax_broadcast(args, shapes),
+        KnownFunction::LaxBroadcastInDim => apply_known_lax_broadcast_in_dim(args),
+        KnownFunction::LaxSlice => apply_known_lax_slice(args, shapes),
+        KnownFunction::LaxDynamicSlice => apply_known_lax_dynamic_slice(args, shapes),
+        KnownFunction::Diagflat => apply_known_diagflat(args, shapes),
+        KnownFunction::Tri => apply_known_tri(args),
+        KnownFunction::Indices => apply_known_indices(args),
+        KnownFunction::Select => apply_known_select(args, shapes),
+        KnownFunction::RollAxis => apply_known_rollaxis(args, shapes),
+        KnownFunction::Resize => apply_known_resize(args),
+        KnownFunction::Insert => apply_known_insert(args, shapes),
+        KnownFunction::Delete => apply_known_delete(args, shapes),
+        KnownFunction::Append => apply_known_append(args, shapes),
+        KnownFunction::Kron => apply_known_kron(args, shapes),
+        KnownFunction::Block => apply_known_block(args, shapes),
+        KnownFunction::TakeAlongAxis => apply_known_take_along_axis(args, shapes),
+        KnownFunction::PutAlongAxis => apply_known_shape_preserving(args, shapes),
+        KnownFunction::Argwhere => apply_known_argwhere(args, shapes),
+        KnownFunction::SearchSorted => apply_known_searchsorted(args, shapes),
+        KnownFunction::Histogram => apply_known_histogram(args),
+        KnownFunction::Cross => apply_known_cross(args, shapes),
+        KnownFunction::LinalgSolve => apply_known_linalg_solve(args, shapes),
+        KnownFunction::LinalgPinv => apply_known_linalg_pinv(args, shapes),
+        KnownFunction::LinalgMatrixRank => apply_known_linalg_matrix_rank(args, shapes),
+        KnownFunction::OneHot => apply_known_one_hot(args, shapes),
+        KnownFunction::DotProductAttention => apply_known_dot_product_attention(args, shapes),
         _ => Ok(None),
     }
 }
@@ -729,6 +859,14 @@ fn parse_einops_groups(side: &str) -> Option<Vec<Vec<String>>> {
                 current = Some(Vec::new());
             }
             ")" => groups.push(current.take()?),
+            "..." => {
+                // Ellipsis is only supported as a standalone group (not
+                // nested inside a composite `(... h)` group).
+                if current.is_some() {
+                    return None;
+                }
+                groups.push(vec!["...".to_string()]);
+            }
             name => {
                 if !name
                     .chars()
@@ -753,7 +891,13 @@ fn parse_einops_groups(side: &str) -> Option<Vec<Vec<String>>> {
 /// full shape algebra. LHS groups bind axis names against the input dims
 /// (composite groups solve one unknown factor by division, concrete dims
 /// only); RHS groups multiply bound axes back together. Keyword arguments
-/// (`p1=16`, `n=4`) pre-seed the bindings. Ellipsis patterns skip (v1).
+/// (`p1=16`, `n=4`) pre-seed the bindings.
+///
+/// `...` (ellipsis) is supported as a standalone group appearing on both
+/// sides: it binds to however many leading/unmatched dims remain once the
+/// named groups are accounted for, and passes them through unchanged and
+/// in order on the output side. Ellipsis nested inside a composite group
+/// (e.g. `(... h)`), or appearing on only one side, isn't modelled.
 fn apply_known_einops(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -777,18 +921,58 @@ fn apply_known_einops(
     } else {
         return Ok(None);
     };
-    if pattern.contains("...") {
-        return Ok(None);
-    }
     let Some((lhs, rhs)) = pattern.split_once("->") else {
         return Ok(None);
     };
-    let Some(lhs_groups) = parse_einops_groups(lhs) else {
+    let Some(mut lhs_groups) = parse_einops_groups(lhs) else {
         return Ok(None);
     };
-    let Some(rhs_groups) = parse_einops_groups(rhs) else {
+    let Some(mut rhs_groups) = parse_einops_groups(rhs) else {
         return Ok(None);
     };
+
+    // Axis bindings, pre-seeded from keyword args (p1=16, n=4, …) before
+    // rank checks/ellipsis expansion so both can see them.
+    let mut bound: HashMap<String, String> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            CallArgument::Keyword { name, value } => Some((name.clone(), value.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let lhs_ellipsis = lhs_groups.iter().position(|g| g.as_slice() == ["..."]);
+    let rhs_ellipsis = rhs_groups.iter().position(|g| g.as_slice() == ["..."]);
+    if lhs_ellipsis.is_some() != rhs_ellipsis.is_some() {
+        // Ellipsis on only one side isn't modelled — skip rather than guess.
+        return Ok(None);
+    }
+    if let Some(lhs_idx) = lhs_ellipsis {
+        let n_named = lhs_groups.len() - 1;
+        if input_shape.len() < n_named {
+            return Err(format!(
+                "einops pattern '{}' expects at least rank {}, got rank {} for '{}'",
+                pattern,
+                n_named,
+                input_shape.len(),
+                input_name
+            ));
+        }
+        let n_ellipsis_dims = input_shape.len() - n_named;
+        let ellipsis_names: Vec<String> =
+            (0..n_ellipsis_dims).map(|i| format!("__ellipsis{i}__")).collect();
+        for (name, dim) in ellipsis_names
+            .iter()
+            .zip(&input_shape[lhs_idx..lhs_idx + n_ellipsis_dims])
+        {
+            bound.insert(name.clone(), dim.clone());
+        }
+        let ellipsis_groups: Vec<Vec<String>> =
+            ellipsis_names.iter().map(|n| vec![n.clone()]).collect();
+        lhs_groups.splice(lhs_idx..=lhs_idx, ellipsis_groups.clone());
+        let rhs_idx = rhs_ellipsis.unwrap();
+        rhs_groups.splice(rhs_idx..=rhs_idx, ellipsis_groups);
+    }
 
     if lhs_groups.len() != input_shape.len() {
         return Err(format!(
@@ -799,15 +983,6 @@ fn apply_known_einops(
             input_name
         ));
     }
-
-    // Axis bindings, pre-seeded from keyword args (p1=16, n=4, …).
-    let mut bound: HashMap<String, String> = args
-        .iter()
-        .filter_map(|arg| match arg {
-            CallArgument::Keyword { name, value } => Some((name.clone(), value.clone())),
-            _ => None,
-        })
-        .collect();
 
     for (group, dim) in lhs_groups.iter().zip(input_shape.iter()) {
         if let [name] = group.as_slice() {
@@ -1315,7 +1490,7 @@ fn apply_known_transpose(
     };
     let rank = input_shape.len();
 
-    let axes = nth_positional_or_keyword(args, 1, &["axes", "axis", "dims"])
+    let axes = nth_positional_or_keyword(args, 1, &["axes", "axis", "dims", "permutation"])
         .and_then(parse_axis_list)
         .unwrap_or_else(|| (0..rank).rev().map(|axis| axis as isize).collect());
     if axes.len() != rank {
@@ -1436,6 +1611,10 @@ fn apply_known_moveaxis(
     ))
 }
 
+/// Handles both a single axis (`jnp.expand_dims(x, 1)`,
+/// `x.unsqueeze(0)`) and a sequence of axes (`jax.lax.expand_dims(x, (1,
+/// 2))`, `np.expand_dims(x, (0, -1))`) — each entry names a position in the
+/// *final* (post-insertion) shape.
 fn apply_known_expand_dims(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -1443,24 +1622,36 @@ fn apply_known_expand_dims(
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let output_rank = input_shape.len() + 1;
-    let Some(axis) = nth_positional_or_keyword(args, 1, &["axis", "dim"]).and_then(parse_axis)
+    let Some(axes) = nth_positional_or_keyword(args, 1, &["axis", "dim", "dimensions"])
+        .and_then(parse_axis_list)
     else {
         return Ok(None);
     };
-    let axis = if axis < 0 {
-        output_rank as isize + axis
-    } else {
-        axis
-    };
-    if axis < 0 || axis as usize > input_shape.len() {
-        return Err(format!(
-            "expand_dims axis {} out of bounds for output rank {}",
-            axis, output_rank
-        ));
+    if axes.contains(&isize::MIN) {
+        // axis=None isn't meaningful for expand_dims.
+        return Ok(None);
     }
+    let output_rank = input_shape.len() + axes.len();
+    let mut normalized: Vec<usize> = Vec::with_capacity(axes.len());
+    for axis in axes {
+        let axis = if axis < 0 {
+            output_rank as isize + axis
+        } else {
+            axis
+        };
+        if axis < 0 || axis as usize >= output_rank {
+            return Err(format!(
+                "expand_dims axis {} out of bounds for output rank {}",
+                axis, output_rank
+            ));
+        }
+        normalized.push(axis as usize);
+    }
+    normalized.sort_unstable();
     let mut output = input_shape.clone();
-    output.insert(axis as usize, "1".to_string());
+    for axis in normalized {
+        output.insert(axis.min(output.len()), "1".to_string());
+    }
     Ok(Some(output))
 }
 
@@ -1471,7 +1662,8 @@ fn apply_known_squeeze(
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let axes = nth_positional_or_keyword(args, 1, &["axis", "dim"]).and_then(parse_axis_list);
+    let axes =
+        nth_positional_or_keyword(args, 1, &["axis", "dim", "dimensions"]).and_then(parse_axis_list);
 
     let rank = input_shape.len();
     let axes = if let Some(axes) = axes {
@@ -2631,6 +2823,1043 @@ pub fn compute_split_shapes(
 
     // ── CASE 3: non-literal → out of scope ───────────────────────────
     Ok(None)
+}
+
+/// Force a fixed split axis for `hsplit`/`vsplit`/`dsplit` (numpy always
+/// picks the axis from the function name, not from an argument) by
+/// synthesizing an explicit `axis` keyword and delegating to
+/// [`compute_split_shapes`].
+pub fn compute_fixed_axis_split_shapes(
+    kind: &KnownFunction,
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<Vec<String>>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let axis = match kind {
+        KnownFunction::HSplit => {
+            if rank <= 1 {
+                0
+            } else {
+                1
+            }
+        }
+        KnownFunction::VSplit => 0,
+        KnownFunction::DSplit => {
+            if rank < 3 {
+                return Err(format!("dsplit requires rank >= 3, got rank {}", rank));
+            }
+            2
+        }
+        _ => return Ok(None),
+    };
+    let mut new_args = args.to_vec();
+    new_args.push(CallArgument::Keyword {
+        name: "axis".to_string(),
+        value: axis.to_string(),
+    });
+    compute_split_shapes(&new_args, shapes)
+}
+
+/// Parse a literal like `"((1, 1, 0), (2, 2, 1))"` into a list of
+/// same-shape int tuples (used by `jax.lax.pad`'s per-axis `(low, high,
+/// interior)` triples and `jax.lax.reduce_window`'s per-axis `(low, high)`
+/// padding pairs). Splits on top-level commas only, respecting nested
+/// paren/bracket depth.
+fn parse_nested_int_tuples(value: &str) -> Option<Vec<Vec<isize>>> {
+    let trimmed = value.trim();
+    let inner = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        return None;
+    };
+    let mut groups = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    groups.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        groups.push(current.trim().to_string());
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(groups.iter().map(|g| parse_ints(g)).collect())
+}
+
+/// Shared "output equals the shape of one named/positional carry argument"
+/// rule for `jax.lax.while_loop`/`fori_loop` (carry invariant across
+/// iterations) and `jax.lax.associative_scan` (shape-preserving scan
+/// variant).
+fn apply_known_lax_carry(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    skip: usize,
+    keyword: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(name) = nth_positional_or_keyword(args, skip, &[keyword]) else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(name).cloned())
+}
+
+/// `jax.lax.broadcast(operand, sizes)` — prepends `sizes` as new leading
+/// dims.
+fn apply_known_lax_broadcast(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(sizes) = nth_positional_or_keyword(args, 1, &["sizes"]).and_then(parse_shape_value)
+    else {
+        return Ok(None);
+    };
+    let mut output = sizes;
+    output.extend(input_shape.clone());
+    Ok(Some(output))
+}
+
+/// `jax.lax.broadcast_in_dim(operand, shape, broadcast_dimensions)` — the
+/// output is the explicit target `shape` argument; `operand`'s own shape
+/// isn't needed to determine it.
+fn apply_known_lax_broadcast_in_dim(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(target) = nth_positional_or_keyword(args, 1, &["shape"]).and_then(parse_shape_value)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(target))
+}
+
+/// `jax.lax.slice(operand, start_indices, limit_indices, strides=None)`.
+/// Concrete (literal) indices/strides only.
+fn apply_known_lax_slice(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let (start, limit) =
+        nth_two_positional_or_keywords(args, 1, &["start_indices"], &["limit_indices"]);
+    let Some(start) = start.map(parse_ints) else {
+        return Ok(None);
+    };
+    let Some(limit) = limit.map(parse_ints) else {
+        return Ok(None);
+    };
+    if start.len() != input_shape.len() || limit.len() != input_shape.len() {
+        return Ok(None);
+    }
+    let strides = nth_positional_or_keyword(args, 3, &["strides"]).map(parse_ints);
+    let strides = match strides {
+        Some(s) if s.len() == input_shape.len() => s,
+        Some(_) => return Ok(None),
+        None => vec![1; input_shape.len()],
+    };
+    let mut output = Vec::with_capacity(input_shape.len());
+    for i in 0..input_shape.len() {
+        let size = limit[i] - start[i];
+        if size < 0 {
+            return Err(format!(
+                "lax.slice: limit_indices[{}]={} < start_indices[{}]={}",
+                i, limit[i], i, start[i]
+            ));
+        }
+        let stride = strides[i].max(1);
+        output.push((((size - 1) / stride) + 1).to_string());
+    }
+    Ok(Some(output))
+}
+
+/// `jax.lax.dynamic_slice(operand, start_indices, slice_sizes)` — the
+/// output shape is exactly `slice_sizes`.
+fn apply_known_lax_dynamic_slice(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(sizes) =
+        nth_positional_or_keyword(args, 2, &["slice_sizes"]).and_then(parse_shape_value)
+    else {
+        return Ok(None);
+    };
+    if sizes.len() != input_shape.len() {
+        return Err(format!(
+            "lax.dynamic_slice: slice_sizes length {} does not match operand rank {}",
+            sizes.len(),
+            input_shape.len()
+        ));
+    }
+    Ok(Some(sizes))
+}
+
+/// `jax.lax.pad(operand, padding_value, padding_config)` — `padding_config`
+/// is a per-axis `(low, high, interior)` triple; `interior` inserts values
+/// *between* existing elements, so the growth is
+/// `low + high + interior * (dim - 1)` for a numeric dim (numeric `dim` is
+/// required whenever `interior != 0`; symbolic dims with `interior == 0`
+/// still resolve via a plain additive expression).
+fn apply_known_lax_pad(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(config_raw) = nth_positional_or_keyword(args, 2, &["padding_config"]) else {
+        return Ok(None);
+    };
+    let Some(config) = parse_nested_int_tuples(config_raw) else {
+        return Ok(None);
+    };
+    if config.len() != input_shape.len() {
+        return Err(format!(
+            "lax.pad: padding_config length {} does not match operand rank {}",
+            config.len(),
+            input_shape.len()
+        ));
+    }
+    let mut output = Vec::with_capacity(input_shape.len());
+    for (dim, triple) in input_shape.iter().zip(config.iter()) {
+        let [lo, hi, interior] = triple.as_slice() else {
+            return Ok(None);
+        };
+        if let Ok(d) = dim.parse::<isize>() {
+            let total = d + lo + hi + interior * (d - 1).max(0);
+            output.push(total.to_string());
+        } else if *interior == 0 {
+            output.push(add_to_dim(dim, lo + hi));
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok(Some(output))
+}
+
+/// `jax.lax.reduce_window(operand, init_value, computation,
+/// window_dimensions, window_strides, padding)` — pooling-style output
+/// shape, concrete window/strides/padding only. `'VALID'` and `'SAME'`
+/// string padding are recognised; explicit per-axis `(low, high)` pairs are
+/// parsed too. Other padding modes bail.
+fn apply_known_lax_reduce_window(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(window) = nth_positional_or_keyword(args, 3, &["window_dimensions"]).map(parse_ints)
+    else {
+        return Ok(None);
+    };
+    let Some(strides) = nth_positional_or_keyword(args, 4, &["window_strides"]).map(parse_ints)
+    else {
+        return Ok(None);
+    };
+    if window.len() != input_shape.len() || strides.len() != input_shape.len() {
+        return Ok(None);
+    }
+    let padding_raw = nth_positional_or_keyword(args, 5, &["padding"]);
+    let padding: Vec<(isize, isize)> = match padding_raw.map(str::trim) {
+        Some("'VALID'") | Some("\"VALID\"") | None => vec![(0, 0); input_shape.len()],
+        Some(raw) => match parse_nested_int_tuples(raw) {
+            Some(p) if p.len() == input_shape.len() && p.iter().all(|t| t.len() == 2) => {
+                p.iter().map(|t| (t[0], t[1])).collect()
+            }
+            _ => return Ok(None), // e.g. 'SAME' or an unrecognised spec
+        },
+    };
+    let mut output = Vec::with_capacity(input_shape.len());
+    for i in 0..input_shape.len() {
+        let Ok(d) = input_shape[i].parse::<isize>() else {
+            return Ok(None);
+        };
+        let (lo, hi) = padding[i];
+        let w = window[i];
+        let s = strides[i].max(1);
+        let padded = d + lo + hi;
+        if padded < w {
+            return Err(format!(
+                "reduce_window: padded dim {} smaller than window {}",
+                padded, w
+            ));
+        }
+        output.push((((padded - w) / s) + 1).to_string());
+    }
+    Ok(Some(output))
+}
+
+/// `jax.lax.conv_general_dilated(lhs, rhs, window_strides, padding,
+/// lhs_dilation=None, rhs_dilation=None, dimension_numbers=None, ...)`.
+/// Only the *default* dimension_numbers case is modelled: `lhs` is
+/// `(batch, in_channel, *spatial)`, `rhs` is `(out_channel, in_channel,
+/// *spatial)`, output is `(batch, out_channel, *spatial)` — i.e. any
+/// explicit `dimension_numbers` bails. `rhs_dilation` (atrous conv) is
+/// supported; `lhs_dilation` (transposed-conv input dilation) is not.
+fn apply_known_lax_conv_general_dilated(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    if args
+        .iter()
+        .any(|a| matches!(a, CallArgument::Keyword { name, .. } if name == "dimension_numbers"))
+    {
+        return Ok(None);
+    }
+    let Some(lhs_name) = first_array_arg(args) else {
+        return Ok(None);
+    };
+    let Some(lhs_shape) = shapes.shape(lhs_name) else {
+        return Ok(None);
+    };
+    let Some(rhs_name) = nth_positional_or_keyword(args, 1, &["rhs"]) else {
+        return Ok(None);
+    };
+    let Some(rhs_shape) = shapes.shape(rhs_name) else {
+        return Ok(None);
+    };
+    if lhs_shape.len() < 3 || rhs_shape.len() != lhs_shape.len() {
+        return Ok(None);
+    }
+    let spatial_rank = lhs_shape.len() - 2;
+
+    let Some(strides) = nth_positional_or_keyword(args, 2, &["window_strides"]).map(parse_ints)
+    else {
+        return Ok(None);
+    };
+    if strides.len() != spatial_rank {
+        return Ok(None);
+    }
+
+    if let Some(d) = nth_positional_or_keyword(args, 4, &["lhs_dilation"])
+        && parse_ints(d).iter().any(|v| *v != 1)
+    {
+        return Ok(None); // input dilation (transposed conv) not modelled
+    }
+    let dilation = match nth_positional_or_keyword(args, 5, &["rhs_dilation"]).map(parse_ints) {
+        Some(d) if d.len() == spatial_rank => d,
+        Some(_) => return Ok(None),
+        None => vec![1; spatial_rank],
+    };
+
+    let padding_raw = nth_positional_or_keyword(args, 3, &["padding"]);
+    let same = matches!(padding_raw.map(str::trim), Some("'SAME'") | Some("\"SAME\""));
+    let padding: Option<Vec<(isize, isize)>> = if same {
+        None
+    } else {
+        match padding_raw.and_then(parse_nested_int_tuples) {
+            Some(p) if p.len() == spatial_rank && p.iter().all(|t| t.len() == 2) => {
+                Some(p.iter().map(|t| (t[0], t[1])).collect())
+            }
+            _ if matches!(padding_raw.map(str::trim), Some("'VALID'") | Some("\"VALID\"")) => {
+                Some(vec![(0, 0); spatial_rank])
+            }
+            _ => return Ok(None),
+        }
+    };
+
+    let mut output = Vec::with_capacity(lhs_shape.len());
+    output.push(lhs_shape[0].clone()); // batch
+    output.push(rhs_shape[0].clone()); // out channels
+    for i in 0..spatial_rank {
+        let Ok(d) = lhs_shape[2 + i].parse::<isize>() else {
+            return Ok(None);
+        };
+        let Ok(k) = rhs_shape[2 + i].parse::<isize>() else {
+            return Ok(None);
+        };
+        let eff_k = (k - 1) * dilation[i] + 1;
+        let s = strides[i].max(1);
+        let out = match &padding {
+            Some(pads) => {
+                let (lo, hi) = pads[i];
+                ((d + lo + hi - eff_k) / s) + 1
+            }
+            None => (d + s - 1) / s, // 'SAME': ceil(d / s)
+        };
+        output.push(out.to_string());
+    }
+    Ok(Some(output))
+}
+
+/// `jnp.diagflat(v, k=0)` — flattens `v` then builds a square diagonal
+/// matrix. `k` (off-diagonal offset) is ignored (v1: `k=0` sizing only).
+fn apply_known_diagflat(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let n = flattened_dim(input_shape);
+    Ok(Some(vec![n.clone(), n]))
+}
+
+/// `jnp.tri(N, M=None, k=0)` — shape `(N, M or N)`.
+fn apply_known_tri(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(n) = nth_positional_or_keyword(args, 0, &["N"]) else {
+        return Ok(None);
+    };
+    let m = nth_positional_or_keyword(args, 1, &["M"]).unwrap_or(n);
+    Ok(Some(vec![n.to_string(), m.to_string()]))
+}
+
+/// `jnp.indices(dimensions)` — prepends a rank dimension:
+/// `indices((2, 3)).shape == (2, 2, 3)`.
+fn apply_known_indices(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(dims_raw) = nth_positional_or_keyword(args, 0, &["dimensions"]) else {
+        return Ok(None);
+    };
+    let Some(dims) = parse_shape_value(dims_raw) else {
+        return Ok(None);
+    };
+    let mut output = vec![dims.len().to_string()];
+    output.extend(dims);
+    Ok(Some(output))
+}
+
+/// `jnp.select(condlist, choicelist, default=0)` — approximated as the
+/// shape of `choicelist`'s first array (all choices are expected to share
+/// a broadcast-compatible shape).
+fn apply_known_select(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(choicelist_raw) = nth_positional_or_keyword(args, 1, &["choicelist"]) else {
+        return Ok(None);
+    };
+    let Some(names) = parse_simple_sequence_names(choicelist_raw) else {
+        return Ok(None);
+    };
+    let Some(first) = names.first() else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(first).cloned())
+}
+
+/// `jnp.rollaxis(a, axis, start=0)` — rolls `axis` backward until it lies
+/// before position `start`.
+fn apply_known_rollaxis(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = input_shape.len();
+    let Some(axis) = nth_positional_or_keyword(args, 1, &["axis"]).and_then(parse_axis) else {
+        return Ok(None);
+    };
+    let start = nth_positional_or_keyword(args, 2, &["start"])
+        .and_then(parse_axis)
+        .unwrap_or(0);
+    let axis = normalize_axis(axis, rank, "rollaxis")?;
+    let start_norm = if start < 0 {
+        (rank as isize + start).max(0) as usize
+    } else {
+        (start as usize).min(rank)
+    };
+    let dest = if axis < start_norm {
+        start_norm - 1
+    } else {
+        start_norm
+    };
+    let mut order: Vec<usize> = (0..rank).filter(|&i| i != axis).collect();
+    let dest = dest.min(order.len());
+    order.insert(dest, axis);
+    Ok(Some(order.iter().map(|&i| input_shape[i].clone()).collect()))
+}
+
+/// `jnp.resize(a, new_shape)` — output is exactly `new_shape` (tiling or
+/// truncating the data as needed doesn't change the *shape* rule).
+fn apply_known_resize(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(target) = nth_positional_or_keyword(args, 1, &["new_shape"]).and_then(parse_shape_value)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(target))
+}
+
+/// `np.insert(arr, obj, values, axis=None)` — axis length grows by the
+/// number of inserted values. Only the `axis` given + concrete insertion
+/// count case is modelled (a scalar literal inserts 1; a known array/list
+/// contributes its own axis-length/element-count); `axis=None` (flattening)
+/// is data-shape-dependent and bails.
+fn apply_known_insert(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(axis_raw) = nth_positional_or_keyword(args, 3, &["axis"]) else {
+        return Ok(None);
+    };
+    let Some(axis) = parse_axis(axis_raw) else {
+        return Ok(None);
+    };
+    let axis = normalize_axis(axis, input_shape.len(), "insert")?;
+    let Some(values_raw) = nth_positional_or_keyword(args, 2, &["values"]) else {
+        return Ok(None);
+    };
+    let count: isize = if let Some(shape) = shapes.shape(values_raw) {
+        match shape.get(axis).and_then(|d| d.parse::<isize>().ok()) {
+            Some(n) => n,
+            None => return Ok(None),
+        }
+    } else if values_raw.trim().parse::<f64>().is_ok() {
+        1
+    } else if let Some(items) = parse_simple_sequence_names(values_raw) {
+        items.len() as isize
+    } else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output[axis] = add_to_dim(&output[axis], count);
+    Ok(Some(output))
+}
+
+/// `np.delete(arr, obj, axis=None)` — axis length shrinks by the number of
+/// removed indices. Only a single-int `obj` (removes 1) or a literal list
+/// of indices (removes its length) is modelled; mask-based deletion is
+/// data-dependent and bails.
+fn apply_known_delete(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(axis_raw) = nth_positional_or_keyword(args, 2, &["axis"]) else {
+        return Ok(None);
+    };
+    let Some(axis) = parse_axis(axis_raw) else {
+        return Ok(None);
+    };
+    let axis = normalize_axis(axis, input_shape.len(), "delete")?;
+    let Some(obj_raw) = nth_positional_or_keyword(args, 1, &["obj"]) else {
+        return Ok(None);
+    };
+    let trimmed = obj_raw.trim();
+    let count: isize = if trimmed.parse::<isize>().is_ok() {
+        1
+    } else if let Some(items) = parse_simple_sequence_names(trimmed) {
+        items.len() as isize
+    } else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output[axis] = add_to_dim(&output[axis], -count);
+    Ok(Some(output))
+}
+
+/// `jnp.append(arr, values, axis=None)` — concatenates like
+/// `jnp.concatenate` when `axis` is given; flattens both operands to 1D and
+/// sums their lengths when `axis` is omitted.
+fn apply_known_append(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    if values.len() < 2 {
+        return Ok(None);
+    }
+    let Some(arr_shape) = shapes.shape(&values[0]) else {
+        return Ok(None);
+    };
+    let Some(val_shape) = shapes.shape(&values[1]) else {
+        return Ok(None);
+    };
+    let axis_raw = nth_positional_or_keyword(args, 2, &["axis"]);
+    match axis_raw {
+        None => {
+            let a = flattened_dim(arr_shape);
+            let b = flattened_dim(val_shape);
+            Ok(Some(vec![concat_dim(&[a, b])]))
+        }
+        Some(raw) => {
+            let Some(axis) = parse_axis(raw) else {
+                return Ok(None);
+            };
+            let rank = arr_shape.len();
+            let axis = if axis < 0 { rank as isize + axis } else { axis };
+            if axis < 0 || axis as usize >= rank {
+                return Err(format!("append axis {} out of bounds for rank {}", axis, rank));
+            }
+            concat_shapes_along_axis(&[arr_shape.clone(), val_shape.clone()], axis as usize)
+        }
+    }
+}
+
+/// `jnp.kron(a, b)` — Kronecker product: elementwise product of dims after
+/// left-padding the shorter shape with size-1 axes.
+fn apply_known_kron(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, a_shape, _, b_shape)) = resolve_binary_shapes(args, shapes) else {
+        return Ok(None);
+    };
+    let rank = a_shape.len().max(b_shape.len());
+    let mut a = vec!["1".to_string(); rank - a_shape.len()];
+    a.extend(a_shape.clone());
+    let mut b = vec!["1".to_string(); rank - b_shape.len()];
+    b.extend(b_shape.clone());
+    Ok(Some(
+        a.iter().zip(b.iter()).map(|(x, y)| multiply_dim(x, y)).collect(),
+    ))
+}
+
+/// A leaf array name, or a nested list of blocks, parsed from `np.block`'s
+/// nested-list literal argument.
+enum BlockItem {
+    Leaf(String),
+    List(Vec<BlockItem>),
+}
+
+fn parse_block_item(value: &str) -> Option<BlockItem> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut current = String::new();
+        for ch in inner.chars() {
+            match ch {
+                '[' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ']' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    if !current.trim().is_empty() {
+                        items.push(current.trim().to_string());
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            items.push(current.trim().to_string());
+        }
+        if items.is_empty() {
+            return None;
+        }
+        let parsed: Option<Vec<BlockItem>> = items.iter().map(|s| parse_block_item(s)).collect();
+        Some(BlockItem::List(parsed?))
+    } else if !trimmed.is_empty()
+        && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(BlockItem::Leaf(trimmed.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Recursively resolves a `BlockItem`, returning its shape and the nesting
+/// depth (list-levels) below it (`0` for a leaf). numpy concatenates the
+/// innermost list level along the last axis, the next level up along the
+/// second-to-last axis, and so on — i.e. axis = `rank - this_depth`.
+fn block_item_shape(
+    item: &BlockItem,
+    shapes: &dyn ShapeLookup,
+) -> Result<(Option<Vec<String>>, usize), String> {
+    match item {
+        BlockItem::Leaf(name) => Ok((shapes.shape(name).cloned(), 0)),
+        BlockItem::List(children) => {
+            let mut child_shapes = Vec::with_capacity(children.len());
+            let mut depth = 0usize;
+            for child in children {
+                let (shape, d) = block_item_shape(child, shapes)?;
+                depth = depth.max(d);
+                match shape {
+                    Some(s) => child_shapes.push(s),
+                    None => return Ok((None, depth + 1)),
+                }
+            }
+            let Some(first) = child_shapes.first() else {
+                return Ok((None, depth + 1));
+            };
+            let rank = first.len();
+            let this_depth = depth + 1;
+            if this_depth > rank {
+                return Err(format!(
+                    "block: nesting depth {} exceeds operand rank {}",
+                    this_depth, rank
+                ));
+            }
+            let axis = rank - this_depth;
+            let combined = concat_shapes_along_axis(&child_shapes, axis)?;
+            Ok((combined, this_depth))
+        }
+    }
+}
+
+fn apply_known_block(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = positional_arg_values(args).into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(item) = parse_block_item(&raw) else {
+        return Ok(None);
+    };
+    let (shape, _depth) = block_item_shape(&item, shapes)?;
+    Ok(shape)
+}
+
+/// `jnp.take_along_axis(arr, indices, axis)` — output shape matches
+/// `indices` exactly.
+fn apply_known_take_along_axis(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    let Some(idx_name) = values.get(1) else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(idx_name).cloned())
+}
+
+/// `np.argwhere(a)` — shape `(N, ndim)`: the element count `N` is
+/// data-dependent (an opaque symbolic dim), but `ndim` is known statically
+/// from `a`'s rank.
+fn apply_known_argwhere(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    Ok(Some(vec![
+        format!("nonzero({input_name})"),
+        input_shape.len().to_string(),
+    ]))
+}
+
+/// `jnp.searchsorted(a, v, ...)` — output shape follows `v` (the values
+/// being searched for), not `a`.
+fn apply_known_searchsorted(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    let Some(v_name) = values.get(1) else {
+        return Ok(None);
+    };
+    Ok(shapes.shape(v_name).cloned())
+}
+
+/// `jnp.histogram(a, bins=10, ...)` — 1D output of length `bins` when
+/// `bins` is an integer literal, or `len(edges) - 1` when `bins` is a
+/// literal list of bin edges. Otherwise unresolvable statically.
+fn apply_known_histogram(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let Some(bins_raw) = nth_positional_or_keyword(args, 1, &["bins"]) else {
+        return Ok(Some(vec!["10".to_string()])); // numpy/jax default
+    };
+    let trimmed = bins_raw.trim();
+    if let Ok(n) = trimmed.parse::<usize>() {
+        return Ok(Some(vec![n.to_string()]));
+    }
+    let looks_like_list = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with('(') && trimmed.ends_with(')'));
+    if looks_like_list
+        && let Some(edges) = parse_simple_sequence_names(trimmed)
+        && edges.len() >= 2
+    {
+        return Ok(Some(vec![(edges.len() - 1).to_string()]));
+    }
+    Ok(None)
+}
+
+/// `jnp.cross(a, b, axis=-1)` — broadcasts like an elementwise binary op;
+/// the cross-product axis length (2 or 3) is unaffected.
+fn apply_known_cross(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, a_shape, _, b_shape)) = resolve_binary_shapes(args, shapes) else {
+        return Ok(None);
+    };
+    broadcast_two_shapes(a_shape, b_shape).map(Some)
+}
+
+/// `jnp.linalg.solve(a, b)` — output shape follows `b` (the right-hand
+/// side); `a` is validated as square.
+fn apply_known_linalg_solve(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, a_shape, _, b_shape)) = resolve_binary_shapes(args, shapes) else {
+        return Ok(None);
+    };
+    require_square_matrix(a_shape, "linalg.solve")?;
+    Ok(Some(b_shape.clone()))
+}
+
+/// `torch.linalg.pinv(A)` — pseudo-inverse swaps the last two dims:
+/// `(..., m, n) -> (..., n, m)`.
+fn apply_known_linalg_pinv(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() < 2 {
+        return Err(format!(
+            "linalg.pinv requires rank >= 2, got rank {}",
+            input_shape.len()
+        ));
+    }
+    let mut output = input_shape.clone();
+    let len = output.len();
+    output.swap(len - 1, len - 2);
+    Ok(Some(output))
+}
+
+/// `torch.linalg.matrix_rank(A)` — batched: reduces the last two dims to a
+/// scalar per batch element, `(..., m, n) -> (...,)`. No square requirement
+/// (rank is defined for non-square matrices too).
+fn apply_known_linalg_matrix_rank(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if input_shape.len() < 2 {
+        return Err(format!(
+            "linalg.matrix_rank requires rank >= 2, got rank {}",
+            input_shape.len()
+        ));
+    }
+    Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
+}
+
+/// `torch.linalg.lstsq(A, B)` — solution shape is `A`'s batch dims + `[n,
+/// (k)]` where `n = A`'s last dim and `k = B`'s last dim (only present when
+/// `B` is a matrix rhs, i.e. same rank as `A`; a vector rhs — one rank
+/// lower — yields a vector solution).
+pub fn apply_known_linalg_lstsq_solution(
+    a_shape: &[String],
+    b_shape: &[String],
+) -> Option<Vec<String>> {
+    if a_shape.len() < 2 || b_shape.is_empty() {
+        return None;
+    }
+    let n = a_shape[a_shape.len() - 1].clone();
+    let mut solution = a_shape[..a_shape.len() - 2].to_vec();
+    if b_shape.len() == a_shape.len() {
+        solution.push(n);
+        solution.push(b_shape.last()?.clone());
+    } else if b_shape.len() + 1 == a_shape.len() {
+        solution.push(n);
+    } else {
+        return None;
+    }
+    Some(solution)
+}
+
+/// `einops.einsum(*operands, pattern)` — same equation-based semantics as
+/// `torch.einsum`/`jnp.einsum`, but the pattern string is the *last*
+/// positional argument rather than the first.
+fn apply_known_einops_einsum(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let positional_values = positional_arg_values(args);
+    if positional_values.len() < 2 {
+        return Ok(None);
+    }
+    let (equation, operand_names) = positional_values.split_last().unwrap();
+
+    let trimmed = equation.trim();
+    let equation_str = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        return Ok(None);
+    };
+    if equation_str.contains("...") {
+        return Ok(None);
+    }
+    let Some((inputs_part, output_part)) = equation_str.split_once("->") else {
+        return Ok(None);
+    };
+
+    let input_specs: Vec<Vec<&str>> = inputs_part
+        .split(',')
+        .map(|s| s.split_whitespace().collect())
+        .collect();
+    let output_spec: Vec<&str> = output_part.split_whitespace().collect();
+
+    if operand_names.len() != input_specs.len() {
+        return Err(format!(
+            "einops.einsum equation has {} input specs but got {} operands",
+            input_specs.len(),
+            operand_names.len()
+        ));
+    }
+
+    let mut label_map: HashMap<&str, String> = HashMap::new();
+    for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
+        let Some(shape) = shapes.shape(operand_name.as_str()) else {
+            return Ok(None);
+        };
+        if shape.len() != spec.len() {
+            return Err(format!(
+                "einops.einsum operand '{}' has rank {} but subscript '{}' has {} axes",
+                operand_name,
+                shape.len(),
+                spec.join(" "),
+                spec.len()
+            ));
+        }
+        for (label, dim) in spec.iter().zip(shape.iter()) {
+            if let Some(existing_dim) = label_map.get(label) {
+                check_dim_match(existing_dim, dim, &format!("einops.einsum label '{}'", label))?;
+            } else {
+                label_map.insert(label, dim.clone());
+            }
+        }
+    }
+
+    let mut output_shape = Vec::with_capacity(output_spec.len());
+    for label in output_spec {
+        let Some(dim) = label_map.get(label) else {
+            return Err(format!(
+                "einops.einsum output label '{}' not found in input subscripts",
+                label
+            ));
+        };
+        output_shape.push(dim.clone());
+    }
+    Ok(Some(output_shape))
+}
+
+/// `einops.pack(tensors, pattern)` — restricted to patterns where `*`
+/// stands for exactly one axis per tensor (the common case: a single
+/// variable batch axis). Under that restriction, packing is exactly
+/// `concatenate` along the `*` axis position; each tensor's rank must
+/// match the pattern's token count. Patterns with more than one `*`, or
+/// where `*` spans a variable number of axes per tensor, aren't modelled.
+pub fn compute_einops_pack_shape(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let positional = positional_arg_values(args);
+    let Some(tensors_raw) = positional.first() else {
+        return Ok(None);
+    };
+    let Some(pattern_raw) = positional.get(1) else {
+        return Ok(None);
+    };
+    let trimmed = pattern_raw.trim();
+    let pattern = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        return Ok(None);
+    };
+    let tokens: Vec<&str> = pattern.split_whitespace().collect();
+    if tokens.iter().filter(|t| **t == "*").count() != 1 {
+        return Ok(None);
+    }
+    let star_pos = tokens.iter().position(|t| *t == "*").unwrap();
+
+    let Some(names) = parse_simple_sequence_names(tensors_raw) else {
+        return Ok(None);
+    };
+    if names.is_empty() {
+        return Ok(None);
+    }
+
+    let mut input_shapes = Vec::with_capacity(names.len());
+    for name in &names {
+        let Some(shape) = shapes.shape(name) else {
+            return Ok(None);
+        };
+        if shape.len() != tokens.len() {
+            return Ok(None);
+        }
+        input_shapes.push(shape.clone());
+    }
+    concat_shapes_along_axis(&input_shapes, star_pos)
+}
+
+/// `jax.nn.one_hot(x, num_classes, ...)` — appends `num_classes` to `x`'s
+/// shape.
+fn apply_known_one_hot(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(num_classes) = nth_positional_or_keyword(args, 1, &["num_classes"]) else {
+        return Ok(None);
+    };
+    let mut output = input_shape.clone();
+    output.push(num_classes.to_string());
+    Ok(Some(output))
+}
+
+/// `jax.nn.dot_product_attention(query, key, value, ...)` — output has
+/// `query`'s shape with the last (head) dim replaced by `value`'s head dim.
+fn apply_known_dot_product_attention(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let values = positional_arg_values(args);
+    if values.len() < 3 {
+        return Ok(None);
+    }
+    let Some(query_shape) = shapes.shape(&values[0]) else {
+        return Ok(None);
+    };
+    let Some(value_shape) = shapes.shape(&values[2]) else {
+        return Ok(None);
+    };
+    if query_shape.is_empty() || value_shape.is_empty() {
+        return Ok(None);
+    }
+    let mut output = query_shape.clone();
+    let last = output.len() - 1;
+    output[last] = value_shape.last().unwrap().clone();
+    Ok(Some(output))
 }
 
 #[cfg(test)]
@@ -4894,6 +6123,574 @@ mod known_function_shape_rule_tests {
                 .contains("rank 2 but subscript 'ijk' has length 3")
         );
     }
+
+    // ── jax.lax higher-order / structured op shape rules ──
+
+    #[test]
+    fn test_lax_while_loop_carry_invariant() {
+        let args = vec![pos("cond_fn"), pos("body_fn"), pos("state")];
+        let shapes = HashMap::from([("state".to_string(), shape(&["b", "d"]))]);
+        let output = apply_known_function(&KnownFunction::LaxWhileLoop, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_lax_fori_loop_carry_invariant() {
+        let args = vec![pos("0"), pos("10"), pos("body_fn"), pos("state")];
+        let shapes = HashMap::from([("state".to_string(), shape(&["b", "d"]))]);
+        let output = apply_known_function(&KnownFunction::LaxForiLoop, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_lax_associative_scan_carry_invariant() {
+        let args = vec![pos("combine_fn"), pos("elems")];
+        let shapes = HashMap::from([("elems".to_string(), shape(&["n", "d"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LaxAssociativeScan, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["n", "d"])));
+    }
+
+    #[test]
+    fn test_lax_scatter_shape_preserving_on_operand() {
+        let args = vec![pos("operand"), pos("indices"), pos("updates")];
+        let shapes = HashMap::from([("operand".to_string(), shape(&["b", "d"]))]);
+        let output = apply_known_function(&KnownFunction::LaxScatter, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_lax_broadcast_prepends_sizes() {
+        let args = vec![pos("x"), pos("(4, 5)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["d"]))]);
+        let output = apply_known_function(&KnownFunction::LaxBroadcast, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "5", "d"])));
+    }
+
+    #[test]
+    fn test_lax_broadcast_in_dim_uses_target_shape() {
+        let args = vec![pos("x"), pos("(2, 3, 4)"), pos("(1,)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["3"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LaxBroadcastInDim, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["2", "3", "4"])));
+    }
+
+    #[test]
+    fn test_lax_slice_concrete_indices() {
+        let args = vec![pos("x"), pos("(0, 1)"), pos("(4, 5)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "8"]))]);
+        let output = apply_known_function(&KnownFunction::LaxSlice, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "4"])));
+    }
+
+    #[test]
+    fn test_lax_slice_with_strides() {
+        let args = vec![pos("x"), pos("(0,)"), pos("(10,)"), pos("(2,)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["10"]))]);
+        let output = apply_known_function(&KnownFunction::LaxSlice, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn test_lax_dynamic_slice_uses_slice_sizes() {
+        let args = vec![pos("x"), pos("(i, j)"), pos("(2, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "8"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LaxDynamicSlice, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_lax_dynamic_update_slice_shape_preserving() {
+        let args = vec![pos("x"), pos("update"), pos("(0, 0)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["8", "8"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LaxDynamicUpdateSlice, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["8", "8"])));
+    }
+
+    #[test]
+    fn test_lax_pad_low_high_interior() {
+        let args = vec![pos("x"), pos("0.0"), pos("((1, 1, 0), (0, 0, 1))")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "3"]))]);
+        let output = apply_known_function(&KnownFunction::LaxPad, &args, &shapes).unwrap();
+        // dim0: 4 + 1 + 1 = 6; dim1: 3 + 1*(3-1) = 5
+        assert_eq!(output, Some(shape(&["6", "5"])));
+    }
+
+    #[test]
+    fn test_lax_reduce_window_valid_padding_pooling_formula() {
+        let args = vec![
+            pos("x"),
+            pos("-inf"),
+            pos("max_fn"),
+            pos("(1, 2, 2, 1)"),
+            pos("(1, 2, 2, 1)"),
+            pos("'VALID'"),
+        ];
+        let shapes = HashMap::from([("x".to_string(), shape(&["1", "8", "8", "3"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LaxReduceWindow, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["1", "4", "4", "3"])));
+    }
+
+    #[test]
+    fn test_lax_conv_general_dilated_default_dimension_numbers_valid() {
+        let args = vec![
+            pos("x"),
+            pos("w"),
+            pos("(1, 1)"),
+            pos("'VALID'"),
+        ];
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["1", "3", "8", "8"])),
+            ("w".to_string(), shape(&["16", "3", "3", "3"])),
+        ]);
+        let output =
+            apply_known_function(&KnownFunction::LaxConvGeneralDilated, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["1", "16", "6", "6"])));
+    }
+
+    #[test]
+    fn test_lax_conv_general_dilated_explicit_dimension_numbers_skips() {
+        let args = vec![
+            pos("x"),
+            pos("w"),
+            pos("(1, 1)"),
+            pos("'VALID'"),
+            kw("dimension_numbers", "('NHWC', 'HWIO', 'NHWC')"),
+        ];
+        let shapes = HashMap::from([
+            ("x".to_string(), shape(&["1", "8", "8", "3"])),
+            ("w".to_string(), shape(&["3", "3", "3", "16"])),
+        ]);
+        let output =
+            apply_known_function(&KnownFunction::LaxConvGeneralDilated, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    // ── jax.numpy / numpy array-creation shape rules ──
+
+    #[test]
+    fn test_diagflat_flattens_then_squares() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+        let output = apply_known_function(&KnownFunction::Diagflat, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["6", "6"])));
+    }
+
+    #[test]
+    fn test_tri_default_square() {
+        let args = vec![pos("4")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Tri, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "4"])));
+    }
+
+    #[test]
+    fn test_tri_rectangular() {
+        let args = vec![pos("4"), pos("6")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Tri, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "6"])));
+    }
+
+    #[test]
+    fn test_indices_prepends_rank() {
+        let args = vec![pos("(2, 3)")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Indices, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["2", "2", "3"])));
+    }
+
+    #[test]
+    fn test_select_approximates_first_choice_shape() {
+        let args = vec![pos("[c1, c2]"), pos("[a, b]")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["n"])), ("b".to_string(), shape(&["n"]))]);
+        let output = apply_known_function(&KnownFunction::Select, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["n"])));
+    }
+
+    // ── jax.numpy / numpy shape-transform shape rules ──
+
+    #[test]
+    fn test_rollaxis_moves_axis_before_start() {
+        let args = vec![pos("x"), pos("2"), pos("0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["a", "b", "c"]))]);
+        let output = apply_known_function(&KnownFunction::RollAxis, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["c", "a", "b"])));
+    }
+
+    #[test]
+    fn test_resize_uses_target_shape() {
+        let args = vec![pos("x"), pos("(3, 3)")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["2"]))]);
+        let output = apply_known_function(&KnownFunction::Resize, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["3", "3"])));
+    }
+
+    #[test]
+    fn test_insert_scalar_grows_axis_by_one() {
+        let args = vec![pos("x"), pos("1"), pos("9"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4"]))]);
+        let output = apply_known_function(&KnownFunction::Insert, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn test_insert_list_grows_axis_by_len() {
+        let args = vec![pos("x"), pos("1"), pos("[9, 10, 11]"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4"]))]);
+        let output = apply_known_function(&KnownFunction::Insert, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["7"])));
+    }
+
+    #[test]
+    fn test_insert_axis_none_skips() {
+        let args = vec![pos("x"), pos("1"), pos("9")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4"]))]);
+        let output = apply_known_function(&KnownFunction::Insert, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_delete_single_index_shrinks_axis_by_one() {
+        let args = vec![pos("x"), pos("2"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["5"]))]);
+        let output = apply_known_function(&KnownFunction::Delete, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4"])));
+    }
+
+    #[test]
+    fn test_delete_list_shrinks_axis_by_len() {
+        let args = vec![pos("x"), pos("[1, 2]"), kw("axis", "0")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["5"]))]);
+        let output = apply_known_function(&KnownFunction::Delete, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["3"])));
+    }
+
+    #[test]
+    fn test_append_with_axis_like_concatenate() {
+        let args = vec![pos("a"), pos("b"), kw("axis", "0")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "d"])),
+            ("b".to_string(), shape(&["3", "d"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::Append, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["5", "d"])));
+    }
+
+    #[test]
+    fn test_append_axis_none_flattens_and_sums() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["4"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::Append, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["10"])));
+    }
+
+    // ── jax.numpy / numpy joining-and-splitting shape rules ──
+
+    #[test]
+    fn test_hsplit_forces_axis_1_for_rank_2() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "6"]))]);
+        let output =
+            compute_fixed_axis_split_shapes(&KnownFunction::HSplit, &args, &shapes).unwrap();
+        assert_eq!(
+            output,
+            Some(vec![shape(&["4", "3"]), shape(&["4", "3"])])
+        );
+    }
+
+    #[test]
+    fn test_hsplit_forces_axis_0_for_rank_1() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["6"]))]);
+        let output =
+            compute_fixed_axis_split_shapes(&KnownFunction::HSplit, &args, &shapes).unwrap();
+        assert_eq!(output, Some(vec![shape(&["3"]), shape(&["3"])]));
+    }
+
+    #[test]
+    fn test_vsplit_uses_axis_0() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "6"]))]);
+        let output =
+            compute_fixed_axis_split_shapes(&KnownFunction::VSplit, &args, &shapes).unwrap();
+        assert_eq!(
+            output,
+            Some(vec![shape(&["2", "6"]), shape(&["2", "6"])])
+        );
+    }
+
+    #[test]
+    fn test_dsplit_uses_axis_2() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "6", "8"]))]);
+        let output =
+            compute_fixed_axis_split_shapes(&KnownFunction::DSplit, &args, &shapes).unwrap();
+        assert_eq!(
+            output,
+            Some(vec![shape(&["4", "6", "4"]), shape(&["4", "6", "4"])])
+        );
+    }
+
+    #[test]
+    fn test_dsplit_requires_rank_3_errors() {
+        let args = vec![pos("x"), pos("2")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "6"]))]);
+        let result = compute_fixed_axis_split_shapes(&KnownFunction::DSplit, &args, &shapes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kron_elementwise_product_of_dims() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["4", "5"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::Kron, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["8", "15"])));
+    }
+
+    #[test]
+    fn test_block_nested_2x2_assembly() {
+        let args = vec![pos("[[a, b], [c, d]]")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "3"])),
+            ("b".to_string(), shape(&["2", "4"])),
+            ("c".to_string(), shape(&["5", "3"])),
+            ("d".to_string(), shape(&["5", "4"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::Block, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["7", "7"])));
+    }
+
+    // ── jax.numpy / numpy indexing-and-selection shape rules ──
+
+    #[test]
+    fn test_take_along_axis_matches_indices_shape() {
+        let args = vec![pos("a"), pos("idx"), kw("axis", "1")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["4", "8"])),
+            ("idx".to_string(), shape(&["4", "1"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::TakeAlongAxis, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "1"])));
+    }
+
+    #[test]
+    fn test_put_along_axis_shape_preserving_on_arr() {
+        let args = vec![pos("a"), pos("idx"), pos("values"), kw("axis", "1")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["4", "8"]))]);
+        let output = apply_known_function(&KnownFunction::PutAlongAxis, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["4", "8"])));
+    }
+
+    #[test]
+    fn test_argwhere_known_rank_unknown_count() {
+        let args = vec![pos("mask")];
+        let shapes = HashMap::from([("mask".to_string(), shape(&["4", "8"]))]);
+        let output = apply_known_function(&KnownFunction::Argwhere, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["nonzero(mask)", "2"])));
+    }
+
+    #[test]
+    fn test_searchsorted_follows_values_shape() {
+        let args = vec![pos("a"), pos("v")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["100"])),
+            ("v".to_string(), shape(&["10"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::SearchSorted, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["10"])));
+    }
+
+    #[test]
+    fn test_histogram_default_bins() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Histogram, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["10"])));
+    }
+
+    #[test]
+    fn test_histogram_literal_bin_count() {
+        let args = vec![pos("x"), pos("20")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Histogram, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["20"])));
+    }
+
+    #[test]
+    fn test_histogram_literal_edges_list() {
+        let args = vec![pos("x"), pos("[0, 1, 2, 3]")];
+        let shapes = HashMap::new();
+        let output = apply_known_function(&KnownFunction::Histogram, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["3"])));
+    }
+
+    #[test]
+    fn test_bincount_conservatively_unknown() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["100"]))]);
+        let output = apply_known_function(&KnownFunction::BinCount, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_unique_conservatively_unknown() {
+        let args = vec![pos("x")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["100"]))]);
+        let output = apply_known_function(&KnownFunction::Unique, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    // ── linear algebra shape rules ──
+
+    #[test]
+    fn test_cross_broadcasts_batch_dims() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["n", "3"])),
+            ("b".to_string(), shape(&["3"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::Cross, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn test_linalg_solve_follows_rhs_shape() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["n", "n"])),
+            ("b".to_string(), shape(&["n", "k"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::LinalgSolve, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["n", "k"])));
+    }
+
+    #[test]
+    fn test_linalg_solve_non_square_errors() {
+        let args = vec![pos("a"), pos("b")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "k"])),
+        ]);
+        let result = apply_known_function(&KnownFunction::LinalgSolve, &args, &shapes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_linalg_pinv_swaps_last_two_dims() {
+        let args = vec![pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["m", "n"]))]);
+        let output = apply_known_function(&KnownFunction::LinalgPinv, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["n", "m"])));
+    }
+
+    #[test]
+    fn test_linalg_matrix_rank_drops_last_two_dims() {
+        let args = vec![pos("a")];
+        let shapes = HashMap::from([("a".to_string(), shape(&["b", "m", "n"]))]);
+        let output =
+            apply_known_function(&KnownFunction::LinalgMatrixRank, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b"])));
+    }
+
+    #[test]
+    fn test_linalg_lstsq_solution_matrix_rhs() {
+        let a = shape(&["m", "n"]);
+        let b = shape(&["m", "k"]);
+        assert_eq!(
+            apply_known_linalg_lstsq_solution(&a, &b),
+            Some(shape(&["n", "k"]))
+        );
+    }
+
+    #[test]
+    fn test_linalg_lstsq_solution_vector_rhs() {
+        let a = shape(&["m", "n"]);
+        let b = shape(&["m"]);
+        assert_eq!(apply_known_linalg_lstsq_solution(&a, &b), Some(shape(&["n"])));
+    }
+
+    #[test]
+    fn test_norm_reduction_axis_semantics() {
+        let args = vec![pos("x"), kw("axis", "1")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["b", "d"]))]);
+        // linalg.norm dispatches through KnownFunction::Sum's reduction rule.
+        let output = apply_known_function(&KnownFunction::Sum, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b"])));
+    }
+
+    // ── einops shape rules ──
+
+    #[test]
+    fn test_einops_einsum_pattern_is_last_positional() {
+        let args = vec![pos("a"), pos("b"), pos("\"i j, j k -> i k\"")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["m", "n"])),
+            ("b".to_string(), shape(&["n", "p"])),
+        ]);
+        let output = apply_known_function(&KnownFunction::EinopsEinsum, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["m", "p"])));
+    }
+
+    #[test]
+    fn test_einops_pack_single_star_axis_like_concatenate() {
+        let args = vec![pos("[a, b]"), pos("\"* d\"")];
+        let shapes = HashMap::from([
+            ("a".to_string(), shape(&["2", "d"])),
+            ("b".to_string(), shape(&["3", "d"])),
+        ]);
+        let output = compute_einops_pack_shape(&args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["5", "d"])));
+    }
+
+    #[test]
+    fn test_einops_parse_shape_always_none() {
+        let args = vec![pos("x"), pos("\"h w\"")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["4", "5"]))]);
+        let output = apply_known_function(&KnownFunction::EinopsParseShape, &args, &shapes).unwrap();
+        assert_eq!(output, None);
+    }
+
+    // ── jax.nn shape rules ──
+
+    #[test]
+    fn test_one_hot_appends_num_classes() {
+        let args = vec![pos("x"), pos("10")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch"]))]);
+        let output = apply_known_function(&KnownFunction::OneHot, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "10"])));
+    }
+
+    #[test]
+    fn test_one_hot_symbolic_num_classes() {
+        let args = vec![pos("x"), pos("n_classes")];
+        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "seq"]))]);
+        let output = apply_known_function(&KnownFunction::OneHot, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["batch", "seq", "n_classes"])));
+    }
+
+    #[test]
+    fn test_dot_product_attention_uses_query_and_value_head_dim() {
+        let args = vec![pos("q"), pos("k"), pos("v")];
+        let shapes = HashMap::from([
+            ("q".to_string(), shape(&["b", "sq", "h", "dk"])),
+            ("k".to_string(), shape(&["b", "sk", "h", "dk"])),
+            ("v".to_string(), shape(&["b", "sk", "h", "dv"])),
+        ]);
+        let output =
+            apply_known_function(&KnownFunction::DotProductAttention, &args, &shapes).unwrap();
+        assert_eq!(output, Some(shape(&["b", "sq", "h", "dv"])));
+    }
 }
 
 #[cfg(test)]
@@ -5715,10 +7512,12 @@ mod known_function_tests {
         ["numpy", "linalg", "dot"],
         None
     );
+    // `linalg.norm` reuses the plain-reduction shape rule (axis/keepdims
+    // mechanics are identical); see `linalg_norm_reduction_tests` below.
     known_case!(
-        jax_numpy_linalg_norm_rejected_for_now,
+        jax_numpy_linalg_norm_classified,
         ["jax", "numpy", "linalg", "norm"],
-        None
+        Some(KnownFunction::Sum)
     );
 
     // ── linalg.inv classification tests ──
@@ -5931,6 +7730,318 @@ mod known_function_tests {
         "F.relu",
         None
     );
+
+    // ── jax.lax higher-order / structured op classification ──
+
+    known_case!(jax_lax_map, ["jax", "lax", "map"], Some(KnownFunction::LaxMap));
+    known_case!(jax_lax_cond, ["jax", "lax", "cond"], Some(KnownFunction::LaxCond));
+    known_case!(jax_lax_switch, ["jax", "lax", "switch"], Some(KnownFunction::LaxSwitch));
+    known_case!(
+        jax_lax_while_loop,
+        ["jax", "lax", "while_loop"],
+        Some(KnownFunction::LaxWhileLoop)
+    );
+    known_case!(
+        jax_lax_fori_loop,
+        ["jax", "lax", "fori_loop"],
+        Some(KnownFunction::LaxForiLoop)
+    );
+    known_case!(
+        jax_lax_conv_general_dilated,
+        ["jax", "lax", "conv_general_dilated"],
+        Some(KnownFunction::LaxConvGeneralDilated)
+    );
+    known_case!(jax_lax_gather, ["jax", "lax", "gather"], Some(KnownFunction::LaxGather));
+    known_case!(
+        jax_lax_scatter,
+        ["jax", "lax", "scatter"],
+        Some(KnownFunction::LaxScatter)
+    );
+    known_case!(
+        jax_lax_scatter_add,
+        ["jax", "lax", "scatter_add"],
+        Some(KnownFunction::LaxScatter)
+    );
+    known_case!(
+        jax_lax_reduce_window,
+        ["jax", "lax", "reduce_window"],
+        Some(KnownFunction::LaxReduceWindow)
+    );
+    known_case!(jax_lax_top_k, ["jax", "lax", "top_k"], Some(KnownFunction::LaxTopK));
+    known_case!(jax_lax_sort, ["jax", "lax", "sort"], Some(KnownFunction::LaxSort));
+    known_case!(
+        jax_lax_sort_key_val,
+        ["jax", "lax", "sort_key_val"],
+        Some(KnownFunction::LaxSortKeyVal)
+    );
+    known_case!(jax_lax_pad, ["jax", "lax", "pad"], Some(KnownFunction::LaxPad));
+    known_case!(
+        jax_lax_broadcast,
+        ["jax", "lax", "broadcast"],
+        Some(KnownFunction::LaxBroadcast)
+    );
+    known_case!(
+        jax_lax_broadcast_in_dim,
+        ["jax", "lax", "broadcast_in_dim"],
+        Some(KnownFunction::LaxBroadcastInDim)
+    );
+    known_case!(jax_lax_slice, ["jax", "lax", "slice"], Some(KnownFunction::LaxSlice));
+    known_case!(
+        jax_lax_dynamic_slice,
+        ["jax", "lax", "dynamic_slice"],
+        Some(KnownFunction::LaxDynamicSlice)
+    );
+    known_case!(
+        jax_lax_dynamic_update_slice,
+        ["jax", "lax", "dynamic_update_slice"],
+        Some(KnownFunction::LaxDynamicUpdateSlice)
+    );
+    known_case!(
+        jax_lax_concatenate,
+        ["jax", "lax", "concatenate"],
+        Some(KnownFunction::Concatenate)
+    );
+    known_case!(jax_lax_rev, ["jax", "lax", "rev"], Some(KnownFunction::Flip));
+    known_case!(
+        jax_lax_squeeze,
+        ["jax", "lax", "squeeze"],
+        Some(KnownFunction::Squeeze)
+    );
+    known_case!(
+        jax_lax_expand_dims,
+        ["jax", "lax", "expand_dims"],
+        Some(KnownFunction::ExpandDims)
+    );
+    known_case!(
+        jax_lax_transpose,
+        ["jax", "lax", "transpose"],
+        Some(KnownFunction::Transpose)
+    );
+    known_case!(
+        jax_lax_associative_scan,
+        ["jax", "lax", "associative_scan"],
+        Some(KnownFunction::LaxAssociativeScan)
+    );
+    known_case!(jax_lax_psum_not_classified, ["jax", "lax", "psum"], None);
+    known_case!(jax_jit_not_classified, ["jax", "jit"], None);
+    known_case!(jax_grad_not_classified, ["jax", "grad"], None);
+
+    // ── jax.numpy / numpy array-creation classification ──
+
+    known_case!(
+        jnp_diagflat,
+        ["jax", "numpy", "diagflat"],
+        Some(KnownFunction::Diagflat)
+    );
+    known_case!(jnp_tri, ["jax", "numpy", "tri"], Some(KnownFunction::Tri));
+    known_case!(
+        jnp_indices,
+        ["jax", "numpy", "indices"],
+        Some(KnownFunction::Indices)
+    );
+    known_case!(
+        jnp_bincount,
+        ["jax", "numpy", "bincount"],
+        Some(KnownFunction::BinCount)
+    );
+    known_case!(jnp_unique, ["jax", "numpy", "unique"], Some(KnownFunction::Unique));
+    known_case!(
+        jnp_select,
+        ["jax", "numpy", "select"],
+        Some(KnownFunction::Select)
+    );
+
+    // ── jax.numpy / numpy shape-transform classification ──
+
+    known_case!(
+        jnp_rollaxis,
+        ["jax", "numpy", "rollaxis"],
+        Some(KnownFunction::RollAxis)
+    );
+    known_case!(
+        jnp_resize,
+        ["jax", "numpy", "resize"],
+        Some(KnownFunction::Resize)
+    );
+    known_case!(
+        jnp_insert,
+        ["jax", "numpy", "insert"],
+        Some(KnownFunction::Insert)
+    );
+    known_case!(
+        jnp_delete,
+        ["jax", "numpy", "delete"],
+        Some(KnownFunction::Delete)
+    );
+    known_case!(
+        jnp_append,
+        ["jax", "numpy", "append"],
+        Some(KnownFunction::Append)
+    );
+    known_case!(
+        jnp_broadcast_shapes_not_classified,
+        ["jax", "numpy", "broadcast_shapes"],
+        None
+    );
+
+    // ── jax.numpy / numpy joining-and-splitting classification ──
+
+    known_case!(
+        jnp_hsplit,
+        ["jax", "numpy", "hsplit"],
+        Some(KnownFunction::HSplit)
+    );
+    known_case!(
+        jnp_vsplit,
+        ["jax", "numpy", "vsplit"],
+        Some(KnownFunction::VSplit)
+    );
+    known_case!(
+        jnp_dsplit,
+        ["jax", "numpy", "dsplit"],
+        Some(KnownFunction::DSplit)
+    );
+    known_case!(jnp_kron, ["jax", "numpy", "kron"], Some(KnownFunction::Kron));
+
+    // ── jax.numpy / numpy indexing-and-selection classification ──
+
+    known_case!(
+        jnp_take_along_axis,
+        ["jax", "numpy", "take_along_axis"],
+        Some(KnownFunction::TakeAlongAxis)
+    );
+    known_case!(
+        jnp_put_along_axis,
+        ["jax", "numpy", "put_along_axis"],
+        Some(KnownFunction::PutAlongAxis)
+    );
+    known_case!(
+        jnp_nonzero,
+        ["jax", "numpy", "nonzero"],
+        Some(KnownFunction::Nonzero)
+    );
+    known_case!(
+        jnp_argwhere,
+        ["jax", "numpy", "argwhere"],
+        Some(KnownFunction::Argwhere)
+    );
+    known_case!(
+        jnp_searchsorted,
+        ["jax", "numpy", "searchsorted"],
+        Some(KnownFunction::SearchSorted)
+    );
+    known_case!(
+        jnp_extract,
+        ["jax", "numpy", "extract"],
+        Some(KnownFunction::Extract)
+    );
+    known_case!(
+        jnp_compress,
+        ["jax", "numpy", "compress"],
+        Some(KnownFunction::Compress)
+    );
+    known_case!(
+        jnp_histogram,
+        ["jax", "numpy", "histogram"],
+        Some(KnownFunction::Histogram)
+    );
+
+    // ── jax.numpy / numpy reduction-alias classification ──
+
+    known_case!(
+        jnp_median_reuses_mean,
+        ["jax", "numpy", "median"],
+        Some(KnownFunction::Mean)
+    );
+    known_case!(
+        jnp_quantile_reuses_mean,
+        ["jax", "numpy", "quantile"],
+        Some(KnownFunction::Mean)
+    );
+    known_case!(
+        jnp_count_nonzero_reuses_sum,
+        ["jax", "numpy", "count_nonzero"],
+        Some(KnownFunction::Sum)
+    );
+    known_case!(jnp_ptp_reuses_max, ["jax", "numpy", "ptp"], Some(KnownFunction::Max));
+    known_case!(
+        jax_numpy_fft_fft_classified,
+        ["jax", "numpy", "fft", "fft"],
+        Some(KnownFunction::Copy)
+    );
+    known_case!(
+        torch_fft_rfft_not_classified,
+        ["torch", "fft", "rfft"],
+        None
+    );
+
+    // ── linear algebra classification ──
+
+    known_case!(jnp_cross, ["jax", "numpy", "cross"], Some(KnownFunction::Cross));
+    known_case!(torch_cross, ["torch", "cross"], Some(KnownFunction::Cross));
+    known_case!(
+        jnp_linalg_solve,
+        ["jax", "numpy", "linalg", "solve"],
+        Some(KnownFunction::LinalgSolve)
+    );
+    known_case!(
+        jnp_linalg_cholesky_reuses_inv,
+        ["jax", "numpy", "linalg", "cholesky"],
+        Some(KnownFunction::LinalgInv)
+    );
+    known_case!(
+        torch_linalg_lstsq,
+        ["torch", "linalg", "lstsq"],
+        Some(KnownFunction::LinalgLstsq)
+    );
+    known_case!(
+        torch_linalg_pinv,
+        ["torch", "linalg", "pinv"],
+        Some(KnownFunction::LinalgPinv)
+    );
+    known_case!(
+        torch_linalg_matrix_rank,
+        ["torch", "linalg", "matrix_rank"],
+        Some(KnownFunction::LinalgMatrixRank)
+    );
+
+    // ── einops classification ──
+
+    known_case!(
+        einops_einsum,
+        ["einops", "einsum"],
+        Some(KnownFunction::EinopsEinsum)
+    );
+    known_case!(einops_pack, ["einops", "pack"], Some(KnownFunction::EinopsPack));
+    known_case!(
+        einops_unpack,
+        ["einops", "unpack"],
+        Some(KnownFunction::EinopsUnpack)
+    );
+    known_case!(
+        einops_parse_shape,
+        ["einops", "parse_shape"],
+        Some(KnownFunction::EinopsParseShape)
+    );
+
+    // ── jax.nn classification ──
+
+    known_case!(
+        jax_nn_one_hot,
+        ["jax", "nn", "one_hot"],
+        Some(KnownFunction::OneHot)
+    );
+    known_case!(
+        jax_nn_dot_product_attention,
+        ["jax", "nn", "dot_product_attention"],
+        Some(KnownFunction::DotProductAttention)
+    );
+    known_case!(
+        jax_nn_logsumexp_reuses_sum,
+        ["jax", "nn", "logsumexp"],
+        Some(KnownFunction::Sum)
+    );
+    known_case!(jax_nn_relu_not_classified, ["jax", "nn", "relu"], None);
 }
 
 #[cfg(test)]

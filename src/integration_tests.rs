@@ -6696,7 +6696,10 @@ mod einops_tests {
 
     #[test]
     fn test_ellipsis_pattern_skips() {
-        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"... d -> d ...\")";
+        // Ellipsis on only one side isn't modelled (symmetric `...` on both
+        // sides IS supported now — see `einops_ellipsis_tests` at the end of
+        // this file).
+        let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"... d -> d\")";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty());
@@ -6905,5 +6908,472 @@ mod bench_harness {
             analyze_layer_shapes(tree.root_node(), code, roots, read, 5, Some(cache)).unwrap();
         let analyze_ms = t1.elapsed().as_secs_f64() * 1000.0;
         (parse_ms, analyze_ms, analysis)
+    }
+}
+
+#[cfg(test)]
+mod jax_lax_higher_order_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_lax_map_over_user_function() {
+        let code = "import jax\ndef step(x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return x\ndef f(xs: Float[Array, \"n d\"]):\n    ys = jax.lax.map(step, xs)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "ys"), Some(&shape(&["n", "d"])));
+    }
+
+    #[test]
+    fn test_lax_while_loop_carry_invariant() {
+        let code = "import jax\ndef f(state: Float[Array, \"b d\"]):\n    out = jax.lax.while_loop(cond_fn, body_fn, state)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_lax_fori_loop_carry_invariant() {
+        let code = "import jax\ndef f(state: Float[Array, \"b d\"]):\n    out = jax.lax.fori_loop(0, 10, body_fn, state)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn test_lax_cond_conservatively_unknown() {
+        let code = "import jax\ndef f(x: Float[Array, \"b d\"]):\n    out = jax.lax.cond(pred, true_fn, false_fn, x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "out"), None);
+    }
+
+    #[test]
+    fn test_lax_top_k_tuple_unpacking() {
+        let code = "import jax\ndef f(x: Float[Array, \"b n\"]):\n    values, indices = jax.lax.top_k(x, 5)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "values"), Some(&shape(&["b", "5"])));
+        assert_eq!(find_shape(&analysis, "indices"), Some(&shape(&["b", "5"])));
+    }
+
+    #[test]
+    fn test_lax_sort_key_val_tuple_unpacking() {
+        let code = "import jax\ndef f(keys: Float[Array, \"n\"], values: Float[Array, \"n\"]):\n    sk, sv = jax.lax.sort_key_val(keys, values)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "sk"), Some(&shape(&["n"])));
+        assert_eq!(find_shape(&analysis, "sv"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn test_lax_sort_single_operand_shape_preserving() {
+        let code = "import jax\ndef f(x: Float[Array, \"n\"]):\n    y = jax.lax.sort(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn test_lax_concatenate_reuses_jnp_concatenate_semantics() {
+        let code = "import jax\ndef f(a: Float[Array, \"m d\"], b: Float[Array, \"n d\"]):\n    y = jax.lax.concatenate([a, b], 0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["m+n", "d"])));
+    }
+
+    #[test]
+    fn test_lax_transpose_permutes_axes() {
+        let code = "import jax\ndef f(x: Float[Array, \"a b c\"]):\n    y = jax.lax.transpose(x, (2, 0, 1))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["c", "a", "b"])));
+    }
+
+    #[test]
+    fn test_lax_broadcast_in_dim_target_shape() {
+        let code = "import jax\ndef f(x: Float[Array, \"3\"]):\n    y = jax.lax.broadcast_in_dim(x, (2, 3, 4), (1,))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["2", "3", "4"])));
+    }
+
+    #[test]
+    fn test_lax_dynamic_slice_uses_slice_sizes() {
+        let code = "import jax\ndef f(x: Float[Array, \"8 8\"]):\n    y = jax.lax.dynamic_slice(x, (0, 0), (2, 3))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn test_lax_conv_general_dilated_default_layout() {
+        let code = "import jax\ndef f(x: Float[Array, \"1 3 8 8\"], w: Float[Array, \"16 3 3 3\"]):\n    y = jax.lax.conv_general_dilated(x, w, (1, 1), 'VALID')";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["1", "16", "6", "6"])));
+    }
+
+    #[test]
+    fn test_lax_gather_classified_but_conservatively_unknown() {
+        let code = "import jax\ndef f(x: Float[Array, \"8 8\"], idx: Float[Array, \"4 2\"]):\n    y = jax.lax.gather(x, idx, dimension_numbers, (1, 1))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), None);
+    }
+}
+
+#[cfg(test)]
+mod jax_numpy_new_builtin_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_hsplit_tuple_unpacking() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"4 6\"]):\n    a, b = jnp.hsplit(x, 2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["4", "3"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["4", "3"])));
+    }
+
+    #[test]
+    fn test_vsplit_tuple_unpacking() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"4 6\"]):\n    a, b = jnp.vsplit(x, 2)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["2", "6"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["2", "6"])));
+    }
+
+    #[test]
+    fn test_nonzero_tuple_unpacking_shares_length() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"4 6\"]):\n    rows, cols = jnp.nonzero(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "rows"), Some(&shape(&["nonzero(x)"])));
+        assert_eq!(find_shape(&analysis, "cols"), Some(&shape(&["nonzero(x)"])));
+    }
+
+    #[test]
+    fn test_diagflat_flattens_then_squares() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"2 3\"]):\n    y = jnp.diagflat(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["6", "6"])));
+    }
+
+    #[test]
+    fn test_select_approximate_shape() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"n\"], b: Float[Array, \"n\"]):\n    y = jnp.select([c1, c2], [a, b], 0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn test_kron_elementwise_product() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"4 5\"]):\n    y = jnp.kron(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["8", "15"])));
+    }
+
+    #[test]
+    fn test_block_nested_assembly() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"2 4\"], c: Float[Array, \"5 3\"], d: Float[Array, \"5 4\"]):\n    y = jnp.block([[a, b], [c, d]])";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["7", "7"])));
+    }
+
+    #[test]
+    fn test_take_along_axis_matches_indices() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"4 8\"], idx: Float[Array, \"4 1\"]):\n    y = jnp.take_along_axis(a, idx, axis=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["4", "1"])));
+    }
+
+    #[test]
+    fn test_argwhere_known_rank_unknown_count() {
+        let code = "import jax.numpy as jnp\ndef f(mask: Float[Array, \"4 8\"]):\n    y = jnp.argwhere(mask)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["nonzero(mask)", "2"])));
+    }
+
+    #[test]
+    fn test_bincount_conservatively_unknown() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"100\"]):\n    y = jnp.bincount(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), None);
+    }
+}
+
+#[cfg(test)]
+mod linear_algebra_extra_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_linalg_solve_follows_rhs_shape() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"n n\"], b: Float[Array, \"n k\"]):\n    x = jnp.linalg.solve(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["n", "k"])));
+    }
+
+    #[test]
+    fn test_linalg_cholesky_shape_preserving_square() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"n n\"]):\n    l = jnp.linalg.cholesky(a)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "l"), Some(&shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn test_torch_linalg_pinv_swaps_last_two_dims() {
+        let code = "import torch\ndef f(a: Float[Array, \"m n\"]):\n    b = torch.linalg.pinv(a)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "m"])));
+    }
+
+    #[test]
+    fn test_torch_linalg_matrix_rank_drops_last_two_dims() {
+        let code = "import torch\ndef f(a: Float[Array, \"b m n\"]):\n    r = torch.linalg.matrix_rank(a)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_torch_linalg_lstsq_solution_matrix_rhs() {
+        let code = "import torch\ndef f(a: Float[Array, \"m n\"], b: Float[Array, \"m k\"]):\n    solution, residuals, rank, sv = torch.linalg.lstsq(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "solution"), Some(&shape(&["n", "k"])));
+        assert_eq!(find_shape(&analysis, "residuals"), None);
+    }
+
+    #[test]
+    fn test_cross_broadcasts_batch_dims() {
+        let code = "import torch\ndef f(a: Float[Array, \"n 3\"], b: Float[Array, \"3\"]):\n    y = torch.cross(a, b)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn test_linalg_norm_reduction_axis_semantics() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"b d\"]):\n    n = jnp.linalg.norm(x, axis=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "n"), Some(&shape(&["b"])));
+    }
+}
+
+#[cfg(test)]
+mod einops_extra_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_einops_einsum_matmul() {
+        let code = "import einops\ndef f(a: Float[Array, \"m n\"], b: Float[Array, \"n p\"]):\n    y = einops.einsum(a, b, \"m n, n p -> m p\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["m", "p"])));
+    }
+
+    #[test]
+    fn test_einops_pack_single_star_axis() {
+        let code = "import einops\ndef f(a: Float[Array, \"2 d\"], b: Float[Array, \"3 d\"]):\n    packed, ps = einops.pack([a, b], \"* d\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "packed"), Some(&shape(&["5", "d"])));
+        assert_eq!(find_shape(&analysis, "ps"), None);
+    }
+
+    #[test]
+    fn test_einops_unpack_conservatively_unknown() {
+        let code = "import einops\ndef f(packed: Float[Array, \"5 d\"]):\n    a, b = einops.unpack(packed, ps, \"* d\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+    }
+
+    #[test]
+    fn test_einops_parse_shape_never_infers_array_shape() {
+        let code = "import einops\ndef f(x: Float[Array, \"h w\"]):\n    dims = einops.parse_shape(x, \"h w\")";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "dims"), None);
+    }
+}
+
+#[cfg(test)]
+mod jax_nn_extra_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    #[test]
+    fn test_one_hot_appends_num_classes() {
+        let code = "import jax.nn as jnn\ndef f(x: Float[Array, \"batch\"]):\n    y = jnn.one_hot(x, 10)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "10"])));
+    }
+
+    #[test]
+    fn test_dot_product_attention_output_shape() {
+        let code = "import jax.nn as jnn\ndef f(q: Float[Array, \"b sq h dk\"], k: Float[Array, \"b sk h dk\"], v: Float[Array, \"b sk h dv\"]):\n    o = jnn.dot_product_attention(q, k, v)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "o"), Some(&shape(&["b", "sq", "h", "dv"])));
+    }
+
+    #[test]
+    fn test_logsumexp_reduction_axis_semantics() {
+        let code = "import jax.nn as jnn\ndef f(x: Float[Array, \"b d\"]):\n    y = jnn.logsumexp(x, axis=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b"])));
+    }
+
+    #[test]
+    fn test_relu_still_shape_preserving() {
+        // Regression check: carving one_hot out of the generic shape-
+        // preserving jax.nn match arm must not disturb the other activations.
+        let code = "import jax.nn as jnn\ndef f(x: Float[Array, \"b d\"]):\n    y = jnn.relu(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["b", "d"])));
     }
 }

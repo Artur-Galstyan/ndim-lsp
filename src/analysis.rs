@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use tree_sitter::Node;
 
 use crate::known_functions::{
-    apply_known_function, apply_method_call, classify_known_function, classify_method_call,
-    compute_split_shapes,
+    apply_known_function, apply_known_linalg_lstsq_solution, apply_method_call,
+    classify_known_function, classify_method_call, compute_einops_pack_shape,
+    compute_fixed_axis_split_shapes, compute_split_shapes,
 };
 use crate::layers::{
     apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
@@ -880,6 +881,46 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         };
     }
 
+    // 2b. `jax.lax.map(f, xs)` — maps `f` over the leading axis of `xs`,
+    // exactly like `vmap(f)(xs)` with `in_axes=out_axes=0`. Handled here
+    // (rather than through `apply_known_function`) because resolving `f`
+    // needs the callee's `FunctionShapeScope`/self-attr-layer machinery.
+    {
+        let resolved_for_map = resolve_call_target(&target, ctx.import_map);
+        if matches!(classify_known_function(&resolved_for_map), Some(KnownFunction::LaxMap)) {
+            let mut positionals = args.iter().filter_map(|a| match a {
+                CallArgument::Positional { value } => Some(value.clone()),
+                _ => None,
+            });
+            let callable = positionals.next()?;
+            let rest: Vec<CallArgument> = args.iter().skip(1).cloned().collect();
+            if let Some(attr) = callable.strip_prefix("self.")
+                && let Some(layer) = ctx.self_attr_layer_at(attr, call_byte).cloned()
+            {
+                return apply_inline_vmap_layer(&layer, &rest, 0, 0, scope_idx, args_node.range(), ctx);
+            }
+            if !callable.contains('.') {
+                let info = VmapInfo {
+                    wrapped: callable,
+                    in_axes: 0,
+                    out_axes: 0,
+                };
+                return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.scopes) {
+                    Ok(shape) => shape,
+                    Err(message) => {
+                        ctx.errors.push(ShapeError {
+                            variable: String::new(),
+                            message,
+                            range: args_node.range(),
+                        });
+                        None
+                    }
+                };
+            }
+            return None;
+        }
+    }
+
     // 3. User-defined function propagation. `self.<method>(...)` resolves
     // to the method's function scope by bare name — methods are function
     // definitions like any other.
@@ -1663,6 +1704,152 @@ fn tuple_rhs_shapes(
                 return Some(vec![Some(init_shape), None]);
             }
 
+            // `values, indices = jax.lax.top_k(operand, k)` — both outputs
+            // share `operand`'s shape with the last axis replaced by `k`.
+            if matches!(known, Some(KnownFunction::LaxTopK)) {
+                if n_targets != 2 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut positionals = args.iter().filter_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                });
+                let operand = positionals.next()?;
+                let k = positionals.next().or_else(|| {
+                    args.iter().find_map(|a| match a {
+                        CallArgument::Keyword { name, value } if name == "k" => {
+                            Some(value.as_str())
+                        }
+                        _ => None,
+                    })
+                })?;
+                let mut out = ctx.resolve_shape(operand, scope_idx)?;
+                let last = out.len().checked_sub(1)?;
+                out[last] = k.to_string();
+                return Some(vec![Some(out.clone()), Some(out)]);
+            }
+
+            // `sorted_keys, sorted_values = jax.lax.sort_key_val(keys, values)`
+            // — each output preserves its own operand's shape.
+            if matches!(known, Some(KnownFunction::LaxSortKeyVal)) {
+                if n_targets != 2 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut positionals = args.iter().filter_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                });
+                let keys = positionals.next()?;
+                let values = positionals.next()?;
+                let keys_shape = ctx.resolve_shape(keys, scope_idx)?;
+                let values_shape = ctx.resolve_shape(values, scope_idx)?;
+                return Some(vec![Some(keys_shape), Some(values_shape)]);
+            }
+
+            // `a, b, c = np.hsplit(x, 3)` / `vsplit` / `dsplit` — like
+            // `split` but the axis is implied by the function name, not an
+            // argument.
+            if matches!(
+                known,
+                Some(KnownFunction::HSplit | KnownFunction::VSplit | KnownFunction::DSplit)
+            ) {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                return match compute_fixed_axis_split_shapes(
+                    &known?,
+                    &args,
+                    &ctx.scope_shapes(scope_idx),
+                ) {
+                    Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
+                    Ok(None) => None,
+                    Err(message) => {
+                        ctx.errors.push(ShapeError {
+                            variable: String::new(),
+                            message,
+                            range: args_node.range(),
+                        });
+                        None
+                    }
+                };
+            }
+
+            // `i0, i1, ... = jnp.nonzero(x)` — one 1D output per input
+            // dimension, all sharing the same data-dependent length.
+            if matches!(known, Some(KnownFunction::Nonzero)) {
+                if n_targets == 0 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let input_name = args.iter().find_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                })?;
+                let input_shape = ctx.resolve_shape(input_name, scope_idx)?;
+                if input_shape.len() != n_targets {
+                    return None;
+                }
+                let dim = format!("nonzero({input_name})");
+                return Some(vec![Some(vec![dim]); n_targets]);
+            }
+
+            // `packed, ps = einops.pack([...], pattern)` — the packed array
+            // gets a real shape (restricted case, see
+            // `compute_einops_pack_shape`); `ps` (packed_shapes) is a list
+            // of shape-tuples, not an array, so it's always `None`.
+            if matches!(known, Some(KnownFunction::EinopsPack)) {
+                if n_targets != 2 {
+                    return None;
+                }
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                return match compute_einops_pack_shape(&args, &ctx.scope_shapes(scope_idx)) {
+                    Ok(shape) => Some(vec![shape, None]),
+                    Err(message) => {
+                        ctx.errors.push(ShapeError {
+                            variable: String::new(),
+                            message,
+                            range: args_node.range(),
+                        });
+                        None
+                    }
+                };
+            }
+
+            // `a, b, ... = einops.unpack(packed, ps, pattern)` — genuinely
+            // dynamic (depends on the runtime `ps` value); conservatively
+            // unknown for every target.
+            if matches!(known, Some(KnownFunction::EinopsUnpack)) {
+                if n_targets == 0 {
+                    return None;
+                }
+                return Some(vec![None; n_targets]);
+            }
+
+            // `solution, residuals, rank, sv = torch.linalg.lstsq(A, B)` (or
+            // any prefix of that tuple) — only `solution`'s shape is
+            // derivable; the rest are algorithm/data-dependent.
+            if matches!(known, Some(KnownFunction::LinalgLstsq)) {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut positionals = args.iter().filter_map(|a| match a {
+                    CallArgument::Positional { value } => Some(value.as_str()),
+                    _ => None,
+                });
+                let a_name = positionals.next()?;
+                let b_name = positionals.next()?;
+                let a_shape = ctx.resolve_shape(a_name, scope_idx)?;
+                let b_shape = ctx.resolve_shape(b_name, scope_idx)?;
+                let solution = apply_known_linalg_lstsq_solution(&a_shape, &b_shape)?;
+                let mut result = vec![Some(solution)];
+                result.resize(n_targets, None);
+                return Some(result);
+            }
+
             // Multi-output linear algebra + meshgrid (v1: default modes only —
             // any keyword argument like full_matrices/mode/indexing skips).
             if matches!(
@@ -2443,11 +2630,13 @@ fn is_shape_preserving_call(resolved: &ResolvedTarget) -> bool {
 
     // jax.nn activations
     if module == ["jax", "nn"] {
+        // `one_hot` is intentionally excluded — it appends a `num_classes`
+        // dim rather than preserving shape; see `KnownFunction::OneHot`.
         return matches!(name,
             "relu" | "sigmoid" | "softplus" | "silu" | "swish" | "gelu"
             | "elu" | "leaky_relu" | "selu" | "hard_sigmoid" | "hard_silu"
             | "hard_tanh" | "hard_swish" | "mish" | "celu" | "log_sigmoid"
-            | "log_softmax" | "softmax" | "standardize" | "one_hot"
+            | "log_softmax" | "softmax" | "standardize"
         );
     }
 
@@ -2478,7 +2667,7 @@ fn is_shape_preserving_call(resolved: &ResolvedTarget) -> bool {
             | "heaviside" | "logical_not" | "logical_and" | "logical_or"
             | "logical_xor" | "equal" | "not_equal" | "less" | "less_equal"
             | "greater" | "greater_equal" | "isnan" | "isfinite" | "isinf"
-            | "isneginf" | "isposinf" | "signbit" | "nextafter"
+            | "isneginf" | "isposinf" | "signbit" | "nextafter" | "nan_to_num"
         );
     }
 
