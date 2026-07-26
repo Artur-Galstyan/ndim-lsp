@@ -5,6 +5,7 @@ use tree_sitter::Node;
 #[cfg(test)]
 use tree_sitter::Range;
 
+use crate::known_functions::apply_known_einops;
 use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_calls, extract_self_attr_calls,
 };
@@ -23,8 +24,15 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     let is_flax_module = call.implementation.target.module_parts.len() >= 2
         && call.implementation.target.module_parts[0] == "flax"
         && call.implementation.target.module_parts[1] == "linen";
+    // einops.layers.torch / einops.layers.flax — layer-object form of the
+    // rearrange/reduce pattern algebra (see `LayerKind::EinopsPattern`).
+    let is_einops_layers_module = call.implementation.target.module_parts.len() >= 3
+        && call.implementation.target.module_parts[0] == "einops"
+        && call.implementation.target.module_parts[1] == "layers"
+        && (call.implementation.target.module_parts[2] == "torch"
+            || call.implementation.target.module_parts[2] == "flax");
 
-    if !is_equinox_module && !is_torch_module && !is_flax_module {
+    if !is_equinox_module && !is_torch_module && !is_flax_module && !is_einops_layers_module {
         return None;
     }
 
@@ -293,6 +301,23 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
             in_size: call.bindings.get("in_size")?.clone(),
             out_size: call.bindings.get("out_size")?.clone(),
         }),
+        // einops.layers.{torch,flax}.Rearrange/Reduce: the pattern string and
+        // any axis-length kwargs pass straight through to
+        // `apply_known_einops` at apply time (see `LayerKind::EinopsPattern`).
+        "Rearrange" | "Reduce" if is_einops_layers_module => {
+            let pattern = call.bindings.get("pattern")?.clone();
+            let kwargs: HashMap<String, String> = call
+                .bindings
+                .iter()
+                .filter(|(name, _)| name.as_str() != "pattern" && name.as_str() != "reduction")
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            Some(LayerKind::EinopsPattern {
+                name: owner.to_string(),
+                pattern,
+                kwargs,
+            })
+        }
         _ => None,
     }
 }
@@ -336,7 +361,11 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     let framework = parts[0].as_str();
     let module = parts[1].as_str();
     let known_framework = (module == "nn" && (framework == "equinox" || framework == "torch"))
-        || (module == "linen" && framework == "flax");
+        || (module == "linen" && framework == "flax")
+        || (framework == "einops"
+            && module == "layers"
+            && parts.len() >= 4
+            && (parts[2] == "torch" || parts[2] == "flax"));
     if !known_framework {
         return None;
     }
@@ -424,6 +453,8 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
             "width_size",
             "depth",
         ],
+        "Rearrange" if framework == "einops" => &["self", "pattern"],
+        "Reduce" if framework == "einops" => &["self", "pattern", "reduction"],
         _ => return None,
     };
 
@@ -542,6 +573,37 @@ fn resolve_layer_kind_for_call<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    // Composite containers need the raw argument nodes (to recurse into
+    // nested constructor calls), which `ResolvedCallSignature` doesn't carry
+    // (its `arguments`/`bindings` are already flattened to strings). Try
+    // these node-level forms first; both return `Ok(None)` for calls that
+    // aren't their target class, falling through to the normal catalog/disk
+    // path unchanged.
+    if let Some(kind) = try_classify_sequential(
+        call,
+        node,
+        text,
+        import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    )? {
+        return Ok(Some(kind));
+    }
+    if let Some(kind) = try_classify_inner_layer_wrapper(
+        call,
+        node,
+        text,
+        import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    )? {
+        return Ok(Some(kind));
+    }
+
     // Catalog-first: hardcoded equinox.nn.* / torch.nn.* signatures bypass
     // disk resolution. Falls through to resolve_call_signature for
     // user-defined layers and frameworks not in the catalog.
@@ -561,6 +623,185 @@ where
         return Ok(None);
     };
     Ok(classify_layer_call(&resolved_call))
+}
+
+/// Named children of a `nn.Sequential`/`SpectralNorm`/`WeightNorm` ctor's
+/// argument list that are candidates for nested layer-constructor calls.
+///
+/// torch's `Sequential` takes variadic positional layers directly:
+/// `nn.Sequential(nn.Linear(...), nn.ReLU())`. equinox's `Sequential` takes a
+/// single `[layer, ...]` list literal instead: `eqx.nn.Sequential([eqx.nn.Linear(...), ...])`.
+/// When the args node holds exactly one positional arg and it's a `list`,
+/// unwrap it; otherwise use the args node's own named children.
+fn sequential_child_nodes(args_node: Node) -> Vec<Node> {
+    if args_node.named_child_count() == 1
+        && let Some(only) = args_node.named_child(0)
+        && only.kind() == "list"
+    {
+        return (0..only.named_child_count())
+            .filter_map(|i| only.named_child(i as u32))
+            .collect();
+    }
+    (0..args_node.named_child_count())
+        .filter_map(|i| args_node.named_child(i as u32))
+        .collect()
+}
+
+/// Resolve an AST node believed to be a nested layer-constructor call (a
+/// `Sequential`/`SpectralNorm`/`WeightNorm` ctor argument) to its `LayerKind`,
+/// reusing the same catalog-first/disk-fallback resolution as top-level layer
+/// assignments. `Ok(None)` for anything that isn't a plain `call` node
+/// (arbitrary callable, `*args` unpacking, a bare identifier, …) — an honest
+/// unknown rather than a guess.
+#[allow(clippy::too_many_arguments)]
+fn classify_nested_layer_node<F>(
+    child: Node,
+    root: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: &F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    if child.kind() != "call" {
+        return Ok(None);
+    }
+    let Some(func_node) = child.child_by_field_name("function") else {
+        return Ok(None);
+    };
+    let Some(inner_args_node) = child.child_by_field_name("arguments") else {
+        return Ok(None);
+    };
+    let Ok(target_text) = func_node.utf8_text(text.as_bytes()) else {
+        return Ok(None);
+    };
+    let inner_call = CallInfo {
+        variable: String::new(),
+        target: target_text.to_string(),
+        args_node_range: inner_args_node.range(),
+    };
+    resolve_layer_kind_for_call(
+        &inner_call,
+        root,
+        text,
+        import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    )
+}
+
+/// `torch.nn.Sequential(l1, l2, ...)` / `equinox.nn.Sequential([l1, l2, ...])`:
+/// classify each child ctor argument via `classify_nested_layer_node`. If any
+/// child fails to classify (`Ok(None)`), the whole `Sequential` is honestly
+/// unclassified — `Ok(None)`, not a guess. `Ok(None)` (not an error) when
+/// `call` isn't a `Sequential` ctor at all, so callers can fall through to
+/// their normal resolution path unchanged.
+#[allow(clippy::too_many_arguments)]
+fn try_classify_sequential<F>(
+    call: &CallInfo,
+    node: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: &F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let target = resolve_call_target(&call.target, import_map);
+    if target.dots != 0 || target.parts.len() < 3 {
+        return Ok(None);
+    }
+    let is_sequential = target.parts.last().map(String::as_str) == Some("Sequential")
+        && ((target.parts[0] == "torch" && target.parts[1] == "nn")
+            || (target.parts[0] == "equinox" && target.parts[1] == "nn"));
+    if !is_sequential {
+        return Ok(None);
+    }
+
+    let Some(args_node) =
+        node.descendant_for_byte_range(call.args_node_range.start_byte, call.args_node_range.end_byte)
+    else {
+        return Ok(None);
+    };
+
+    let mut children = Vec::new();
+    for child in sequential_child_nodes(args_node) {
+        let Some(kind) = classify_nested_layer_node(
+            child,
+            node,
+            text,
+            import_map,
+            search_roots,
+            read_file,
+            max_depth,
+            cache,
+        )?
+        else {
+            return Ok(None);
+        };
+        children.push(kind);
+    }
+    Ok(Some(LayerKind::Sequential { children }))
+}
+
+/// `equinox.nn.SpectralNorm(layer, ...)` / `equinox.nn.WeightNorm(layer, ...)`:
+/// wrapper modules around one inner layer, tracked only for shape purposes —
+/// classify the first ctor argument and delegate transparently (the wrapper
+/// itself carries no shape information of its own). `Ok(None)` when `call`
+/// isn't one of these two wrapper ctors, or when the first argument isn't a
+/// resolvable layer-constructor call.
+#[allow(clippy::too_many_arguments)]
+fn try_classify_inner_layer_wrapper<F>(
+    call: &CallInfo,
+    node: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: &F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let target = resolve_call_target(&call.target, import_map);
+    if target.dots != 0 || target.parts.len() < 3 {
+        return Ok(None);
+    }
+    let is_wrapper = target.parts[0] == "equinox"
+        && target.parts[1] == "nn"
+        && matches!(target.parts.last().map(String::as_str), Some("SpectralNorm") | Some("WeightNorm"));
+    if !is_wrapper {
+        return Ok(None);
+    }
+
+    let Some(args_node) =
+        node.descendant_for_byte_range(call.args_node_range.start_byte, call.args_node_range.end_byte)
+    else {
+        return Ok(None);
+    };
+    let Some(first_arg) = args_node.named_child(0) else {
+        return Ok(None);
+    };
+    classify_nested_layer_node(
+        first_arg,
+        node,
+        text,
+        import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    )
 }
 
 pub fn extract_layer_assignments_scoped<F>(
@@ -958,14 +1199,15 @@ fn parse_dim_sequence(text: &str) -> Option<Vec<String>> {
 /// is too low-rank.
 fn check_min_rank(
     layer_name: &str,
-    app: &LayerApplication,
+    layer: &str,
+    input: &str,
     input_rank: usize,
     min_rank: usize,
 ) -> Result<(), String> {
     if input_rank < min_rank {
         return Err(format!(
             "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-            layer_name, app.layer, min_rank, input_rank, app.input
+            layer_name, layer, min_rank, input_rank, input
         ));
     }
     Ok(())
@@ -975,7 +1217,8 @@ fn check_min_rank(
 fn apply_conv_layer(
     layer_name: &str,
     spatial_rank: usize,
-    app: &LayerApplication,
+    layer: &str,
+    input: &str,
     input_shape: &[String],
     in_channels: &str,
     out_channels: &str,
@@ -984,14 +1227,14 @@ fn apply_conv_layer(
     padding: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let min_rank = spatial_rank + 1;
-    check_min_rank(layer_name, app, input_shape.len(), min_rank)?;
+    check_min_rank(layer_name, layer, input, input_shape.len(), min_rank)?;
 
     let channels_idx = input_shape.len() - spatial_rank - 1;
     let channels_dim = &input_shape[channels_idx];
     if dims_provably_mismatch(in_channels, channels_dim) {
         return Err(format!(
             "{} layer '{}' expected {} input channels, got {} for '{}'",
-            layer_name, app.layer, in_channels, channels_dim, app.input
+            layer_name, layer, in_channels, channels_dim, input
         ));
     }
 
@@ -1062,8 +1305,22 @@ pub fn apply_layer_application(
     let Some(input_shape) = shapes.shape(&app.input) else {
         return Ok(None);
     };
+    apply_layer_kind(&app.kind, input_shape, &app.layer, &app.input)
+}
 
-    match &app.kind {
+/// Apply a `LayerKind`'s shape rule to a known input shape, given the names
+/// used only for error-message text (`layer`, the layer's variable/label;
+/// `input`, the input's variable/label). Factored out of
+/// `apply_layer_application` so `LayerKind::Sequential` can thread a shape
+/// through each child's rule in turn without needing a `ShapeLookup`/
+/// `LayerApplication` for intermediate (unnamed) shapes.
+fn apply_layer_kind(
+    kind: &LayerKind,
+    input_shape: &[String],
+    layer: &str,
+    input: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match kind {
         LayerKind::Linear {
             in_features,
             out_features,
@@ -1071,18 +1328,18 @@ pub fn apply_layer_application(
             let Some(last_dim) = input_shape.last() else {
                 return Err(format!(
                     "Cannot apply linear layer '{}' to scalar input '{}'",
-                    app.layer, app.input
+                    layer, input
                 ));
             };
 
             if dims_provably_mismatch(in_features, last_dim) {
                 return Err(format!(
                     "Linear layer '{}' expected input last dim {}, got {} for '{}'",
-                    app.layer, in_features, last_dim, app.input
+                    layer, in_features, last_dim, input
                 ));
             }
 
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = out_features.clone();
             Ok(Some(output_shape))
@@ -1097,7 +1354,8 @@ pub fn apply_layer_application(
         } => apply_conv_layer(
             "Conv1d",
             1,
-            app,
+            layer,
+            input,
             input_shape,
             in_channels,
             out_channels,
@@ -1115,7 +1373,8 @@ pub fn apply_layer_application(
         } => apply_conv_layer(
             "Conv2d",
             2,
-            app,
+            layer,
+            input,
             input_shape,
             in_channels,
             out_channels,
@@ -1133,7 +1392,8 @@ pub fn apply_layer_application(
         } => apply_conv_layer(
             "Conv3d",
             3,
-            app,
+            layer,
+            input,
             input_shape,
             in_channels,
             out_channels,
@@ -1151,10 +1411,10 @@ pub fn apply_layer_application(
             if input_shape.is_empty() {
                 return Err(format!(
                     "Cannot apply Dense layer '{}' to scalar input '{}'",
-                    app.layer, app.input
+                    layer, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = features.clone();
             Ok(Some(output_shape))
@@ -1163,9 +1423,9 @@ pub fn apply_layer_application(
             features,
             spatial_rank,
         } => {
-            check_min_rank("Conv", app, input_shape.len(), spatial_rank + 1)?;
+            check_min_rank("Conv", layer, input, input_shape.len(), spatial_rank + 1)?;
             // Stride-1 / SAME padding: spatial dims unchanged.
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = features.clone();
             Ok(Some(output_shape))
@@ -1179,8 +1439,8 @@ pub fn apply_layer_application(
             stride,
             padding,
         } => {
-            check_min_rank(name, app, input_shape.len(), spatial_rank + 1)?;
-            let mut output_shape = input_shape.clone();
+            check_min_rank(name, layer, input, input_shape.len(), spatial_rank + 1)?;
+            let mut output_shape = input_shape.to_vec();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
                 *dim = conv_spatial_dim(dim, kernel_size, stride, padding);
@@ -1192,8 +1452,8 @@ pub fn apply_layer_application(
             spatial_rank,
             output_size,
         } => {
-            check_min_rank(name, app, input_shape.len(), spatial_rank + 1)?;
-            let mut output_shape = input_shape.clone();
+            check_min_rank(name, layer, input, input_shape.len(), spatial_rank + 1)?;
+            let mut output_shape = input_shape.to_vec();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
                 dim.clone_from(output_size);
@@ -1202,7 +1462,7 @@ pub fn apply_layer_application(
         }
         // Index lookup: appends the embedding dim to the (integer) input shape.
         LayerKind::Embedding { embedding_size } => {
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             output_shape.push(embedding_size.clone());
             Ok(Some(output_shape))
         }
@@ -1217,16 +1477,16 @@ pub fn apply_layer_application(
             padding,
         } => {
             let layer_name = format!("ConvTranspose{}d", spatial_rank);
-            check_min_rank(&layer_name, app, input_shape.len(), spatial_rank + 1)?;
+            check_min_rank(&layer_name, layer, input, input_shape.len(), spatial_rank + 1)?;
             let channels_idx = input_shape.len() - spatial_rank - 1;
             let channels_dim = &input_shape[channels_idx];
             if dims_provably_mismatch(in_channels, channels_dim) {
                 return Err(format!(
                     "{} layer '{}' expected {} input channels, got {} for '{}'",
-                    layer_name, app.layer, in_channels, channels_dim, app.input
+                    layer_name, layer, in_channels, channels_dim, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             output_shape[channels_idx] = out_channels.clone();
             for i in 0..*spatial_rank {
                 let spatial_idx = channels_idx + 1 + i;
@@ -1275,9 +1535,9 @@ pub fn apply_layer_application(
         // trails the leading (batch, channel) pair, determined here from
         // the actual input rank.
         LayerKind::Upsample { scale_factor, size } => {
-            check_min_rank("Upsample", app, input_shape.len(), 3)?;
+            check_min_rank("Upsample", layer, input, input_shape.len(), 3)?;
             let spatial_count = input_shape.len() - 2;
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             if let Some(size) = size {
                 let sizes = parse_dim_sequence(size).unwrap_or_else(|| vec![size.clone()]);
                 if sizes.len() != spatial_count {
@@ -1316,15 +1576,15 @@ pub fn apply_layer_application(
             input_size,
             hidden_size,
         } => {
-            check_min_rank(name, app, input_shape.len(), 2)?;
+            check_min_rank(name, layer, input, input_shape.len(), 2)?;
             let last_dim = input_shape.last().unwrap();
             if dims_provably_mismatch(input_size, last_dim) {
                 return Err(format!(
                     "{} layer '{}' expected input last dim {}, got {} for '{}'",
-                    name, app.layer, input_size, last_dim, app.input
+                    name, layer, input_size, last_dim, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = hidden_size.clone();
             Ok(Some(output_shape))
@@ -1336,48 +1596,48 @@ pub fn apply_layer_application(
             input_size,
             hidden_size,
         } => {
-            check_min_rank(name, app, input_shape.len(), 1)?;
+            check_min_rank(name, layer, input, input_shape.len(), 1)?;
             let last_dim = input_shape.last().unwrap();
             if dims_provably_mismatch(input_size, last_dim) {
                 return Err(format!(
                     "{} layer '{}' expected input last dim {}, got {} for '{}'",
-                    name, app.layer, input_size, last_dim, app.input
+                    name, layer, input_size, last_dim, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = hidden_size.clone();
             Ok(Some(output_shape))
         }
         // torch.nn.PixelShuffle(r): (*, C*r^2, H, W) -> (*, C, H*r, W*r).
         LayerKind::PixelShuffle { upscale_factor } => {
-            check_min_rank("PixelShuffle", app, input_shape.len(), 3)?;
+            check_min_rank("PixelShuffle", layer, input, input_shape.len(), 3)?;
             let Ok(r) = upscale_factor.trim().parse::<u64>() else {
                 return Ok(None);
             };
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let len = output_shape.len();
             let channels_idx = len - 3;
             output_shape[channels_idx] = div_dim(&input_shape[channels_idx], r * r)
-                .map_err(|e| format!("PixelShuffle layer '{}': {}", app.layer, e))?;
+                .map_err(|e| format!("PixelShuffle layer '{}': {}", layer, e))?;
             output_shape[len - 2] = mul_dim(&input_shape[len - 2], r);
             output_shape[len - 1] = mul_dim(&input_shape[len - 1], r);
             Ok(Some(output_shape))
         }
         // torch.nn.PixelUnshuffle(r): (*, C, H*r, W*r) -> (*, C*r^2, H, W).
         LayerKind::PixelUnshuffle { downscale_factor } => {
-            check_min_rank("PixelUnshuffle", app, input_shape.len(), 3)?;
+            check_min_rank("PixelUnshuffle", layer, input, input_shape.len(), 3)?;
             let Ok(r) = downscale_factor.trim().parse::<u64>() else {
                 return Ok(None);
             };
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let len = output_shape.len();
             let channels_idx = len - 3;
             output_shape[channels_idx] = mul_dim(&input_shape[channels_idx], r * r);
             output_shape[len - 2] = div_dim(&input_shape[len - 2], r)
-                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", app.layer, e))?;
+                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", layer, e))?;
             output_shape[len - 1] = div_dim(&input_shape[len - 1], r)
-                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", app.layer, e))?;
+                .map_err(|e| format!("PixelUnshuffle layer '{}': {}", layer, e))?;
             Ok(Some(output_shape))
         }
         // Constant/Zero/Reflection/ReplicationPad Nd: only a concrete
@@ -1388,8 +1648,8 @@ pub fn apply_layer_application(
             spatial_rank,
             padding,
         } => {
-            check_min_rank(name, app, input_shape.len(), *spatial_rank)?;
-            let mut output_shape = input_shape.clone();
+            check_min_rank(name, layer, input, input_shape.len(), *spatial_rank)?;
+            let mut output_shape = input_shape.to_vec();
             let start = input_shape.len() - spatial_rank;
             if let Ok(p) = padding.trim().parse::<isize>() {
                 for dim in &mut output_shape[start..] {
@@ -1424,16 +1684,16 @@ pub fn apply_layer_application(
             let Some(last_dim) = input_shape.last() else {
                 return Err(format!(
                     "Cannot apply Bilinear layer '{}' to scalar input '{}'",
-                    app.layer, app.input
+                    layer, input
                 ));
             };
             if dims_provably_mismatch(in1_features, last_dim) {
                 return Err(format!(
                     "Bilinear layer '{}' expected input last dim {}, got {} for '{}'",
-                    app.layer, in1_features, last_dim, app.input
+                    layer, in1_features, last_dim, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = out_features.clone();
             Ok(Some(output_shape))
@@ -1445,7 +1705,7 @@ pub fn apply_layer_application(
             let Some(axis) = resolve_axis(dim, rank) else {
                 return Ok(None);
             };
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             output_shape.remove(axis);
             Ok(Some(output_shape))
         }
@@ -1454,16 +1714,16 @@ pub fn apply_layer_application(
             let Some(last_dim) = input_shape.last() else {
                 return Err(format!(
                     "Cannot apply MLP layer '{}' to scalar input '{}'",
-                    app.layer, app.input
+                    layer, input
                 ));
             };
             if dims_provably_mismatch(in_size, last_dim) {
                 return Err(format!(
                     "MLP layer '{}' expected input last dim {}, got {} for '{}'",
-                    app.layer, in_size, last_dim, app.input
+                    layer, in_size, last_dim, input
                 ));
             }
-            let mut output_shape = input_shape.clone();
+            let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = out_size.clone();
             Ok(Some(output_shape))
@@ -1472,10 +1732,64 @@ pub fn apply_layer_application(
         // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
         LayerKind::ShapePreserving { name } => {
             if let Some(min_rank) = min_rank_for_shape_preserving(name) {
-                check_min_rank(name, app, input_shape.len(), min_rank)?;
+                check_min_rank(name, layer, input, input_shape.len(), min_rank)?;
             }
-            Ok(Some(input_shape.clone()))
+            Ok(Some(input_shape.to_vec()))
         }
+        // torch.nn.Sequential / equinox.nn.Sequential: thread the shape
+        // through each child in order via this same function. An unknown
+        // (`Ok(None)`) child makes the whole chain unknown; an `Err` from a
+        // child propagates as-is, so the reported message is that child's
+        // own (`layer[index]`-qualified for context).
+        LayerKind::Sequential { children } => {
+            let mut current = input_shape.to_vec();
+            for (i, child) in children.iter().enumerate() {
+                let child_layer = format!("{layer}[{i}]");
+                match apply_layer_kind(child, &current, &child_layer, input)? {
+                    Some(shape) => current = shape,
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(current))
+        }
+        // einops.layers.{torch,flax}.Rearrange/Reduce: delegate straight to
+        // the free-function pattern engine (`apply_known_einops`) via a
+        // single-entry `ShapeLookup` that answers only for `input`'s shape.
+        LayerKind::EinopsPattern { pattern, kwargs, .. } => {
+            let mut args = vec![
+                CallArgument::Positional {
+                    value: input.to_string(),
+                },
+                CallArgument::Positional {
+                    value: pattern.clone(),
+                },
+            ];
+            args.extend(kwargs.iter().map(|(name, value)| CallArgument::Keyword {
+                name: name.clone(),
+                value: value.clone(),
+            }));
+            let lookup = SingleShapeLookup {
+                name: input.to_string(),
+                shape: input_shape.to_vec(),
+            };
+            apply_known_einops(&args, &lookup)
+        }
+    }
+}
+
+/// `ShapeLookup` over exactly one (name, shape) pair — lets
+/// `known_functions::apply_known_einops` (built for free-function calls
+/// where the input tensor is itself a named `CallArgument`) be reused for a
+/// `LayerKind::EinopsPattern` layer application, where the input shape is
+/// already known but has no scope-wide variable name.
+struct SingleShapeLookup {
+    name: String,
+    shape: Vec<String>,
+}
+
+impl ShapeLookup for SingleShapeLookup {
+    fn shape(&self, name: &str) -> Option<&Vec<String>> {
+        (name == self.name).then_some(&self.shape)
     }
 }
 
@@ -2848,6 +3162,73 @@ mod classify_layer_call_tests {
             })
         );
     }
+
+    // --- einops.layers.{torch,flax}.Rearrange / Reduce ---
+
+    #[test]
+    fn test_classifies_einops_torch_rearrange() {
+        let call = call(
+            &["einops", "layers", "torch"],
+            Some("Rearrange"),
+            "__init__",
+            &[("pattern", "\"b c h w -> b (c h w)\"")],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::EinopsPattern {
+                name: "Rearrange".to_string(),
+                pattern: "\"b c h w -> b (c h w)\"".to_string(),
+                kwargs: HashMap::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_classifies_einops_flax_reduce_with_axis_kwargs() {
+        let call = call(
+            &["einops", "layers", "flax"],
+            Some("Reduce"),
+            "__init__",
+            &[
+                ("pattern", "\"b (h w) c -> b h w c\""),
+                ("reduction", "\"mean\""),
+                ("h", "14"),
+                ("w", "14"),
+            ],
+        );
+
+        assert_eq!(
+            classify_layer_call(&call),
+            Some(LayerKind::EinopsPattern {
+                name: "Reduce".to_string(),
+                pattern: "\"b (h w) c -> b h w c\"".to_string(),
+                kwargs: HashMap::from([
+                    ("h".to_string(), "14".to_string()),
+                    ("w".to_string(), "14".to_string()),
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn test_einops_rearrange_missing_pattern_returns_none() {
+        let call = call(&["einops", "layers", "torch"], Some("Rearrange"), "__init__", &[]);
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
+
+    #[test]
+    fn test_einops_rearrange_wrong_module_returns_none() {
+        let call = call(
+            &["einops", "layers", "chainer"],
+            Some("Rearrange"),
+            "__init__",
+            &[("pattern", "\"a b -> b a\"")],
+        );
+
+        assert_eq!(classify_layer_call(&call), None);
+    }
 }
 
 #[cfg(test)]
@@ -3085,6 +3466,30 @@ mod known_layer_signature_tests {
                 assert_eq!(sig.owner.as_deref(), Some(name));
             }
         }
+    }
+
+    #[test]
+    fn test_einops_rearrange_reduce_signatures() {
+        for framework in ["torch", "flax"] {
+            let sig =
+                known_layer_signature(&parts(&["einops", "layers", framework, "Rearrange"]))
+                    .unwrap();
+            assert_eq!(sig.owner.as_deref(), Some("Rearrange"));
+            assert_eq!(&sig.params[..2], &["self", "pattern"]);
+
+            let sig = known_layer_signature(&parts(&["einops", "layers", framework, "Reduce"]))
+                .unwrap();
+            assert_eq!(sig.owner.as_deref(), Some("Reduce"));
+            assert_eq!(&sig.params[..3], &["self", "pattern", "reduction"]);
+        }
+    }
+
+    #[test]
+    fn test_einops_layers_chainer_not_in_catalog() {
+        assert!(
+            known_layer_signature(&parts(&["einops", "layers", "chainer", "Rearrange"]))
+                .is_none()
+        );
     }
 }
 
@@ -3528,6 +3933,234 @@ mod catalog_first_extract_layer_assignments_tests {
             })
         );
     }
+
+    // --- torch.nn.Sequential / equinox.nn.Sequential ---
+
+    #[test]
+    fn test_torch_sequential_of_linear_relu_linear() {
+        let code = "import torch.nn as nn\n\
+                     net = nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10))";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("net"),
+            Some(&LayerKind::Sequential {
+                children: vec![
+                    LayerKind::Linear {
+                        in_features: "784".to_string(),
+                        out_features: "256".to_string(),
+                    },
+                    LayerKind::ShapePreserving {
+                        name: "ReLU".to_string(),
+                    },
+                    LayerKind::Linear {
+                        in_features: "256".to_string(),
+                        out_features: "10".to_string(),
+                    },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_equinox_sequential_takes_a_single_list_argument() {
+        let code = "import equinox as eqx\n\
+                     net = eqx.nn.Sequential([eqx.nn.Linear(4, 8), eqx.nn.Linear(8, 2)])";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("net"),
+            Some(&LayerKind::Sequential {
+                children: vec![
+                    LayerKind::Linear {
+                        in_features: "4".to_string(),
+                        out_features: "8".to_string(),
+                    },
+                    LayerKind::Linear {
+                        in_features: "8".to_string(),
+                        out_features: "2".to_string(),
+                    },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_nested_sequential_classifies() {
+        let code = "import torch.nn as nn\n\
+                     net = nn.Sequential(nn.Sequential(nn.Linear(4, 8), nn.ReLU()), nn.Linear(8, 2))";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("net"),
+            Some(&LayerKind::Sequential {
+                children: vec![
+                    LayerKind::Sequential {
+                        children: vec![
+                            LayerKind::Linear {
+                                in_features: "4".to_string(),
+                                out_features: "8".to_string(),
+                            },
+                            LayerKind::ShapePreserving {
+                                name: "ReLU".to_string(),
+                            },
+                        ]
+                    },
+                    LayerKind::Linear {
+                        in_features: "8".to_string(),
+                        out_features: "2".to_string(),
+                    },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_sequential_with_arbitrary_callable_child_is_unclassified() {
+        // `some_fn` isn't a resolvable layer constructor call (nor even a
+        // `call` node at all in this position) — the whole Sequential must
+        // stay honestly unclassified rather than guessing.
+        let code = "import torch.nn as nn\n\
+                     net = nn.Sequential(nn.Linear(4, 8), some_fn)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(layers.get("net"), None);
+    }
+
+    #[test]
+    fn test_sequential_with_unpacked_star_args_is_unclassified() {
+        let code = "import torch.nn as nn\n\
+                     net = nn.Sequential(*layer_list)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(layers.get("net"), None);
+    }
+
+    #[test]
+    fn test_sequential_with_unclassifiable_inner_child_is_unclassified() {
+        // The inner call resolves to a `call` node, but `mystery.Thing` isn't
+        // a recognised layer constructor, so classification of the middle
+        // child fails, and that must fail the whole Sequential.
+        let code = "import torch.nn as nn\nimport mystery\n\
+                     net = nn.Sequential(nn.Linear(4, 8), mystery.Thing(1, 2))";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(layers.get("net"), None);
+    }
+
+    // --- equinox.nn.SpectralNorm / equinox.nn.WeightNorm ---
+
+    #[test]
+    fn test_spectral_norm_delegates_to_inner_linear() {
+        let code = "import equinox as eqx\n\
+                     layer = eqx.nn.SpectralNorm(eqx.nn.Linear(4, 8), \"weight\", key=None)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Linear {
+                in_features: "4".to_string(),
+                out_features: "8".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_weight_norm_delegates_to_inner_conv() {
+        let code = "import equinox as eqx\n\
+                     layer = eqx.nn.WeightNorm(eqx.nn.Conv2d(3, 16, 3))";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::Conv2d {
+                in_channels: "3".to_string(),
+                out_channels: "16".to_string(),
+                kernel_size: "3".to_string(),
+                stride: "1".to_string(),
+                padding: "0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_spectral_norm_with_unclassifiable_inner_layer_is_unclassified() {
+        let code = "import equinox as eqx\nimport mystery\n\
+                     layer = eqx.nn.SpectralNorm(mystery.Thing(1, 2), \"weight\")";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(layers.get("layer"), None);
+    }
+
+    // --- einops.layers.torch.Rearrange / Reduce, end-to-end ---
+
+    #[test]
+    fn test_einops_torch_rearrange_layer_classifies_via_from_import() {
+        let code = "from einops.layers.torch import Rearrange\n\
+                     layer = Rearrange(\"b c h w -> b (c h w)\")";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::EinopsPattern {
+                name: "Rearrange".to_string(),
+                pattern: "\"b c h w -> b (c h w)\"".to_string(),
+                kwargs: HashMap::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_einops_flax_reduce_layer_classifies_with_kwargs() {
+        let code = "from einops.layers.flax import Reduce\n\
+                     layer = Reduce(\"b (h w) c -> b h w c\", \"max\", h=14, w=14)";
+        let tree = parse(code);
+        let roots: Vec<PathBuf> = Vec::new();
+
+        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
+
+        assert_eq!(
+            layers.get("layer"),
+            Some(&LayerKind::EinopsPattern {
+                name: "Reduce".to_string(),
+                pattern: "\"b (h w) c -> b h w c\"".to_string(),
+                kwargs: HashMap::from([
+                    ("h".to_string(), "14".to_string()),
+                    ("w".to_string(), "14".to_string()),
+                ]),
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3959,5 +4592,176 @@ mod new_layer_kind_apply_tests {
         let err = apply_layer_application(&app("scalar", kind), &shapes).unwrap_err();
 
         assert!(err.contains("requires input with at least 1 dims"));
+    }
+
+    // --- Sequential ---
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear {
+            in_features: in_features.to_string(),
+            out_features: out_features.to_string(),
+        }
+    }
+
+    fn relu() -> LayerKind {
+        LayerKind::ShapePreserving {
+            name: "ReLU".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_sequential_threads_shape_through_linear_relu_linear() {
+        // The acceptance-bar case: nn.Sequential(Linear(784,256), ReLU(), Linear(256,10))
+        // applied to a (batch, 784) input ends at (batch, 10).
+        let shapes = shapes_of(&[("x", &["batch", "784"])]);
+        let kind = LayerKind::Sequential {
+            children: vec![linear("784", "256"), relu(), linear("256", "10")],
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "10"])));
+    }
+
+    #[test]
+    fn test_sequential_mid_chain_mismatch_reports_that_childs_error() {
+        // x is (batch, 784); the first Linear produces (batch, 256), which
+        // the second Linear (expecting 999) can't accept — the error must be
+        // that *second* layer's own mismatch message, index-qualified.
+        let shapes = shapes_of(&[("x", &["batch", "784"])]);
+        let kind = LayerKind::Sequential {
+            children: vec![linear("784", "256"), linear("999", "10")],
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("layer[1]"), "error was: {err}");
+        assert!(err.contains("expected input last dim 999"), "error was: {err}");
+        assert!(err.contains("got 256"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_sequential_scalar_input_to_first_linear_errors_at_index_0() {
+        let shapes = shapes_of(&[("x", &[])]);
+        let kind = LayerKind::Sequential {
+            children: vec![linear("784", "256")],
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("layer[0]"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_sequential_with_unknown_child_output_is_unknown() {
+        // MultiheadAttention's direct (non-tuple) application is always
+        // `Ok(None)` (see its apply arm) — a Sequential containing it can't
+        // know the downstream shape either, so the whole chain is unknown.
+        let shapes = shapes_of(&[("x", &["batch", "seq", "512"])]);
+        let kind = LayerKind::Sequential {
+            children: vec![
+                LayerKind::MultiheadAttention {
+                    feature_dim: "512".to_string(),
+                },
+                linear("512", "10"),
+            ],
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_nested_sequential_applies_end_to_end() {
+        let shapes = shapes_of(&[("x", &["batch", "4"])]);
+        let kind = LayerKind::Sequential {
+            children: vec![
+                LayerKind::Sequential {
+                    children: vec![linear("4", "8"), relu()],
+                },
+                linear("8", "2"),
+            ],
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "2"])));
+    }
+
+    #[test]
+    fn test_empty_sequential_is_identity() {
+        let shapes = shapes_of(&[("x", &["batch", "4"])]);
+        let kind = LayerKind::Sequential { children: Vec::new() };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["batch", "4"])));
+    }
+
+    // --- EinopsPattern (Rearrange / Reduce layers) ---
+
+    #[test]
+    fn test_einops_pattern_rearrange_layer_applies_like_free_function() {
+        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
+        let kind = LayerKind::EinopsPattern {
+            name: "Rearrange".to_string(),
+            pattern: "\"b c h w -> b (c h w)\"".to_string(),
+            kwargs: HashMap::new(),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "60"])));
+    }
+
+    #[test]
+    fn test_einops_pattern_reduce_layer_uses_axis_kwargs() {
+        let shapes = shapes_of(&[("x", &["2", "196", "8"])]);
+        let kind = LayerKind::EinopsPattern {
+            name: "Reduce".to_string(),
+            pattern: "\"b (h w) c -> b h w c\"".to_string(),
+            kwargs: HashMap::from([("h".to_string(), "14".to_string())]),
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "14", "14", "8"])));
+    }
+
+    #[test]
+    fn test_einops_pattern_rank_mismatch_errors() {
+        let shapes = shapes_of(&[("x", &["2", "3", "4"])]);
+        let kind = LayerKind::EinopsPattern {
+            name: "Rearrange".to_string(),
+            pattern: "\"b c h w -> b (c h w)\"".to_string(),
+            kwargs: HashMap::new(),
+        };
+
+        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
+
+        assert!(err.contains("expects rank 4"));
+    }
+
+    #[test]
+    fn test_sequential_of_rearrange_then_linear() {
+        // Rearrange inside a Sequential, feeding a Linear — proves the
+        // EinopsPattern arm composes through the same chaining machinery as
+        // every other LayerKind.
+        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
+        let kind = LayerKind::Sequential {
+            children: vec![
+                LayerKind::EinopsPattern {
+                    name: "Rearrange".to_string(),
+                    pattern: "\"b c h w -> b (c h w)\"".to_string(),
+                    kwargs: HashMap::new(),
+                },
+                linear("60", "10"),
+            ],
+        };
+
+        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
+
+        assert_eq!(out, Some(shape(&["2", "10"])));
     }
 }
