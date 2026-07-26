@@ -1810,11 +1810,7 @@ pub fn apply_layer_applications(
                     .insert(app.variable.clone(), output_shape);
             }
             Ok(None) => {}
-            Err(message) => errors.push(ShapeError {
-                variable: app.variable.clone(),
-                message,
-                range: app.range,
-            }),
+            Err(message) => errors.push(ShapeError::mismatch(app.variable.clone(), message, app.range)),
         }
     }
 

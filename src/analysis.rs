@@ -694,11 +694,7 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
             // We don't have a natural variable name here — use the full
             // expression text as the "variable" in the error.
             let var_text = node.utf8_text(ctx.text.as_bytes()).unwrap_or("?").to_string();
-            ctx.errors.push(ShapeError {
-                variable: var_text,
-                message,
-                range: node.range(),
-            });
+            ctx.errors.push(ShapeError::mismatch(var_text, message, node.range()));
             None
         }
     }
@@ -707,6 +703,34 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
 /// Resolve a `call` node's shape.
 ///
 /// This is the main dispatch point that handles:
+/// Build the `ShapeError` for a failed method-call shape rule, classifying
+/// it as `Approximation` for the one documented case where the rule is known
+/// to be unsound rather than genuinely contradictory: `x.transpose(i, j)`
+/// dispatches to the same axes-permutation rule as `jnp.transpose`/`.permute`
+/// (`apply_known_transpose`), but torch's 2-arg method form swaps exactly
+/// those two axes and leaves the rest alone — it's valid for *any* rank, not
+/// just rank 2 (see `llm.txt` "Known limitations"). `apply_known_transpose`
+/// can't tell the two call styles apart, so an "expected N axes, got 2"
+/// error from exactly 2 positional args is this approximation firing, not a
+/// real mismatch.
+fn shape_error_for_method(
+    known: &KnownFunction,
+    args: &[CallArgument],
+    variable: String,
+    message: String,
+    range: tree_sitter::Range,
+) -> ShapeError {
+    let positional_count = args
+        .iter()
+        .filter(|a| matches!(a, CallArgument::Positional { .. }))
+        .count();
+    if matches!(known, KnownFunction::Transpose) && positional_count == 2 {
+        ShapeError::approximation(variable, message, range)
+    } else {
+        ShapeError::mismatch(variable, message, range)
+    }
+}
+
 /// 1. Chained method calls (e.g. `x.reshape(3,4).sum(axis=1)`)
 /// 2. Free function calls (e.g. `jnp.exp(...)`)
 /// 3. Layer applications
@@ -790,11 +814,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 Ok(Some(output)) => Some(output),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             };
@@ -831,11 +851,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError {
-                                variable: method_name,
-                                message,
-                                range: args_node.range(),
-                            });
+                            ctx.errors.push(shape_error_for_method(&known, &args, method_name, message, args_node.range()));
                             None
                         }
                     };
@@ -875,11 +891,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError {
-                                variable: receiver_name,
-                                message,
-                                range: args_node.range(),
-                            });
+                            ctx.errors.push(shape_error_for_method(&known, &args, receiver_name, message, args_node.range()));
                             None
                         }
                     };
@@ -938,11 +950,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Err(message) => {
                 // We'll record the error with a variable name from the caller.
                 // For now use the target as placeholder — caller replaces it.
-                ctx.errors.push(ShapeError {
-                    variable: target.clone(),
-                    message,
-                    range: application.range,
-                });
+                ctx.errors.push(ShapeError::mismatch(target.clone(), message, application.range));
                 return None;
             }
         }
@@ -960,11 +968,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: target,
-                    message,
-                    range: args_node.range(),
-                });
+                ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
                 None
             }
         };
@@ -997,11 +1001,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.scopes) {
                     Ok(shape) => shape,
                     Err(message) => {
-                        ctx.errors.push(ShapeError {
-                            variable: String::new(),
-                            message,
-                            range: args_node.range(),
-                        });
+                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -1026,11 +1026,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 Ok(Some(shape)) => Some(shape),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: target,
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
                     None
                 }
             };
@@ -1060,11 +1056,18 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: target,
-                    message,
-                    range: args_node.range(),
-                });
+                // `jax.lax.dot_general` is classified as `KnownFunction::Matmul`
+                // but is only *approximated* as matmul (see `llm.txt`); a
+                // mismatch here may be a false positive from that
+                // approximation rather than a real shape bug. Real
+                // `matmul`/`dot` calls (also `KnownFunction::Matmul`) don't
+                // resolve to a `dot_general` target, so they stay `Mismatch`.
+                let error = if resolved.parts.last().map(String::as_str) == Some("dot_general") {
+                    ShapeError::approximation(target, message, args_node.range())
+                } else {
+                    ShapeError::mismatch(target, message, args_node.range())
+                };
+                ctx.errors.push(error);
                 None
             }
         };
@@ -1104,11 +1107,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: target,
-                    message,
-                    range: args_node.range(),
-                });
+                ctx.errors
+                    .push(ShapeError::mismatch(target, message, args_node.range()));
                 None
             }
         };
@@ -1514,11 +1514,7 @@ fn propagate_calls(
                                     }
                                     Err(message) => {
                                         ctx.evict_binding(scope_idx, &lhs_name);
-                                        ctx.errors.push(ShapeError {
-                                            variable: lhs_name.clone(),
-                                            message,
-                                            range: application.range,
-                                        });
+                                        ctx.errors.push(ShapeError::mismatch(lhs_name.clone(), message, application.range));
                                     }
                                 }
                                 ctx.applications.push(application);
@@ -1703,11 +1699,7 @@ fn handle_augmented_assignment(
             ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
         }
         Ok(None) => {}
-        Err(message) => ctx.errors.push(ShapeError {
-            variable: name.to_string(),
-            message,
-            range: assignment_node.range(),
-        }),
+        Err(message) => ctx.errors.push(ShapeError::mismatch(name.to_string(), message, assignment_node.range())),
     }
 }
 
@@ -1951,11 +1943,7 @@ fn tuple_rhs_shapes(
                     Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                     Ok(None) => None,
                     Err(message) => {
-                        ctx.errors.push(ShapeError {
-                            variable: String::new(),
-                            message,
-                            range: args_node.range(),
-                        });
+                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -1994,11 +1982,7 @@ fn tuple_rhs_shapes(
                 return match compute_einops_pack_shape(&args, &ctx.scope_shapes(scope_idx)) {
                     Ok(shape) => Some(vec![shape, None]),
                     Err(message) => {
-                        ctx.errors.push(ShapeError {
-                            variable: String::new(),
-                            message,
-                            range: args_node.range(),
-                        });
+                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -2086,11 +2070,7 @@ fn tuple_rhs_shapes(
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2120,11 +2100,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2137,11 +2113,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2166,11 +2138,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2183,11 +2151,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2196,11 +2160,7 @@ fn tuple_multi_output_shapes(
             Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: String::new(),
-                    message,
-                    range: args_node.range(),
-                });
+                ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                 None
             }
         },
@@ -2213,11 +2173,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError {
-                        variable: String::new(),
-                        message,
-                        range: args_node.range(),
-                    });
+                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -2566,11 +2522,7 @@ fn shape_of_inline_vmap(
         ) {
             Ok(shape) => shape,
             Err(message) => {
-                ctx.errors.push(ShapeError {
-                    variable: String::new(),
-                    message,
-                    range: outer_args_node.range(),
-                });
+                ctx.errors.push(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
                 None
             }
         };
@@ -2646,11 +2598,7 @@ fn shape_of_inline_layer(
         Ok(Some(output)) => Some(output),
         Ok(None) => None,
         Err(message) => {
-            ctx.errors.push(ShapeError {
-                variable: String::new(),
-                message,
-                range: outer_args_node.range(),
-            });
+            ctx.errors.push(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
             None
         }
     }
@@ -2725,11 +2673,7 @@ fn apply_inline_vmap_layer_chain(
         Ok(Some(output)) => output,
         Ok(None) => return None,
         Err(message) => {
-            ctx.errors.push(ShapeError {
-                variable: String::new(),
-                message,
-                range,
-            });
+            ctx.errors.push(ShapeError::mismatch(String::new(), message, range));
             return None;
         }
     };

@@ -8246,3 +8246,69 @@ mod torch_new_builtin_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shape_error_kind_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    // `jax.lax.dot_general` is approximated as matmul (see `llm.txt`); a
+    // batch-dim mismatch it flags may be a false positive from that
+    // approximation, so it's classified `Approximation`, not `Mismatch`.
+    #[test]
+    fn dot_general_mismatch_is_classified_approximation() {
+        let code = "import jax\ndef f(a: Float[Array, \"2 3 4\"], b: Float[Array, \"5 4 6\"]):\n    y = jax.lax.dot_general(a, b, (((2,), (1,)), ((0,), (0,))))";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Approximation);
+    }
+
+    // A genuine `jnp.matmul` dimension mismatch (not `dot_general`) stays a
+    // real `Mismatch` even though it also resolves to `KnownFunction::Matmul`.
+    #[test]
+    fn real_matmul_mismatch_is_classified_mismatch() {
+        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"4 5\"]):\n    y = jnp.matmul(a, b)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Mismatch);
+    }
+
+    // Torch-style `x.transpose(dim0, dim1)` two-axis swap is valid for any
+    // rank, but `apply_known_transpose` (shared with `.permute`/`jnp.transpose`)
+    // treats 2 positional args as a full axes permutation, so it's only
+    // correct for rank-2 inputs — a documented approximation limitation.
+    #[test]
+    fn method_transpose_two_axis_rank_mismatch_is_classified_approximation() {
+        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.transpose(0, 1)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Approximation);
+    }
+
+    // `jnp.transpose`/`.permute`-style full-rank axis permutations with a
+    // genuine duplicate-axis bug stay `Mismatch`.
+    #[test]
+    fn method_permute_duplicate_axis_is_classified_mismatch() {
+        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.permute(0, 0, 1)";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Mismatch);
+    }
+}
