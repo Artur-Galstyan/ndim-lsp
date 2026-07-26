@@ -36,10 +36,21 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
 ///
 /// Anything containing parens, subtraction, or division is returned
 /// unchanged (whitespace-stripped only) — those aren't provably commutative
-/// under this simple a token shuffle, so we don't risk a false "equal".
+/// under this simple a token shuffle, so we don't risk a false "equal" —
+/// except for the one unambiguous case `fold_paren_cancellation` recognizes
+/// (a leading paren group whose contents are cancelled by the very next
+/// operation, e.g. `(d-1)+1` → `d`): additive-inverse cancellation is sound
+/// regardless of what the parenthesized expression is, so it's folded
+/// before the conservative bail-out.
 pub fn canonicalize_dim(dim: &str) -> String {
     let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
-    if stripped.is_empty() || stripped.contains(['(', ')', '-', '/']) {
+    if stripped.is_empty() {
+        return stripped;
+    }
+    if stripped.contains(['(', ')', '-', '/']) {
+        if let Some(folded) = fold_paren_cancellation(&stripped) {
+            return canonicalize_dim(&folded);
+        }
         return stripped;
     }
 
@@ -50,6 +61,52 @@ pub fn canonicalize_dim(dim: &str) -> String {
     }
     terms.sort_unstable();
     terms.join("+")
+}
+
+/// Fold the narrow, unambiguous shape `(expr<op1><lit1>)<op2><lit2>` → `expr`
+/// when `<op1><lit1>` and `<op2><lit2>` are additive inverses (e.g.
+/// `(d-1)+1` → `d`, `(d+2)-2` → `d`). Only a single leading paren group
+/// followed by exactly one more `+`/`-` literal term is recognized —
+/// anything else (a coefficient before the paren like `2*(d+1)`, division,
+/// multiple paren groups, non-literal trailing terms) returns `None` and is
+/// left for the caller's conservative "leave unchanged" fallback.
+fn fold_paren_cancellation(stripped: &str) -> Option<String> {
+    if !stripped.starts_with('(') {
+        return None;
+    }
+    let close = stripped.find(')')?;
+    let inner = &stripped[1..close];
+    let rest = &stripped[close + 1..];
+    let mut rest_chars = rest.chars();
+    let outer_op = rest_chars.next()?;
+    if outer_op != '+' && outer_op != '-' {
+        return None;
+    }
+    let outer_lit: i64 = rest_chars.as_str().parse().ok()?;
+
+    // Split `inner` at its last `+`/`-` (not at position 0, to avoid a
+    // leading unary sign) into `expr` and a trailing `<op><literal>` term.
+    let inner_op_idx = inner
+        .char_indices()
+        .skip(1)
+        .filter(|&(_, c)| c == '+' || c == '-')
+        .last()
+        .map(|(i, _)| i)?;
+    let (expr, inner_term) = inner.split_at(inner_op_idx);
+    if expr.is_empty() {
+        return None;
+    }
+    let mut inner_chars = inner_term.chars();
+    let inner_op = inner_chars.next()?;
+    let inner_lit: i64 = inner_chars.as_str().parse().ok()?;
+
+    let inner_signed = if inner_op == '-' { -inner_lit } else { inner_lit };
+    let outer_signed = if outer_op == '-' { -outer_lit } else { outer_lit };
+    if inner_signed + outer_signed == 0 {
+        Some(expr.to_string())
+    } else {
+        None
+    }
 }
 
 /// Canonicalize one `+`-separated term: a flat product of int literals and
@@ -136,6 +193,27 @@ mod canonicalize_dim_tests {
         assert_eq!(canonicalize_dim("(d)"), "(d)");
         assert_eq!(canonicalize_dim("d-1"), "d-1");
         assert_eq!(canonicalize_dim("d/2"), "d/2");
+    }
+
+    #[test]
+    fn test_paren_cancellation_folds() {
+        assert_eq!(canonicalize_dim("(d-1)+1"), "d");
+        assert_eq!(canonicalize_dim("(d+2)-2"), "d");
+        assert_eq!(canonicalize_dim("(d_state-1)+1"), "d_state");
+        // Folds fully back down into commutative canonicalization too.
+        assert_eq!(canonicalize_dim("(d-1)+1"), canonicalize_dim("d"));
+    }
+
+    #[test]
+    fn test_paren_cancellation_is_conservative() {
+        // A coefficient before the paren isn't the narrow single-group
+        // shape this recognizes — left unchanged.
+        assert_eq!(canonicalize_dim("2*(d+1)"), "2*(d+1)");
+        // Non-cancelling literals: not an identity, left unchanged.
+        assert_eq!(canonicalize_dim("(d-1)+2"), "(d-1)+2");
+        // Division inside/after the group still bails (no cancellation to
+        // find, and dividing stays unfolded regardless).
+        assert_eq!(canonicalize_dim("(d-1)/2"), "(d-1)/2");
     }
 
     #[test]
@@ -410,6 +488,38 @@ pub enum LayerKind {
     Mlp {
         in_size: String,
         out_size: String,
+    },
+    /// `torch.nn.Unfold(kernel_size, dilation=1, padding=0, stride=1)` —
+    /// im2col: extracts sliding `kernel_size`-shaped blocks from a
+    /// channels-first `(C, H, W)` / `(N, C, H, W)` input into columns:
+    /// `(C*kh*kw, L)` / `(N, C*kh*kw, L)`, where `L = num_blocks_h *
+    /// num_blocks_w` follows the same block-count formula as
+    /// `conv_spatial_dim`. Each of `kernel_size`/`stride`/`padding`/
+    /// `dilation` is the raw ctor arg text: a single value applies to both
+    /// H and W, or an explicit 2-tuple gives them independently (parsed at
+    /// apply time via `parse_pair_arg`; anything else is unknown). Exact
+    /// when H/W and the geometry args are literal ints, or when `dilation`
+    /// is literal `1` (the overwhelmingly common default, which folds away
+    /// even against a symbolic kernel size); any other non-literal
+    /// `dilation` combination isn't foldable and yields `Ok(None)`.
+    Unfold {
+        kernel_size: String,
+        stride: String,
+        padding: String,
+        dilation: String,
+    },
+    /// `torch.nn.Fold(output_size, kernel_size, dilation=1, padding=0,
+    /// stride=1)` — inverse of `Unfold`: input `(C*kh*kw, L)` /
+    /// `(N, C*kh*kw, L)` folds back into `(C, oh, ow)` / `(N, C, oh, ow)`.
+    /// `output_size` and `kernel_size` are the raw ctor arg text (each a
+    /// single value or 2-tuple, parsed at apply time); the channel dim is
+    /// recovered by dividing the input's second-to-last dim by `kh*kw`
+    /// (`Err` when literal and not evenly divisible, a symbolic
+    /// `dim/(kh*kw)` string otherwise). The `L` dim itself is not
+    /// cross-checked against `output_size`/kernel geometry.
+    Fold {
+        output_size: String,
+        kernel_size: String,
     },
     /// `torch.nn.Sequential` / `equinox.nn.Sequential`: a composite container
     /// wrapping an ordered list of child layers (torch: variadic positional
