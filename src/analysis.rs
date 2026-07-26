@@ -9,7 +9,7 @@ use crate::known_functions::{
 };
 use crate::layers::{
     apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
-    extract_self_attr_layers,
+    extract_self_attr_layers_by_class,
 };
 use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_jaxtyping_shapes, extract_self_attr_aliases,
@@ -31,10 +31,24 @@ where
 {
     let mut scopes = extract_jaxtyping_shapes(node, text)?;
     let import_map = build_import_map(node, text)?;
-    let layer_records =
-        extract_layer_assignments_scoped(node, text, search_roots, &read_file, max_depth, cache)?;
-    let self_attr_layers =
-        extract_self_attr_layers(node, text, search_roots, &read_file, max_depth, cache)?;
+    let layer_records = extract_layer_assignments_scoped(
+        node,
+        text,
+        &import_map,
+        search_roots,
+        &read_file,
+        max_depth,
+        cache,
+    )?;
+    let self_attr_layers = extract_self_attr_layers_by_class(
+        node,
+        text,
+        &import_map,
+        search_roots,
+        &read_file,
+        max_depth,
+        cache,
+    )?;
     let self_attr_aliases = extract_self_attr_aliases(node, text)?;
 
     let (applications, errors, assignment_shapes) = propagate_calls(
@@ -210,9 +224,10 @@ struct ShapeCtx<'a> {
     text: &'a str,
     import_map: &'a HashMap<String, ImportPath>,
     layer_records: &'a [LayerAssignment],
-    /// `self.<attr>` → layer, from constructor assignments in `__init__`.
-    /// Used to resolve `jax.vmap(self.<attr>)(x)` (issue #35).
-    self_attr_layers: &'a HashMap<String, LayerKind>,
+    /// `self.<attr>` → layer bindings keyed by defining class range, from
+    /// constructor assignments in `__init__`. Used to resolve
+    /// `jax.vmap(self.<attr>)(x)` (issue #35) and direct `self.<attr>(x)` calls.
+    self_attr_layers: &'a HashMap<String, Vec<ScopedSelfAttrLayer>>,
     /// `<attr>` → identifier, from `self.<attr> = <ident>` assignments. Used to
     /// canonicalize symbolic dims (`self.dt_rank` ≡ `dt_rank`) before storage.
     aliases: &'a HashMap<String, String>,
@@ -290,6 +305,19 @@ fn normalize_dim(dim: &str, aliases: &HashMap<String, String>) -> String {
 }
 
 impl<'a> ShapeCtx<'a> {
+    /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`.
+    /// Falls back to a lone binding when the use site sits outside any class
+    /// that defines the attr; ambiguous cross-class matches return None.
+    fn self_attr_layer_at(&self, attr: &str, byte: usize) -> Option<&LayerKind> {
+        let entries = self.self_attr_layers.get(attr)?;
+        entries
+            .iter()
+            .filter(|e| e.class_start <= byte && byte < e.class_end)
+            .min_by_key(|e| e.class_end - e.class_start)
+            .or_else(|| (entries.len() == 1).then(|| &entries[0]))
+            .map(|e| &e.kind)
+    }
+
     /// Insert a shape under a synthetic name and return that name.
     /// Used when an inline expression (e.g. a nested call) produces a shape
     /// but has no variable binding of its own. The helpers in
@@ -655,7 +683,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         // layer rule already handles its own input rank).
         if obj_node.kind() == "identifier"
             && obj_node.utf8_text(ctx.text.as_bytes()).ok()? == "self"
-            && let Some(layer) = ctx.self_attr_layers.get(&method_name).cloned()
+            && let Some(layer) = ctx
+                .self_attr_layer_at(&method_name, attr_node.start_byte())
+                .cloned()
         {
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
             let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
@@ -1123,11 +1153,14 @@ fn parse_int_keyword(args: &[CallArgument], name: &str, default: isize) -> Optio
 fn peel_batch_dim(shape: &[String], axis: isize) -> Result<(Vec<String>, String), String> {
     let len = shape.len() as isize;
     if len == 0 {
-        return Err("cannot peel axis from scalar (rank-0)".to_string());
+        return Err("vmap cannot map over a scalar (rank-0) input".to_string());
     }
     let axis = if axis < 0 { axis + len } else { axis };
     if axis < 0 || axis >= len {
-        return Err(format!("axis {} out of bounds for rank {}", axis, len));
+        return Err(format!(
+            "vmap in_axes {} out of bounds for input rank {}",
+            axis, len
+        ));
     }
     let axis = axis as usize;
     let batch_dim = shape[axis].clone();
@@ -1180,7 +1213,7 @@ fn propagate_calls(
     text: &str,
     import_map: &HashMap<String, ImportPath>,
     layer_records: &[LayerAssignment],
-    self_attr_layers: &HashMap<String, LayerKind>,
+    self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, String>,
     scopes: &mut [FunctionShapeScope],
 ) -> Result<PropagateOutput, String> {
@@ -1572,7 +1605,7 @@ fn tuple_rhs_shapes(
             // average_attn_weights.
             if let Some(attr) = target.strip_prefix("self.")
                 && matches!(
-                    ctx.self_attr_layers.get(attr),
+                    ctx.self_attr_layer_at(attr, rhs.start_byte()),
                     Some(LayerKind::MultiheadAttention { .. })
                 )
             {
@@ -1971,7 +2004,9 @@ fn shape_of_inline_vmap(
 
     // Case A: the vmapped callable is `self.<attr>` resolving to a known layer.
     if let Some(attr) = callable.strip_prefix("self.")
-        && let Some(layer) = ctx.self_attr_layers.get(attr).cloned()
+        && let Some(layer) = ctx
+            .self_attr_layer_at(attr, outer_args_node.start_byte())
+            .cloned()
     {
         return apply_inline_vmap_layer(
             &layer,
@@ -2293,17 +2328,28 @@ fn apply_matmul_shape(
         return Ok(None);
     }
 
-    // Batch dims must match exactly (no broadcasting in v1)
+    // Batch dims broadcast numpy-style: align right, missing or literal-1
+    // dims broadcast, anything else must match exactly (symbolic equality).
     let left_batch = &left[..left.len() - 2];
     let right_batch = &right[..right.len() - 2];
-    if left_batch != right_batch {
-        return Err(format!(
-            "matmul batch dimension mismatch: {} batch [{}] != {} batch [{}]",
-            left_name,
-            left_batch.join(", "),
-            right_name,
-            right_batch.join(", ")
-        ));
+    let batch_rank = left_batch.len().max(right_batch.len());
+    let mut batch = Vec::with_capacity(batch_rank);
+    for k in (1..=batch_rank).rev() {
+        let l = left_batch.len().checked_sub(k).map(|i| &left_batch[i]);
+        let r = right_batch.len().checked_sub(k).map(|i| &right_batch[i]);
+        match (l, r) {
+            (Some(l), Some(r)) if l == r => batch.push(l.clone()),
+            (Some(l), Some(r)) if l == "1" => batch.push(r.clone()),
+            (Some(l), Some(r)) if r == "1" => batch.push(l.clone()),
+            (Some(l), Some(r)) => {
+                return Err(format!(
+                    "matmul batch dimension mismatch: {} has {}, {} has {} (align from the right)",
+                    left_name, l, right_name, r
+                ));
+            }
+            (Some(d), None) | (None, Some(d)) => batch.push(d.clone()),
+            (None, None) => unreachable!(),
+        }
     }
 
     // Last dim of LHS must equal second-to-last dim of RHS.
@@ -2320,7 +2366,8 @@ fn apply_matmul_shape(
         ));
     }
 
-    let mut output = left[..left.len() - 1].to_vec();
+    let mut output = batch;
+    output.push(left[left.len() - 2].clone());
     output.push(
         right
             .last()

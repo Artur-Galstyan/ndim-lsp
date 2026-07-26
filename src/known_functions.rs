@@ -303,6 +303,89 @@ fn first_array_arg(args: &[CallArgument]) -> Option<&str> {
     None
 }
 
+/// Resolve the first array argument to its name and known shape, or `None`
+/// if the argument or its shape isn't known. Used by the many `apply_known_*`
+/// functions that bail out early when the input's shape is unavailable.
+fn first_array_arg_shape<'a, 'b>(
+    args: &'a [CallArgument],
+    shapes: &'b dyn ShapeLookup,
+) -> Option<(&'a str, &'b Vec<String>)> {
+    let input_name = first_array_arg(args)?;
+    let input_shape = shapes.shape(input_name)?;
+    Some((input_name, input_shape))
+}
+
+/// After skipping the first `skip` positional arguments, return the value of
+/// the next positional argument, or the value of a keyword argument whose
+/// name is in `keywords` (whichever comes later wins, matching Python's
+/// left-to-right evaluation order).
+fn nth_positional_or_keyword<'a>(
+    args: &'a [CallArgument],
+    skip: usize,
+    keywords: &[&str],
+) -> Option<&'a str> {
+    let mut value = None;
+    let mut positional_seen = 0usize;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value: v } => {
+                if positional_seen < skip {
+                    positional_seen += 1;
+                    continue;
+                }
+                positional_seen += 1;
+                if value.is_none() {
+                    value = Some(v.as_str());
+                }
+            }
+            CallArgument::Keyword { name, value: v } if keywords.contains(&name.as_str()) => {
+                value = Some(v.as_str());
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    value
+}
+
+/// Two-slot variant of [`nth_positional_or_keyword`]: after skipping the
+/// first `skip` positional arguments, the next two positional arguments fill
+/// `a` and `b` in order, unless overridden by a keyword argument matching
+/// `keywords_a` / `keywords_b` respectively.
+fn nth_two_positional_or_keywords<'a>(
+    args: &'a [CallArgument],
+    skip: usize,
+    keywords_a: &[&str],
+    keywords_b: &[&str],
+) -> (Option<&'a str>, Option<&'a str>) {
+    let mut a = None;
+    let mut b = None;
+    let mut positional_seen = 0usize;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } => {
+                if positional_seen < skip {
+                    positional_seen += 1;
+                    continue;
+                }
+                positional_seen += 1;
+                if a.is_none() {
+                    a = Some(value.as_str());
+                } else if b.is_none() {
+                    b = Some(value.as_str());
+                }
+            }
+            CallArgument::Keyword { name, value } if keywords_a.contains(&name.as_str()) => {
+                a = Some(value.as_str());
+            }
+            CallArgument::Keyword { name, value } if keywords_b.contains(&name.as_str()) => {
+                b = Some(value.as_str());
+            }
+            CallArgument::Keyword { .. } => {}
+        }
+    }
+    (a, b)
+}
+
 fn parse_shape_value(value: &str) -> Option<Vec<String>> {
     let trimmed = value.trim();
     let inner = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
@@ -412,8 +495,11 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
             left_dim.to_string()
         } else {
             return Err(format!(
-                "cannot broadcast dimensions {} and {}",
-                left_dim, right_dim
+                "cannot broadcast dim {} with {} (shapes [{}] and [{}])",
+                left_dim,
+                right_dim,
+                left.join(", "),
+                right.join(", ")
             ));
         };
         result.push(dim);
@@ -793,42 +879,18 @@ fn apply_known_flax_pool(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut window = None;
-    let mut strides = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                if window.is_none() {
-                    window = parse_shape_value(value);
-                } else if strides.is_none() {
-                    strides = parse_shape_value(value);
-                }
-            }
-            CallArgument::Keyword { name, value } if name == "window_shape" => {
-                window = parse_shape_value(value)
-            }
-            CallArgument::Keyword { name, value } if name == "strides" => {
-                strides = parse_shape_value(value)
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    let Some(window) = window else {
+    let (window, strides) =
+        nth_two_positional_or_keywords(args, 1, &["window_shape"], &["strides"]);
+    let Some(window) = window.and_then(parse_shape_value) else {
         return Ok(None);
     };
-    let strides = strides.unwrap_or_else(|| vec!["1".to_string(); window.len()]);
+    let strides = strides
+        .and_then(parse_shape_value)
+        .unwrap_or_else(|| vec!["1".to_string(); window.len()]);
     if strides.len() != window.len() {
         return Ok(None);
     }
@@ -1119,36 +1181,12 @@ fn apply_known_reshape(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut shape_value = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                if shape_value.is_none() {
-                    shape_value = Some(value.as_str());
-                }
-            }
-            CallArgument::Keyword { name, value }
-                if name == "shape" || name == "newshape" || name == "size" =>
-            {
-                shape_value = Some(value.as_str());
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-
-    let Some(shape_value) = shape_value else {
+    let Some(shape_value) = nth_positional_or_keyword(args, 1, &["shape", "newshape", "size"])
+    else {
         return Ok(None);
     };
     let Some(mut output_shape) = parse_shape_value(shape_value) else {
@@ -1250,10 +1288,7 @@ fn apply_known_flatten(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
@@ -1275,38 +1310,19 @@ fn apply_known_transpose(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     let rank = input_shape.len();
 
-    let mut axes = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                axes = parse_axis_list(value);
-            }
-            CallArgument::Keyword { name, value }
-                if name == "axes" || name == "axis" || name == "dims" =>
-            {
-                axes = parse_axis_list(value);
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-
-    let axes = axes.unwrap_or_else(|| (0..rank).rev().map(|axis| axis as isize).collect());
+    let axes = nth_positional_or_keyword(args, 1, &["axes", "axis", "dims"])
+        .and_then(parse_axis_list)
+        .unwrap_or_else(|| (0..rank).rev().map(|axis| axis as isize).collect());
     if axes.len() != rank {
         return Err(format!(
-            "transpose expected {} axes, got {}",
+            "transpose of '{}' (rank {}) expected {} axes, got {}",
+            input_name,
+            rank,
             rank,
             axes.len()
         ));
@@ -1315,7 +1331,10 @@ fn apply_known_transpose(
     for axis in axes {
         let axis = normalize_axis(axis, rank, "transpose")?;
         if normalized.contains(&axis) {
-            return Err(format!("transpose duplicate axis {}", axis));
+            return Err(format!(
+                "transpose of '{}': axis {} given more than once",
+                input_name, axis
+            ));
         }
         normalized.push(axis);
     }
@@ -1332,10 +1351,7 @@ fn apply_known_swapaxes(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     let rank = input_shape.len();
@@ -1378,46 +1394,17 @@ fn apply_known_moveaxis(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     let rank = input_shape.len();
 
-    let mut source = None;
-    let mut destination = None;
-    let mut positional = Vec::new();
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                positional.push(value.as_str());
-            }
-            CallArgument::Keyword { name, value } if name == "source" => {
-                source = parse_axis_list(value)
-            }
-            CallArgument::Keyword { name, value } if name == "destination" => {
-                destination = parse_axis_list(value)
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    if source.is_none() && !positional.is_empty() {
-        source = parse_axis_list(positional[0]);
-    }
-    if destination.is_none() && positional.len() > 1 {
-        destination = parse_axis_list(positional[1]);
-    }
-    let Some(source) = source else {
+    let (source, destination) =
+        nth_two_positional_or_keywords(args, 1, &["source"], &["destination"]);
+    let Some(source) = source.and_then(parse_axis_list) else {
         return Ok(None);
     };
-    let Some(destination) = destination else {
+    let Some(destination) = destination.and_then(parse_axis_list) else {
         return Ok(None);
     };
     if source.len() != destination.len() {
@@ -1453,31 +1440,12 @@ fn apply_known_expand_dims(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     let output_rank = input_shape.len() + 1;
-    let mut axis = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                axis = parse_axis(value);
-            }
-            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
-                axis = parse_axis(value);
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    let Some(axis) = axis else {
+    let Some(axis) = nth_positional_or_keyword(args, 1, &["axis", "dim"]).and_then(parse_axis)
+    else {
         return Ok(None);
     };
     let axis = if axis < 0 {
@@ -1500,29 +1468,10 @@ fn apply_known_squeeze(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.shape(input_name) else {
-        return Ok(None);
-    };
-    let mut axes = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                axes = parse_axis_list(value);
-            }
-            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
-                axes = parse_axis_list(value);
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
+    let axes = nth_positional_or_keyword(args, 1, &["axis", "dim"]).and_then(parse_axis_list);
 
     let rank = input_shape.len();
     let axes = if let Some(axes) = axes {
@@ -1558,10 +1507,7 @@ fn apply_known_atleast(
     shapes: &dyn ShapeLookup,
     min_rank: usize,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     if input_shape.len() >= min_rank {
@@ -1596,6 +1542,40 @@ fn numeric_min_dim(left: &str, right: &str) -> String {
 fn first_two_positional_values(args: &[CallArgument]) -> Option<(String, String)> {
     let values = positional_arg_values(args);
     Some((values.first()?.clone(), values.get(1)?.clone()))
+}
+
+/// Resolve the first two positional arguments to their names and known
+/// shapes, or `None` if either argument or its shape isn't known. Used by
+/// the binary shape functions (matmul, dot, tensordot, outer, inner, vdot).
+fn resolve_binary_shapes<'a>(
+    args: &[CallArgument],
+    shapes: &'a dyn ShapeLookup,
+) -> Option<(String, &'a Vec<String>, String, &'a Vec<String>)> {
+    let (left_name, right_name) = first_two_positional_values(args)?;
+    let left = shapes.shape(&left_name)?;
+    let right = shapes.shape(&right_name)?;
+    Some((left_name, left, right_name, right))
+}
+
+/// Validate that `shape` has rank >= 2 and its last two dimensions match,
+/// erroring with `context` (e.g. `"linalg.inv"`) if not.
+fn require_square_matrix(shape: &[String], context: &str) -> Result<(), String> {
+    if shape.len() < 2 {
+        return Err(format!(
+            "{} requires rank >= 2, got rank {}",
+            context,
+            shape.len()
+        ));
+    }
+    let last = &shape[shape.len() - 1];
+    let second_last = &shape[shape.len() - 2];
+    if last != second_last {
+        return Err(format!(
+            "{} requires last two dimensions to match, got {} and {}",
+            context, second_last, last
+        ));
+    }
+    Ok(())
 }
 
 fn check_dim_match(left: &str, right: &str, context: &str) -> Result<(), String> {
@@ -1671,13 +1651,7 @@ fn apply_known_matmul(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
-        return Ok(None);
-    };
-    let Some(left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(right) = shapes.shape(&right_name) else {
+    let Some((_, left, _, right)) = resolve_binary_shapes(args, shapes) else {
         return Ok(None);
     };
 
@@ -1742,13 +1716,7 @@ fn apply_known_dot(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
-        return Ok(None);
-    };
-    let Some(left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(right) = shapes.shape(&right_name) else {
+    let Some((_, left, _, right)) = resolve_binary_shapes(args, shapes) else {
         return Ok(None);
     };
 
@@ -1780,13 +1748,7 @@ fn apply_known_tensordot(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
-        return Ok(None);
-    };
-    let Some(left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(right) = shapes.shape(&right_name) else {
+    let Some((_, left, _, right)) = resolve_binary_shapes(args, shapes) else {
         return Ok(None);
     };
 
@@ -1841,13 +1803,7 @@ fn apply_known_outer(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
-        return Ok(None);
-    };
-    let Some(left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(right) = shapes.shape(&right_name) else {
+    let Some((_, left, _, right)) = resolve_binary_shapes(args, shapes) else {
         return Ok(None);
     };
 
@@ -1873,13 +1829,7 @@ fn apply_known_inner(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
-        return Ok(None);
-    };
-    let Some(left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(right) = shapes.shape(&right_name) else {
+    let Some((_, left, _, right)) = resolve_binary_shapes(args, shapes) else {
         return Ok(None);
     };
 
@@ -1905,15 +1855,9 @@ fn apply_known_vdot(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some((left_name, right_name)) = first_two_positional_values(args) else {
+    if resolve_binary_shapes(args, shapes).is_none() {
         return Ok(None);
-    };
-    let Some(_left) = shapes.shape(&left_name) else {
-        return Ok(None);
-    };
-    let Some(_right) = shapes.shape(&right_name) else {
-        return Ok(None);
-    };
+    }
 
     Ok(Some(Vec::new()))
 }
@@ -1922,10 +1866,7 @@ fn apply_known_diag(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     match input_shape.as_slice() {
@@ -1942,10 +1883,7 @@ fn apply_known_diagonal(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -1966,10 +1904,7 @@ fn apply_known_trace(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -2019,30 +1954,12 @@ fn apply_known_broadcast_to(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut shape_value = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                shape_value = Some(value.as_str());
-            }
-            CallArgument::Keyword { name, value } if name == "shape" => shape_value = Some(value),
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-
-    let Some(mut target) = shape_value.and_then(parse_shape_value) else {
+    let Some(mut target) = nth_positional_or_keyword(args, 1, &["shape"]).and_then(parse_shape_value)
+    else {
         return Ok(None);
     };
     // torch `x.expand(...)`: -1 means "keep this dim". Right-align against
@@ -2084,31 +2001,13 @@ fn apply_known_tile(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut reps_value = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                reps_value = Some(value.as_str());
-            }
-            CallArgument::Keyword { name, value } if name == "reps" || name == "dims" => {
-                reps_value = Some(value);
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    let Some(reps) = reps_value.and_then(parse_shape_value) else {
+    let Some(reps) =
+        nth_positional_or_keyword(args, 1, &["reps", "dims"]).and_then(parse_shape_value)
+    else {
         return Ok(None);
     };
 
@@ -2131,36 +2030,12 @@ fn apply_known_repeat(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut repeats = None;
-    let mut axis = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                if repeats.is_none() {
-                    repeats = Some(value.as_str());
-                } else if axis.is_none() {
-                    axis = parse_axis(value);
-                }
-            }
-            CallArgument::Keyword { name, value } if name == "repeats" => repeats = Some(value),
-            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
-                axis = parse_axis(value)
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
+    let (repeats, axis) = nth_two_positional_or_keywords(args, 1, &["repeats"], &["axis", "dim"]);
+    let axis = axis.and_then(parse_axis);
     let Some(repeats) = repeats else {
         return Ok(None);
     };
@@ -2302,10 +2177,7 @@ fn apply_known_rot90(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     if input_shape.len() < 2 {
@@ -2315,42 +2187,11 @@ fn apply_known_rot90(
         ));
     }
 
-    let mut k = 1;
-    let mut axes = vec![0, 1];
-    let mut seen_first_positional = false;
-    let mut positional_after_input = Vec::new();
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                positional_after_input.push(value.as_str());
-            }
-            CallArgument::Keyword { name, value } if name == "k" => {
-                if let Some(parsed) = parse_axis(value) {
-                    k = parsed;
-                }
-            }
-            CallArgument::Keyword { name, value } if name == "axes" => {
-                if let Some(parsed) = parse_axis_list(value) {
-                    axes = parsed;
-                }
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    if let Some(value) = positional_after_input.first()
-        && let Some(parsed) = parse_axis(value)
-    {
-        k = parsed;
-    }
-    if let Some(value) = positional_after_input.get(1)
-        && let Some(parsed) = parse_axis_list(value)
-    {
-        axes = parsed;
-    }
+    let (k_value, axes_value) = nth_two_positional_or_keywords(args, 1, &["k"], &["axes"]);
+    let k = k_value.and_then(parse_axis).unwrap_or(1);
+    let axes = axes_value
+        .and_then(parse_axis_list)
+        .unwrap_or_else(|| vec![0, 1]);
     if axes.len() != 2 {
         return Err("rot90 expects exactly two axes".to_string());
     }
@@ -2371,32 +2212,11 @@ fn apply_known_pad(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut pad_width = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                pad_width = Some(value.as_str());
-            }
-            CallArgument::Keyword { name, value } if name == "pad_width" || name == "pad" => {
-                pad_width = Some(value);
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-
-    let Some(pad_width) = pad_width else {
+    let Some(pad_width) = nth_positional_or_keyword(args, 1, &["pad_width", "pad"]) else {
         return Ok(None);
     };
     let values = parse_ints(pad_width);
@@ -2448,50 +2268,28 @@ fn apply_known_reduction(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let mut axes: Option<Vec<isize>> = None;
-    let mut invalid_axis = false;
+    let axis_raw = nth_positional_or_keyword(args, 1, &["axis", "dim"]);
     let mut keepdims = false;
-    let mut seen_first_positional = false;
-
     for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue;
-                }
-                if axes.is_none() {
-                    match parse_axis_list(value) {
-                        Some(parsed) => axes = Some(parsed),
-                        None => invalid_axis = true,
-                    }
-                }
-            }
-            CallArgument::Keyword { name, value } if name == "axis" || name == "dim" => {
-                match parse_axis_list(value) {
-                    Some(parsed) => axes = Some(parsed),
-                    None => invalid_axis = true,
-                }
-            }
-            CallArgument::Keyword { name, value } if name == "keepdims" || name == "keepdim" => {
-                if let Some(parsed) = parse_bool(value) {
-                    keepdims = parsed;
-                }
-            }
-            CallArgument::Keyword { .. } => {}
+        if let CallArgument::Keyword { name, value } = arg
+            && (name == "keepdims" || name == "keepdim")
+            && let Some(parsed) = parse_bool(value)
+        {
+            keepdims = parsed;
         }
     }
 
-    if invalid_axis {
-        return Ok(None);
-    }
+    let axes = match axis_raw {
+        None => None,
+        Some(raw) => match parse_axis_list(raw) {
+            Some(parsed) => Some(parsed),
+            None => return Ok(None),
+        },
+    };
 
     let rank = input_shape.len();
     let Some(axes) = axes else {
@@ -2550,28 +2348,10 @@ fn apply_known_linalg_inv(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.shape(input_name) else {
-        return Ok(None);
-    };
-
-    if input_shape.len() < 2 {
-        return Err(format!(
-            "linalg.inv requires rank >= 2, got rank {}",
-            input_shape.len()
-        ));
-    }
-
-    let last = &input_shape[input_shape.len() - 1];
-    let second_last = &input_shape[input_shape.len() - 2];
-    if last != second_last {
-        return Err(format!(
-            "linalg.inv requires last two dimensions to match, got {} and {}",
-            second_last, last
-        ));
-    }
+    require_square_matrix(input_shape, "linalg.inv")?;
 
     Ok(Some(input_shape.clone()))
 }
@@ -2580,28 +2360,10 @@ fn apply_known_linalg_det(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(input_name) = first_array_arg(args) else {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(input_shape) = shapes.shape(input_name) else {
-        return Ok(None);
-    };
-
-    if input_shape.len() < 2 {
-        return Err(format!(
-            "linalg.det requires rank >= 2, got rank {}",
-            input_shape.len()
-        ));
-    }
-
-    let last = &input_shape[input_shape.len() - 1];
-    let second_last = &input_shape[input_shape.len() - 2];
-    if last != second_last {
-        return Err(format!(
-            "linalg.det requires last two dimensions to match, got {} and {}",
-            second_last, last
-        ));
-    }
+    require_square_matrix(input_shape, "linalg.det")?;
 
     Ok(Some(input_shape[..input_shape.len() - 2].to_vec()))
 }
@@ -2700,10 +2462,7 @@ pub fn compute_split_shapes(
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<Vec<String>>>, String> {
     // ── input array ──────────────────────────────────────────────────
-    let Some(input_name) = first_array_arg(args) else {
-        return Ok(None);
-    };
-    let Some(input_shape) = shapes.shape(input_name) else {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
     if input_shape.is_empty() {
@@ -2715,26 +2474,9 @@ pub fn compute_split_shapes(
     let axis = normalize_axis(axis_arg(args, 0), rank, "split")?;
 
     // ── split specification (second positional or keyword) ───────────
-    let mut split_spec: Option<&str> = None;
-    let mut seen_first_positional = false;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if !seen_first_positional {
-                    seen_first_positional = true;
-                    continue; // this was the input array
-                }
-                split_spec = Some(value.as_str());
-            }
-            CallArgument::Keyword { name, value }
-                if name == "indices_or_sections" || name == "sections" =>
-            {
-                split_spec = Some(value.as_str());
-            }
-            CallArgument::Keyword { .. } => {}
-        }
-    }
-    let Some(split_spec) = split_spec else {
+    let Some(split_spec) =
+        nth_positional_or_keyword(args, 1, &["indices_or_sections", "sections"])
+    else {
         return Ok(None);
     };
     let trimmed_spec = split_spec.trim();
@@ -3382,7 +3124,7 @@ mod known_function_shape_rule_tests {
 
         let error = apply_known_function(&KnownFunction::Transpose, &args, &shapes).unwrap_err();
 
-        assert!(error.contains("duplicate"));
+        assert!(error.contains("axis 0 given more than once"), "{error}");
     }
 
     #[test]

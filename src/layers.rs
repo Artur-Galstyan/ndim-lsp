@@ -337,8 +337,16 @@ pub fn extract_layer_assignments<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let records =
-        extract_layer_assignments_scoped(node, text, search_roots, read_file, max_depth, None)?;
+    let import_map = build_import_map(node, text)?;
+    let records = extract_layer_assignments_scoped(
+        node,
+        text,
+        &import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        None,
+    )?;
     let mut layers = HashMap::new();
     for rec in records {
         layers.insert(rec.name, rec.kind);
@@ -346,9 +354,47 @@ where
     Ok(layers)
 }
 
+/// Catalog-first / disk-fallback resolution of a single layer constructor
+/// call to its `LayerKind`, or `None` if the call isn't a recognised layer.
+#[allow(clippy::too_many_arguments)]
+fn resolve_layer_kind_for_call<F>(
+    call: &CallInfo,
+    node: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: &F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<LayerKind>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    // Catalog-first: hardcoded equinox.nn.* / torch.nn.* signatures bypass
+    // disk resolution. Falls through to resolve_call_signature for
+    // user-defined layers and frameworks not in the catalog.
+    let resolved_call = match try_catalog_signature(call, node, text, import_map)? {
+        Some(c) => Some(c),
+        None => resolve_call_signature(
+            call,
+            text,
+            import_map,
+            search_roots,
+            read_file,
+            max_depth,
+            cache,
+        )?,
+    };
+    let Some(resolved_call) = resolved_call else {
+        return Ok(None);
+    };
+    Ok(classify_layer_call(&resolved_call))
+}
+
 pub fn extract_layer_assignments_scoped<F>(
     node: Node,
     text: &str,
+    import_map: &HashMap<String, ImportPath>,
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
@@ -357,30 +403,21 @@ pub fn extract_layer_assignments_scoped<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let import_map = build_import_map(node, text)?;
     let calls = extract_calls(node, text)?;
     let mut records = Vec::new();
 
     for call in calls {
-        // Catalog-first: hardcoded equinox.nn.* / torch.nn.* signatures
-        // bypass disk resolution. Falls through to resolve_call_signature for
-        // user-defined layers and frameworks not in the catalog.
-        let resolved_call = match try_catalog_signature(&call, node, text, &import_map)? {
-            Some(c) => Some(c),
-            None => resolve_call_signature(
-                &call,
-                text,
-                &import_map,
-                search_roots,
-                &read_file,
-                max_depth,
-                cache,
-            )?,
-        };
-        let Some(resolved_call) = resolved_call else {
-            continue;
-        };
-        let Some(layer) = classify_layer_call(&resolved_call) else {
+        let Some(layer) = resolve_layer_kind_for_call(
+            &call,
+            node,
+            text,
+            import_map,
+            search_roots,
+            &read_file,
+            max_depth,
+            cache,
+        )?
+        else {
             continue;
         };
         records.push(LayerAssignment {
@@ -396,9 +433,11 @@ where
 /// Resolve `self.<attr> = <layer constructor>` assignments (typically in an
 /// `__init__`) to a map of bare attribute name → `LayerKind`. Mirrors the
 /// catalog-first / disk-fallback resolution of `extract_layer_assignments_scoped`.
+/// Flat last-wins view of `extract_self_attr_layers_by_class`.
 pub fn extract_self_attr_layers<F>(
     node: Node,
     text: &str,
+    import_map: &HashMap<String, ImportPath>,
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
@@ -407,33 +446,85 @@ pub fn extract_self_attr_layers<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let import_map = build_import_map(node, text)?;
+    let by_class =
+        extract_self_attr_layers_by_class(node, text, import_map, search_roots, read_file, max_depth, cache)?;
+    Ok(by_class
+        .into_iter()
+        .filter_map(|(attr, mut entries)| entries.pop().map(|e| (attr, e.kind)))
+        .collect())
+}
+
+/// Like `extract_self_attr_layers`, but each binding keeps the byte range of
+/// its enclosing `class_definition`, so `self.fc` in class A and `self.fc` in
+/// class B resolve independently at their respective call sites.
+pub fn extract_self_attr_layers_by_class<F>(
+    node: Node,
+    text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<HashMap<String, Vec<ScopedSelfAttrLayer>>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
     let calls = extract_self_attr_calls(node, text)?;
-    let mut layers = HashMap::new();
+    let classes = class_ranges(node);
+    let mut layers: HashMap<String, Vec<ScopedSelfAttrLayer>> = HashMap::new();
 
     for call in calls {
-        let resolved_call = match try_catalog_signature(&call, node, text, &import_map)? {
-            Some(c) => Some(c),
-            None => resolve_call_signature(
-                &call,
-                text,
-                &import_map,
-                search_roots,
-                &read_file,
-                max_depth,
-                cache,
-            )?,
-        };
-        let Some(resolved_call) = resolved_call else {
+        let Some(layer) = resolve_layer_kind_for_call(
+            &call,
+            node,
+            text,
+            import_map,
+            search_roots,
+            &read_file,
+            max_depth,
+            cache,
+        )?
+        else {
             continue;
         };
-        let Some(layer) = classify_layer_call(&resolved_call) else {
-            continue;
-        };
-        layers.insert(call.variable, layer);
+        let (class_start, class_end) =
+            enclosing_class_range(&classes, call.args_node_range.start_byte);
+        layers.entry(call.variable).or_default().push(ScopedSelfAttrLayer {
+            class_start,
+            class_end,
+            kind: layer,
+        });
     }
 
     Ok(layers)
+}
+
+/// Byte ranges of every `class_definition` in the tree (DFS, includes nested).
+fn class_ranges(node: Node) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "class_definition" {
+            ranges.push((n.start_byte(), n.end_byte()));
+        }
+        for i in (0..n.child_count()).rev() {
+            if let Some(c) = n.child(i as u32) {
+                stack.push(c);
+            }
+        }
+    }
+    ranges
+}
+
+/// Innermost class range containing `byte`; whole file if none (module-level
+/// `self` is malformed Python anyway, but stay permissive).
+fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> (usize, usize) {
+    classes
+        .iter()
+        .filter(|(s, e)| *s <= byte && byte < *e)
+        .min_by_key(|(s, e)| e - s)
+        .copied()
+        .unwrap_or((0, usize::MAX))
 }
 
 pub fn extract_layer_applications(
@@ -567,6 +658,28 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
 /// This is the *opposite* of Flax/JAX-NN channel-last layout. When
 /// `flax.linen.Conv` is added, a separate variant or layout field will be
 /// needed.
+/// Validate that `input_shape` has at least `min_rank` dims for a layer
+/// application, erroring with a message naming the layer kind, the layer's
+/// variable name, and the input's variable name.
+fn check_min_rank(
+    name: &str,
+    app: &LayerApplication,
+    input_shape: &[String],
+    min_rank: usize,
+) -> Result<(), String> {
+    if input_shape.len() < min_rank {
+        return Err(format!(
+            "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
+            name,
+            app.layer,
+            min_rank,
+            input_shape.len(),
+            app.input
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_conv_layer(
     layer_name: &str,
@@ -580,16 +693,7 @@ fn apply_conv_layer(
     padding: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let min_rank = spatial_rank + 1;
-    if input_shape.len() < min_rank {
-        return Err(format!(
-            "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-            layer_name,
-            app.layer,
-            min_rank,
-            input_shape.len(),
-            app.input
-        ));
-    }
+    check_min_rank(layer_name, app, input_shape, min_rank)?;
 
     let channels_idx = input_shape.len() - spatial_rank - 1;
     let channels_dim = &input_shape[channels_idx];
@@ -781,15 +885,7 @@ pub fn apply_layer_application(
             spatial_rank,
         } => {
             let min_rank = spatial_rank + 1;
-            if input_shape.len() < min_rank {
-                return Err(format!(
-                    "Conv layer '{}' requires input with at least {} dims, got {} for '{}'",
-                    app.layer,
-                    min_rank,
-                    input_shape.len(),
-                    app.input
-                ));
-            }
+            check_min_rank("Conv", app, input_shape, min_rank)?;
             // Stride-1 / SAME padding: spatial dims unchanged.
             let mut output_shape = input_shape.clone();
             let last = output_shape.len() - 1;
@@ -806,16 +902,7 @@ pub fn apply_layer_application(
             padding,
         } => {
             let min_rank = spatial_rank + 1;
-            if input_shape.len() < min_rank {
-                return Err(format!(
-                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-                    name,
-                    app.layer,
-                    min_rank,
-                    input_shape.len(),
-                    app.input
-                ));
-            }
+            check_min_rank(name, app, input_shape, min_rank)?;
             let mut output_shape = input_shape.clone();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
@@ -829,16 +916,7 @@ pub fn apply_layer_application(
             output_size,
         } => {
             let min_rank = spatial_rank + 1;
-            if input_shape.len() < min_rank {
-                return Err(format!(
-                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-                    name,
-                    app.layer,
-                    min_rank,
-                    input_shape.len(),
-                    app.input
-                ));
-            }
+            check_min_rank(name, app, input_shape, min_rank)?;
             let mut output_shape = input_shape.clone();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
@@ -855,17 +933,8 @@ pub fn apply_layer_application(
         // Shape-preserving layers: output shape equals input shape, but some
         // layers have minimum-rank expectations (e.g. BatchNorm2d needs 3D (C, H, W)).
         LayerKind::ShapePreserving { name } => {
-            if let Some(min_rank) = min_rank_for_shape_preserving(name)
-                && input_shape.len() < min_rank
-            {
-                return Err(format!(
-                    "{} layer '{}' requires input with at least {} dims, got {} for '{}'",
-                    name,
-                    app.layer,
-                    min_rank,
-                    input_shape.len(),
-                    app.input
-                ));
+            if let Some(min_rank) = min_rank_for_shape_preserving(name) {
+                check_min_rank(name, app, input_shape, min_rank)?;
             }
             Ok(Some(input_shape.clone()))
         }

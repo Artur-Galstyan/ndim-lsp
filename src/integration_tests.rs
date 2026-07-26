@@ -6825,3 +6825,85 @@ mod multihead_attention_tests {
         assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["tgt", "src"])));
     }
 }
+
+/// Timing harness over `bench/benchmark_large.py` (regenerate with
+/// `python3 bench/generate_benchmark.py`). Not part of the default suite.
+/// Run with: `cargo test --release bench_large_file -- --ignored --nocapture`.
+#[cfg(test)]
+mod bench_harness {
+    use super::*;
+    use std::fs;
+    use std::time::Instant;
+    use tree_sitter::Parser;
+
+    #[test]
+    #[ignore]
+    fn bench_large_file() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/benchmark_large.py");
+        let code = fs::read_to_string(&path).unwrap();
+        let lines = code.lines().count();
+        let roots: Vec<PathBuf> = Vec::new();
+        let cache = new_resolution_cache();
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+
+        let (_, _, warm) = run_with(&mut parser, &code, &roots, &cache);
+        let mut parse_times = Vec::new();
+        let mut analyze_times = Vec::new();
+        for _ in 0..10 {
+            let (p, a, _) = run_with(&mut parser, &code, &roots, &cache);
+            parse_times.push(p);
+            analyze_times.push(a);
+        }
+        parse_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        analyze_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = |v: &[f64]| v[v.len() / 2];
+        let shaped = warm.assignment_shapes.len();
+        println!("\n=== bench: {} lines ===", lines);
+        println!("  parse    median {:.1} ms  max {:.1} ms", med(&parse_times), parse_times[parse_times.len() - 1]);
+        println!("  analyze  median {:.1} ms  max {:.1} ms", med(&analyze_times), analyze_times[analyze_times.len() - 1]);
+        println!("  shapes inferred: {}   errors: {}", shaped, warm.errors.len());
+        let mut msgs: std::collections::BTreeMap<String, usize> = Default::default();
+        for e in &warm.errors {
+            *msgs.entry(e.message.clone()).or_default() += 1;
+        }
+        for (m, n) in msgs.iter().take(30) {
+            println!("    {:>3}x  {}", n, m);
+        }
+        assert!(shaped > 1000, "expected >1000 inferred shapes, got {shaped}");
+        let deliberate = code.matches("# expected-error:").count();
+        assert_eq!(
+            warm.errors.len(),
+            deliberate,
+            "diagnostics should match the deliberate '# expected-error:' markers exactly \
+             (fewer = missed detection, more = false positives)"
+        );
+        // Keystroke budget: parse + analyze should stay well under one frame-ish
+        // interval even in debug. Release should be far below this.
+        assert!(
+            med(&analyze_times) < 1000.0,
+            "analyze median {:.1} ms exceeds 1s regression tripwire",
+            med(&analyze_times)
+        );
+    }
+
+    fn run_with(
+        parser: &mut Parser,
+        code: &str,
+        roots: &[PathBuf],
+        cache: &ResolutionCache,
+    ) -> (f64, f64, LayerShapeAnalysis) {
+        let read = |_: &PathBuf| -> Option<String> { None };
+        let t0 = Instant::now();
+        let tree = parser.parse(code, None).unwrap();
+        let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = Instant::now();
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, roots, read, 5, Some(cache)).unwrap();
+        let analyze_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        (parse_ms, analyze_ms, analysis)
+    }
+}

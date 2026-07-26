@@ -10,8 +10,9 @@ use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
-    InlayHintLabel, InlayHintParams, MarkedString, MessageType, OneOf, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    InlayHintLabel, InlayHintParams, MarkupContent, MarkupKind, MessageType, OneOf,
+    Position, PositionEncodingKind, Range, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url,
     WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -67,6 +68,7 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(PositionEncodingKind::UTF16),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
@@ -103,14 +105,30 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.republish_diagnostics(
-                &params.text_document.uri,
-                &change.text,
-                params.text_document.version,
-            )
-            .await;
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        let uri = params.text_document.uri;
+        let version = params.text_document.version;
+        // Record the new text immediately so hover/inlay requests see it...
+        {
+            let mut doc_lock = self.document_text.write().await;
+            doc_lock.insert(uri.clone(), change.text);
         }
+        {
+            let mut ver_lock = self.document_version.write().await;
+            ver_lock.insert(uri.clone(), version);
+        }
+        // ...but debounce the analysis: if another keystroke lands during the
+        // window, this run bows out and the newer one does the work.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let ver_lock = self.document_version.read().await;
+            if ver_lock.get(&uri).copied() != Some(version) {
+                return;
+            }
+        }
+        self.publish_diagnostics_for(&uri, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -314,8 +332,11 @@ impl Backend {
             let mut ver_lock = self.document_version.write().await;
             ver_lock.insert(uri.clone(), version);
         }
+        self.publish_diagnostics_for(uri, version).await;
+    }
 
-        // Run analysis (will populate cache)
+    /// Analyze (or hit the cache) and publish diagnostics for `version`.
+    async fn publish_diagnostics_for(&self, uri: &Url, version: i32) {
         let Some(cached) = self.get_analysis(uri, version).await else {
             self.client
                 .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
@@ -500,12 +521,10 @@ impl Backend {
         let hover_range = ts_range_to_lsp_range(node.range());
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::LanguageString(
-                tower_lsp::lsp_types::LanguageString {
-                    language: "python".into(),
-                    value: hover_content,
-                },
-            )),
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```python\n{}\n```", hover_content),
+            }),
             range: Some(hover_range),
         }))
     }

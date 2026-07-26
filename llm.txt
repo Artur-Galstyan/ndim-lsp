@@ -9,8 +9,15 @@ Current validation baseline
 ---------------------------
 As of this checkpoint:
 
-- `cargo test --quiet` passes with ~1188 tests across the lib + integration suites.
+- `cargo test --quiet` passes with ~1259 tests across the lib + integration suites (plus 1 ignored benchmark).
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
+- `cargo test --release bench_large_file -- --ignored --nocapture` runs the
+  timing harness over `bench/benchmark_large.py` (3730 lines, regenerate with
+  `python3 bench/generate_benchmark.py`): parse ~9 ms, analyze ~21 ms median
+  in release. It asserts >1000 inferred shapes and that the diagnostic count
+  exactly equals the file's deliberate `# expected-error:` markers — fewer
+  means missed detection, more means false positives. Treat it as the
+  scale/regression tripwire.
 - `cargo test corpus_coverage_report -- --nocapture` prints a shape-coverage
   report over `corpus/*.py` (currently mamba_ssm, attention, conv_net,
   transformer_block), ranks un-shapeable assignments ("dark spots") by
@@ -107,8 +114,12 @@ Current file layout
     - `classify_layer_call`
     - `extract_layer_assignments`
     - `extract_layer_applications`
-    - `extract_self_attr_layers` — resolves `self.<attr> = <constructor>` (e.g.
-      from `__init__`) to a `{attr -> LayerKind}` map; used by inline vmap (#35).
+    - `extract_self_attr_layers_by_class` — resolves `self.<attr> = <constructor>`
+      (e.g. from `__init__`) to `{attr -> Vec<ScopedSelfAttrLayer>}`, each entry
+      carrying its enclosing class byte range so same-named attrs in different
+      classes don't collide. Lookup goes through `ShapeCtx::self_attr_layer_at`
+      (innermost class containing the call byte; lone-binding fallback).
+      `extract_self_attr_layers` is the flat last-wins wrapper kept for tests.
     - `apply_layer_application`
     - `apply_layer_applications`
 
@@ -140,6 +151,15 @@ Current file layout
 
 - `TO_IMPLEMENT.md`
   - Tracker for built-in functions/classes and whether they are classified, have shape rules, and have tests.
+  - This is THE exhaustive coverage list (~365 rows incl. jnp/np, torch,
+    torch.Tensor methods, jax.lax, jax.nn, eqx.nn/torch.nn layers, einops),
+    with priority annotations on open rows. Add new gaps here, not in this file.
+
+- `bench/`
+  - `generate_benchmark.py` emits `benchmark_large.py` (~3.7k lines of
+    transformer/GRU/conv/numpy-soup/indexing blocks with unique per-block dims,
+    plus deliberate `# expected-error:` blocks). Consumed by the ignored
+    `bench_large_file` test in `src/integration_tests.rs`.
 
 - `README.md`
   - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
@@ -272,13 +292,16 @@ What works now
 Known limitations / important caveats
 -------------------------------------
 
-- `src/main.rs` is wired end-to-end: `republish_diagnostics` runs `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as LSP diagnostics; `on_hover` renders shape strings; inlay hints are emitted. Diagnostic severity is configurable via `initializationOptions.diagnostic_severity` (`error`/`warning`/`information`/`hint`, case-insensitive; defaults to `ERROR`). `ShapeError`'s tree-sitter range is converted to LSP range via `ts_range_to_lsp_range`.
+- `src/main.rs` is wired end-to-end: `republish_diagnostics` runs `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as LSP diagnostics; `on_hover` renders shape strings (markdown `MarkupContent` with a fenced python block); inlay hints are emitted. `did_change` debounces analysis by 150 ms (stores text/version immediately, then bows out if a newer version landed during the window). The server advertises UTF-16 `position_encoding`. Diagnostic severity is configurable via `initializationOptions.diagnostic_severity` (`error`/`warning`/`information`/`hint`, case-insensitive; defaults to `ERROR`). `ShapeError`'s tree-sitter range is converted to LSP range via `ts_range_to_lsp_range`.
+- Editor integrations: `ndim-lsp-vscode` resolves the server from the `ndim-lsp.serverPath` setting (default: `ndim-lsp` on PATH), exposes `ndim-lsp.diagnosticSeverity`, passes both via `initializationOptions`, and restarts the client on config change. `ndim-lsp-zed` forwards `initialization_options` from Zed's `lsp.ndim-lsp` settings and already supported `binary.path` + PATH lookup.
+- All diagnostics share one configured severity; per-error-kind severities (e.g. hint-level for approximate rules) would need a kind/severity field on `ShapeError` — not done yet.
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
 - Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`, `x.astype(...)`, `x.to(...)` are wired end-to-end. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)` are not yet covered.
 - Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
 - Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (numeric `a:b` and `:n` folded; others approximated by the original axis), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. Advanced/boolean array indexing is approximated as a single axis drop.
 - Multi-output functions: `split` family is done (tuple-pattern LHS bound via `compute_split_shapes`). Still single-shape / `Ok(None)`: `meshgrid`, `svd`, `eig`, `qr` — extend `tuple_rhs_shapes` to cover them.
-- Symbolic dims are bare strings compared by exact equality. `self.<attr>` is canonicalized to its `self.<attr> = <ident>` alias (from `__init__`) before a shape is stored, so `self.dt_rank` ≡ `dt_rank` (see `extract_self_attr_aliases` + `normalize_dim`/`normalize_shape`). Limitations: only identifier-RHS aliases; the map is file-global (cross-class same-name collisions are last-wins); layer ctor args carrying `self.` (e.g. `Linear(self.d_inner, ...)`) are not yet normalized; no constant folding across different spellings (`d_state*2` vs `2*d_state`).
+- Symbolic dims are bare strings compared by exact equality. `self.<attr>` is canonicalized to its `self.<attr> = <ident>` alias (from `__init__`) before a shape is stored, so `self.dt_rank` ≡ `dt_rank` (see `extract_self_attr_aliases` + `normalize_dim`/`normalize_shape`). Limitations: only identifier-RHS aliases; the ALIAS map is still file-global (cross-class same-name collisions are last-wins) — self-attr LAYER resolution, by contrast, is class-scoped since the `extract_self_attr_layers_by_class` change; layer ctor args carrying `self.` (e.g. `Linear(self.d_inner, ...)`) are not yet normalized; no constant folding across different spellings (`d_state*2` vs `2*d_state`).
+- `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
 - Higher-order functions: `vmap` is modeled (free/inline/attribute). `grad`, `scan`, `pmap` are not.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.

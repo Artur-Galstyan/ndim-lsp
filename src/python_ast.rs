@@ -8,17 +8,17 @@ use crate::types::*;
 #[cfg(test)]
 use crate::resolution::bind_call_arguments;
 
+fn node_text(node: Node, text: &str) -> Result<String, String> {
+    node.utf8_text(text.as_bytes())
+        .map(|s| s.to_string())
+        .map_err(|e| e.to_string())
+}
+
 pub fn extract_callable_signature(
     node: Node,
     text: &str,
     symbol: &PythonSymbol,
 ) -> Result<Option<PythonCallableSignature>, String> {
-    fn node_text(node: Node, text: &str) -> Result<String, String> {
-        node.utf8_text(text.as_bytes())
-            .map(|s| s.to_string())
-            .map_err(|e| e.to_string())
-    }
-
     fn definition_name(node: Node, text: &str) -> Result<Option<String>, String> {
         node.child_by_field_name("name")
             .map(|name| node_text(name, text))
@@ -159,21 +159,12 @@ pub fn extract_call_arguments(args_node: Node, text: &str) -> Result<Vec<CallArg
                 return Err("keyword_argument missing value".to_string());
             };
             args.push(CallArgument::Keyword {
-                name: name_node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string(),
-                value: value_node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string(),
+                name: node_text(name_node, text)?,
+                value: node_text(value_node, text)?,
             });
         } else {
             args.push(CallArgument::Positional {
-                value: child
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string(),
+                value: node_text(child, text)?,
             });
         }
     }
@@ -182,12 +173,6 @@ pub fn extract_call_arguments(args_node: Node, text: &str) -> Result<Vec<CallArg
 }
 
 pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionShapeScope>, String> {
-    fn node_text(node: Node, text: &str) -> Result<String, String> {
-        node.utf8_text(text.as_bytes())
-            .map(|s| s.to_string())
-            .map_err(|e| e.to_string())
-    }
-
     fn first_identifier(node: Node, text: &str) -> Result<Option<String>, String> {
         if node.kind() == "identifier" {
             return Ok(Some(node_text(node, text)?));
@@ -429,10 +414,7 @@ pub fn find_top_level_symbol(
             0 => {
                 for capture in match_.captures {
                     if capture.index == class_idx {
-                        let class_name = capture
-                            .node
-                            .utf8_text(text.as_bytes())
-                            .map_err(|e| e.to_string())?;
+                        let class_name = node_text(capture.node, text)?;
 
                         if class_name == name {
                             found = Some(PythonSymbol::Class {
@@ -445,10 +427,7 @@ pub fn find_top_level_symbol(
             1 => {
                 for capture in match_.captures {
                     if capture.index == fn_idx {
-                        let fn_name = capture
-                            .node
-                            .utf8_text(text.as_bytes())
-                            .map_err(|e| e.to_string())?;
+                        let fn_name = node_text(capture.node, text)?;
 
                         if fn_name == name {
                             found = Some(PythonSymbol::Function {
@@ -527,12 +506,9 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                 if capture.index == import_statement_idx {
                     match capture.node.kind() {
                         "dotted_name" => {
-                            let dotted_name = capture
-                                .node
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?;
+                            let dotted_name = node_text(capture.node, text)?;
                             let (module, name, first) =
-                                plain_import_dotted_name_to_vec(dotted_name)
+                                plain_import_dotted_name_to_vec(&dotted_name)
                                     .map_err(|e| e.to_string())?;
                             import_map.insert(
                                 first.to_string(),
@@ -547,18 +523,13 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                             let Some(name_child) = capture.node.child_by_field_name("name") else {
                                 return Err("aliased_import missing name".to_string());
                             };
-                            let dotted_name = name_child
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?;
-                            let (module, name, _) = plain_import_dotted_name_to_vec(dotted_name)?;
+                            let dotted_name = node_text(name_child, text)?;
+                            let (module, name, _) = plain_import_dotted_name_to_vec(&dotted_name)?;
 
                             let Some(alias_node) = capture.node.child_by_field_name("alias") else {
                                 return Err("aliased_import missing alias".to_string());
                             };
-                            let alias = alias_node
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?
-                                .to_string();
+                            let alias = node_text(alias_node, text)?;
 
                             import_map.insert(
                                 alias,
@@ -584,7 +555,7 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                     match n.kind() {
                         "dotted_name" => {
                             let identifier =
-                                n.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?;
+                                node_text(n, text)?;
                             module = identifier.split(".").map(|f| f.to_string()).collect();
                         }
                         "relative_import" => {
@@ -592,15 +563,11 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                             for child in n.named_children(&mut child_cursor) {
                                 match child.kind() {
                                     "import_prefix" => {
-                                        let prefix = child
-                                            .utf8_text(text.as_bytes())
-                                            .map_err(|e| e.to_string())?;
+                                        let prefix = node_text(child, text)?;
                                         dots = prefix.len();
                                     }
                                     "dotted_name" => {
-                                        let dotted = child
-                                            .utf8_text(text.as_bytes())
-                                            .map_err(|e| e.to_string())?;
+                                        let dotted = node_text(child, text)?;
                                         module = dotted.split(".").map(|f| f.to_string()).collect();
                                     }
                                     _ => {}
@@ -613,28 +580,19 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                     let n = capture.node;
                     match n.kind() {
                         "dotted_name" => {
-                            name = n
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?
-                                .to_string();
+                            name = node_text(n, text)?;
                             alias = name.clone();
                         }
                         "aliased_import" => {
                             let Some(alias_child_node) = n.child_by_field_name("alias") else {
                                 return Err("aliased_import has no alias field".to_string());
                             };
-                            alias = alias_child_node
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?
-                                .to_string();
+                            alias = node_text(alias_child_node, text)?;
 
                             let Some(dotted_name_idx) = n.child_by_field_name("name") else {
                                 return Err("aliased_import has no name field".to_string());
                             };
-                            let dotted_name = dotted_name_idx
-                                .utf8_text(text.as_bytes())
-                                .map_err(|e| e.to_string())?
-                                .to_string();
+                            let dotted_name = node_text(dotted_name_idx, text)?;
                             name = dotted_name;
                         }
                         _ => {}
@@ -692,23 +650,11 @@ pub fn extract_method_calls(node: Node, text: &str) -> Result<Vec<MethodCallInfo
 
         for capture in match_.captures {
             if capture.index == var_idx {
-                variable = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                variable = node_text(capture.node, text)?;
             } else if capture.index == receiver_idx {
-                receiver = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                receiver = node_text(capture.node, text)?;
             } else if capture.index == method_idx {
-                method = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                method = node_text(capture.node, text)?;
             } else if capture.index == assignment_idx {
                 let Some(right_child_node) = capture.node.child_by_field_name("right") else {
                     return Err("right child not found".to_string());
@@ -777,11 +723,7 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
 
         for capture in match_.captures {
             if capture.index == var_idx {
-                variable = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                variable = node_text(capture.node, text)?;
             } else if capture.index == assignment_idx {
                 let Some(right_child_node) = capture.node.child_by_field_name("right") else {
                     return Err("right child not found".to_string());
@@ -792,11 +734,7 @@ pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
                 };
                 args_node_range = Some(arguments_node.range());
             } else if capture.index == fn_id_idx || capture.index == fn_attr_idx {
-                target = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                target = node_text(capture.node, text)?;
             }
         }
 
@@ -855,14 +793,9 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
 
         for capture in match_.captures {
             if capture.index == obj_idx {
-                is_self = capture.node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?
-                    == "self";
+                is_self = node_text(capture.node, text)? == "self";
             } else if capture.index == attr_idx {
-                variable = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                variable = node_text(capture.node, text)?;
             } else if capture.index == assignment_idx {
                 let right = capture
                     .node
@@ -873,11 +806,7 @@ pub fn extract_self_attr_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, 
                     .ok_or("arguments child not found")?;
                 args_node_range = Some(arguments.range());
             } else if capture.index == fn_id_idx || capture.index == fn_attr_idx {
-                target = capture
-                    .node
-                    .utf8_text(text.as_bytes())
-                    .map_err(|e| e.to_string())?
-                    .to_string();
+                target = node_text(capture.node, text)?;
             }
         }
 
@@ -933,10 +862,7 @@ pub fn extract_self_attr_aliases(
         let mut attr = String::new();
         let mut val = String::new();
         for capture in match_.captures {
-            let t = capture
-                .node
-                .utf8_text(text.as_bytes())
-                .map_err(|e| e.to_string())?;
+            let t = node_text(capture.node, text)?;
             if capture.index == obj_idx {
                 is_self = t == "self";
             } else if capture.index == attr_idx {
@@ -2681,7 +2607,7 @@ fn try_extract_binary_op(node: Node, text: &str) -> Result<Option<BinaryOpInfo>,
     let Some(op_node) = node.child_by_field_name("operator") else {
         return Ok(None);
     };
-    let op_text = op_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string();
+    let op_text = node_text(op_node, text)?;
 
     let op = match op_text.as_str() {
         "@" => BinaryOp::MatMul,
@@ -2701,8 +2627,8 @@ fn try_extract_binary_op(node: Node, text: &str) -> Result<Option<BinaryOpInfo>,
 
     Ok(Some(BinaryOpInfo {
         variable,
-        left: left_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string(),
-        right: right_node.utf8_text(text.as_bytes()).map_err(|e| e.to_string())?.to_string(),
+        left: node_text(left_node, text)?,
+        right: node_text(right_node, text)?,
         op,
         range: node.range(),
     }))

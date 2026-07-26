@@ -293,6 +293,16 @@ pub struct LayerAssignment {
     pub byte_position: usize,
 }
 
+/// A `self.<attr> = <layer ctor>` binding together with the byte range of the
+/// class it was defined in, so same-named attrs in different classes don't
+/// collide at lookup time.
+#[derive(Debug, PartialEq, Clone)]
+pub struct ScopedSelfAttrLayer {
+    pub class_start: usize,
+    pub class_end: usize,
+    pub kind: LayerKind,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ShapeError {
     pub variable: String,
