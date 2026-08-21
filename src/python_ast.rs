@@ -195,27 +195,26 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
         Ok(None)
     }
 
-    fn find_string_literal(node: Node, text: &str) -> Result<Option<String>, String> {
+    fn find_string_literal<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
         if node.kind() == "string" {
-            return Ok(Some(node_text(node, text)?));
+            return Some(node);
         }
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i as u32) else {
                 continue;
             };
-            if let Some(value) = find_string_literal(child, text)? {
-                return Ok(Some(value));
+            if let Some(value) = find_string_literal(child) {
+                return Some(value);
             }
         }
-        Ok(None)
+        None
     }
 
-    fn contains_array_type(node: Node, text: &str) -> Result<bool, String> {
-        let node_text = node_text(node, text)?;
-        if node.kind() == "identifier" && node_text == "Array" {
-            return Ok(true);
-        }
-        if node.kind() == "attribute" && node_text.ends_with(".Array") {
+    fn contains_type_name(node: Node, text: &str, type_name: &str) -> Result<bool, String> {
+        let value = node_text(node, text)?;
+        if (node.kind() == "identifier" && value == type_name)
+            || (node.kind() == "attribute" && value.ends_with(&format!(".{type_name}")))
+        {
             return Ok(true);
         }
 
@@ -223,7 +222,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             let Some(child) = node.named_child(i as u32) else {
                 continue;
             };
-            if contains_array_type(child, text)? {
+            if contains_type_name(child, text, type_name)? {
                 return Ok(true);
             }
         }
@@ -231,37 +230,78 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
         Ok(false)
     }
 
-    fn shape_dims(raw_string: &str) -> Vec<String> {
-        let trimmed = raw_string.trim();
+    fn contains_array_type(node: Node, text: &str) -> Result<bool, String> {
+        Ok(contains_type_name(node, text, "Array")?
+            || (contains_type_name(node, text, "NDArray")?
+                && contains_type_name(node, text, "Shape")?))
+    }
+
+    fn point_for_byte(text: &str, byte: usize) -> tree_sitter::Point {
+        let prefix = &text.as_bytes()[..byte];
+        let row = prefix.iter().filter(|&&b| b == b'\n').count();
+        let line_start = prefix.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        tree_sitter::Point::new(row, byte - line_start)
+    }
+
+    fn shape_dims(node: Node, text: &str) -> Result<Vec<(String, tree_sitter::Range)>, String> {
+        let raw = node_text(node, text)?;
+        let trimmed = raw.trim();
+        let trim_start = raw.len() - raw.trim_start().len();
         let Some(quote_start) = trimmed.find(['"', '\'']) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let prefix = trimmed[..quote_start].to_ascii_lowercase();
         if prefix.chars().any(|c| c != 'r' && c != 'u') {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let quoted = &trimmed[quote_start..];
-        // Invariant: `quote_start` comes from `trimmed.find(['"', '\''])` above,
-        // so `trimmed[quote_start..]` begins with a quote character.
         let quote = quoted
             .chars()
             .next()
             .expect("invariant: quote_start points to a quote char");
         let triple = quote.to_string().repeat(3);
-        let unquoted = if quoted.starts_with(&triple) && quoted.ends_with(&triple) {
-            &quoted[3..quoted.len() - 3]
+        let quote_len = if quoted.starts_with(&triple) && quoted.ends_with(&triple) {
+            3
         } else if quoted.starts_with(quote) && quoted.ends_with(quote) {
-            &quoted[1..quoted.len() - 1]
+            1
         } else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
+        let unquoted = &quoted[quote_len..quoted.len() - quote_len];
+        let base_byte = node.start_byte() + trim_start + quote_start + quote_len;
+        let mut spans = Vec::new();
+        let mut token_start = None;
 
-        unquoted
-            .split_whitespace()
-            .filter(|dim| !dim.is_empty())
-            .map(|dim| dim.to_string())
-            .collect()
+        for (offset, ch) in unquoted.char_indices() {
+            if ch.is_whitespace() || ch == ',' {
+                if let Some(start) = token_start.take() {
+                    spans.push((start, offset));
+                }
+            } else if token_start.is_none() {
+                token_start = Some(offset);
+            }
+        }
+        if let Some(start) = token_start {
+            spans.push((start, unquoted.len()));
+        }
+
+        Ok(spans
+            .into_iter()
+            .map(|(start, end)| {
+                let start_byte = base_byte + start;
+                let end_byte = base_byte + end;
+                (
+                    unquoted[start..end].to_string(),
+                    tree_sitter::Range {
+                        start_byte,
+                        end_byte,
+                        start_point: point_for_byte(text, start_byte),
+                        end_point: point_for_byte(text, end_byte),
+                    },
+                )
+            })
+            .collect())
     }
 
     fn visit(
@@ -280,6 +320,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             let mut function_shapes = HashMap::new();
             let mut param_order = Vec::new();
             let mut all_params = Vec::new();
+            let mut dimension_sites = Vec::new();
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 for i in 0..parameters.named_child_count() {
                     let Some(parameter) = parameters.named_child(i as u32) else {
@@ -307,34 +348,48 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                         }
                         continue;
                     }
-                    let Some(raw_shape) = find_string_literal(type_node, text)? else {
+                    let Some(shape_node) = find_string_literal(type_node) else {
                         continue;
                     };
-                    let dims = shape_dims(&raw_shape);
-                    if dims.is_empty() {
+                    let parsed_dims = shape_dims(shape_node, text)?;
+                    if parsed_dims.is_empty() {
                         continue;
                     }
                     let Some(name) = first_identifier(parameter, text)? else {
                         continue;
                     };
+                    let dims = parsed_dims.iter().map(|(value, _)| value.clone()).collect();
+                    for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
+                        dimension_sites.push(ShapeDimensionSite {
+                            binding: Some(name.clone()),
+                            axis,
+                            value,
+                            range,
+                        });
+                    }
                     function_shapes.insert(name.clone(), dims);
                     param_order.push(name);
                 }
             }
-            let return_shape = if let Some(ret_type) = node.child_by_field_name("return_type") {
-                if contains_array_type(ret_type, text)? {
-                    if let Some(raw_shape) = find_string_literal(ret_type, text)? {
-                        let dims = shape_dims(&raw_shape);
-                        if dims.is_empty() { None } else { Some(dims) }
-                    } else {
-                        None
+            let mut return_shape = None;
+            if let Some(ret_type) = node.child_by_field_name("return_type")
+                && contains_array_type(ret_type, text)?
+                && let Some(shape_node) = find_string_literal(ret_type)
+            {
+                let parsed_dims = shape_dims(shape_node, text)?;
+                if !parsed_dims.is_empty() {
+                    return_shape = Some(parsed_dims.iter().map(|(value, _)| value.clone()).collect());
+                    for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
+                        dimension_sites.push(ShapeDimensionSite {
+                            binding: None,
+                            axis,
+                            value,
+                            range,
+                        });
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
-            };
+            }
+
 
             let new_idx = scopes.len();
             scopes.push(FunctionShapeScope {
@@ -345,6 +400,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                 return_shape,
                 param_order,
                 all_params,
+                dimension_sites,
             });
             new_idx
         } else {
@@ -365,11 +421,20 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             && let Some(left_node) = node.child_by_field_name("left")
             && left_node.kind() == "identifier"
             && contains_array_type(type_node, text)?
-            && let Some(raw_shape) = find_string_literal(type_node, text)?
+            && let Some(shape_node) = find_string_literal(type_node)
         {
-            let dims = shape_dims(&raw_shape);
-            if !dims.is_empty() {
+            let parsed_dims = shape_dims(shape_node, text)?;
+            if !parsed_dims.is_empty() {
                 let name = node_text(left_node, text)?;
+                let dims = parsed_dims.iter().map(|(value, _)| value.clone()).collect();
+                for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
+                    scopes[child_scope_idx].dimension_sites.push(ShapeDimensionSite {
+                        binding: Some(name.clone()),
+                        axis,
+                        value,
+                        range,
+                    });
+                }
                 scopes[child_scope_idx].shapes.insert(name, dims);
             }
         }
@@ -392,6 +457,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
         return_shape: None,
         param_order: Vec::new(),
         all_params: Vec::new(),
+        dimension_sites: Vec::new(),
     }];
     visit(node, text, &mut scopes, 0)?;
     Ok(scopes)
@@ -1389,6 +1455,22 @@ mod extract_jaxtyping_shapes_tests {
         let f = scope_by_name(&scopes, "f");
         assert_eq!(f.shapes.get("x"), Some(&shape(&["batch", "features"])));
         assert!(module_scope(&scopes).shapes.is_empty());
+    }
+
+    #[test]
+    fn test_dimension_sites_keep_exact_source_ranges() {
+        let code = r#"def f(x: Float[Array, r" batch, hidden*2 "]) -> NDArray[Shape["batch, output"], Float]: pass"#;
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        let sites = &scope_by_name(&scopes, "f").dimension_sites;
+
+        assert_eq!(sites.len(), 4);
+        assert_eq!(sites[0].binding.as_deref(), Some("x"));
+        assert_eq!(sites[0].axis, 0);
+        assert_eq!(&code[sites[0].range.start_byte..sites[0].range.end_byte], "batch");
+        assert_eq!(&code[sites[1].range.start_byte..sites[1].range.end_byte], "hidden*2");
+        assert_eq!(sites[2].binding, None);
+        assert_eq!(&code[sites[3].range.start_byte..sites[3].range.end_byte], "output");
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::known_functions::{
     compute_unbind_shape,
 };
 use crate::layers::{
-    apply_layer_application, classify_inline_constructor, extract_layer_assignments_scoped,
-    extract_self_attr_layers_by_class,
+    apply_layer_application, apply_layer_kind, classify_inline_constructor,
+    extract_layer_assignments_scoped, extract_self_attr_layers_by_class,
 };
 use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_jaxtyping_shapes,
@@ -712,6 +712,107 @@ fn binop_operand(node: Node, scope_idx: usize, ctx: &mut ShapeCtx) -> Option<Bin
     }
 }
 
+fn binary_mismatch_axes(
+    left: &[String],
+    right: &[String],
+    op: BinaryOp,
+) -> Option<(usize, usize)> {
+    if matches!(op, BinaryOp::MatMul) {
+        if left.len() < 2 || right.len() < 2 {
+            return None;
+        }
+        let left_batch_len = left.len() - 2;
+        let right_batch_len = right.len() - 2;
+        for k in (1..=left_batch_len.max(right_batch_len)).rev() {
+            let left_axis = left_batch_len.checked_sub(k);
+            let right_axis = right_batch_len.checked_sub(k);
+            if let (Some(left_axis), Some(right_axis)) = (left_axis, right_axis) {
+                let left_dim = &left[left_axis];
+                let right_dim = &right[right_axis];
+                if !dims_canonically_equal(left_dim, right_dim)
+                    && left_dim != "1"
+                    && right_dim != "1"
+                {
+                    return Some((left_axis, right_axis));
+                }
+            }
+        }
+        let left_axis = left.len() - 1;
+        let right_axis = right.len() - 2;
+        return (!dims_canonically_equal(&left[left_axis], &right[right_axis]))
+            .then_some((left_axis, right_axis));
+    }
+
+    let rank = left.len().max(right.len());
+    for i in 0..rank {
+        let left_axis = (i + left.len()).checked_sub(rank);
+        let right_axis = (i + right.len()).checked_sub(rank);
+        if let (Some(left_axis), Some(right_axis)) = (left_axis, right_axis) {
+            let left_dim = &left[left_axis];
+            let right_dim = &right[right_axis];
+            if !dims_canonically_equal(left_dim, right_dim)
+                && left_dim != "1"
+                && right_dim != "1"
+            {
+                return Some((left_axis, right_axis));
+            }
+        }
+    }
+    None
+}
+
+fn annotation_dimension_range(
+    scope: &FunctionShapeScope,
+    operand: Node,
+    axis: usize,
+    value: &str,
+    text: &str,
+) -> Option<tree_sitter::Range> {
+    if operand.kind() != "identifier" {
+        return None;
+    }
+    let binding = operand.utf8_text(text.as_bytes()).ok()?;
+    scope
+        .dimension_sites
+        .iter()
+        .rev()
+        .find(|site| {
+            site.binding.as_deref() == Some(binding)
+                && site.axis == axis
+                && site.range.end_byte <= operand.start_byte()
+                && dims_canonically_equal(&site.value, value)
+        })
+        .map(|site| site.range)
+}
+
+fn transpose_fix(
+    node: Node,
+    right_node: Node,
+    left_shape: &[String],
+    right_shape: &[String],
+    left_name: &str,
+    right_name: &str,
+) -> Option<ShapeFix> {
+    if right_shape.len() != 2
+        || !matches!(
+            right_node.kind(),
+            "identifier" | "attribute" | "call" | "subscript" | "parenthesized_expression"
+        )
+    {
+        return None;
+    }
+    let mut transposed = right_shape.to_vec();
+    transposed.reverse();
+    matches!(
+        apply_matmul_shape(left_shape, &transposed, left_name, right_name),
+        Ok(Some(_))
+    )
+    .then_some(ShapeFix::AppendTranspose {
+        expression_range: node.range(),
+        operand_range: right_node.range(),
+    })
+}
+
 fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let left_node = node.child_by_field_name("left")?;
     let right_node = node.child_by_field_name("right")?;
@@ -768,8 +869,44 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
                 right_name,
                 right_shape.join(", ")
             );
-            let error = ShapeError::mismatch(var_text, message, node.range())
-                .with_related(right_node.range(), related_message);
+            let (primary_range, related_range) = binary_mismatch_axes(
+                &left_shape,
+                &right_shape,
+                op,
+            )
+            .and_then(|(left_axis, right_axis)| {
+                let scope = &ctx.scopes[scope_idx];
+                let left_range = annotation_dimension_range(
+                    scope,
+                    left_node,
+                    left_axis,
+                    &left_shape[left_axis],
+                    ctx.text,
+                )?;
+                let right_range = annotation_dimension_range(
+                    scope,
+                    right_node,
+                    right_axis,
+                    &right_shape[right_axis],
+                    ctx.text,
+                )?;
+                Some((left_range, right_range))
+            })
+            .unwrap_or((node.range(), right_node.range()));
+            let mut error = ShapeError::mismatch(var_text, message, primary_range)
+                .with_related(related_range, related_message);
+            if matches!(op, BinaryOp::MatMul)
+                && let Some(fix) = transpose_fix(
+                    node,
+                    right_node,
+                    &left_shape,
+                    &right_shape,
+                    left_name,
+                    right_name,
+                )
+            {
+                error = error.with_fix(fix);
+            }
             ctx.errors.push(error);
             None
         }
@@ -1066,7 +1203,15 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             if let Some(attr) = callable.strip_prefix("self.")
                 && let Some(layer) = ctx.self_attr_layer_at(attr, call_byte).cloned()
             {
-                return apply_inline_vmap_layer(&layer, &rest, 0, 0, scope_idx, args_node.range(), ctx);
+                return apply_inline_vmap_layer(
+                    (&callable, &layer),
+                    &rest,
+                    0,
+                    0,
+                    scope_idx,
+                    args_node.range(),
+                    ctx,
+                );
             }
             if !callable.contains('.') {
                 let info = VmapInfo {
@@ -2831,7 +2976,7 @@ fn shape_of_inline_vmap(
             .cloned()
     {
         return apply_inline_vmap_layer_chain(
-            &layer,
+            (&callable, &layer),
             &outer_args,
             &axes,
             scope_idx,
@@ -2937,7 +3082,7 @@ fn shape_of_inline_layer(
 /// `in_axes`, run the layer's normal shape rule on the per-element shape,
 /// then re-insert the batch dim at `out_axes`.
 fn apply_inline_vmap_layer(
-    layer: &LayerKind,
+    layer: (&str, &LayerKind),
     outer_args: &[CallArgument],
     in_axes: isize,
     out_axes: isize,
@@ -2955,13 +3100,14 @@ fn apply_inline_vmap_layer(
 /// shape rule on the fully-peeled per-example shape, then re-prepends the
 /// batch dims outward-to-inward in reverse.
 fn apply_inline_vmap_layer_chain(
-    layer: &LayerKind,
+    layer: (&str, &LayerKind),
     outer_args: &[CallArgument],
     axes: &[(isize, isize)],
     scope_idx: usize,
     range: tree_sitter::Range,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
+    let (layer_name, layer) = layer;
     let input_name = outer_args.iter().find_map(|a| match a {
         CallArgument::Positional { value } => Some(value.clone()),
         _ => None,
@@ -2990,15 +3136,7 @@ fn apply_inline_vmap_layer_chain(
         return Some(output);
     }
 
-    let synth = ctx.bind_synthetic(shape, scope_idx, range.start_byte);
-    let application = LayerApplication {
-        variable: String::new(),
-        layer: "vmap".to_string(),
-        input: synth,
-        kind: layer.clone(),
-        range,
-    };
-    let mut output = match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
+    let mut output = match apply_layer_kind(layer, &shape, layer_name, &input_name) {
         Ok(Some(output)) => output,
         Ok(None) => return None,
         Err(message) => {

@@ -62,7 +62,8 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "x"), Some(&shape(&["batch", "3"])));
@@ -136,7 +137,8 @@ mod analyze_layer_shapes_tests {
         let tree = parse(code);
         let roots = vec![tmp.path().to_path_buf()];
 
-        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
@@ -668,6 +670,7 @@ mod end_to_end_layer_shape_tests {
             return_shape: None,
             param_order: Vec::new(),
         all_params: Vec::new(),
+            dimension_sites: Vec::new(),
         }]
     }
 
@@ -1560,7 +1563,17 @@ mod additional_edge_case_tests {
         []
     );
     annotation_case!(
-        ann_numpy_ndarray_rejected_for_now,
+        ann_numpy_style_ndarray_shape,
+        "def f(x: NDArray[Shape[\"a, b\"], Float]): pass",
+        [("x", ["a", "b"])]
+    );
+    annotation_case!(
+        ann_dtype_only_ndarray_rejected,
+        "def f(x: NDArray[Float]): pass",
+        []
+    );
+    annotation_case!(
+        ann_numpy_ndarray_without_shape_rejected,
         "def f(x: Float[np.ndarray, \"b d\"]): pass",
         []
     );
@@ -1580,10 +1593,20 @@ mod additional_edge_case_tests {
         [("x", ["b", "d"])]
     );
     annotation_case!(
-        ann_shape_with_comma_kept_as_token,
-        "def f(x: Float[Array, \"b, d\"]): pass",
-        [("x", ["b,", "d"])]
+        ann_shape_comma_separates_dimensions,
+        "def f(x: Float[Array, \"b,d\"]): pass",
+        [("x", ["b", "d"])]
     );
+
+    #[test]
+    fn ann_qualified_numpy_style_ndarray_return_shape() {
+        let code = "def f(x: nptyping.NDArray[nptyping.Shape[\"a, b\"], nptyping.Float]) -> nptyping.NDArray[nptyping.Shape[\"a, c\"], nptyping.Float]: pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        let scope = &scopes[1];
+        assert_eq!(scope.shapes["x"], vec!["a", "b"]);
+        assert_eq!(scope.return_shape, Some(vec!["a".to_string(), "c".to_string()]));
+    }
     annotation_case!(
         ann_newline_inside_shape_splits_whitespace,
         "def f(x: Float[Array, \"b\\nd\"]): pass",
@@ -2089,6 +2112,7 @@ mod torch_nn_linear_tests {
             return_shape: None,
             param_order: Vec::new(),
         all_params: Vec::new(),
+            dimension_sites: Vec::new(),
         }]
     }
 
@@ -2360,8 +2384,8 @@ mod binary_op_propagation_tests {
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
         // variable is empty for return-statement ops
         assert_eq!(analysis.errors[0].variable, "");
-        // range should cover the `x @ y` expression
-        assert_eq!(&code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte], "x @ y");
+        // The primary range selects the exact conflicting left dimension.
+        assert_eq!(&code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte], "b");
     }
 
     #[test]
@@ -5948,6 +5972,73 @@ class M(eqx.Module):
     }
 
     #[test]
+    fn test_inline_vmap_self_attr_layers_stay_class_scoped() {
+        // The same attribute name in two classes must use each class's layer.
+        // A file-global last-wins lookup makes class A use class B's dimensions.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import equinox as eqx
+class A(eqx.Module):
+    qkv: eqx.nn.Linear
+
+    def __init__(self, key):
+        self.qkv = eqx.nn.Linear(4, 12, key=key)
+
+    def run_a(self, x: Float[Array, "seq_a 4"]):
+        y = jax.vmap(self.qkv)(x)
+
+class B(eqx.Module):
+    qkv: eqx.nn.Linear
+
+    def __init__(self, key):
+        self.qkv = eqx.nn.Linear(8, 24, key=key)
+
+    def run_b(self, x: Float[Array, "seq_b 8"]):
+        y = jax.vmap(self.qkv)(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty(), "errors: {:?}", analysis.errors);
+        assert_eq!(
+            find_shape_in_scope(&analysis, "run_a", "y"),
+            Some(&shape(&["seq_a", "12"]))
+        );
+        assert_eq!(
+            find_shape_in_scope(&analysis, "run_b", "y"),
+            Some(&shape(&["seq_b", "24"]))
+        );
+    }
+
+    #[test]
+    fn test_inline_vmap_layer_error_uses_source_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = r#"
+import jax
+import equinox as eqx
+class M(eqx.Module):
+    qkv: eqx.nn.Linear
+
+    def __init__(self, key):
+        self.qkv = eqx.nn.Linear(8, 16, key=key)
+
+    def run(self, x: Float[Array, "seq 7"]):
+        y = jax.vmap(self.qkv)(x)
+"#;
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "errors: {:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors[0].message,
+            "Linear layer 'self.qkv' expected input last dim 8, got 7 for 'x'"
+        );
+    }
+
+    #[test]
     fn test_symbolic_dim_normalization_self_attr_alias() {
         // `self.dt_rank` (from a split index) and `dt_rank` (the Linear
         // in_features) are the same value via `self.dt_rank = dt_rank`. Without
@@ -7481,15 +7572,41 @@ mod multihead_attention_tests {
     }
 }
 
-/// Timing harness over `bench/benchmark_large.py` (regenerate with
-/// `python3 bench/generate_benchmark.py`). Not part of the default suite.
-/// Run with: `cargo test --release bench_large_file -- --ignored --nocapture`.
+/// Correctness and timing harnesses over `bench/benchmark_large.py` (regenerate
+/// with `python3 bench/generate_benchmark.py`). The default suite runs one
+/// correctness pass; the repeated timing harness stays ignored.
+/// Run timing with: `cargo test --release bench_large_file -- --ignored --nocapture`.
 #[cfg(test)]
 mod bench_harness {
     use super::*;
     use std::fs;
     use std::time::Instant;
     use tree_sitter::Parser;
+
+    #[test]
+    fn benchmark_large_diagnostics_match_oracle() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/benchmark_large.py");
+        let code = fs::read_to_string(&path).unwrap();
+        let roots: Vec<PathBuf> = Vec::new();
+        let cache = new_resolution_cache();
+        let read = |_: &PathBuf| -> Option<String> { None };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        let analysis = analyze_layer_shapes(
+            tree.root_node(),
+            &code,
+            &roots,
+            read,
+            5,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_benchmark_diagnostics(&code, tree.root_node(), &analysis.errors);
+    }
 
     #[test]
     #[ignore]
@@ -7529,13 +7646,9 @@ mod bench_harness {
             println!("    {:>3}x  {}", n, m);
         }
         assert!(shaped > 1000, "expected >1000 inferred shapes, got {shaped}");
-        let deliberate = code.matches("# expected-error:").count();
-        assert_eq!(
-            warm.errors.len(),
-            deliberate,
-            "diagnostics should match the deliberate '# expected-error:' markers exactly \
-             (fewer = missed detection, more = false positives)"
-        );
+
+        let tree = parser.parse(&code, None).unwrap();
+        assert_benchmark_diagnostics(&code, tree.root_node(), &warm.errors);
         // Keystroke budget: parse + analyze should stay well under one frame-ish
         // interval even in debug. Release should be far below this.
         assert!(
@@ -7543,6 +7656,72 @@ mod bench_harness {
             "analyze median {:.1} ms exceeds 1s regression tripwire",
             med(&analyze_times)
         );
+    }
+
+    fn assert_benchmark_diagnostics(
+        code: &str,
+        root: tree_sitter::Node,
+        errors: &[ShapeError],
+    ) {
+        // A count-only check can hide one missed marker behind one false positive.
+        // Require exactly one diagnostic inside each marked top-level definition.
+        let marked_ranges: Vec<_> = code
+            .match_indices("# expected-error:")
+            .map(|(byte, _)| {
+                let mut definition = root.descendant_for_byte_range(byte, byte + 1).unwrap();
+                while let Some(parent) = definition.parent() {
+                    if parent.kind() == "module" {
+                        break;
+                    }
+                    definition = parent;
+                }
+                definition.byte_range()
+            })
+            .collect();
+        let mut diagnostic_counts = vec![0; marked_ranges.len()];
+        for error in errors {
+            let Some(index) = marked_ranges
+                .iter()
+                .position(|range| range.contains(&error.range.start_byte))
+            else {
+                panic!(
+                    "unexpected diagnostic outside an expected-error block at line {}: {}",
+                    error.range.start_point.row + 1,
+                    error.message
+                );
+            };
+            diagnostic_counts[index] += 1;
+        }
+        assert_eq!(
+            diagnostic_counts,
+            vec![1; marked_ranges.len()],
+            "each '# expected-error:' block must produce exactly one diagnostic"
+        );
+
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(
+            "Linear layer 'self.fc2' expected input last dim 32, got 64 for 'h'".to_string(),
+            5,
+        );
+        for i in [0, 6, 12, 18, 24] {
+            expected.insert(
+                format!(
+                    "matmul dimension mismatch: a last dim k{i} != b second-to-last dim j{i}"
+                ),
+                1,
+            );
+            expected.insert(
+                format!(
+                    "concatenate dimension mismatch at axis 1: expected c{i}, got e{i}"
+                ),
+                1,
+            );
+        }
+        let mut actual = std::collections::BTreeMap::new();
+        for error in errors {
+            *actual.entry(error.message.clone()).or_default() += 1;
+        }
+        assert_eq!(actual, expected, "benchmark diagnostics changed");
     }
 
     fn run_with(
@@ -8670,27 +8849,65 @@ mod binary_op_related_information_tests {
     }
 
     #[test]
-    fn matmul_mismatch_related_info_points_at_right_operand() {
-        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"2 3\"], b: Float[Array, \"4 5\"]):\n    y = a @ b";
+    fn matmul_mismatch_points_at_exact_annotation_dimensions() {
+        let code = r#"import jax.numpy as jnp
+def f(a: Float[Array, "2 3"], b: Float[Array, "4 5"]):
+    y = a @ b"#;
         let analysis = analyze(code);
 
         assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         let err = &analysis.errors[0];
         let (related_range, related_message) = err.related.as_ref().expect("related info");
         assert_eq!(related_message, "other operand `b`: shape [4, 5]");
-        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "b");
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "3");
+        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "4");
     }
 
     #[test]
-    fn elementwise_mismatch_related_info_points_at_right_operand() {
-        let code = "import jax.numpy as jnp\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"4\"]):\n    y = a + b";
+    fn elementwise_mismatch_points_at_exact_annotation_dimensions() {
+        let code = r#"import jax.numpy as jnp
+def f(a: Float[Array, "3"], b: Float[Array, "4"]):
+    y = a + b"#;
         let analysis = analyze(code);
 
         assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         let err = &analysis.errors[0];
         let (related_range, related_message) = err.related.as_ref().expect("related info");
         assert_eq!(related_message, "other operand `b`: shape [4]");
-        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "b");
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "3");
+        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "4");
+    }
+
+    #[test]
+    fn matmul_batch_mismatch_points_at_exact_annotation_dimensions() {
+        let code = r#"def f(a: Float[Array, "left_batch rows inner"], b: Float[Array, "right_batch inner cols"]):
+    y = a @ b"#;
+        let analysis = analyze(code);
+        let err = &analysis.errors[0];
+        let (related_range, _) = err.related.as_ref().expect("related info");
+
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "left_batch");
+        assert_eq!(&code[related_range.start_byte..related_range.end_byte], "right_batch");
+    }
+
+    #[test]
+    fn matmul_marks_only_a_proved_rank_two_transpose_fix() {
+        let code = r#"def f(a: Float[Array, "m k"], b: Float[Array, "n k"]):
+    y = a @ b"#;
+        let analysis = analyze(code);
+        let fix = analysis.errors[0].fix.as_ref().expect("transpose fix");
+        let ShapeFix::AppendTranspose { operand_range, .. } = fix;
+        assert_eq!(&code[operand_range.start_byte..operand_range.end_byte], "b");
+
+        let unsafe_code = r#"def f(a: Float[Array, "m k"], b: Float[Array, "n p"]):
+    y = a @ b"#;
+        let unsafe_analysis = analyze(unsafe_code);
+        assert!(unsafe_analysis.errors[0].fix.is_none());
+
+        let batched_code = r#"def f(a: Float[Array, "batch m k"], b: Float[Array, "other n k"]):
+    y = a @ b"#;
+        let batched_analysis = analyze(batched_code);
+        assert!(batched_analysis.errors[0].fix.is_none());
     }
 
     #[test]

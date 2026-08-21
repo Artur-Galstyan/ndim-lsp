@@ -7,14 +7,16 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, InlayHintTooltip, Location,
-    MarkupContent, MarkupKind, MessageType, OneOf,
-    Position, PositionEncodingKind, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, Diagnostic, DiagnosticRelatedInformation,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
+    InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, Range,
+    ServerCapabilities, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Parser, Tree};
@@ -83,6 +85,14 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: Some(false),
+                        ..Default::default()
+                    },
+                )),
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -198,6 +208,40 @@ impl LanguageServer for Backend {
         }
         drop(doc_lock);
         Ok(self.compute_inlay_hints(&uri, &visible_range).await)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        self.on_goto_definition(&uri, &position).await
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let version = {
+            let versions = self.document_version.read().await;
+            versions.get(&uri).copied()
+        };
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        let Some(cached) = self.get_analysis(&uri, version).await else {
+            return Ok(None);
+        };
+        if self.document_version.read().await.get(&uri).copied() != Some(version) {
+            return Ok(None);
+        }
+        Ok(Some(transpose_quick_fixes(
+            &cached.analysis,
+            &cached.text,
+            &uri,
+            version,
+            &params.range,
+            params.context.only.as_deref(),
+        )))
     }
 }
 
@@ -360,7 +404,15 @@ impl Backend {
             .errors
             .iter()
             .cloned()
-            .map(|e| shape_error_to_diagnostic(e, uri, mismatch_severity, approximation_severity))
+            .map(|e| {
+                shape_error_to_diagnostic(
+                    e,
+                    uri,
+                    &cached.text,
+                    mismatch_severity,
+                    approximation_severity,
+                )
+            })
             .collect();
 
         self.client
@@ -490,8 +542,10 @@ impl Backend {
             None => return Ok(None),
         };
         let root = cached.tree.root_node();
-        let point = tree_sitter::Point::new(pos.line as usize, pos.character as usize);
-        let Some(node) = root.descendant_for_point_range(point, point) else {
+        let Some(cursor_byte) = lsp_position_to_byte(&cached.text, pos) else {
+            return Ok(None);
+        };
+        let Some(node) = root.descendant_for_byte_range(cursor_byte, cursor_byte) else {
             return Ok(None);
         };
         if node.kind() != "identifier" {
@@ -501,8 +555,6 @@ impl Backend {
             Ok(v) => v.to_string(),
             Err(_) => return Ok(None),
         };
-        let cursor_byte = node.start_byte();
-
         // If the document advanced while we were waiting on `get_analysis`,
         // `cursor_byte` points into stale text and `analysis.scopes` byte
         // ranges may have moved. Bail; the editor will re-request.
@@ -531,7 +583,7 @@ impl Backend {
         };
 
         let hover_content = format_hover(&var_name, &shape);
-        let hover_range = ts_range_to_lsp_range(node.range());
+        let hover_range = ts_range_to_lsp_range(&cached.text, node.range());
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -540,6 +592,37 @@ impl Backend {
             }),
             range: Some(hover_range),
         }))
+    }
+
+    async fn on_goto_definition(
+        &self,
+        uri: &Url,
+        position: &Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let version = {
+            let versions = self.document_version.read().await;
+            versions.get(uri).copied()
+        };
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        let Some(cached) = self.get_analysis(uri, version).await else {
+            return Ok(None);
+        };
+        if self.document_version.read().await.get(uri).copied() != Some(version) {
+            return Ok(None);
+        }
+        let Some(range) = find_dimension_definition(
+            &cached.analysis.scopes,
+            &cached.text,
+            position,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: ts_range_to_lsp_range(&cached.text, range),
+        })))
     }
 }
 
@@ -571,6 +654,103 @@ fn find_shape_for_variable(
         }
     }
     None
+}
+
+fn is_symbolic_dimension(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn find_dimension_definition(
+    scopes: &[ndim_lsp::FunctionShapeScope],
+    text: &str,
+    position: &Position,
+) -> Option<tree_sitter::Range> {
+    let byte = lsp_position_to_byte(text, position)?;
+    let scope = ndim_lsp::scope_for_byte(scopes, byte)?;
+    let current = scope
+        .dimension_sites
+        .iter()
+        .find(|site| site.range.start_byte <= byte && byte < site.range.end_byte)?;
+    if !is_symbolic_dimension(&current.value) {
+        return None;
+    }
+    scope
+        .dimension_sites
+        .iter()
+        .filter(|site| site.value == current.value)
+        .min_by_key(|site| site.range.start_byte)
+        .map(|site| site.range)
+}
+
+fn position_is_before_or_equal(left: &Position, right: &Position) -> bool {
+    left.line < right.line || (left.line == right.line && left.character <= right.character)
+}
+
+fn ranges_intersect(left: &Range, right: &Range) -> bool {
+    position_is_before_or_equal(&left.start, &right.end)
+        && position_is_before_or_equal(&right.start, &left.end)
+}
+
+fn transpose_quick_fixes(
+    analysis: &LayerShapeAnalysis,
+    text: &str,
+    uri: &Url,
+    version: i32,
+    requested_range: &Range,
+    only: Option<&[CodeActionKind]>,
+) -> CodeActionResponse {
+    if only.is_some_and(|kinds| {
+        !kinds
+            .iter()
+            .any(|kind| kind.as_str() == CodeActionKind::QUICKFIX.as_str())
+    }) {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+    for error in &analysis.errors {
+        let Some(ndim_lsp::ShapeFix::AppendTranspose {
+            expression_range,
+            operand_range,
+        }) = error.fix.as_ref()
+        else {
+            continue;
+        };
+        let error_range = ts_range_to_lsp_range(text, error.range);
+        let expression_range = ts_range_to_lsp_range(text, *expression_range);
+        if !ranges_intersect(requested_range, &error_range)
+            && !ranges_intersect(requested_range, &expression_range)
+        {
+            continue;
+        }
+        let Some(position) = byte_to_lsp_position(text, operand_range.end_byte) else {
+            continue;
+        };
+        let edit = TextEdit {
+            range: Range {
+                start: position,
+                end: position,
+            },
+            new_text: ".T".to_string(),
+        };
+        let workspace_edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
+                edits: vec![OneOf::Left(edit)],
+            }])),
+            ..Default::default()
+        };
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Append .T to the right operand".to_string(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            edit: Some(workspace_edit),
+            is_preferred: Some(true),
+            ..Default::default()
+        }));
+    }
+    actions
 }
 
 /// Format the variable name and shape into a Python-annotated string.
@@ -633,6 +813,7 @@ fn parse_severity(
 fn shape_error_to_diagnostic(
     error: ShapeError,
     uri: &Url,
+    text: &str,
     mismatch_severity: DiagnosticSeverity,
     approximation_severity: DiagnosticSeverity,
 ) -> Diagnostic {
@@ -644,13 +825,13 @@ fn shape_error_to_diagnostic(
         vec![DiagnosticRelatedInformation {
             location: Location {
                 uri: uri.clone(),
-                range: ts_range_to_lsp_range(range),
+                range: ts_range_to_lsp_range(text, range),
             },
             message,
         }]
     });
     Diagnostic {
-        range: ts_range_to_lsp_range(error.range),
+        range: ts_range_to_lsp_range(text, error.range),
         severity: Some(severity),
         source: Some("ndim-lsp".to_string()),
         message: if error.variable.is_empty() {
@@ -664,16 +845,56 @@ fn shape_error_to_diagnostic(
     }
 }
 
-fn ts_range_to_lsp_range(ts: tree_sitter::Range) -> Range {
+fn byte_to_lsp_position(text: &str, byte: usize) -> Option<Position> {
+    if byte > text.len() || !text.is_char_boundary(byte) {
+        return None;
+    }
+    let prefix = &text[..byte];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+    Some(Position {
+        line,
+        character: text[line_start..byte].encode_utf16().count() as u32,
+    })
+}
+
+fn lsp_position_to_byte(text: &str, position: &Position) -> Option<usize> {
+    let line_start = if position.line == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(position.line as usize - 1)
+            .map(|(i, _)| i + 1)?
+    };
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |i| line_start + i);
+    let line = &text[line_start..line_end];
+    let mut utf16 = 0u32;
+    for (offset, ch) in line.char_indices() {
+        if utf16 == position.character {
+            return Some(line_start + offset);
+        }
+        utf16 += ch.len_utf16() as u32;
+        if utf16 > position.character {
+            return None;
+        }
+    }
+    (utf16 == position.character).then_some(line_end)
+}
+
+fn ts_range_to_lsp_range(text: &str, ts: tree_sitter::Range) -> Range {
+    let fallback_start = Position {
+        line: ts.start_point.row as u32,
+        character: ts.start_point.column as u32,
+    };
+    let fallback_end = Position {
+        line: ts.end_point.row as u32,
+        character: ts.end_point.column as u32,
+    };
     Range {
-        start: Position {
-            line: ts.start_point.row as u32,
-            character: ts.start_point.column as u32,
-        },
-        end: Position {
-            line: ts.end_point.row as u32,
-            character: ts.end_point.column as u32,
-        },
+        start: byte_to_lsp_position(text, ts.start_byte).unwrap_or(fallback_start),
+        end: byte_to_lsp_position(text, ts.end_byte).unwrap_or(fallback_end),
     }
 }
 
@@ -762,6 +983,15 @@ async fn main() {
 mod tests {
     use super::*;
 
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
     #[test]
     fn parse_severity_maps_values() {
         use serde_json::json;
@@ -832,6 +1062,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             mismatch,
             &uri,
+            "x",
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -840,16 +1071,17 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             approximation,
             &uri,
+            "y",
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
         assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
 
-        // Approximation severity is independent of a custom mismatch severity.
         let approximation2 = ShapeError::approximation("z", "approx shape", range);
         let diag = shape_error_to_diagnostic(
             approximation2,
             &uri,
+            "z",
             DiagnosticSeverity::HINT,
             DiagnosticSeverity::INFORMATION,
         );
@@ -858,6 +1090,7 @@ mod tests {
 
     #[test]
     fn shape_error_to_diagnostic_maps_related_information() {
+        let text = "x\n  abc";
         let range = tree_sitter::Range {
             start_point: tree_sitter::Point::new(0, 0),
             end_point: tree_sitter::Point::new(0, 1),
@@ -867,8 +1100,8 @@ mod tests {
         let related_range = tree_sitter::Range {
             start_point: tree_sitter::Point::new(1, 2),
             end_point: tree_sitter::Point::new(1, 5),
-            start_byte: 10,
-            end_byte: 13,
+            start_byte: 4,
+            end_byte: 7,
         };
         let uri = Url::parse("file:///test.py").unwrap();
         let error = ShapeError::mismatch("y", "matmul dimension mismatch", range)
@@ -877,6 +1110,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             error,
             &uri,
+            text,
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -884,7 +1118,7 @@ mod tests {
         let related = diag.related_information.expect("related_information");
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].location.uri, uri);
-        assert_eq!(related[0].location.range, ts_range_to_lsp_range(related_range));
+        assert_eq!(related[0].location.range, ts_range_to_lsp_range(text, related_range));
         assert_eq!(related[0].message, "other operand `b`: shape [n, d]");
     }
 
@@ -898,45 +1132,98 @@ mod tests {
         };
         let uri = Url::parse("file:///test.py").unwrap();
         let error = ShapeError::mismatch("x", "bad shape", range);
-
         let diag = shape_error_to_diagnostic(
             error,
             &uri,
+            "x",
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
-
         assert!(diag.related_information.is_none());
     }
 
     #[test]
-    fn ts_range_to_lsp_range_converts_correctly() {
+    fn lsp_positions_use_utf16_code_units() {
+        let text = "πx\n😀z";
         let ts = tree_sitter::Range {
-            start_point: tree_sitter::Point::new(0, 5),
-            end_point: tree_sitter::Point::new(2, 10),
-            start_byte: 0,
-            end_byte: 0,
+            start_point: tree_sitter::Point::new(0, 2),
+            end_point: tree_sitter::Point::new(1, 5),
+            start_byte: 2,
+            end_byte: 9,
         };
-        let lsp = ts_range_to_lsp_range(ts);
-        assert_eq!(lsp.start.line, 0);
-        assert_eq!(lsp.start.character, 5);
-        assert_eq!(lsp.end.line, 2);
-        assert_eq!(lsp.end.character, 10);
+        let lsp = ts_range_to_lsp_range(text, ts);
+        assert_eq!(lsp.start, Position { line: 0, character: 1 });
+        assert_eq!(lsp.end, Position { line: 1, character: 3 });
+        assert_eq!(lsp_position_to_byte(text, &lsp.start), Some(2));
+        assert_eq!(lsp_position_to_byte("😀", &Position { line: 0, character: 1 }), None);
     }
 
     #[test]
-    fn ts_range_to_lsp_range_zero_based() {
-        let ts = tree_sitter::Range {
-            start_point: tree_sitter::Point::new(0, 0),
-            end_point: tree_sitter::Point::new(0, 1),
-            start_byte: 0,
-            end_byte: 0,
+    fn dimension_definition_uses_first_name_in_the_same_scope() {
+        let code = r#"def first(x: Float[Array, "n width"], y: Float[Array, "n width"]):
+    pass
+
+def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
+    pass"#;
+        let analysis = analyze(code);
+        let use_byte = code.rfind("n width").unwrap();
+        let position = byte_to_lsp_position(code, use_byte).unwrap();
+        let definition = find_dimension_definition(&analysis.scopes, code, &position).unwrap();
+        let second_start = code.find("def second").unwrap();
+
+        assert!(definition.start_byte > second_start);
+        assert_eq!(&code[definition.start_byte..definition.end_byte], "n");
+    }
+
+    #[test]
+    fn dimension_definition_skips_concrete_and_expression_dimensions() {
+        let code = r#"def f(x: Float[Array, "3 hidden*2"]):
+    pass"#;
+        let analysis = analyze(code);
+        for token in ["3", "hidden*2"] {
+            let byte = code.find(token).unwrap();
+            let position = byte_to_lsp_position(code, byte).unwrap();
+            assert!(find_dimension_definition(&analysis.scopes, code, &position).is_none());
+        }
+    }
+
+    #[test]
+    fn transpose_quick_fix_is_versioned_and_utf16_safe() {
+        let code = r#"def f(α: Float[Array, "m k"], b: Float[Array, "n k"]):
+    y = α @ b"#;
+        let analysis = analyze(code);
+        let ndim_lsp::ShapeFix::AppendTranspose { expression_range, .. } =
+            analysis.errors[0].fix.as_ref().unwrap();
+        let request_range = ts_range_to_lsp_range(code, *expression_range);
+        let uri = Url::parse("file:///test.py").unwrap();
+        let actions = transpose_quick_fixes(&analysis, code, &uri, 7, &request_range, None);
+
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
         };
-        let lsp = ts_range_to_lsp_range(ts);
-        assert_eq!(lsp.start.line, 0);
-        assert_eq!(lsp.start.character, 0);
-        assert_eq!(lsp.end.line, 0);
-        assert_eq!(lsp.end.character, 1);
+        assert_eq!(action.title, "Append .T to the right operand");
+        let changes = action.edit.as_ref().unwrap().document_changes.as_ref().unwrap();
+        let DocumentChanges::Edits(edits) = changes else {
+            panic!("expected versioned edits");
+        };
+        assert_eq!(edits[0].text_document.version, Some(7));
+        let OneOf::Left(edit) = &edits[0].edits[0] else {
+            panic!("expected text edit");
+        };
+        assert_eq!(edit.new_text, ".T");
+        assert_eq!(edit.range.start, edit.range.end);
+        assert_eq!(lsp_position_to_byte(code, &edit.range.start), code.rfind('b').map(|i| i + 1));
+
+        let filtered = transpose_quick_fixes(
+            &analysis,
+            code,
+            &uri,
+            7,
+            &request_range,
+            Some(&[CodeActionKind::REFACTOR]),
+        );
+        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -980,6 +1267,7 @@ mod tests {
                 return_shape: None,
                 param_order: Vec::new(),
             all_params: Vec::new(),
+            dimension_sites: Vec::new(),
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
@@ -989,6 +1277,7 @@ mod tests {
                 return_shape: None,
                 param_order: Vec::new(),
             all_params: Vec::new(),
+            dimension_sites: Vec::new(),
             },
         ];
 
@@ -1016,6 +1305,7 @@ mod tests {
                 return_shape: None,
                 param_order: Vec::new(),
             all_params: Vec::new(),
+            dimension_sites: Vec::new(),
             },
             FunctionShapeScope {
                 function_name: Some("foo".into()),
@@ -1025,6 +1315,7 @@ mod tests {
                 return_shape: None,
                 param_order: Vec::new(),
             all_params: Vec::new(),
+            dimension_sites: Vec::new(),
             },
         ];
 
@@ -1046,6 +1337,7 @@ mod tests {
             return_shape: None,
             param_order: Vec::new(),
         all_params: Vec::new(),
+            dimension_sites: Vec::new(),
         }];
 
         let result = find_shape_for_variable(&scopes, 50, "z");

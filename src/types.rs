@@ -805,6 +805,14 @@ pub enum ShapeErrorKind {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum ShapeFix {
+    AppendTranspose {
+        expression_range: Range,
+        operand_range: Range,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct ShapeError {
     pub variable: String,
     pub message: String,
@@ -815,6 +823,7 @@ pub struct ShapeError {
     /// surfaced as LSP `DiagnosticRelatedInformation` by `main.rs`. `None`
     /// for errors that don't have a natural second location.
     pub related: Option<(Range, String)>,
+    pub fix: Option<ShapeFix>,
 }
 
 impl ShapeError {
@@ -826,6 +835,7 @@ impl ShapeError {
             range,
             kind: ShapeErrorKind::Mismatch,
             related: None,
+            fix: None,
         }
     }
 
@@ -843,6 +853,7 @@ impl ShapeError {
             range,
             kind: ShapeErrorKind::Approximation,
             related: None,
+            fix: None,
         }
     }
 
@@ -853,6 +864,19 @@ impl ShapeError {
         self.related = Some((range, message.into()));
         self
     }
+
+    pub fn with_fix(mut self, fix: ShapeFix) -> Self {
+        self.fix = Some(fix);
+        self
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ShapeDimensionSite {
+    pub binding: Option<String>,
+    pub axis: usize,
+    pub value: String,
+    pub range: Range,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -874,6 +898,7 @@ pub struct FunctionShapeScope {
     /// jaxtyping-annotated params, so its index doesn't match the true
     /// declared position when annotated and un-annotated params are mixed.
     pub all_params: Vec<String>,
+    pub dimension_sites: Vec<ShapeDimensionSite>,
 }
 
 /// One record per (non-annotated) assignment that produced a shape, in the

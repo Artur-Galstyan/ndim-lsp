@@ -1649,7 +1649,7 @@ pub fn apply_layer_application(
 /// `apply_layer_application` so `LayerKind::Sequential` can thread a shape
 /// through each child's rule in turn without needing a `ShapeLookup`/
 /// `LayerApplication` for intermediate (unnamed) shapes.
-fn apply_layer_kind(
+pub(crate) fn apply_layer_kind(
     kind: &LayerKind,
     input_shape: &[String],
     layer: &str,
@@ -2417,6 +2417,7 @@ mod apply_layer_applications_tests {
             return_shape: None,
             param_order: Vec::new(),
         all_params: Vec::new(),
+            dimension_sites: Vec::new(),
         }]
     }
 

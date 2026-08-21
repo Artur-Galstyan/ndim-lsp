@@ -8,7 +8,7 @@ Legend:
 - **Shape rule**: analyzer can actually infer/check output shapes for the function.
 - **Tests**: shape-rule behavior has focused tests.
 
-> Current state: many functions are classified as known, but shape rules are mostly not implemented yet. `equinox.nn.Linear` layer handling is implemented separately from this built-in-function registry.
+> Current state: all catalog entries that fit the current array-shape model have shape rules. Tests cover each rule directly or through its shared dispatch path. Remaining ❌ entries need richer control-flow/value tracking or return non-array values. Layer handling uses a separate registry in `layers.rs`.
 
 ## JAX higher-order functions
 
@@ -418,11 +418,23 @@ Legend:
 | `x.diagonal(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Diagonal`'s rule (method form of `torch.diagonal`). |
 | `x.tril(...)` / `x.triu(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Tril`/`KnownFunction::Triu`'s shape-preserving rules. |
 
+## Annotation inputs
+
+Annotation parsing is outside the built-in-function registry, but it seeds every rule in this tracker.
+
+- `jaxtyping` forms such as `Float[Array, "batch features"]` support whitespace-separated dimensions.
+- NumPy-style forms such as `NDArray[Shape["batch, features"], Float]` support qualified names and comma-separated dimensions.
+- Parameter and return annotations support symbolic names and concrete integer dimensions.
+- Same-file and imported helper calls bind annotated parameter dimensions into annotated return shapes.
+- Exact annotation-token ranges drive binary mismatch diagnostics and same-scope definition lookup for simple symbolic dimensions.
+- A matmul quick fix appends `.T` only when the analyzer proves that the rank-2 transpose removes the mismatch.
+- Flat symbolic sums and products compare canonically. Full algebra, nested substitution, generics, and `TypeVar` mapping remain open.
+
 ## Lazy call-site parameter seeding
 
 Closes the architectural limit documented in `llm.txt`'s "Known
 architectural limit (the next big thing)": previously, a callee whose
-parameters weren't jaxtyping-annotated could never be shaped, even when
+parameters had no shape annotations could never be shaped, even when
 every call site passed fully-shaped arguments — `lax.scan` body functions
 destructuring their carry, nested closures, and helper functions relying on
 inference all went dark.
@@ -481,42 +493,20 @@ inference all went dark.
 
 ## Open targets (current)
 
-Earlier suggested-order items (concatenate/stack, reductions, reshape/flatten,
-transpose family, expand_dims/squeeze, broadcast_to, matmul/dot, array creation,
-method-call equivalents, Linear/Conv layers) are all done. So are: `split`
-tuple-unpacking + `L, _ = x.shape` (#30), `self.<field>` lookup (#31), nested/
-chained calls (#40), vmap of attribute callables + inline vmap (#35), diagnostic
-severity config (#45), and same-file cross-function tracing via `-> Float[...]`
-return annotations — plus, for same-file `self.<method>(...)` callees with
-*no* return annotation (the common `forward(self, x: Float[Array, "..."])`
-style), a body-tracing fallback: a single, non-nested bare `return <name>`
-statement's shape is read from the callee's own already-computed body
-shapes (methods are analyzed in one global source-order pass, so an
-earlier-defined callee like `forward` has already shaped its locals by the
-time a later sibling method calls it) — see `trace_user_function_return` /
-`trace_bare_return_identifier` in `analysis.rs`. Cross-*file* callees still
-need an explicit annotation (tracing isn't wired through
-`apply_imported_user_function` yet); an inline-expression or tuple return
-isn't traced either (v1, deliberately conservative).
+The catalog pass is complete. The remaining ❌ rows need analysis beyond a single array-shape rule:
 
-**Prioritization is harness-driven** — run `cargo test corpus_coverage_report
--- --nocapture` (analyzes `corpus/*.py`, ranks un-shapeable assignments by
-frequency, and lists each as `file:line kind`). Work the top-ranked dark spots
-first; treat the ❌ catalog rows above as low-priority fill-in. Done so far via
-this loop: `shape_of_subscript`, symbolic-dim normalization (`self.<attr>` ≡
-`<attr>`), direct `self.layer(x)` calls, and `split` factor cancellation
-(`d*3` split 3 → `d`). Corpus coverage is **100%** (75/75) across eleven corpus files; the dark spots
-below are the current ranked gap list.
+- Higher-order wrappers (`jit`, the `grad` family, and `pmap`) need wrapped-function and transform semantics.
+- `lax.cond` and `lax.switch` need branch-output analysis and shape unification.
+- Device collectives need mesh and named-axis state.
+- `broadcast_shapes` returns a shape tuple, not an array.
+- `einops.unpack` needs tracked literal values for the `ps` object, while `equinox.nn.Lambda` wraps an arbitrary callable.
 
-Current open work, roughly in impact order:
+Imported helpers with parameter and return annotations now propagate through `resolve_imported_function_shape` and its signature cache. Lazy body seeding remains same-file only, so imported helpers without return annotations stay unknown.
 
-1. **Grow the corpus again** — 100% (176/176) as of the lazy call-site
-   parameter seeding wave (see that section above). Known remaining
-   approximations: strided flax Conv, non-default svd/qr/meshgrid modes.
-   Scan's stacked `ys` output is now modelled for same-file bodies.
-2. **Cross-*file* return-type tracing** — same-file helpers already propagate
-   (including, as of this wave, same-file callees with un-annotated params
-   via lazy call-site parameter seeding); imported helpers don't yet.
-3. **Remaining single-function shape rules** — see ❌ rows above
-   (`diagflat`, `tri`, `indices`, `median`, `cross`, `linalg.solve`/`cholesky`,
-   `hsplit`/`vsplit`/`dsplit`, `take_along_axis`, etc.).
+Run `cargo test corpus_coverage_report -- --nocapture` before a new rule. The harness reports **100% coverage (176/176) across 24 corpus files**, so add representative corpus code before work on a low-impact ❌ row.
+
+Current work, in impact order:
+
+1. **Grow the corpus** with Flax-heavy models, `jax.lax.scan` pipelines, and Torch training steps.
+2. **Add richer tracing when the corpus needs it** for branch merges, user-helper tuple returns, or tracked non-array values.
+3. **Improve expression precision** for symbolic subtraction/division, parenthesized dimensions, and advanced or boolean indexing.
