@@ -3,36 +3,36 @@ ndim-lsp LLM handoff
 
 Purpose
 -------
-ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shape analysis in Python code. The library modules under `src/` carry the analysis logic; `src/main.rs` is now wired end-to-end as a working LSP server (diagnostics, hover, inlay hints) on top of `analyze_layer_shapes`.
+ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shape analysis in Python code. The library modules under `src/` carry the analysis logic; `src/main.rs` is now wired end-to-end as an LSP server (diagnostics, hover, inlay hints, symbolic-dimension definition, and safe matmul fixes) on top of `analyze_layer_shapes`.
 
 Current validation baseline
 ---------------------------
-As of this checkpoint:
+Last verified at `ec66fac` (`ndim-lsp` 0.1.1):
 
-- `cargo test --quiet` passes with ~1764 tests across the lib + integration suites (plus 1 ignored benchmark).
+- `cargo test --quiet` passes: 1,775 tests pass and one benchmark is ignored
+  (1,753 library/integration tests plus 22 LSP-server tests).
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
-  timing harness over `bench/benchmark_large.py` (~4.5k lines, regenerate with
-  `python3 bench/generate_benchmark.py`): parse ~10 ms, analyze ~25 ms median
-  in release. It asserts >1000 inferred shapes and that the diagnostic count
-  exactly equals the file's deliberate `# expected-error:` markers — fewer
-  means missed detection, more means false positives. Treat it as the
-  scale/regression tripwire.
+  timing harness over `bench/benchmark_large.py` (currently 4,541 lines;
+  regenerate with `python3 bench/generate_benchmark.py`). On the validation
+  machine it measured 34.1 ms parse and 124.3 ms analyze medians in release.
+  The timing is machine-dependent. The invariant is >1,000 inferred shapes and
+  a diagnostic count exactly equal to the deliberate `# expected-error:`
+  markers — fewer means missed detection, more means false positives. Treat it
+  as the scale/regression tripwire.
 - `cargo test corpus_coverage_report -- --nocapture` prints a shape-coverage
-  report over `corpus/*.py` (currently mamba_ssm, attention, conv_net,
-  transformer_block), ranks un-shapeable assignments ("dark spots") by
-  frequency, and lists each one as `file:line  kind`. This is the
-  prioritization tool: implement the top-ranked gap, re-measure, then grow the
-  corpus. Coverage is 100% (35/35) on the current four files — the next move is
-  to add more/different model files (RNN/`scan`, embeddings, a CNN with
-  pooling) to surface the next gaps.
+  report over all 24 `corpus/*.py` files, ranks un-shapeable assignments
+  ("dark spots") by frequency, and lists each one as `file:line  kind`. This is
+  the prioritization tool: add a representative model that exposes a gap,
+  implement the top-ranked gap, then re-measure. The current corpus is 176/176
+  (100%), with no dark spots.
 
 Rule for agents working on this repo
 ------------------------------------
 
-**Verify before implementing.** The roadmap in `README.md` lags the codebase. Before adding a known function, layer, or analysis feature, grep first:
+**Verify before implementing.** `src/` is the source of truth; the roadmaps are summaries and may lag it. Before adding a known function, layer, or analysis feature, grep first:
 
 ```sh
 grep -E "KnownFunction::|apply_known_" src/known_functions.rs
@@ -67,8 +67,10 @@ Current file layout
     - `LayerKind`
     - `KnownFunction`
     - `LayerApplication`
-    - `ShapeError`
-    - `FunctionShapeScope` (function-scoped shape map)
+    - `ShapeError` / `ShapeErrorKind` / `ShapeFix` — diagnostics, confidence,
+      related location, and optional editor fix metadata
+    - `ShapeDimensionSite` — exact source range for one annotation dimension
+    - `FunctionShapeScope` (function-scoped shape map plus `dimension_sites`)
     - `AssignmentShape` (`line`, `name`, `shape`) — per-assignment record for inlay hints
     - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`, `assignment_shapes`)
   - Public helpers: `scope_for_byte`, `scope_index_for_byte`.
@@ -80,7 +82,8 @@ Current file layout
     - `build_import_map`
     - `extract_calls`
     - `extract_call_arguments`
-    - `extract_jaxtyping_shapes`
+    - `extract_jaxtyping_shapes` — jaxtyping/NumPy-style dimensions and their
+      source ranges
     - `find_top_level_symbol`
     - `extract_callable_signature`
     - `extract_method_calls`
@@ -138,14 +141,17 @@ Current file layout
       `shape_of_unary`, `shape_of_subscript` + `slice_dim`,
       `shape_of_binary_operator`, `shape_of_inline_vmap`, `apply_inline_vmap_layer`)
     - `handle_tuple_assignment` / `tuple_rhs_shapes` — tuple-pattern unpacking
+    - `matmul_transpose_fix` — proposes `.T` only when it proves the rank-2
+      right operand resolves a matmul mismatch
     - `normalize_dim` / `normalize_shape` — canonicalize `self.<attr>` dims via
       the alias map at storage time
     - `analyze_coverage` → `CoverageReport { total, shaped, dark: Vec<DarkSpot> }`
       — powers the `corpus_coverage_report` harness
 
 - `corpus/*.py`
-  - Real model files (Mamba SSM, attention, ConvNet, transformer block) the
-    coverage harness analyzes. Add more to surface the next gaps.
+  - 24 real model snippets across JAX, Equinox, Flax, NumPy, and PyTorch
+    (including scan/RNN, CNN/pooling, embeddings, attention, and transformer
+    flows) that the coverage harness analyzes.
 
 - `src/integration_tests.rs`
   - Cross-module/end-to-end tests, plus the `coverage_harness` module
@@ -158,7 +164,7 @@ Current file layout
     with priority annotations on open rows. Add new gaps here, not in this file.
 
 - `bench/`
-  - `generate_benchmark.py` emits `benchmark_large.py` (~3.7k lines of
+  - `generate_benchmark.py` emits `benchmark_large.py` (currently ~4.5k lines of
     transformer/GRU/conv/numpy-soup/indexing blocks with unique per-block dims,
     plus deliberate `# expected-error:` blocks). Consumed by the ignored
     `bench_large_file` test in `src/integration_tests.rs`.
@@ -318,21 +324,52 @@ tuple returns kept element-wise for scan). Key invariants:
 Known limitations / important caveats
 -------------------------------------
 
-- `src/main.rs` is wired end-to-end: `republish_diagnostics` runs `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as LSP diagnostics; `on_hover` renders shape strings (markdown `MarkupContent` with a fenced python block); inlay hints are emitted. `did_change` debounces analysis by 150 ms (stores text/version immediately, then bows out if a newer version landed during the window). The server advertises UTF-16 `position_encoding`. Diagnostic severity is configurable via `initializationOptions.diagnostic_severity` (`error`/`warning`/`information`/`hint`, case-insensitive; defaults to `ERROR`). `ShapeError`'s tree-sitter range is converted to LSP range via `ts_range_to_lsp_range`.
-- Editor integrations: `ndim-lsp-vscode` resolves the server from the `ndim-lsp.serverPath` setting (default: `ndim-lsp` on PATH), exposes `ndim-lsp.diagnosticSeverity`, passes both via `initializationOptions`, and restarts the client on config change. `ndim-lsp-zed` forwards `initialization_options` from Zed's `lsp.ndim-lsp` settings and already supported `binary.path` + PATH lookup.
-- All diagnostics share one configured severity; per-error-kind severities (e.g. hint-level for approximate rules) would need a kind/severity field on `ShapeError` — not done yet.
+- `src/main.rs` is wired end-to-end: `republish_diagnostics` runs
+  `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as
+  LSP diagnostics; `on_hover` renders shape strings (markdown `MarkupContent`
+  with a fenced python block); inlay hints are emitted. `did_change` debounces
+  analysis by 150 ms (stores text/version immediately, then bows out if a newer
+  version landed during the window). The server advertises UTF-16
+  `position_encoding` and converts every tree-sitter range by byte offset to
+  UTF-16 LSP positions.
+- LSP also advertises `textDocument/definition` and quick-fix code actions.
+  Go-to-definition takes a simple symbolic dimension token to its first
+  annotation occurrence in the same function scope. A matmul diagnostic offers
+  “Append `.T` to the right operand” only when the analyzer proves a rank-2
+  transpose resolves that exact mismatch; the edit is UTF-16-safe and
+  document-versioned.
+- Diagnostic severity is independently configurable, case-insensitively, via
+  `initializationOptions.diagnostic_severity` for `Mismatch` errors (default
+  `ERROR`) and `initializationOptions.approximation_severity` for
+  `Approximation` errors (default `WARNING`).
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
-- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`, `x.astype(...)`, `x.to(...)` are wired end-to-end. `x.transpose(i, j)` torch-style two-axis swap is only correct for rank-2 inputs. `x.repeat(...)`, `x.expand(...)` are not yet covered.
+- Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`,
+  `x.astype(...)`, `x.to(...)`, `x.repeat(...)`, and `x.expand(...)` are wired
+  end-to-end. `x.transpose(i, j)` torch-style two-axis swap is only correct for
+  rank-2 inputs.
 - Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
 - Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (numeric `a:b` and `:n` folded; others approximated by the original axis), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. Advanced/boolean array indexing is approximated as a single axis drop.
-- Multi-output functions: `split` family is done (tuple-pattern LHS bound via `compute_split_shapes`). Still single-shape / `Ok(None)`: `meshgrid`, `svd`, `eig`, `qr` — extend `tuple_rhs_shapes` to cover them.
-- Symbolic dims are bare strings compared by exact equality. `self.<attr>` is canonicalized to its `self.<attr> = <ident>` alias (from `__init__`) before a shape is stored, so `self.dt_rank` ≡ `dt_rank` (see `extract_self_attr_aliases` + `normalize_dim`/`normalize_shape`). Limitations: only identifier-RHS aliases; the ALIAS map is still file-global (cross-class same-name collisions are last-wins) — self-attr LAYER resolution, by contrast, is class-scoped since the `extract_self_attr_layers_by_class` change; layer ctor args carrying `self.` (e.g. `Linear(self.d_inner, ...)`) are not yet normalized; no constant folding across different spellings (`d_state*2` vs `2*d_state`).
+- Multi-output tuple assignment covers `split`, default `meshgrid`, default
+  linalg `svd`/`qr`/`eig`, top-k-style functions, supported RNN/LSTM/GRU
+  layers, and other explicitly modeled calls in `tuple_rhs_shapes`. Its
+  approximations and unsupported modes intentionally return `Ok(None)`.
+- Symbolic-dimension comparison canonicalizes flat commutative sums/products
+  and literal factors, so `d_state*2` equals `2*d_state`. `self.<attr>` is
+  canonicalized to an identifier alias from `__init__` before storage, and the
+  alias lookup is class-scoped. Limitations: aliases still need an
+  identifier RHS; layer constructor arguments carrying `self.` (for example,
+  `Linear(self.d_inner, ...)`) are not normalized; and subtraction, division,
+  and arbitrary parenthesized expressions are not generally normalized.
 - `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
-- Higher-order functions: `vmap` is modeled (free/inline/attribute). `grad`, `scan`, `pmap` are not.
+- Higher-order functions: `vmap` is modeled (free/inline/attribute);
+  `jax.lax.map` and same-file-body `jax.lax.scan` are modeled. `jit`, the
+  `grad` family, and `pmap` are not.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
 - Layer assignments are tracked with their defining byte position via `extract_layer_assignments_scoped` (returns `Vec<LayerAssignment>`). At call time, `analyze_layer_shapes` picks the innermost function-scoped layer whose enclosing scope contains the call site. The flat `LayerShapeAnalysis.layers` HashMap is preserved (last-wins) for backward compatibility with existing tests, but resolution no longer uses it.
-- `ShapeError` has `variable`, `message`, and a tree-sitter `Range`, converted to an LSP range by `ts_range_to_lsp_range` in `src/main.rs`.
+- `ShapeError` has `variable`, `message`, a tree-sitter `Range`, kind,
+  optional related-information location, and optional `ShapeFix`; `main.rs`
+  converts its ranges to UTF-16 LSP ranges.
 
 How to continue
 ---------------
@@ -349,53 +386,37 @@ Clippy is fully clean (including `src/main.rs`); keep it that way.
 Recommended next implementation steps
 -------------------------------------
 
-**The exhaustive tracker pass is done.** TO_IMPLEMENT.md went from 152 open
-rows to 21; everything feasible now has classify + shape rule + tests:
-jax.lax structured ops (map/scan-adjacent, slice/pad/broadcast families,
-top_k/sort, conv_general_dilated default case), the full jnp/np
-creation/transform/indexing/reduction matrix, torch functions AND
-torch.Tensor methods (incl. tuple outputs topk/chunk/unbind/kthvalue/median
-via `tuple_rhs_shapes`, `x.T`/`x.mT` via `shape_of_attribute`), einops
-einsum/pack/parse_shape + ellipsis `...` patterns, and the NN layer catalog
-(ConvTranspose, RNN/LSTM/GRU + cells, Flatten/Unflatten, Upsample,
-PixelShuffle, pad layers, InstanceNorm/RMSNorm, Bilinear, CosineSimilarity,
-eqx MLP; equinox MultiheadAttention ctor binding fixed — it binds
-`query_size`, not torch's `embed_dim`). The 21 remaining ❌ rows each carry
-an honest infeasibility/composite note (Sequential, Fold/Unfold, wrapper
-modules, jax.grad family, device collectives, data-dependent outputs).
+**The exhaustive tracker pass is done.** Every catalog entry that fits the
+current array-shape model has classification, a rule, and tests. The remaining
+❌ entries in `TO_IMPLEMENT.md` need a richer model: wrapped-function semantics
+(`jit`, the `grad` family, `pmap`), branch-output unification
+(`lax.cond`/`lax.switch`), device-mesh state, plain non-array values
+(`broadcast_shapes` and the `ps` argument to `einops.unpack`), or an arbitrary
+callable (`equinox.nn.Lambda`). Treat the tracker, not this paragraph, as the
+authoritative detailed list.
 
 **Prioritize by the coverage harness, not by gut.** Run
 `cargo test corpus_coverage_report -- --nocapture`, read the ranked dark spots,
 and implement the top one. Grow `corpus/*.py` so the ranking stays
 representative. Current open targets, in impact order:
 
-(Done in the latest waves: Sequential/SpectralNorm/WeightNorm/einops-layer
-composition — `LayerKind::Sequential`/`EinopsPattern` in layers.rs; real
-`torch.split(split_size)` semantics — `KnownFunction::TorchSplit`;
-symbolic-dim canonicalization at comparison time — `canonicalize_dim`/
-`dims_canonically_equal` in types.rs, so `d*2` ≡ `2*d`; class-scoped alias
-map; cross-file return-type tracing for imported helpers —
-`resolve_imported_function_shape` + signature cache in resolution.rs;
-expression arguments bound as synthetics in method-call positions; nested
-`vmap(vmap(...))`; MHA single-LHS + vmap'd binding; per-error-kind
-severities — `ShapeErrorKind::{Mismatch,Approximation}` → configurable
-ERROR/WARNING via `diagnostic_severity`/`approximation_severity` init
-options, exposed in the VSCode extension settings.)
+1. Add a representative corpus model only when it exercises a behavior absent
+   from the current 24 files; run the coverage report first and work from an
+   actual dark spot rather than increasing the file count.
 
-1. Grow the corpus further (flax-heavy models, jax.lax.scan pipelines,
-   torch training-step files) — the harness is at 100%, so new files are
-   the only way to surface the next ranked gaps.
+2. If corpus evidence warrants a richer architecture, choose one coherent
+   extension: branch merge/unification, user-helper tuple returns, or tracking
+   a narrowly scoped non-array literal value. Do not implement a low-value
+   tracker row in isolation.
 
-2. Remaining ❌ tracker rows with feasible-but-deferred notes: Fold/Unfold
-   window geometry, `jax.lax.gather` GatherDimensionNumbers modeling,
-   `einops.unpack`, true tuple `(output, state)` binding for RNN layers
-   under tuple LHS.
+3. Improve expression precision where it affects real code: normalize
+   `self.`-prefixed layer constructor arguments (`Linear(self.d_inner, ...)`)
+   and extend symbolic normalization beyond the supported flat
+   sum/product forms.
 
-3. Normalize `self.`-prefixed layer ctor args (`Linear(self.d_inner, ...)`);
-   extend canonicalization to subtraction/division and parenthesized forms.
-
-4. related_information on two-operand diagnostics (point at the other
-   operand's definition site); inlay-hint tooltips.
+4. Expand LSP presentation only after the underlying analysis proves the
+   information is correct (for example, richer related-information or inlay
+   tooltips).
 
 5. Keep `TO_IMPLEMENT.md` and `README.md` honest
    - When a function is classified, mark Classified ✅.
