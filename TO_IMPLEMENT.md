@@ -454,8 +454,8 @@ inference all went dark.
   `return <expr>` via `shape_of_expression`, or a bare-tuple/`expression_
   list` return's elements kept distinct), and reports whichever the caller
   needs. A fully-annotated callee is unaffected — it still goes through the
-  older `apply_user_function`/`bind_and_substitute`/`trace_user_function_
-  return` path unchanged.
+  `bind_user_function_args`/`bind_and_substitute`/`trace_user_function_return`
+  path. Return tracing now uses the existing function node, not a new parse.
 - **Specialization vs. global state**: every specialization runs against a
   scope-local shapes map seeded fresh from `original_shapes` (so one call
   site's argument shapes can never leak into another's). First-call-wins:

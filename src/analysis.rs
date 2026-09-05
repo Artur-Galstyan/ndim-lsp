@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::known_functions::{
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
@@ -301,7 +301,7 @@ struct ShapeCtx<'a> {
     /// call site's argument shapes into this one (`x.entry(name).or_insert`
     /// is a no-op once `x` is already present). Also used to decide,
     /// call-site-independently, whether a callee is "fully annotated" (safe
-    /// for the older `apply_user_function` path) vs. needs seeding.
+    /// for `bind_user_function_args`'s body-tracing path) vs. needs seeding.
     original_shapes: &'a [HashMap<String, Vec<String>>],
 }
 
@@ -1235,12 +1235,12 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // to the method's function scope by bare name — methods are function
     // definitions like any other. When the callee has no `-> ReturnType`
     // annotation (e.g. a typical `forward(self, x: Float[Array, "..."])`),
-    // `apply_user_function` falls back to tracing a bare `return <name>`
+    // `bind_user_function_args` falls back to tracing a bare `return <name>`
     // statement against the callee's own already-computed body shapes.
     //
     // Gated on the callee being FULLY annotated (checked against the
     // call-site-independent `original_shapes` snapshot, never the live,
-    // mutable `scopes[...].shapes`): `apply_user_function`'s bare-return
+    // mutable `scopes[...].shapes`): the bare-return
     // trace reads `callee.shapes.get(name)` directly, which is only sound
     // when every one of the callee's params was statically annotated (so
     // its body shapes are the same regardless of which call site asks) —
@@ -1256,14 +1256,15 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         let fully_annotated = callee_idx.is_none_or(|idx| callee_all_params_annotated(idx, ctx));
 
         if fully_annotated {
-            if let Some(result) = apply_user_function(
-                user_target,
-                call_byte,
-                &args,
-                &ctx.scope_shapes(scope_idx),
-                ctx.scopes,
-                ctx.text,
-            ) {
+            if let Some(callee_idx) = callee_idx
+                && let Some(result) = bind_user_function_args(
+                    &ctx.scopes[callee_idx],
+                    user_target,
+                    &args,
+                    &ctx.scope_shapes(scope_idx),
+                    ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
+                )
+            {
                 match result {
                     Ok(Some(shape)) => return Some(shape),
                     Ok(None) => {}
@@ -3301,38 +3302,23 @@ fn trace_user_function_return(
     callee: &FunctionShapeScope,
     target_name: &str,
     positional_arg_shapes: &[(&str, Vec<String>)],
-    text: &str,
+    (func_node, text): (Node, &str),
 ) -> Result<Option<Vec<String>>, String> {
     let binding = build_dim_binding(callee, target_name, positional_arg_shapes)?;
-    let Some(return_name) = trace_bare_return_identifier(text, callee.start_byte, callee.end_byte)
-    else {
+    let Some(body) = func_node.child_by_field_name("body") else {
+        return Ok(None);
+    };
+    let mut return_name = None;
+    if collect_bare_return_identifiers(body, text, &mut return_name).is_none() {
+        return Ok(None);
+    }
+    let Some(return_name) = return_name else {
         return Ok(None);
     };
     let Some(return_shape) = callee.shapes.get(&return_name) else {
         return Ok(None);
     };
     Ok(Some(substitute_dims(return_shape, &binding)))
-}
-
-/// Re-parse `text[start_byte..end_byte]` (a single function definition's own
-/// byte range, from `FunctionShapeScope`) as a standalone snippet and find
-/// its one `return <identifier>` statement, not descending into nested
-/// function/class definitions (a `return` there belongs to a different
-/// scope). Returns `None` for zero, multiple distinct, or non-identifier
-/// return targets — deliberately conservative (v1).
-fn trace_bare_return_identifier(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
-    let snippet = text.get(start_byte..end_byte)?;
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
-    let tree = parser.parse(snippet, None)?;
-    let func_node = tree.root_node().named_child(0)?;
-    if func_node.kind() != "function_definition" {
-        return None;
-    }
-    let body = func_node.child_by_field_name("body")?;
-    let mut found: Option<String> = None;
-    collect_bare_return_identifiers(body, snippet, &mut found)?;
-    found
 }
 
 /// Walk a function body collecting `return <identifier>` targets. Returns
@@ -3367,7 +3353,7 @@ fn collect_bare_return_identifiers(
 
 // ── Lazy call-site parameter seeding ────────────────────────────────────
 //
-// The mechanism above (`apply_user_function` / `bind_and_substitute` /
+// The mechanism above (`bind_user_function_args` / `bind_and_substitute` /
 // `trace_user_function_return`) requires the callee's OWN annotations (or,
 // for the bare-identifier-return fallback, shapes the callee's body already
 // computed from its own annotations in the one global whole-file pass) —
@@ -3425,7 +3411,7 @@ fn collect_own_return_exprs<'t>(block: Node<'t>, out: &mut Vec<Node<'t>>) {
 /// kept distinct (`tuple`), anything else (bare identifier or general
 /// expression) is one shape (`single`). Multiple return statements are only
 /// resolved when every one is the same bare identifier (mirrors the older,
-/// more conservative `trace_bare_return_identifier` convention) — genuinely
+/// more conservative `collect_bare_return_identifiers` convention) — genuinely
 /// divergent return expressions across branches aren't unifiable without
 /// deeper control-flow analysis, so they stay `None`.
 fn trace_specialized_return(body: Node, callee_idx: usize, ctx: &mut ShapeCtx) -> SpecializedReturn {
@@ -3623,12 +3609,9 @@ fn seed_params_from_call(
 /// Fallback for a same-file call whose callee (a top-level function, a
 /// nested closure, or a `self.<method>`) has at least one un-annotated
 /// parameter: seed the un-annotated params from this call site's resolved
-/// argument shapes and evaluate the callee's body on demand. Tried only
-/// after `apply_user_function`'s existing annotation/bare-return-trace path
-/// has already run and found nothing — when every param is already
-/// annotated, that path already covers the call (or correctly found
-/// nothing to propagate), so this returns `None` up front rather than
-/// re-doing the same work.
+/// argument shapes and evaluate the callee's body on demand. Fully annotated
+/// callees use `bind_user_function_args` instead; this returns `None` for
+/// them rather than redoing the annotation/bare-return-trace work.
 fn apply_seeded_user_function(
     target: &str,
     call_byte: usize,
@@ -3708,43 +3691,8 @@ fn scan_body_ys_shape(
     Some(out)
 }
 
-/// Attempt to resolve `target` as a user-defined function in the same file
-/// and propagate its declared (or traced) return shape to the call site.
-///
-/// Returns:
-/// - `Some(Ok(Some(shape)))` if a matching function was found and its
-///   return shape could be computed after binding param dims to arg dims —
-///   either from a `-> ReturnType` annotation, or (when absent) traced from
-///   a bare `return <name>` statement against the callee's own body shapes
-///   (see `trace_user_function_return`).
-/// - `Some(Ok(None))` if a matching function was found but no shape could
-///   be produced (no annotation and no traceable bare-identifier return) —
-///   argument validation still ran but nothing to propagate.
-/// - `Some(Err(msg))` if argument shapes don't unify with declared param shapes.
-/// - `None` if no matching user-defined function was found (fall through to
-///   the known-function branch).
-///
-/// v1 limitations (documented in PR):
-/// - Only positional arguments are matched. Keyword args that match a param
-///   name are honoured; otherwise the call is skipped with Ok(None).
-/// - No cross-file resolution (the tracing fallback is same-file only —
-///   `apply_imported_user_function` passes `text: None`, disabling it).
-/// - Qualified names ("module.func") are excluded at the call site.
-/// - Fresh output dims (not in the binding) pass through unchanged.
-fn apply_user_function(
-    target: &str,
-    call_byte: usize,
-    args: &[CallArgument],
-    caller_shapes: &dyn ShapeLookup,
-    scopes: &[FunctionShapeScope],
-    text: &str,
-) -> Option<Result<Option<Vec<String>>, String>> {
-    let scope_idx = find_callee_scope(target, Some(call_byte), scopes)?;
-    bind_user_function_args(&scopes[scope_idx], target, args, caller_shapes, Some(text))
-}
-
 /// Bind a callee's declared parameter shapes to the caller's argument shapes
-/// and substitute into its return shape. Shared by `apply_user_function`
+/// and substitute into its return shape. Shared by `shape_of_call`
 /// (same-file helpers, callee found via `find_callee_scope`) and
 /// `apply_imported_user_function` (cross-file helpers, callee found by
 /// resolving the import and extracting its jaxtyping annotations on disk).
@@ -3765,10 +3713,9 @@ fn bind_user_function_args(
     target: &str,
     args: &[CallArgument],
     caller_shapes: &dyn ShapeLookup,
-    // `Some(source_text)` for the same-file path (enables the no-return-
-    // annotation tracing fallback); `None` for the cross-file path
-    // (`apply_imported_user_function`), where tracing isn't supported yet.
-    text: Option<&str>,
+    // The existing function node and its source enable body tracing for
+    // same-file calls. Imported helpers pass None and use annotations only.
+    source: Option<(Node, &str)>,
 ) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
@@ -3812,24 +3759,24 @@ fn bind_user_function_args(
     }
 
     // Delegate to the shared bind_and_substitute helper — or, when the
-    // callee has no `-> ReturnType` annotation and source text is available
+    // callee has no `-> ReturnType` annotation and its source node is available
     // (same-file path), the body-tracing fallback (see
     // `trace_user_function_return`).
     if callee.return_shape.is_some() {
         Some(bind_and_substitute(callee, target, &arg_shapes))
-    } else if let Some(text) = text {
-        Some(trace_user_function_return(callee, target, &arg_shapes, text))
+    } else if let Some(source) = source {
+        Some(trace_user_function_return(callee, target, &arg_shapes, source))
     } else {
         Some(Ok(None))
     }
 }
 
-/// Cross-file counterpart of `apply_user_function`: resolve `target` through
-/// the import map to a function defined in another file on disk, extract its
+/// Cross-file counterpart of the same-file path in `shape_of_call`: resolve
+/// `target` through the import map to a function in another file, extract its
 /// jaxtyping parameter + return shape annotations, and apply the same
 /// bind-and-substitute logic. `None` means "not an imported function we can
 /// resolve, or it has no jaxtyping annotations" — the caller falls through to
-/// the known-function branch, same contract as `apply_user_function`.
+/// the known-function branch, same contract as `bind_user_function_args`.
 #[allow(clippy::too_many_arguments)]
 fn apply_imported_user_function(
     target: &str,

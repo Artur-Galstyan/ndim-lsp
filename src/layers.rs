@@ -10,7 +10,7 @@ use crate::python_ast::{
     build_import_map, extract_call_arguments, extract_calls, extract_self_attr_calls,
 };
 use crate::resolution::{
-    ResolutionCache, bind_call_arguments, resolve_call_signature, resolve_call_target,
+    ResolutionCache, bind_call_arguments, resolve_call_signature_with_node, resolve_call_target,
 };
 use crate::types::*;
 
@@ -882,8 +882,9 @@ where
     // user-defined layers and frameworks not in the catalog.
     let resolved_call = match try_catalog_signature(call, node, text, import_map)? {
         Some(c) => Some(c),
-        None => resolve_call_signature(
+        None => resolve_call_signature_with_node(
             call,
+            Some(node),
             text,
             import_map,
             search_roots,

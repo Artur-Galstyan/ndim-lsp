@@ -795,6 +795,27 @@ mod resolve_call_signature_tests {
         fs::write(tmp.path().join("equinox/nn/_linear.py"), init_source).unwrap();
     }
 
+    fn resolve_first_call(source: &str, roots: &[PathBuf]) -> Option<ResolvedCallSignature> {
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let cache = new_resolution_cache();
+        let expected =
+            resolve_call_signature(&calls[0], source, &import_map, roots, read, 5, Some(&cache));
+        let actual = crate::resolution::resolve_call_signature_with_node(
+            &calls[0],
+            Some(tree.root_node()),
+            source,
+            &import_map,
+            roots,
+            read,
+            5,
+            Some(&cache),
+        );
+        assert_eq!(actual, expected, "text-only and existing-tree paths differ");
+        actual.unwrap()
+    }
+
     #[test]
     fn test_resolves_call_signature_through_reexport() {
         let tmp = tempfile::tempdir().unwrap();
@@ -804,14 +825,8 @@ mod resolve_call_signature_tests {
         );
 
         let source = "import equinox as eqx\nlayer = eqx.nn.Linear(3, out_features=5)";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
-
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
-            .unwrap()
-            .unwrap();
+        let found = resolve_first_call(source, &roots).unwrap();
 
         assert_eq!(found.signature.owner, Some("Linear".to_string()));
         assert_eq!(found.signature.name, "__init__");
@@ -829,14 +844,8 @@ mod resolve_call_signature_tests {
         );
 
         let source = "import equinox as eqx\nlayer = eqx.nn.Linear(features, hidden)";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
-
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
-            .unwrap()
-            .unwrap();
+        let found = resolve_first_call(source, &roots).unwrap();
 
         assert_eq!(
             classify_layer_call(&found),
@@ -856,14 +865,8 @@ mod resolve_call_signature_tests {
         );
 
         let source = "from equinox.nn import Linear as Lin\nlayer = Lin(3, 5)";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
-
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
-            .unwrap()
-            .unwrap();
+        let found = resolve_first_call(source, &roots).unwrap();
 
         assert_eq!(found.bindings.get("in_features"), Some(&"3".to_string()));
         assert_eq!(found.bindings.get("out_features"), Some(&"5".to_string()));
@@ -885,14 +888,8 @@ mod resolve_call_signature_tests {
         );
 
         let source = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
-
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
-            .unwrap()
-            .unwrap();
+        let found = resolve_first_call(source, &roots).unwrap();
 
         assert_eq!(found.bindings.get("in_features"), Some(&"3".to_string()));
         assert_eq!(found.bindings.get("out_features"), Some(&"5".to_string()));
@@ -909,15 +906,9 @@ mod resolve_call_signature_tests {
         )
         .unwrap();
 
-        let source = "import jax.numpy as jnp\nout = jnp.concatenate(xs, axis=1)";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
+        let source = "# π😀\nimport jax.numpy as jnp\ndef f():\n    out = jnp.concatenate(\n        xs, axis=1\n    )";
         let roots = vec![tmp.path().to_path_buf()];
-
-        let found = resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None)
-            .unwrap()
-            .unwrap();
+        let found = resolve_first_call(source, &roots).unwrap();
 
         assert_eq!(found.signature.owner, None);
         assert_eq!(found.signature.name, "concatenate");
@@ -929,15 +920,9 @@ mod resolve_call_signature_tests {
     fn test_returns_none_when_implementation_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let source = "import missing\nx = missing.Foo()";
-        let tree = parse(source);
-        let import_map = build_import_map(tree.root_node(), source).unwrap();
-        let calls = extract_calls(tree.root_node(), source).unwrap();
         let roots = vec![tmp.path().to_path_buf()];
 
-        let found =
-            resolve_call_signature(&calls[0], source, &import_map, &roots, read, 5, None).unwrap();
-
-        assert_eq!(found, None);
+        assert_eq!(resolve_first_call(source, &roots), None);
     }
 }
 
@@ -5092,7 +5077,7 @@ def caller(y: Float[Array, "batch"]) -> None:
     }
 
     // ── Cross-file return-type tracing ──────────────────────────────────
-    // Same-file helpers are covered above via `apply_user_function`; these
+    // Same-file helpers are covered above via `bind_user_function_args`; these
     // extend the coverage to helpers imported from another file on disk,
     // resolved through `resolve_imported_function_shape` +
     // `apply_imported_user_function`.
@@ -7147,6 +7132,32 @@ mod literal_binop_scan_method_tests {
     }
 
     #[test]
+    fn test_body_return_tracing_preserves_scope_and_branch_rules() {
+        for (body, traceable) in [
+            ("return x", true),
+            ("if flag:\n    return x\nreturn x", true),
+            ("if flag:\n    return x\nreturn other", false),
+            ("if flag:\n    return\nreturn x", false),
+            ("return x, other", false),
+            ("pass", false),
+            ("def inner():\n    return other\nreturn x", true),
+            ("class Inner:\n    def f(self):\n        return other\nreturn x", true),
+        ] {
+            // Exercise the original tree's nonzero offsets and nested scopes.
+            let indented = body.replace('\n', "\n        ");
+            let code = format!(
+                "# π😀\nclass M:\n    @decorator\n    def helper(self, x: Float[Array, \"d\"]):\n        {indented}\n\n    def run(self, a: Float[Array, \"n\"], b: Float[Array, \"m\"]):\n        first = self.helper(a)\n        second = self.helper(b)"
+            );
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{body}: {:?}", analysis.errors);
+            for (name, dim) in [("first", "n"), ("second", "m")] {
+                let expected = traceable.then(|| shape(&[dim]));
+                assert_eq!(find_shape(&analysis, name), expected.as_ref(), "{body}");
+            }
+        }
+    }
+
+    #[test]
     fn test_chained_reshape_neg_one_then_astype_with_known_receiver() {
         // Mirrors corpus/scope_soup.py:31's `h.reshape(-1).astype(jnp.float32)`
         // chain, but with a receiver whose shape IS known — confirms the
@@ -7164,7 +7175,7 @@ mod literal_binop_scan_method_tests {
     #[test]
     fn test_nested_closure_call_with_annotated_param_resolves() {
         // A locally-defined (nested) function called by bare name, with its
-        // OWN param annotated — resolves via the same `apply_user_function`
+        // OWN param annotated — resolves via the same `bind_user_function_args`
         // path as a top-level helper or a `self.<method>` call. Confirms
         // nested-function scopes ARE reachable by call resolution; the
         // corpus/scope_soup.py `inner(h)` dark spot (item 5) is instead
@@ -7658,6 +7669,57 @@ mod bench_harness {
         );
     }
 
+    /// Repeated calls expose reparsing costs that the model corpus does not.
+    /// Run with `cargo test --release bench_repeated_helper_calls -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_repeated_helper_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("helper.py"),
+            "def identity(x: Float[Array, \"b d\"]) -> Float[Array, \"b d\"]:\n    return x\n",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let mut local = String::from("def identity(x: Float[Array, \"b d\"]):\n");
+        for i in 0..100 {
+            local.push_str(&format!("    h{i} = x + x\n"));
+        }
+        local.push_str("    return h99\n");
+
+        for (label, prefix) in [
+            ("imported", "from helper import identity\n".to_string()),
+            ("same-file", local),
+        ] {
+            for calls in [100, 200, 400] {
+                let mut code = format!("{prefix}\ndef caller(x: Float[Array, \"b d\"]):\n");
+                for i in 0..calls {
+                    code.push_str(&format!("    y{i} = identity(x)\n"));
+                }
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&tree_sitter_python::LANGUAGE.into())
+                    .unwrap();
+                let cache = new_resolution_cache();
+                let (_, _, warm) = run_with(&mut parser, &code, &roots, &cache);
+                assert!(warm.errors.is_empty(), "{:?}", warm.errors);
+                let outputs: Vec<_> = warm.assignment_shapes.iter()
+                    .filter(|rec| rec.name.starts_with('y'))
+                    .collect();
+                assert_eq!(outputs.len(), calls);
+                assert!(outputs.iter().all(|rec| rec.shape == ["b", "d"]));
+                let mut times: Vec<_> = (0..9)
+                    .map(|_| run_with(&mut parser, &code, &roots, &cache).1)
+                    .collect();
+                times.sort_by(f64::total_cmp);
+                println!(
+                    "{label}: {calls} calls, analyze median {:.1} ms",
+                    times[times.len() / 2]
+                );
+            }
+        }
+    }
+
     fn assert_benchmark_diagnostics(
         code: &str,
         root: tree_sitter::Node,
@@ -7730,7 +7792,7 @@ mod bench_harness {
         roots: &[PathBuf],
         cache: &ResolutionCache,
     ) -> (f64, f64, LayerShapeAnalysis) {
-        let read = |_: &PathBuf| -> Option<String> { None };
+        let read = |path: &PathBuf| fs::read_to_string(path).ok();
         let t0 = Instant::now();
         let tree = parser.parse(code, None).unwrap();
         let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;

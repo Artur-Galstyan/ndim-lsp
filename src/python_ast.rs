@@ -236,11 +236,17 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                 && contains_type_name(node, text, "Shape")?))
     }
 
-    fn point_for_byte(text: &str, byte: usize) -> tree_sitter::Point {
-        let prefix = &text.as_bytes()[..byte];
-        let row = prefix.iter().filter(|&&b| b == b'\n').count();
-        let line_start = prefix.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-        tree_sitter::Point::new(row, byte - line_start)
+    fn point_for_byte(node: Node, text: &str, byte: usize) -> tree_sitter::Point {
+        // The string node already locates us in the file. Scan only its text,
+        // including any newlines in triple-quoted annotations.
+        let prefix = &text.as_bytes()[node.start_byte()..byte];
+        let base = node.start_position();
+        let row = base.row + prefix.iter().filter(|&&b| b == b'\n').count();
+        let column = prefix
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(base.column + prefix.len(), |i| prefix.len() - i - 1);
+        tree_sitter::Point::new(row, column)
     }
 
     fn shape_dims(node: Node, text: &str) -> Result<Vec<(String, tree_sitter::Range)>, String> {
@@ -296,8 +302,8 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                     tree_sitter::Range {
                         start_byte,
                         end_byte,
-                        start_point: point_for_byte(text, start_byte),
-                        end_point: point_for_byte(text, end_byte),
+                        start_point: point_for_byte(node, text, start_byte),
+                        end_point: point_for_byte(node, text, end_byte),
                     },
                 )
             })
@@ -1459,18 +1465,35 @@ mod extract_jaxtyping_shapes_tests {
 
     #[test]
     fn test_dimension_sites_keep_exact_source_ranges() {
-        let code = r#"def f(x: Float[Array, r" batch, hidden*2 "]) -> NDArray[Shape["batch, output"], Float]: pass"#;
-        let tree = parse(code);
-        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
-        let sites = &scope_by_name(&scopes, "f").dimension_sites;
+        for code in [
+            r#"def f(x: Float[Array, r" batch, hidden*2 "]) -> NDArray[Shape["batch, output"], Float]: pass"#,
+            "# π😀\r\nclass M:\r\n    def f(x: Float[Array, r''' batch,\r\n        hidden*2 ''']) -> NDArray[Shape['batch, output'], Float]: pass",
+            "# offset\n\ndef f(x: Float[Array, u' δ, hidden*2 ']) -> NDArray[Shape['δ, output'], Float]: pass",
+        ] {
+            let tree = parse(code);
+            let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+            let sites = &scope_by_name(&scopes, "f").dimension_sites;
 
-        assert_eq!(sites.len(), 4);
-        assert_eq!(sites[0].binding.as_deref(), Some("x"));
-        assert_eq!(sites[0].axis, 0);
-        assert_eq!(&code[sites[0].range.start_byte..sites[0].range.end_byte], "batch");
-        assert_eq!(&code[sites[1].range.start_byte..sites[1].range.end_byte], "hidden*2");
-        assert_eq!(sites[2].binding, None);
-        assert_eq!(&code[sites[3].range.start_byte..sites[3].range.end_byte], "output");
+            assert_eq!(sites.len(), 4);
+            assert_eq!(sites[0].binding.as_deref(), Some("x"));
+            assert_eq!(sites[0].axis, 0);
+            assert_eq!(sites[1].value, "hidden*2");
+            assert_eq!(sites[2].binding, None);
+            assert_eq!(sites[3].value, "output");
+            for site in sites {
+                assert_eq!(&code[site.range.start_byte..site.range.end_byte], site.value);
+                for (byte, point) in [
+                    (site.range.start_byte, site.range.start_point),
+                    (site.range.end_byte, site.range.end_point),
+                ] {
+                    // Independent whole-source oracle for tree-sitter's byte columns.
+                    let prefix = &code[..byte];
+                    let row = prefix.bytes().filter(|&b| b == b'\n').count();
+                    let column = prefix.rsplit('\n').next().unwrap().len();
+                    assert_eq!(point, tree_sitter::Point::new(row, column), "{code}");
+                }
+            }
+        }
     }
 
     #[test]

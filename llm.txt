@@ -7,21 +7,27 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Last verified at `ec66fac` (`ndim-lsp` 0.1.1):
+Verified after the AST-reuse refactor based on `b0ee443` (`ndim-lsp` 0.1.1):
 
-- `cargo test --quiet` passes: 1,775 tests pass and one benchmark is ignored
-  (1,753 library/integration tests plus 22 LSP-server tests).
+- `cargo test --quiet` passes: 1,776 tests pass and two benchmarks are ignored
+  (1,754 library/integration tests plus 22 LSP-server tests).
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
   timing harness over `bench/benchmark_large.py` (currently 4,541 lines;
   regenerate with `python3 bench/generate_benchmark.py`). On the validation
-  machine it measured 34.1 ms parse and 124.3 ms analyze medians in release.
+  machine it measured 10.7 ms parse and 30.4 ms analyze medians in release
+  (analysis was 40.1 ms before this refactor on the same machine).
   The timing is machine-dependent. The invariant is >1,000 inferred shapes and
-  a diagnostic count exactly equal to the deliberate `# expected-error:`
-  markers — fewer means missed detection, more means false positives. Treat it
-  as the scale/regression tripwire.
+  exactly one diagnostic per marked top-level definition, with the expected
+  diagnostic messages. Treat it as the scale/regression tripwire.
+- `cargo test --release bench_repeated_helper_calls -- --ignored --nocapture`
+  measures full analysis for 100/200/400 repeated imported and same-file calls
+  with warm resolution caches. At 400 calls, imported helpers improved from
+  302.7 to 8.9 ms, and same-file helpers from 74.7 to 11.2 ms.
+  Run both timing harnesses serially with
+  `cargo test --release bench_ -- --ignored --nocapture --test-threads=1`.
 - `cargo test corpus_coverage_report -- --nocapture` prints a shape-coverage
   report over all 24 `corpus/*.py` files, ranks un-shapeable assignments
   ("dark spots") by frequency, and lists each one as `file:line  kind`. This is
@@ -101,7 +107,9 @@ Current file layout
     - `resolve_reexport_once`
     - `resolve_terminal_symbol_once`
     - `resolve_implementation`
-    - `resolve_call_signature`
+    - `resolve_call_signature` — public text-only compatibility entry point;
+      the analyzer uses `resolve_call_signature_with_node` with its existing
+      AST, so resolving each call does not reparse the whole caller file
     - `bind_call_arguments`
 
 - `src/known_functions.rs`
@@ -141,7 +149,10 @@ Current file layout
       `shape_of_unary`, `shape_of_subscript` + `slice_dim`,
       `shape_of_binary_operator`, `shape_of_inline_vmap`, `apply_inline_vmap_layer`)
     - `handle_tuple_assignment` / `tuple_rhs_shapes` — tuple-pattern unpacking
-    - `matmul_transpose_fix` — proposes `.T` only when it proves the rank-2
+    - `bind_user_function_args` / `trace_user_function_return` — annotated
+      same-file callees reuse `scope_function_nodes` for bare-return tracing;
+      no separate parser or duplicate callee lookup
+    - `transpose_fix` — proposes `.T` only when it proves the rank-2
       right operand resolves a matmul mismatch
     - `normalize_dim` / `normalize_shape` — canonicalize `self.<attr>` dims via
       the alias map at storage time

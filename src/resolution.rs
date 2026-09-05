@@ -334,6 +334,35 @@ pub fn resolve_call_signature<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    resolve_call_signature_with_node(
+        call,
+        None,
+        source_text,
+        import_map,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    )
+}
+
+/// Reuse a node from the source tree to locate the call's arguments. Only the
+/// public text-only wrapper passes `None`, parsing the caller on demand after
+/// the implementation resolves. The node and text must be from the same snapshot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_call_signature_with_node<F>(
+    call: &CallInfo,
+    source_node: Option<Node>,
+    source_text: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<ResolvedCallSignature>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
     let target = resolve_call_target(&call.target, import_map);
     let Some(implementation) =
         resolve_implementation(target, search_roots, &read_file, max_depth, cache)?
@@ -366,10 +395,17 @@ where
         return Ok(None);
     };
 
-    let Some(source_tree) = parser.parse(source_text, None) else {
-        return Err("failed to parse source file".to_string());
+    let source_tree;
+    let source_node = match source_node {
+        Some(node) => node,
+        None => {
+            source_tree = parser
+                .parse(source_text, None)
+                .ok_or_else(|| "failed to parse source file".to_string())?;
+            source_tree.root_node()
+        }
     };
-    let Some(args_node) = source_tree.root_node().descendant_for_byte_range(
+    let Some(args_node) = source_node.descendant_for_byte_range(
         call.args_node_range.start_byte,
         call.args_node_range.end_byte,
     ) else {
