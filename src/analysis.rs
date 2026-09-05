@@ -1308,6 +1308,14 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 5. Known-function check
     if let Some(known) = classify_known_function(&resolved) {
+        // A stack consumes a sequence, not one tensor. In particular, the
+        // homogeneous-tuple approximation used for scan carries must not
+        // collapse `(x, x)` into one operand. Share this rule across backends.
+        let args = if matches!(known, KnownFunction::Stack) {
+            resolve_stack_args(args_node, scope_idx, ctx)?
+        } else {
+            args
+        };
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
             Ok(Some(shape)) => Some(shape),
@@ -1452,6 +1460,53 @@ fn resolve_call_args(
     }
 
     Some(resolved)
+}
+
+fn resolve_stack_args(
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<CallArgument>> {
+    let mut args = extract_call_arguments(args_node, ctx.text).ok()?;
+    let sequence = find_positional_arg_node(args_node, 0).or_else(|| {
+        ["arrays", "tensors", "arys", "operands"].iter().find_map(|name| {
+            find_keyword_arg_node(args_node, name, ctx.text.as_bytes())?
+                .child_by_field_name("value")
+        })
+    })?;
+    if !matches!(sequence.kind(), "tuple" | "list") {
+        // A sequence variable is not represented by the tensor-shape map.
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut cursor = sequence.walk();
+    for element in sequence.named_children(&mut cursor) {
+        if element.kind() == "comment" {
+            continue;
+        }
+        let shape = match binop_operand(element, scope_idx, ctx)? {
+            BinopOperand::Scalar => Vec::new(),
+            BinopOperand::Shaped(shape) => shape,
+        };
+        names.push(ctx.bind_synthetic(shape, scope_idx, element.start_byte()));
+    }
+    let value = format!("[{}]", names.join(", "));
+    for arg in &mut args {
+        match arg {
+            CallArgument::Positional { value: original } => {
+                *original = value;
+                break;
+            }
+            CallArgument::Keyword { name, value: original }
+                if ["arrays", "tensors", "arys", "operands"].contains(&name.as_str()) =>
+            {
+                *original = value;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Some(args)
 }
 
 /// Find the i-th positional argument node in an argument_list.
@@ -2355,31 +2410,28 @@ fn tuple_rhs_shapes(
                 return Some(vec![Some(init_shape), ys_shape]);
             }
 
-            // `values, indices = jax.lax.top_k(operand, k)` — both outputs
-            // share `operand`'s shape with the last axis replaced by `k`.
-            if matches!(known, Some(KnownFunction::LaxTopK)) {
-                if n_targets != 2 {
-                    return None;
-                }
+            // JAX tuple returns use the same validation as single-name calls,
+            // but keep each output distinct. Resolve inline array expressions.
+            if matches!(known, Some(KnownFunction::LaxTopK | KnownFunction::QrMultiply)) {
                 let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let mut positionals = args.iter().filter_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                });
-                let operand = positionals.next()?;
-                let k = positionals.next().or_else(|| {
-                    args.iter().find_map(|a| match a {
-                        CallArgument::Keyword { name, value } if name == "k" => {
-                            Some(value.as_str())
-                        }
-                        _ => None,
-                    })
-                })?;
-                let mut out = ctx.resolve_shape(operand, scope_idx)?;
-                let last = out.len().checked_sub(1)?;
-                out[last] = k.to_string();
-                return Some(vec![Some(out.clone()), Some(out)]);
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+                let result = if matches!(known, Some(KnownFunction::LaxTopK)) {
+                    crate::known_functions::compute_top_k_shape(&args, &ctx.scope_shapes(scope_idx))
+                        .map(|shape| shape.map(|s| vec![s.clone(), s]))
+                } else {
+                    crate::known_functions::compute_qr_multiply_shapes(&args, &ctx.scope_shapes(scope_idx))
+                };
+                return match result {
+                    Ok(Some(outputs)) if outputs.len() == n_targets => {
+                        Some(outputs.into_iter().map(Some).collect())
+                    }
+                    Ok(_) => None,
+                    Err(message) => {
+                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                        None
+                    }
+                };
             }
 
             // `sorted_keys, sorted_values = jax.lax.sort_key_val(keys, values)`
@@ -2532,7 +2584,8 @@ fn tuple_rhs_shapes(
                 )
             ) {
                 let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
                 return tuple_multi_output_shapes(&known?, &args, args_node, n_targets, scope_idx, ctx);
             }
 

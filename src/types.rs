@@ -744,6 +744,26 @@ pub enum KnownFunction {
     FunctionalGlu,
     // torch.nn.utils.rnn
     PadSequence,
+    /// Elementwise array arguments, in signature order. Other parameters do
+    /// not affect shape. LAX primitives can prohibit non-scalar rank promotion.
+    Elementwise {
+        parameters: &'static [&'static str],
+        rank_promotion: bool,
+    },
+    BroadcastLike,
+    // Structured matrix constructors in jax.scipy.linalg.
+    Hadamard,
+    Dft,
+    InvHilbert,
+    InvPascal,
+    Helmert,
+    Circulant,
+    Fiedler,
+    Companion,
+    FiedlerCompanion,
+    Leslie,
+    ConvolutionMatrix,
+    QrMultiply,
 }
 
 #[derive(Debug, Clone)]

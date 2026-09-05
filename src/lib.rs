@@ -8,6 +8,9 @@ mod types;
 #[cfg(test)]
 mod integration_tests;
 
+#[cfg(test)]
+mod jax_compat_tests;
+
 pub use analysis::*;
 pub use known_functions::*;
 pub use layers::*;

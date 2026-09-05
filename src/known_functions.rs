@@ -2,11 +2,18 @@ use std::collections::HashMap;
 
 use crate::types::*;
 
+mod jax;
+pub(crate) use jax::{compute_qr_multiply_shapes, compute_top_k_shape};
+
 #[cfg(test)]
 use crate::{build_import_map, resolve_call_target};
 
 pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction> {
     let (name, module) = target.parts.split_last()?;
+
+    if let Some(function) = jax::classify(module, name) {
+        return Some(function);
+    }
 
     let is_jax = module == ["jax"];
     let is_jax_numpy = module == ["jax", "numpy"];
@@ -689,7 +696,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "repeat" | "repeat_interleave" => Some(KnownFunction::Repeat),
         "expand" | "broadcast_to" => Some(KnownFunction::BroadcastTo),
         "astype" => Some(KnownFunction::Astype),
-        "copy" => Some(KnownFunction::Copy),
+        "copy" | "byteswap" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
@@ -967,6 +974,26 @@ pub fn apply_known_function(
         }
         KnownFunction::FunctionalEmbedding => apply_known_functional_embedding(args, shapes),
         KnownFunction::PadSequence => apply_known_pad_sequence(args, shapes),
+        KnownFunction::Elementwise { parameters, rank_promotion } => {
+            jax::apply_elementwise(args, shapes, parameters, *rank_promotion)
+        }
+        KnownFunction::BroadcastLike => jax::apply_broadcast_like(args, shapes),
+        KnownFunction::Hadamard | KnownFunction::Dft | KnownFunction::InvHilbert
+        | KnownFunction::InvPascal | KnownFunction::Helmert | KnownFunction::Circulant
+        | KnownFunction::Fiedler | KnownFunction::Companion | KnownFunction::FiedlerCompanion
+        | KnownFunction::Leslie | KnownFunction::ConvolutionMatrix => {
+            jax::apply_matrix(function, args, shapes)
+        }
+        // Validate tuple-returning JAX calls without assigning a tensor shape
+        // to the tuple itself. Tuple unpacking uses these same helpers.
+        KnownFunction::LaxTopK => {
+            compute_top_k_shape(args, shapes)?;
+            Ok(None)
+        }
+        KnownFunction::QrMultiply => {
+            compute_qr_multiply_shapes(args, shapes)?;
+            Ok(None)
+        }
         _ => Ok(None),
     }
 }
@@ -1227,16 +1254,7 @@ fn apply_known_flax_pool(
 }
 
 fn sequence_arg_value(args: &[CallArgument]) -> Option<&str> {
-    let first_arg = args.first()?;
-    match first_arg {
-        CallArgument::Positional { value } => Some(value),
-        CallArgument::Keyword { name, value }
-            if name == "arrays" || name == "tensors" || name == "arys" =>
-        {
-            Some(value)
-        }
-        CallArgument::Keyword { .. } => None,
-    }
+    nth_positional_or_keyword(args, 0, &["arrays", "tensors", "arys", "operands"])
 }
 
 fn axis_arg(args: &[CallArgument], default: isize) -> isize {
@@ -1462,7 +1480,11 @@ fn apply_known_stack(
     }
 
     let output_rank = first_shape.len() + 1;
-    let axis = axis_arg(args, 0);
+    let Some(axis) = parse_axis(
+        nth_positional_or_keyword(args, 1, &["axis", "dim"]).unwrap_or("0"),
+    ) else {
+        return Ok(None);
+    };
     let axis = if axis < 0 {
         output_rank as isize + axis
     } else {
@@ -4565,7 +4587,7 @@ pub fn compute_unbind_shape(
     if rank == 0 {
         return Err("unbind requires rank >= 1 input".to_string());
     }
-    let dim_raw = nth_positional_or_keyword(args, 1, &["dim"]).unwrap_or("0");
+    let dim_raw = nth_positional_or_keyword(args, 1, &["dim", "axis"]).unwrap_or("0");
     let Some(dim) = parse_axis(dim_raw) else {
         return Ok(None);
     };

@@ -7,16 +7,21 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified after the AST-reuse refactor based on `b0ee443` (`ndim-lsp` 0.1.1):
+Verified after the JAX 0.11.1 compatibility audit based on `f2bcb7f`
+(`ndim-lsp` 0.1.1):
 
-- `cargo test --quiet` passes: 1,776 tests pass and two benchmarks are ignored
-  (1,754 library/integration tests plus 22 LSP-server tests).
+- `cargo test --quiet` passes: 1,781 tests pass and two benchmarks are ignored
+  (1,759 library/integration tests plus 22 LSP-server tests).
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
+- `bench/jax_compat/check.py` passes 84 shared runtime cases against real
+  JAX/jaxlib 0.11.1. `cargo test jax_compat_tests` checks the same fixtures
+  through the analyzer, including inlay-hint records, plus symbolic/unknown
+  inputs and namespace isolation. Rust tests do not require JAX.
 - `cargo test --release bench_large_file -- --ignored --nocapture` runs the
   timing harness over `bench/benchmark_large.py` (currently 4,541 lines;
-  regenerate with `python3 bench/generate_benchmark.py`). On the validation
+  regenerate with `python3 bench/generate_benchmark.py`). At `f2bcb7f`, the validation
   machine it measured 10.7 ms parse and 30.4 ms analyze medians in release
   (analysis was 40.1 ms before this refactor on the same machine).
   The timing is machine-dependent. The invariant is >1,000 inferred shapes and
@@ -34,6 +39,26 @@ Verified after the AST-reuse refactor based on `b0ee443` (`ndim-lsp` 0.1.1):
   the prioritization tool: add a representative model that exposes a gap,
   implement the top-ranked gap, then re-measure. The current corpus is 176/176
   (100%), with no dark spots.
+
+JAX compatibility audit
+-----------------------
+
+`bench/jax_compat/README.md` records the 0.9.2 -> 0.11.1 public-export audit,
+its eight namespaces, source links, and conservative limits. This covers
+recent additions, not all older or experimental JAX APIs. `audit.py` can
+repeat the export comparison for the next release without installing JAX.
+
+`src/known_functions/jax.rs` adds rules for all 26 new array functions in
+those namespace differences. Existing stack/unbind rules are shared, and
+the new byteswap method is shape-preserving. LAX top_k now honors axis.
+Top-k and qr_multiply share validation between single-name and unpacked
+calls, but only unpacking exposes their component tensor shapes.
+Shape-changing options that are not static stay unknown.
+
+Stack arguments now preserve list/tuple elements (including inline array
+expressions) instead of collapsing a homogeneous tuple into one operand.
+This applies to JAX, NumPy, and PyTorch. General sequence variables remain
+unknown because the shape map does not represent container types.
 
 Rule for agents working on this repo
 ------------------------------------
