@@ -458,12 +458,11 @@ impl Backend {
                 continue;
             }
             let line = rec.line;
-
-            if !seen.insert((line, rec.name.clone())) {
+            if line < visible_range.start.line || line > visible_range.end.line {
                 continue;
             }
 
-            if line < visible_range.start.line || line > visible_range.end.line {
+            if !seen.insert((line, rec.name.clone())) {
                 continue;
             }
 

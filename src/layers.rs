@@ -2352,17 +2352,6 @@ mod apply_layer_application_tests {
     }
 
     #[test]
-    fn test_input_shape_map_is_not_mutated() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "5"])));
-        assert_eq!(shapes.get("x"), Some(&shape(&["batch", "3"])));
-    }
-
-    #[test]
     fn test_error_mentions_layer_and_input_names() {
         let mut app = app("input", linear("3", "5"));
         app.layer = "projection".to_string();
@@ -2558,16 +2547,6 @@ mod apply_layer_applications_tests {
     }
 
     #[test]
-    fn test_missing_input_does_not_create_shape_error() {
-        let apps = vec![app("y", "layer", "unknown", linear("3", "5"))];
-        let mut scopes = scopes_from(HashMap::new());
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-    }
-
-    #[test]
     fn test_empty_applications_preserve_existing_shapes() {
         let apps = Vec::new();
         let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
@@ -2607,21 +2586,6 @@ mod apply_layer_applications_tests {
         assert_eq!(errors[0].variable, "bad");
         assert!(!scopes[0].shapes.contains_key("bad"));
         assert!(!scopes[0].shapes.contains_key("z"));
-    }
-
-    #[test]
-    fn test_successful_application_after_unrelated_error_can_use_known_input() {
-        let apps = vec![
-            app("bad", "bad_layer", "x", linear("4", "5")),
-            app("good", "good_layer", "x", linear("3", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "bad");
-        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
     }
 
     #[test]

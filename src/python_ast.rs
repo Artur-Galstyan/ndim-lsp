@@ -1497,6 +1497,40 @@ mod extract_jaxtyping_shapes_tests {
     }
 
     #[test]
+    fn test_dimension_sites_unicode_multiline_raw_triple_quote_ranges() {
+        let code = "é = 1\ndef f(π: Float[Array, r\"\"\"batch\n  δim, out\"\"\"]): pass";
+        let tree = parse(code);
+        let scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
+        let sites = &scope_by_name(&scopes, "f").dimension_sites;
+
+        assert_eq!(sites.len(), 3);
+        for (site, (name, bytes, start, end)) in sites.iter().zip([
+            (
+                "batch",
+                34..39,
+                tree_sitter::Point::new(1, 27),
+                tree_sitter::Point::new(1, 32),
+            ),
+            (
+                "δim",
+                42..46,
+                tree_sitter::Point::new(2, 2),
+                tree_sitter::Point::new(2, 6),
+            ),
+            (
+                "out",
+                48..51,
+                tree_sitter::Point::new(2, 8),
+                tree_sitter::Point::new(2, 11),
+            ),
+        ]) {
+            assert_eq!(&code[site.range.start_byte..site.range.end_byte], name);
+            assert_eq!(site.range.start_byte..site.range.end_byte, bytes);
+            assert_eq!((site.range.start_point, site.range.end_point), (start, end));
+        }
+    }
+
+    #[test]
     fn test_extracts_concrete_integer_dimension() {
         let code = "def f(x: Float[Array, \"batch 3\"]): pass";
         let tree = parse(code);

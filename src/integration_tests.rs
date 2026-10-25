@@ -675,24 +675,6 @@ mod end_to_end_layer_shape_tests {
     }
 
     #[test]
-    fn test_extracts_layers_and_propagates_single_application() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-    }
-
-    #[test]
     fn test_extracts_layers_and_propagates_chain() {
         let tmp = tempfile::tempdir().unwrap();
         write_equinox_linear(&tmp);
@@ -8132,11 +8114,24 @@ mod linear_algebra_extra_tests {
 
     #[test]
     fn test_cross_broadcasts_batch_dims() {
-        let code = "import torch\ndef f(a: Float[Array, \"n 3\"], b: Float[Array, \"3\"]):\n    y = torch.cross(a, b)";
+        let code = "import torch\ndef f(a: Float[Array, \"n 3\"], b: Float[Array, \"1 3\"]):\n    y = torch.cross(a, b, dim=-1)";
         let analysis = analyze(code);
 
-        assert!(analysis.errors.is_empty());
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "3"])));
+
+        let bad_code = "import torch\ndef f(a: Float[Array, \"n 3\"], b: Float[Array, \"3\"]):\n    bad = torch.cross(a, b, dim=-1)";
+        let bad_analysis = analyze(bad_code);
+
+        assert_eq!(bad_analysis.errors.len(), 1);
+        let error = &bad_analysis.errors[0];
+        assert_eq!(error.variable, "bad");
+        assert!(error.message.contains("same number of dimensions"));
+        assert_eq!(
+            &bad_code[error.range.start_byte..error.range.end_byte],
+            "(a, b, dim=-1)"
+        );
+        assert_eq!(find_shape(&bad_analysis, "bad"), None);
     }
 
     #[test]

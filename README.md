@@ -2,6 +2,19 @@
 
 A Rust-based Language Server Protocol (LSP) for statically detecting tensor shape mismatches in Python deep learning code (NumPy, JAX, PyTorch, Equinox, etc.) using `tree-sitter` and type annotations.
 
+## Scoped shape support
+
+This pass covers selected JAX 0.11/0.12, NumPy 2.4/2.5, and Torch 2.14 shape rules. See the [JAX changelog](https://docs.jax.dev/en/latest/changelog.html), [NumPy 2.5 notes](https://numpy.org/doc/2.5/release/2.5.0-notes.html), and [Torch 2.14 release](https://github.com/pytorch/pytorch/releases/tag/v2.14.0). It is not complete framework coverage or a dependency upgrade.
+
+- `jax.scipy.special.erfcinv`, `jax.lax.log2`, and `jax.lax.one_minus_square` preserve shape; `jax.lax.polynomial` broadcasts scalar or known coefficient sequences.
+- `jnp.minmax` and `jnp.top_k` track two unpacked outputs; `jax.random.multinomial` tracks batch dimensions and the category axis.
+- Multi-input `atleast_1d`/`atleast_2d`/`atleast_3d` and `broadcast_arrays` bind tuple-unpacked outputs. `atleast_3d` adds a trailing axis to vectors and matrices.
+- A tuple returned by these calls and bound to one name has no tensor shape. `np.pad` supports literal axis dictionaries; `jnp.pad` does not.
+- `np.cross`/`jnp.cross` require size-3 vector axes. `torch.cross` has distinct rank and axis rules; `torch.linalg.matrix_sqrth` preserves square matrix shapes.
+- Concrete split points support negative and clipped indices; `array_split`/`tensor_split` allow uneven chunks. Symbolic points assume positive, ordered, in-bounds values without proof.
+- `row_stack` remains a legacy alias rule, not API or version validation. Numerical, compiler, device, and autodiff changes do not change shape rules.
+- Generalized SciPy `eigh` and batched SciPy `lu` remain unsupported in this pass.
+
 ## For agents working on this repo
 
 The roadmap below tracks broad support and lists important limits. **Authoritative state lives in `src/`.** Before adding any feature, grep for it first:

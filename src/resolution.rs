@@ -288,21 +288,29 @@ where
                 return Err("failed to parse file".to_string());
             };
 
-            let root = tree.root_node();
+            let Some(symbol) = find_top_level_symbol(
+                tree.root_node(),
+                &text,
+                &resolved.symbol_parts[0],
+            )? else {
+                return Ok(None);
+            };
 
-            if let Some(symbol) = resolve_terminal_symbol_once(&resolved, root, &text)? {
-                return Ok(Some(ResolvedImplementation {
-                    target: resolved,
-                    symbol: Some(symbol),
-                }));
+            match symbol {
+                PythonSymbol::Class { .. } | PythonSymbol::Function { .. } => {
+                    return Ok(Some(ResolvedImplementation {
+                        target: resolved,
+                        symbol: Some(symbol),
+                    }));
+                }
+                PythonSymbol::Import { .. } => {
+                    let Some(mut next) = follow_import_symbol_once(&resolved.module_parts, &symbol) else {
+                        return Ok(None);
+                    };
+                    next.parts.extend(resolved.symbol_parts.iter().skip(1).cloned());
+                    current = next;
+                }
             }
-
-            if let Some(next) = resolve_reexport_once(&resolved, root, &text)? {
-                current = next;
-                continue;
-            }
-
-            return Ok(None);
         }
 
         Ok(None)

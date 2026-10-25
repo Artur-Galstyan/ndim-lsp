@@ -6,8 +6,9 @@ use tree_sitter::Node;
 use crate::known_functions::{
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
     apply_known_reduction, apply_known_topk_shape, apply_method_call, classify_known_function,
-    classify_method_call, compute_chunk_shapes, compute_einops_pack_shape,
-    compute_fixed_axis_split_shapes, compute_split_shapes, compute_torch_split_shapes,
+    classify_method_call, compute_array_split_shapes, compute_chunk_shapes,
+    compute_einops_pack_shape, compute_fixed_axis_split_shapes, compute_split_shapes,
+    compute_torch_split_shapes,
     compute_unbind_shape,
 };
 use crate::layers::{
@@ -1131,8 +1132,21 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // Resolve arguments — but first, recursively evaluate any inline
     // expression arguments (nested calls, unary ops, etc.) so they have
     // shapes in the scope.
+    let resolved = resolve_call_target(&target, ctx.import_map);
+    let known = classify_known_function(&resolved);
     let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
-    let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+    let args = if matches!(known, Some(KnownFunction::LaxPolynomial)) {
+        let mut args = raw_args;
+        if let Some((i, input)) = args.iter_mut().enumerate().find(|(_, arg)| {
+            matches!(arg, CallArgument::Positional { .. })
+                || matches!(arg, CallArgument::Keyword { name, .. } if name == "x")
+        }) {
+            *input = resolve_call_arg(input.clone(), args_node.named_child(i as u32)?, scope_idx, ctx)?;
+        }
+        args
+    } else {
+        resolve_call_args(raw_args, args_node, scope_idx, ctx)?
+    };
 
     // 1. Layer check
     if let Some(kind) = find_scoped_layer(ctx.layer_records, ctx.scopes, call_byte, &target) {
@@ -1192,8 +1206,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // (rather than through `apply_known_function`) because resolving `f`
     // needs the callee's `FunctionShapeScope`/self-attr-layer machinery.
     {
-        let resolved_for_map = resolve_call_target(&target, ctx.import_map);
-        if matches!(classify_known_function(&resolved_for_map), Some(KnownFunction::LaxMap)) {
+        if matches!(known.as_ref(), Some(KnownFunction::LaxMap)) {
             let mut positionals = args.iter().filter_map(|a| match a {
                 CallArgument::Positional { value } => Some(value.clone()),
                 _ => None,
@@ -1290,8 +1303,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     }
 
     // 4. vmap *recording* (e.g. `vf = jax.vmap(f)`)
-    let resolved = resolve_call_target(&target, ctx.import_map);
-    if let Some(KnownFunction::Vmap) = classify_known_function(&resolved)
+    if matches!(known.as_ref(), Some(KnownFunction::Vmap))
         && let Some(_info) = parse_vmap_call(&args) {
             // The caller (propagate_calls) will handle binding the LHS
             // variable name to the vmap target. For now we just signal
@@ -1307,7 +1319,13 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         }
 
     // 5. Known-function check
-    if let Some(known) = classify_known_function(&resolved) {
+    if let Some(known) = known {
+        if matches!(known, KnownFunction::BroadcastArrays)
+            || (matches!(known, KnownFunction::AtLeast1D | KnownFunction::AtLeast2D | KnownFunction::AtLeast3D)
+                && args.len() > 1)
+        {
+            return None;
+        }
         // A stack consumes a sequence, not one tensor. In particular, the
         // homogeneous-tuple approximation used for scan carries must not
         // collapse `(x, x)` into one operand. Share this rule across backends.
@@ -1382,84 +1400,45 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     None
 }
 
-/// Given the raw `CallArgument`s extracted from a call's argument_list node,
-/// recursively evaluate any argument that is itself a non-trivial expression
-/// (nested call, unary operator, etc.) and bind its shape under a synthetic
-/// name so that downstream lookups in `apply_known_function` etc. can find it.
-///
-/// Simple identifier arguments pass through unchanged.
+/// Resolve one argument from its matching AST node. Expressions without a
+/// known shape pass through unchanged.
+fn resolve_call_arg(
+    arg: CallArgument,
+    arg_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<CallArgument> {
+    let value = match &arg {
+        CallArgument::Positional { value } | CallArgument::Keyword { value, .. } => value,
+    };
+    if value.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Some(arg);
+    }
+    let value_node = match &arg {
+        CallArgument::Positional { .. } => arg_node,
+        CallArgument::Keyword { .. } => arg_node.child_by_field_name("value")?,
+    };
+    let Some(shape) = shape_of_expression(value_node, ctx) else {
+        return Some(arg);
+    };
+    let value = ctx.bind_synthetic(shape, scope_idx, value_node.start_byte());
+    Some(match arg {
+        CallArgument::Positional { .. } => CallArgument::Positional { value },
+        CallArgument::Keyword { name, .. } => CallArgument::Keyword { name, value },
+    })
+}
+
 fn resolve_call_args(
     raw_args: Vec<CallArgument>,
     args_node: Node,
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<CallArgument>> {
-    let mut resolved = Vec::with_capacity(raw_args.len());
-
-    for (i, arg) in raw_args.into_iter().enumerate() {
-        match arg {
-            CallArgument::Positional { value } => {
-                // Check if the argument text looks like a simple identifier.
-                // This is a fast-path heuristic: strings matching
-                // [A-Za-z0-9_]+ are either identifiers (which are already
-                // in shapes or not) or numeric literals (which won't
-                // match any shape entry and are silently skipped).
-                // Complex expressions (dots, parens, operators) fall through
-                // to the recursive evaluator.
-                let looks_like_identifier = value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_');
-
-                if looks_like_identifier {
-                    resolved.push(CallArgument::Positional { value });
-                } else {
-                    // Find the corresponding named child in args_node.
-                    // Positional args map to named children that aren't
-                    // keyword_arguments.
-                    let child_node = find_positional_arg_node(args_node, i)?;
-                    let shape = shape_of_expression(child_node, ctx);
-                    if let Some(shape) = shape {
-                        let synth_name =
-                            ctx.bind_synthetic(shape, scope_idx, child_node.start_byte());
-                        resolved.push(CallArgument::Positional {
-                            value: synth_name,
-                        });
-                    } else {
-                        // Can't resolve this argument — pass through as-is.
-                        // Downstream lookups will fail and return None,
-                        // which is the expected fallback.
-                        resolved.push(CallArgument::Positional { value });
-                    }
-                }
-            }
-            CallArgument::Keyword { name, value } => {
-                // For keyword args, check if the value looks like a simple identifier.
-                let looks_like_identifier = value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_');
-                if looks_like_identifier {
-                    resolved.push(CallArgument::Keyword { name, value });
-                } else {
-                    // Find the keyword argument node and evaluate its value.
-                    let kw_node = find_keyword_arg_node(args_node, &name, ctx.text.as_bytes())?;
-                    let value_node = kw_node.child_by_field_name("value")?;
-                    let shape = shape_of_expression(value_node, ctx);
-                    if let Some(shape) = shape {
-                        let synth_name =
-                            ctx.bind_synthetic(shape, scope_idx, value_node.start_byte());
-                        resolved.push(CallArgument::Keyword {
-                            name,
-                            value: synth_name,
-                        });
-                    } else {
-                        resolved.push(CallArgument::Keyword { name, value });
-                    }
-                }
-            }
-        }
-    }
-
-    Some(resolved)
+    raw_args
+        .into_iter()
+        .enumerate()
+        .map(|(i, arg)| resolve_call_arg(arg, args_node.named_child(i as u32)?, scope_idx, ctx))
+        .collect()
 }
 
 fn resolve_stack_args(
@@ -2545,6 +2524,65 @@ fn tuple_rhs_shapes(
                 return Some(result);
             }
 
+            if matches!(
+                known,
+                Some(
+                    KnownFunction::AtLeast1D
+                        | KnownFunction::AtLeast2D
+                        | KnownFunction::AtLeast3D
+                        | KnownFunction::BroadcastArrays
+                )
+            ) {
+                let args_node = rhs.child_by_field_name("arguments")?;
+                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                if raw_args.len() != n_targets
+                    || raw_args
+                        .iter()
+                        .any(|arg| !matches!(arg, CallArgument::Positional { .. }))
+                {
+                    return None;
+                }
+                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+                let known = known.as_ref()?;
+                if matches!(known, KnownFunction::BroadcastArrays) {
+                    return match apply_known_function(known, &args, &ctx.scope_shapes(scope_idx)) {
+                        Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
+                        Ok(None) => None,
+                        Err(message) => {
+                            ctx.errors.push(ShapeError::mismatch(
+                                String::new(),
+                                message,
+                                args_node.range(),
+                            ));
+                            None
+                        }
+                    };
+                }
+                if n_targets < 2 {
+                    return None;
+                }
+                let mut shapes = Vec::with_capacity(n_targets);
+                for arg in &args {
+                    match apply_known_function(
+                        known,
+                        std::slice::from_ref(arg),
+                        &ctx.scope_shapes(scope_idx),
+                    ) {
+                        Ok(Some(shape)) => shapes.push(Some(shape)),
+                        Ok(None) => return None,
+                        Err(message) => {
+                            ctx.errors.push(ShapeError::mismatch(
+                                String::new(),
+                                message,
+                                args_node.range(),
+                            ));
+                            return None;
+                        }
+                    }
+                }
+                return Some(shapes);
+            }
+
             // Multi-output linear algebra + meshgrid (v1: default modes only —
             // any keyword argument like full_matrices/mode/indexing skips).
             if matches!(
@@ -2576,6 +2614,7 @@ fn tuple_rhs_shapes(
                 known,
                 Some(
                     KnownFunction::TopK
+                        | KnownFunction::MinMax
                         | KnownFunction::Chunk
                         | KnownFunction::Unbind
                         | KnownFunction::KthValue
@@ -2584,17 +2623,32 @@ fn tuple_rhs_shapes(
                 )
             ) {
                 let args_node = rhs.child_by_field_name("arguments")?;
-                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+                let mut args = extract_call_arguments(args_node, ctx.text).ok()?;
+                if matches!(known, Some(KnownFunction::TopK | KnownFunction::MinMax)) {
+                    if let Some((i, input)) = args.iter_mut().enumerate().find(|(_, arg)| {
+                        matches!(arg, CallArgument::Positional { .. })
+                            || matches!(arg, CallArgument::Keyword { name, .. }
+                                if matches!(name.as_str(), "a" | "x" | "input" | "array" | "y"))
+                    }) {
+                        *input = resolve_call_arg(input.clone(), args_node.named_child(i as u32)?, scope_idx, ctx)?;
+                    }
+                } else {
+                    args = resolve_call_args(args, args_node, scope_idx, ctx)?;
+                }
                 return tuple_multi_output_shapes(&known?, &args, args_node, n_targets, scope_idx, ctx);
             }
 
-            if !matches!(known, Some(KnownFunction::Split)) {
+            if !matches!(known, Some(KnownFunction::Split | KnownFunction::ArraySplit)) {
                 return None;
             }
             let args_node = rhs.child_by_field_name("arguments")?;
             let args = extract_call_arguments(args_node, ctx.text).ok()?;
-            match compute_split_shapes(&args, &ctx.scope_shapes(scope_idx)) {
+            let result = if matches!(known, Some(KnownFunction::ArraySplit)) {
+                compute_array_split_shapes(&args, &ctx.scope_shapes(scope_idx))
+            } else {
+                compute_split_shapes(&args, &ctx.scope_shapes(scope_idx))
+            };
+            match result {
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
@@ -2646,7 +2700,7 @@ fn tuple_multi_output_shapes(
                 }
             }
         }
-        KnownFunction::MedianDim => {
+        KnownFunction::MinMax | KnownFunction::MedianDim => {
             if n_targets != 2 {
                 return None;
             }
@@ -2658,7 +2712,7 @@ fn tuple_multi_output_shapes(
                 || args
                     .iter()
                     .any(|a| matches!(a, CallArgument::Keyword { name, .. } if name == "dim" || name == "axis"));
-            if !has_dim {
+            if !has_dim && matches!(known, KnownFunction::MedianDim) {
                 // No-dim scalar form (`torch.median(x)`) isn't a 2-tuple.
                 return None;
             }
@@ -4054,6 +4108,11 @@ mod shape_of_expression_tests {
         parser.parse(code, None).unwrap()
     }
 
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
     fn shape(dims: &[&str]) -> Vec<String> {
         dims.iter().map(|dim| dim.to_string()).collect()
     }
@@ -4472,5 +4531,258 @@ def f(x: Float[Array, "3 5"]):
         assert!(
             apply_elementwise_shape(&shape(&["batch"]), &shape(&["seq"]), BinaryOp::Add).is_err()
         );
+    }
+
+    #[test]
+    fn test_minmax_tuple_reduction_and_binding_safety() {
+        let code = r#"import jax.numpy as jnp
+from jax.numpy import minmax as mm
+def f(x: Float[Array, "2 3 5"]):
+    low, high = mm(jnp.exp(x), axis=1, keepdims=True)
+    kw_low, kw_high = mm(a=jnp.exp(x), axis=2)
+    reordered_low, reordered_high = mm(axis=1, a=jnp.exp(x))
+    all_low, all_high = jnp.minmax(x)
+    single = jnp.minmax(x, axis=1)
+    extra_a, extra_b, extra_c = jnp.minmax(x, axis=1)
+    bad_low, bad_high = mm(x, axis=3)
+"#;
+        let analysis = analyze(code);
+        for name in ["low", "high"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "1", "5"])));
+        }
+        for name in ["kw_low", "kw_high"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "3"])));
+        }
+        for name in ["reordered_low", "reordered_high"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "5"])));
+        }
+        for name in ["all_low", "all_high"] {
+            assert_eq!(find_shape(&analysis, name), Some(&Vec::new()));
+        }
+        for name in ["single", "extra_a", "extra_b", "extra_c", "bad_low", "bad_high"] {
+            assert_eq!(find_shape(&analysis, name), None);
+        }
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(x, axis=3)");
+    }
+
+    #[test]
+    fn test_topk_tuple_axis_alias_nested_and_bounds() {
+        let code = r#"import jax.numpy as jnp
+from jax.numpy import top_k as tk
+import torch
+def f(x: Float[Array, "2 3 5"], k: int):
+    v, i = jnp.top_k(jnp.exp(x), 2, axis=1)
+    v_alias, i_alias = tk(x, 3, axis=-1)
+    single = jnp.top_k(x, 2, axis=0)
+    extra_a, extra_b, extra_c = tk(x, 2, axis=0)
+    symbolic_v, symbolic_i = tk(x, k, axis=1)
+    unknown_v, unknown_i = tk(x, jnp.sum(x), axis=1)
+    bad_k_v, bad_k_i = tk(x, 6, axis=2)
+    bad_v, bad_i = tk(x, 2, axis=3)
+def g(t: Float[Array, "2 3 5"]):
+    v_kw, i_kw = torch.topk(input=torch.exp(t), k=1, dim=0)
+    v_torch, i_torch = torch.topk(t, 4, dim=2)
+"#;
+        let analysis = analyze(code);
+        for name in ["v", "i"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "2", "5"])));
+        }
+        for name in ["v_alias", "i_alias"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "3", "3"])));
+        }
+        for name in ["symbolic_v", "symbolic_i"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "k", "5"])));
+        }
+        for name in ["v_kw", "i_kw"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["1", "3", "5"])));
+        }
+        for name in ["v_torch", "i_torch"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2", "3", "4"])));
+        }
+        for name in ["single", "extra_a", "extra_b", "extra_c", "unknown_v", "unknown_i", "bad_k_v", "bad_k_i", "bad_v", "bad_i"] {
+            assert_eq!(find_shape(&analysis, name), None);
+        }
+        assert_eq!(analysis.errors.len(), 2, "{:?}", analysis.errors);
+        assert!(analysis.errors[0].message.contains("top_k k=6 exceeds axis size 5"));
+        assert!(analysis.errors[1].message.contains("out of bounds"));
+        let ranges: Vec<_> = analysis.errors.iter().map(|error| {
+            &code[error.range.start_byte..error.range.end_byte]
+        }).collect();
+        assert_eq!(ranges, ["(x, 6, axis=2)", "(x, 2, axis=3)"]);
+    }
+
+    #[test]
+    fn test_multi_input_atleast_keeps_each_array_shape() {
+        let code = r#"import jax.numpy as jnp
+import torch
+def f(s: float, v: Float[Array, "5"], m: Float[Array, "2 5"]):
+    a, b = jnp.atleast_1d(s, v)
+    c, d = jnp.atleast_2d(jnp.exp(v), m)
+    e, g, h = jnp.atleast_3d(s, v, m)
+    t, u = torch.atleast_2d(v, m)
+    one = jnp.atleast_2d(v)
+    not_a, not_b = jnp.atleast_2d((v, v))
+    unpacked_a, unpacked_b = jnp.atleast_2d(v)
+    unpacked_one, = jnp.atleast_2d(v)
+    packed = jnp.atleast_2d(v, m)
+    torch_packed = torch.atleast_2d(v, m)
+"#;
+        let analysis = analyze(code);
+        for (name, dims) in [
+            ("a", &["1"][..]),
+            ("b", &["5"][..]),
+            ("c", &["1", "5"][..]),
+            ("d", &["2", "5"][..]),
+            ("e", &["1", "1", "1"][..]),
+            ("g", &["1", "5", "1"][..]),
+            ("h", &["2", "5", "1"][..]),
+            ("t", &["1", "5"][..]),
+            ("u", &["2", "5"][..]),
+            ("one", &["1", "5"][..]),
+        ] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(dims)), "{name}");
+        }
+        assert_eq!(find_shape(&analysis, "not_a"), None);
+        for name in ["not_b", "unpacked_a", "unpacked_b", "unpacked_one", "packed", "torch_packed"] {
+            assert_eq!(find_shape(&analysis, name), None);
+        }
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_broadcast_array_tuple_uses_shared_shape_and_reports_mismatch() {
+        let code = r#"import jax.numpy as jnp
+import torch
+def f(x: Float[Array, "3 1"], y: Float[Array, "1 5"], bad: Float[Array, "4 5"]):
+    a, b = jnp.broadcast_arrays(jnp.exp(x), y)
+    c, d = torch.broadcast_tensors(x, y)
+    single = jnp.broadcast_arrays(x, y)
+    wrong_a, wrong_b = jnp.broadcast_arrays(x, bad)
+"#;
+        let analysis = analyze(code);
+        for name in ["a", "b", "c", "d"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["3", "5"])));
+        }
+        for name in ["single", "wrong_a", "wrong_b"] {
+            assert_eq!(find_shape(&analysis, name), None);
+        }
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(x, bad)");
+    }
+
+    #[test]
+    fn test_resolve_nested_positional_and_keyword_keeps_error_range() {
+        let code = r#"import jax.numpy as jnp
+def f(x: Float[Array, "2 3"]):
+    positional = jnp.sum(jnp.exp(x), axis=1)
+    keyword = jnp.sum(x=jnp.exp(x), axis=0)
+    bad = jnp.sum(jnp.exp(x), axis=(0, 3))
+"#;
+        let analysis = analyze(code);
+        assert_eq!(find_shape(&analysis, "positional"), Some(&shape(&["2"])));
+        assert_eq!(find_shape(&analysis, "keyword"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "bad"), None);
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let range = &analysis.errors[0].range;
+        assert_eq!(
+            &code[range.start_byte..range.end_byte],
+            "(jnp.exp(x), axis=(0, 3))"
+        );
+    }
+
+    #[test]
+    fn test_polynomial_coefficients_keep_sequence_text() {
+        let code = r#"import jax
+import jax.numpy as jnp
+def f(x: Float[Array, "1 4"], a: Float[Array, "3 1"], b: Float[Array, "3 1"], bad: Float[Array, "2 5"]):
+    tuple_coeffs = jax.lax.polynomial(x, (a, b))
+    list_coeffs = jax.lax.polynomial(jnp.exp(x), [1., a, 3])
+    scalar_coeffs = jax.lax.polynomial(x, (1., 2.))
+    keyword_coeffs = jax.lax.polynomial(coeffs=(a, b), x=jnp.exp(x))
+    unknown_coeffs = jax.lax.polynomial(x, [missing])
+    bad_coeffs = jax.lax.polynomial(x, [bad])
+"#;
+        let analysis = analyze(code);
+        for name in ["tuple_coeffs", "list_coeffs", "keyword_coeffs"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["3", "4"])), "{name}");
+        }
+        assert_eq!(find_shape(&analysis, "scalar_coeffs"), Some(&shape(&["1", "4"])));
+        assert_eq!(find_shape(&analysis, "unknown_coeffs"), None);
+        assert_eq!(find_shape(&analysis, "bad_coeffs"), None);
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(x, [bad])");
+    }
+
+    #[test]
+    fn test_new_known_calls_preserve_scalars_and_error_locations() {
+        let code = r#"import jax
+import jax.numpy as jnp
+import numpy as np
+import torch
+def f(key, dynamic, y: Float[Array, "2 3"], s: float, p: Float[Array, "7"], batched: Float[Array, "2 7"], arr: Float[Array, "n 4"]):
+    inv = jax.scipy.special.erfcinv(y=y)
+    scalar_inv = jax.scipy.special.erfcinv(y=s)
+    logarithm = jax.lax.log2(jnp.exp(y))
+    one_minus_square = jax.lax.one_minus_square(y)
+    sample = jax.random.multinomial(key, n=3, p=p, shape=())
+    unknown = jax.random.multinomial(key, 3, p, shape=dynamic)
+    bad_batch = jax.random.multinomial(key, 3, p=batched, shape=())
+    padded_valid = np.pad(arr, pad_width=1)
+    padded = np.pad(arr, pad_width={0: (1, 2), -1: 3})
+    bad_pad = np.pad(arr, pad_width={2: 1})
+def g(mat: Float[Array, "2 3 3"], nonsquare: Float[Array, "2 3 4"]):
+    root = torch.linalg.matrix_sqrth(A=mat)
+    bad_root = torch.linalg.matrix_sqrth(A=nonsquare)
+"#;
+        let analysis = analyze(code);
+        assert_eq!(find_shape(&analysis, "inv"), Some(&shape(&["2", "3"])));
+        assert_eq!(find_shape(&analysis, "scalar_inv"), Some(&Vec::new()));
+        assert_eq!(find_shape(&analysis, "logarithm"), Some(&shape(&["2", "3"])));
+        assert_eq!(find_shape(&analysis, "one_minus_square"), Some(&shape(&["2", "3"])));
+        assert_eq!(find_shape(&analysis, "sample"), Some(&shape(&["7"])));
+        assert_eq!(find_shape(&analysis, "padded_valid"), Some(&shape(&["n+2", "6"])));
+        assert_eq!(find_shape(&analysis, "padded"), Some(&shape(&["n+3", "10"])));
+        assert_eq!(find_shape(&analysis, "root"), Some(&shape(&["2", "3", "3"])));
+        for name in ["unknown", "bad_batch", "bad_pad", "bad_root"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        let ranges: Vec<_> = analysis.errors.iter().map(|error| {
+            &code[error.range.start_byte..error.range.end_byte]
+        }).collect();
+        assert_eq!(ranges, ["(key, 3, p=batched, shape=())", "(arr, pad_width={2: 1})", "(A=nonsquare)"]);
+    }
+
+    #[test]
+    fn test_array_split_tuple_defaults_uneven_parts_and_unknown_axes() {
+        let code = r#"import numpy as np
+import jax.numpy as jnp
+import torch
+def f(x: Float[Array, "4"], uneven: Float[Array, "7"], symbolic: Float[Array, "n"], axis: int):
+    left, right = np.split(x, 2)
+    a, b, c = np.array_split(uneven, 3)
+    d, e, f = jnp.array_split(uneven, 3)
+    g, h, i = torch.tensor_split(uneven, 3)
+    single = np.array_split(uneven, 3)
+    dyn_a, dyn_b, dyn_c = np.array_split(uneven, 3, axis=axis)
+    sym_a, sym_b, sym_c = np.array_split(symbolic, 3)
+    wrong_a, wrong_b, wrong_c = np.split(x, 3)
+"#;
+        let analysis = analyze(code);
+        for name in ["left", "right", "b", "c", "e", "f", "h", "i"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["2"])), "{name}");
+        }
+        for name in ["a", "d", "g"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["3"])), "{name}");
+        }
+        for name in ["single", "dyn_a", "dyn_b", "dyn_c", "sym_a", "sym_b", "sym_c", "wrong_a", "wrong_b", "wrong_c"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        let range = &analysis.errors[0].range;
+        assert_eq!(&code[range.start_byte..range.end_byte], "(x, 3)");
     }
 }

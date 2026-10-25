@@ -560,6 +560,7 @@ pub enum KnownFunction {
     Mean,
     Max,
     Min,
+    MinMax,
     Prod,
     Std,
     Var,
@@ -567,9 +568,10 @@ pub enum KnownFunction {
     Dot,
     Einsum,
     Split,
+    ArraySplit,
     /// Real torch `split`/`Tensor.split` semantics: the 2nd arg is a
     /// `split_size` (or list of sizes), not a section *count* like
-    /// `jnp.split`/`np.split`/`torch.tensor_split` (see [`KnownFunction::Split`]).
+    /// `jnp.split`/`np.split` or `torch.tensor_split`.
     TorchSplit,
     Tile,
     Repeat,
@@ -595,6 +597,7 @@ pub enum KnownFunction {
     AtLeast2D,
     AtLeast3D,
     Pad,
+    NumpyPad,
     Roll,
     Flip,
     Rot90,
@@ -634,6 +637,7 @@ pub enum KnownFunction {
     Inner,
     Vdot,
     LinalgInv,
+    LinalgMatrixSqrth,
     LinalgDet,
     LinalgSvd,
     LinalgQr,
@@ -663,6 +667,8 @@ pub enum KnownFunction {
     LaxDynamicSlice,
     LaxDynamicUpdateSlice,
     LaxAssociativeScan,
+    LaxPolynomial,
+    RandomMultinomial,
     // jax.numpy / numpy array creation
     Diagflat,
     Tri,
@@ -692,6 +698,7 @@ pub enum KnownFunction {
     Histogram,
     // linear algebra
     Cross,
+    TorchCross,
     LinalgSolve,
     LinalgLstsq,
     LinalgPinv,

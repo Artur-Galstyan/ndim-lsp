@@ -44,6 +44,14 @@ Legend:
 | `jax.lax.associative_scan` | ✅ | ✅ | ✅ | Shape-preserving: output = `elems`'s shape (2nd positional / `elems` keyword). |
 | `jax.lax.psum` / `jax.lax.pmean` / `jax.lax.all_gather` (collectives) | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics under `pmap`/`shard_map`, not statically derivable with the current design. |
 
+## Scoped JAX additions
+
+| Function | Classified | Shape rule | Tests | Notes |
+|---|---:|---:|---:|---|
+| `jax.scipy.special.erfcinv` / `jax.lax.log2` / `jax.lax.one_minus_square` | ✅ | ✅ | ✅ | Unary, shape-preserving. |
+| `jax.lax.polynomial` | ✅ | ✅ | ✅ | Broadcasts `x` with scalar or known coefficient sequences; unknown coefficients stay unknown. |
+| `jax.random.multinomial` | ✅ | ✅ | ✅ | Output uses `p`'s category axis and its batch shape or a compatible literal `shape`; unknown `shape` stays unknown. |
+
 ## JAX NumPy / NumPy array creation
 
 | Function | Classified | Shape rule | Tests | Notes |
@@ -86,13 +94,13 @@ Legend:
 | `jnp.moveaxis` / `np.moveaxis` | ✅ | ✅ | ✅ | Move axes preserving order. |
 | `jnp.expand_dims` / `np.expand_dims` | ✅ | ✅ | ✅ | Insert size-1 axes. |
 | `jnp.squeeze` / `np.squeeze` | ✅ | ✅ | ✅ | Remove size-1 axes. |
-| `jnp.atleast_1d` / `np.atleast_1d` | ✅ | ✅ | ✅ | Promote scalar to rank 1. |
-| `jnp.atleast_2d` / `np.atleast_2d` | ✅ | ✅ | ✅ | Promote to rank 2. |
-| `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ✅ | ✅ | Promote to rank 3. |
+| `jnp.atleast_1d` / `np.atleast_1d` | ✅ | ✅ | ✅ | Scalars become `(1,)`; multiple positional inputs bind separately on tuple unpacking. |
+| `jnp.atleast_2d` / `np.atleast_2d` | ✅ | ✅ | ✅ | Vectors become `(1, n)`; multiple positional inputs bind separately on tuple unpacking. |
+| `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ✅ | ✅ | Vectors become `(1, n, 1)`, matrices `(m, n, 1)`; multiple positional inputs bind separately on tuple unpacking. |
 | `jnp.broadcast_to` / `np.broadcast_to` | ✅ | ✅ | ✅ | Output explicit target shape. |
-| `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ✅ | ✅ | Common broadcasted shape for all args. |
+| `jnp.broadcast_arrays` / `np.broadcast_arrays` | ✅ | ✅ | ✅ | Positional inputs bind to the common shape on tuple unpacking; a single-name tuple has no tensor shape. |
 | `jnp.broadcast_shapes` / `np.broadcast_shapes` | ❌ | ❌ | ❌ | Genuinely out of scope: returns a plain shape *tuple*, not an array — not applicable to this analyzer's "shape of an array" model. |
-| `jnp.pad` / `np.pad` | ✅ | ✅ | ✅ | Modifies dimensions by pad widths. |
+| `jnp.pad` / `np.pad` | ✅ | ✅ | ✅ | Adds pad widths; `np.pad` supports literal axis dictionaries (scalar or nonnegative pair per axis), but `jnp.pad` does not. |
 | `jnp.roll` / `np.roll` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.flip` / `np.flip` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.fliplr` / `np.fliplr` | ✅ | ✅ | ✅ | Shape-preserving, rank >= 2. |
@@ -115,10 +123,10 @@ Legend:
 | `jnp.hstack` / `np.hstack` | ✅ | ✅ | ✅ | Concatenate along axis depending rank. |
 | `jnp.dstack` / `np.dstack` | ✅ | ✅ | ✅ | Stack along depth axis. |
 | `jnp.column_stack` / `np.column_stack` | ✅ | ✅ | ✅ | Stack 1D as columns. |
-| `jnp.row_stack` / `np.row_stack` | ✅ | ✅ | ✅ | Alias-ish for vstack. |
+| `jnp.row_stack` / `np.row_stack` | ✅ | ✅ | ✅ | Legacy `vstack` alias rule; not API or version validation. |
 | `jnp.block` / `np.block` | ✅ | ✅ | ✅ | Recursively parses the nested-list literal; concatenates the innermost level along the last axis, each level up along the next axis (numpy semantics: axis = `rank - nesting_depth`). |
-| `jnp.split` / `np.split` | ✅ | ✅ | ✅ | Per-element shapes via `compute_split_shapes`; `a, b = split(...)` LHS bound in `analyze`. |
-| `jnp.array_split` / `np.array_split` / `torch.tensor_split` | ✅ | ✅ | ✅ | Shares `compute_split_shapes` (CASE 1/2), section-*count* semantics. `torch.tensor_split` verified against torch docs to use the same section-count semantics as `jnp`/`np` (unlike `torch.split`, which is a distinct `KnownFunction::TorchSplit` — see the Torch section below). |
+| `jnp.split` / `np.split` | ✅ | ✅ | ✅ | Tuple-unpacked parts: equal sections or literal points; concrete negative/out-of-bounds points normalize/clip, reversed slices are empty. Symbolic points assume positive, ordered, in-bounds values without proof. |
+| `jnp.array_split` / `np.array_split` / `torch.tensor_split` | ✅ | ✅ | ✅ | Tuple-unpacked uneven sections for concrete sizes (larger first, possibly empty); `torch.tensor_split` uses section counts, unlike `torch.split` sizes. Symbolic sizes with multiple sections stay unknown. |
 | `jnp.hsplit` / `np.hsplit` | ✅ | ✅ | ✅ | Tuple LHS via `compute_fixed_axis_split_shapes` (forces axis=1, or axis=0 for rank-1 input) delegating to `compute_split_shapes`. |
 | `jnp.vsplit` / `np.vsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=0. |
 | `jnp.dsplit` / `np.dsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=2; errors if rank < 3. |
@@ -140,6 +148,7 @@ Legend:
 | `jnp.argmin` / `np.argmin` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.argsort` / `np.argsort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.sort` / `np.sort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
+| `jnp.top_k` | ✅ | ✅ | ✅ | Tuple-unpacked values and indices replace the selected axis with `k`; a single-name tuple has no tensor shape. |
 | `jnp.searchsorted` / `np.searchsorted` | ✅ | ✅ | ✅ | Shape follows `v` (the values arg, 2nd positional), not `a`. |
 | `jnp.extract` / `np.extract` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — 1D length is data-dependent. |
 | `jnp.compress` / `np.compress` | ✅ | ✅ | ✅ | Classified; conservatively `Ok(None)` — axis length is data-dependent. |
@@ -154,6 +163,7 @@ Legend:
 | `jnp.max` / `np.max` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.amax` / `np.amax` | ✅ | ✅ | ✅ | Alias max. |
 | `jnp.min` / `np.min` | ✅ | ✅ | ✅ | Same axis semantics. |
+| `jnp.minmax` | ✅ | ✅ | ✅ | Tuple-unpacked minimum and maximum share the reduced shape; a single-name tuple has no tensor shape. |
 | `jnp.amin` / `np.amin` | ✅ | ✅ | ✅ | Alias min. |
 | `jnp.prod` / `np.prod` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.std` / `np.std` | ✅ | ✅ | ✅ | Same axis semantics. |
@@ -185,7 +195,7 @@ Legend:
 | `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ✅ | ✅ | ✅ | Contract axes. Only int-axes form supported; tuple-of-lists form is a follow-up. |
 | `jnp.outer` / `np.outer` / `torch.outer` | ✅ | ✅ | ✅ | Output `(a, b)`. |
 | `jnp.inner` / `np.inner` | ✅ | ✅ | ✅ | Last-axis contraction. |
-| `jnp.cross` / `np.cross` / `torch.cross` | ✅ | ✅ | ✅ | Broadcasts like an elementwise binary op (reuses `broadcast_two_shapes`); the cross-product axis length (2 or 3) is unaffected. |
+| `jnp.cross` / `np.cross` / `torch.cross` | ✅ | ✅ | ✅ | NumPy/JAX require concrete size-3 vector axes and broadcast batch dims; Torch requires equal input ranks and size-3 vector axes, with distinct default-axis behavior. |
 | `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule — axis/keepdims mechanics are identical to a plain reduction. |
 | `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ✅ | ✅ | ✅ | Square matrix -> batch shape; validates last two dims. |
 | `jnp.linalg.inv` / `np.linalg.inv` / `torch.linalg.inv` | ✅ | ✅ | ✅ | Shape-preserving for square matrices; validates last two dims. |
@@ -197,6 +207,7 @@ Legend:
 | `torch.linalg.lstsq` | ✅ | ✅ | ✅ | Tuple LHS (any prefix of `solution, residuals, rank, sv`): `solution` = `A`'s batch dims + `[n, k]` (matrix rhs) or `+ [n]` (vector rhs); the rest are algorithm/data-dependent → `None`. Extends `tuple_rhs_shapes`. |
 | `torch.linalg.pinv` | ✅ | ✅ | ✅ | Swaps the last two dims: `(..., m, n) -> (..., n, m)`. |
 | `torch.linalg.matrix_rank` | ✅ | ✅ | ✅ | Reduces last two dims to scalar (batched); no square requirement. |
+| `torch.linalg.matrix_sqrth` | ✅ | ✅ | ✅ | Preserves the shape of a square matrix or batch of square matrices; rejects known non-square inputs. |
 | `torch.fft.*` | ✅ | ✅ | ✅ | Same module-path check as `jnp`/`np` `fft.*` — `fft`/`ifft`/`fft2`/`ifft2`/`fftn`/`ifftn`/`fftshift`/`ifftshift` shape-preserving; `rfft`/`irfft` (last-axis length change) intentionally unclassified. |
 
 ## einops
@@ -239,7 +250,8 @@ Legend:
 | `torch.unsqueeze` | ✅ | ✅ | ✅ | Insert size-1 dim. |
 | `torch.squeeze` | ✅ | ✅ | ✅ | Remove size-1 dims. |
 | `torch.broadcast_to` | ✅ | ✅ | ✅ | Output target shape. |
-| `torch.broadcast_tensors` | ✅ | ✅ | ✅ | Common broadcast shape. |
+| `torch.broadcast_tensors` | ✅ | ✅ | ✅ | Tuple-unpacked positional inputs share the broadcast shape; a single-name tuple has no tensor shape. |
+| `torch.atleast_1d` / `torch.atleast_2d` / `torch.atleast_3d` | ✅ | ✅ | ✅ | Multiple positional inputs bind separately on tuple unpacking; single-name tuples have no tensor shape. |
 | `torch.tile` | ✅ | ✅ | ✅ | Repeat dims. |
 | `torch.repeat` | ✅ | ✅ | ✅ | Tensor method and function nuance. |
 | `torch.take` | ✅ | ✅ | ✅ | Output follows indices. |
