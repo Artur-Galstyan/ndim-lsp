@@ -1,9 +1,13 @@
 mod analysis;
+mod incremental;
 mod known_functions;
 mod layers;
 mod python_ast;
 mod resolution;
 mod types;
+
+#[cfg(test)]
+mod incremental_tests;
 
 #[cfg(test)]
 mod integration_tests;
@@ -12,6 +16,7 @@ mod integration_tests;
 mod jax_compat_tests;
 
 pub use analysis::*;
+pub use incremental::*;
 pub use known_functions::*;
 pub use layers::*;
 pub use python_ast::*;

@@ -328,7 +328,7 @@ fn slow_text() -> String {
     text
 }
 
-const SLOW_COPIES: usize = 4000;
+const SLOW_COPIES: usize = 30000;
 
 #[test]
 fn slow_analyses_do_not_pile_up_while_typing() {
@@ -352,4 +352,188 @@ fn slow_analyses_do_not_pile_up_while_typing() {
         "{} analyses for 8 slow keystrokes",
         c.analyses - before
     );
+}
+
+impl Client {
+    fn change_with(&self, version: i64, changes: Value) {
+        self.notify(
+            "textDocument/didChange",
+            json!({"textDocument": {"uri": URI, "version": version}, "contentChanges": changes}),
+        );
+    }
+
+    fn hint_text(&mut self) -> String {
+        let id = self.inlay();
+        let hints = self.wait_response(id);
+        hints["result"].to_string()
+    }
+
+    /// Milliseconds from sending `change` to the publication of `version`.
+    fn publish_latency_ms(&mut self, version: i64, send: impl FnOnce(&Client)) -> f64 {
+        let t0 = Instant::now();
+        send(self);
+        self.wait_version(version);
+        t0.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+#[test]
+fn single_edit_after_idle_beats_the_old_window() {
+    let mut c = Client::start();
+    c.open();
+    c.settle(500);
+    let ms = c.publish_latency_ms(2, |c| c.change(2));
+    assert!(ms < 120.0, "an isolated edit of a cheap document took {ms} ms");
+}
+
+#[test]
+fn twelve_plain_keys_100_ms_apart_run_one_analysis() {
+    let mut c = Client::start();
+    c.open();
+    let before = c.analyses;
+    for v in 2..=13 {
+        c.change(v);
+        c.settle(100);
+    }
+    c.wait_version(13);
+    c.settle(400);
+    assert_eq!(c.analyses - before, 1);
+}
+
+#[test]
+fn burst_of_50_after_idle_runs_exactly_one_analysis() {
+    let mut c = Client::start();
+    c.open();
+    c.settle(500);
+    let before = c.analyses;
+    let burst: Vec<u8> = (2..=51).flat_map(Client::change_frame).collect();
+    c.write(&burst);
+    c.wait_version(51);
+    c.settle(400);
+    assert_eq!(c.analyses - before, 1);
+}
+
+#[test]
+fn workspace_root_change_restores_the_full_window() {
+    let mut c = Client::start();
+    c.open();
+    c.settle(500);
+    let from = c.pubs.len();
+    c.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({"event": {"added": [{"uri": "file:///tmp/ndim_debounce_root", "name": "r"}], "removed": []}}),
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while c.pubs.len() == from {
+        assert!(Instant::now() < end, "no republication after the root change");
+        c.pump(Duration::from_millis(20));
+    }
+    c.settle(600);
+    let ms = c.publish_latency_ms(2, |c| c.change(2));
+    assert!(ms >= 145.0, "the window after a root change was {ms} ms");
+}
+
+fn incremental_edit(
+    sl: u32,
+    sc: u32,
+    el: u32,
+    ec: u32,
+    text: &str,
+) -> Value {
+    json!({"range": {"start": {"line": sl, "character": sc}, "end": {"line": el, "character": ec}}, "text": text})
+}
+
+#[test]
+fn incremental_edits_apply_in_order_in_one_message() {
+    let mut c = Client::start();
+    c.open();
+    assert!(c.hint_text().contains("batch"));
+    // Line 3 is `def f(x: Float[Array, "batch features"]):`. Column 23 starts "batch".
+    // The second range counts the text after the first edit.
+    c.change_with(
+        2,
+        json!([
+            incremental_edit(3, 23, 3, 28, "rows"),
+            incremental_edit(3, 28, 3, 36, "depth"),
+        ]),
+    );
+    c.wait_version(2);
+    let hints = c.hint_text();
+    assert!(hints.contains("rows, depth"), "{hints}");
+}
+
+#[test]
+fn change_without_range_replaces_the_whole_text() {
+    let mut c = Client::start();
+    c.open();
+    c.change_with(2, json!([incremental_edit(0, 0, 0, 0, "# a\n"), {"text": BASE.replace("batch", "rows")}]));
+    c.wait_version(2);
+    let hints = c.hint_text();
+    assert!(hints.contains("rows") && !hints.contains("batch"), "{hints}");
+}
+
+#[test]
+fn multibyte_crlf_and_surrogate_pairs_use_utf16_columns() {
+    let mut c = Client::start();
+    let text = BASE.replace('\n', "\r\n").replace("def f", "s = \"\u{1F600}\u{e9}\"\r\ndef f");
+    c.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": URI, "languageId": "python", "version": 1, "text": text}}),
+    );
+    c.wait_version(1);
+    // The emoji spans columns 5 and 6 of line 3. Line 4 is the def.
+    c.change_with(2, json!([incremental_edit(3, 5, 3, 7, "q")]));
+    c.change_with(3, json!([incremental_edit(4, 23, 4, 28, "rows")]));
+    c.wait_version(3);
+    let hints = c.hint_text();
+    assert!(hints.contains("rows") && !hints.contains("batch"), "{hints}");
+}
+
+#[test]
+fn change_past_the_end_of_a_line_clamps_to_the_line_end() {
+    let mut c = Client::start();
+    c.open();
+    c.change_with(2, json!([incremental_edit(3, 999, 3, 999, " ")]));
+    c.change_with(3, json!([incremental_edit(99, 0, 99, 0, "# end\n")]));
+    c.change_with(4, json!([incremental_edit(3, 23, 3, 28, "rows")]));
+    c.wait_version(4);
+    let hints = c.hint_text();
+    assert!(hints.contains("rows, features"), "{hints}");
+}
+
+#[test]
+fn stale_version_is_discarded() {
+    let mut c = Client::start();
+    c.open();
+    c.change_with(5, json!([incremental_edit(3, 23, 3, 28, "rows")]));
+    c.wait_version(5);
+    c.change_with(4, json!([incremental_edit(3, 23, 3, 28, "late")]));
+    c.settle(400);
+    let hints = c.hint_text();
+    assert!(hints.contains("rows") && !hints.contains("late"), "{hints}");
+}
+
+#[test]
+fn unusable_range_marks_the_document_out_of_sync_until_a_full_text_change() {
+    let mut c = Client::start();
+    c.open();
+    // Column 1 lies inside the surrogate pair of the first change. The message is dropped whole.
+    c.change_with(
+        2,
+        json!([incremental_edit(0, 0, 0, 0, "\u{1F600}"), incremental_edit(0, 1, 0, 1, "z")]),
+    );
+    c.wait_version(2);
+    assert_eq!(c.pubs.last().unwrap().diags, 0);
+    assert_eq!(c.hint_text(), "null");
+    // A ranged edit would apply to a text the editor does not hold: it is ignored.
+    c.change_with(3, json!([incremental_edit(3, 23, 3, 28, "rows")]));
+    c.settle(400);
+    assert_eq!(c.hint_text(), "null");
+    c.change_with(4, json!([{"text": BASE.replace("batch", "cols")}]));
+    c.wait_version(4);
+    let hints = c.hint_text();
+    assert!(hints.contains("cols") && !hints.contains("rows"), "{hints}");
+    c.change_with(5, json!([incremental_edit(3, 23, 3, 27, "rows")]));
+    c.wait_version(5);
+    assert!(c.hint_text().contains("rows"));
 }

@@ -7,13 +7,24 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified after the JAX 0.11.1 compatibility audit, on `f63b9b8` (`ndim-lsp` 0.1.1):
+Verified on the dark spot commit ("feat: close dark spots in bindings,
+closures, submodules, and operands") plus the work made after it: the wrong
+shape fixes, incremental parse and analysis, adaptive debounce, and
+incremental sync. That work is not committed yet. After the next commit, read
+this as "verified on that commit". `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 1,850 tests pass and four are ignored
-  (1,815 library/integration tests, 22 LSP-server tests, 6 in
-  `tests/lsp_debounce.rs`, 7 in `tests/lsp_helper_save.rs`; the ignored
-  tests are the two timing harnesses below plus the two `lsp_stress` tests).
-  The known-function tests live in `src/known_functions/*_tests.rs`.
+- `cargo test --quiet` passes: 2,073 tests pass and six are ignored.
+  - 2,013 library tests (47 of them in `src/incremental_tests.rs`). Two
+    ignored: `bench_large_file` and `bench_repeated_helper_calls`.
+  - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
+  - 5 in `tests/incremental_edits.rs`. One ignored:
+    `stress_main_two_thousand_chained_edits`.
+  - 16 in `tests/lsp_debounce.rs`, 7 in `tests/lsp_helper_save.rs`, and 1 in
+    `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
+    `golden_dump`, `golden_has_no_internal_names`.
+  The known-function tests live in `src/known_functions/*_tests.rs`. The dev
+  profile compiles `tree-sitter` at opt-level 3, so the randomized edit tests
+  stay fast (a debug `cargo test` takes about a minute).
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
@@ -71,19 +82,20 @@ End-to-end LSP stress benchmark
 -------------------------------
 
 `bench/generate_stress.py` writes `bench/stress/` deterministically (fixed seed):
-a 21,038-line `stress_main.py`, three imported helper modules, and a 500-line
+a 21,518-line `stress_main.py`, three imported helper modules, and a 500-line
 `paste_block.txt`. Regenerate with `python3 bench/generate_stress.py`.
 `tests/lsp_stress.rs` spawns the built `ndim-lsp` binary, talks JSON-RPC over
-stdio, and runs about 35 scenarios (including `typing_plain` and
+stdio, and runs about 40 scenarios (including `typing_plain` and
 `typing_with_inlay_requests`) (open, edits at line start/middle/end,
 50-change burst, 500-line paste and delete, inserted errors, helper-file edits,
-hover, definition, full inlay requests).
+hover, definition, full inlay requests, edits after an idle pause, and a tiny
+document).
 
 Markers in the generated Python define the expected result and come from
 operation semantics, never from analyzer output:
 `# expected-error:`, `# expected-shape: a=[b, 4]`, `# stress-site: <name>`.
 
-Both tests are `#[ignore]`:
+The tests are `#[ignore]`:
 
 ```sh
 NDIM_STRESS_RUNS=3 NDIM_BENCH_OUT=/tmp/bench.json cargo test --release --test lsp_stress lsp_stress_benchmark -- --ignored --nocapture
@@ -92,35 +104,64 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 - `NDIM_STRESS_RUNS` (default 5) sets the runs per scenario.
 - `NDIM_BENCH_OUT` writes the JSON result. `NDIM_GOLDEN_OUT` writes the golden dump.
-- Latency is total = debounce (the `DEBOUNCE` const in `src/main.rs`) + server compute (from
-  the server's `analysis: total=Nms` log) + other (transport and scheduling).
-  Peak RSS is sampled with `ps` every 25 ms, so it is a lower bound.
+- Latency is total = debounce + server compute (from the server's
+  `analysis: total=Nms` log) + other (transport and scheduling). The debounce
+  column is the value the server chose for that edit, read from the
+  `debounce=` field of the same log line: 150 ms while typing, 20 to 150 ms
+  after an idle pause (see "Incremental analysis"), 0 for `didOpen`.
+- A fast loop that sends each edit right after the previous publication counts
+  as typing, so it gets 150 ms. The `floor_tiny_doc_change` scenario therefore
+  waits (`settle(450)`) before each edit, to measure an edit after idle. The
+  old 155 ms figure for it measured back-to-back edits, so it is not
+  comparable.
+- Peak RSS is sampled with `ps` every 25 ms, so it is a lower bound.
+- The harness sends full text with no range, so it does not measure the saving
+  of incremental sync transport.
+- Do not benchmark with `NDIM_VERIFY_INCREMENTAL=1`: it adds a fresh parse and a
+  fresh analysis to every edit.
 
 Golden gate for refactors: `golden_dump` writes every diagnostic and inlay hint
 of the stress project. Dump before and after a change, then `cmp` the two files.
-A cleanup must give a byte-identical dump. Do not fix analyzer defects inside a
-cleanup, because the fix changes the dump.
+A cleanup or a speed change must give a byte-identical dump. Do not fix
+analyzer defects inside such a change, because the fix changes the dump.
+`golden_has_no_internal_names` checks that no `__synth_` or `__ellipsis` name
+reaches a message or a hint.
 
 `lsp_stress_benchmark` passes: 0 marker failures and 0 scenario failures. It
 asserts the expected markers and the scenario invariants. Do not loosen the
 test to make it pass. A refactor must keep it green and keep the golden dump
 byte-identical.
 
-Baseline (f63b9b8, release, 10 CPUs, macOS, 5 runs, p50):
+Baseline (the dark spot commit plus the work after it, release, 10 CPUs, macOS,
+5 runs, p50, 21,518-line file):
 
-- One edit costs about 405 ms: 150 ms debounce plus about 242 ms server compute
-  (full re-analysis of the 21,038-line file) plus about 11 ms other.
-- Compute p50 is 239-249 ms for every edit scenario. Total p50 is 401-413 ms.
-- `cold_open_first_diagnostics`: 329 ms compute, 335 ms total.
-- `main_after_helper_saved_to_disk`: 242 ms compute, 574 ms total.
-  `main_after_helper_restored`: 319 ms compute, 481 ms total. Both pay for
-  the cold re-read of the changed helper.
-- `inlay_full_cached` 9.1 ms, `inlay_full_first` 11.7 ms, `hover` 0.3 ms,
+- One edit while typing costs about 190 to 225 ms: 150 ms debounce plus
+  about 25 to 60 ms server compute plus about 11 to 18 ms other. Examples:
+  `edit_char_end` 189.8 ms total (25 ms compute), `edit_char_middle` 202.9
+  (37), `edit_unannotated_helper_body` 190.1 (26), `error_insert_matmul` 191.0
+  (26), `edit_base_class_init_layer` 204.9 (42), `paste_500_lines` 215.8 (53),
+  `edit_init_layer` 223.0 (59), `typing_plain` 212.4 (44),
+  `burst_50_changes` 187.7 (24). The old full re-analysis baseline was about
+  405 to 420 ms per edit (150 ms debounce plus about 242 ms compute).
+- `edit_char_start` is the worst case: 402.3 ms total, 239 ms compute. The
+  edit moves every position of the file, so the analysis runs in full
+  (a "fallback" run).
+- An edit after an idle pause waits less than 150 ms: `edit_after_idle` 96.2 ms
+  total (39 ms debounce, 38 ms compute). `floor_tiny_doc_change` 28.8 ms total
+  (20 ms debounce, 6 ms compute).
+- `cold_open_first_diagnostics`: 297 ms compute, 304.9 ms total. The first
+  analysis builds no memo.
+- `main_after_helper_saved_to_disk`: 33 ms compute, 195.8 ms total.
+  `main_after_helper_restored`: 128 ms compute, 289.6 ms total. Both pay for
+  the re-read of the changed helper.
+- `inlay_full_cached` 9.0 ms, `inlay_full_first` 11.5 ms, `hover` 0.3 ms,
   `goto_definition` 0.2 ms.
-- Peak RSS 161.5 MB (53.0 MB after open). 22 diagnostics, 14,514 inlay hints.
+- Peak RSS 160.9 MB (54.6 MB after open). 34 diagnostics, 14,873 inlay hints.
 - Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
-- Results are in `/tmp/ndim-bench-after.json` (5 runs, 0 failures). This is a
-  local file, not in the repo.
+  If numbers look shifted, run an interleaved control of the old and the new
+  binary before you decide.
+- A fresh run: `NDIM_STRESS_RUNS=5 NDIM_BENCH_OUT=/tmp/ndim-bench-after.json`. The
+  result file is local, not in the repo.
 
 Closed targets (found by the benchmark, fixed in f63b9b8):
 
@@ -145,6 +186,124 @@ Closed targets (found by the benchmark, fixed in f63b9b8):
 
 Open limit: an unsaved helper buffer is still ignored (the server reads
 imports from disk).
+
+Incremental analysis
+--------------------
+
+An edit used to cost a full parse and a full analysis (about 260 ms on the
+stress file). It now costs a reused parse and a replay of the unchanged parts.
+The result must always equal a fresh analysis of the same text. Three layers:
+
+1. Sync and parse (`src/sync.rs`, `src/incremental.rs`, `src/main.rs`).
+   - The server advertises `TextDocumentSyncKind::INCREMENTAL`.
+     `apply_changes` applies the ranged changes in order to the stored text
+     (UTF-16 positions; lines end at `\n`, `\r\n`, or `\r`). A change without a
+     range replaces the whole text.
+   - `diff_edit` finds the one edit between the old and the new text (common
+     prefix and suffix). `reparse` feeds it to tree-sitter with the old tree.
+     If the old tree or the new tree has a syntax error, `reparse` parses from
+     scratch, because tree-sitter recovers differently from errors with a
+     reused tree. So the tree always equals a fresh parse, also after errors.
+   - `parse_states` keeps, per URI, the text, tree, and memo of the last analysis
+     that was committed. `commit` runs only for a successful result of the
+     newest rev, so a stale or failed analysis changes nothing. `parse_states`
+     is not cleared when a watched-file event clears `analysis_cache`: the tree
+     base stays valid because the memo checks its disk dependencies itself.
+2. Pre-pass memo (`UnitMemo`, `analyze_layer_shapes_with_memo`).
+   - A "unit" is a top-level statement (every root child; an anonymous `;`
+     is also a unit with an empty record). The pre-passes (`PrePass`: scopes,
+     annotations, layer assignments, self-attribute layers, class summaries)
+     are stored per unit in unit-relative positions
+     (`SyntaxRecord`, `LayerRecord`), and shifted to the new positions with the
+     `Shift` trait, `Delta`, and `Remap`.
+   - A unit with the same text reuses its `SyntaxRecord`. A `LayerRecord` also
+     needs the same import map (a digest of the whole import map, so an edit
+     of any import line recomputes the layer records of all units) and valid
+     disk dependencies (`ResolutionCache::record_deps`, `deps_valid`).
+   - A unit with a syntax error is never reused, because its parse can depend
+     on the text after it.
+   - The first analysis of a text builds no memo, so opening a file is as fast as
+     before. The first edit builds it (about 4 ms more than the plain
+     pre-pass). A file over 4 MiB of text or 100,000 units gets no memo
+     (`MAX_MEMO_TEXT`, `MAX_MEMO_UNITS`) and runs the plain path.
+3. Propagation memo (`PropPlan`, `PropRecord`, `src/incremental/names.rs`).
+   - `names.rs` finds the names each unit defines and reads and links units that
+     share a name (a union-find over name hashes). The closure over-approximates:
+     every identifier token counts as a read. Common names such as `__init__`
+     and `forward` join most units into one hub group (567 of 858 units on
+     `stress_main.py`), so an edit in a hub saves only part of the cost.
+   - The plan marks the groups with a changed unit as dirty. Dirty groups run
+     the propagate pass (`run_units`); clean groups replay their stored output
+     (`Segment`s of errors, applications, assignment shapes, and the final scope
+     shapes), shifted to the new positions. Statement-level groups need a
+     `Remap` that finds a unit for every position. Loop bodies replay as part
+     of their unit.
+   - The plan falls back to a full run (`propagate_full`) when the dirty bytes
+     exceed `MAX_DIRTY_SHARE` (0.6) of the file, a position has no unit, or two
+     statements share a row. A fallback run records too, so later edits can
+     replay.
+   - The setup of the pass (function nodes, scope links, submodules,
+     `original_shapes`, `ScopeIndex`) still runs over the whole file on any
+     dirty edit (about 14 ms). It is not incremental.
+   - `NDIM_NO_PROPAGATE_MEMO=1` is a kill switch: it turns layer 3 off and runs
+     the whole-tree propagate pass (the pre-pass memo stays on).
+
+`ResolutionCache` supports the memo with a per-path generation (a count of
+`revalidate` marks), a clear count, and a cache id. `record_deps` records
+which files a computation touched and `deps_valid` tells if they are unchanged.
+A save that keeps mtime and size is seen only through the editor event path
+(`revalidate` with the changed path), as the cache already works.
+
+Verify mode. `NDIM_VERIFY_INCREMENTAL=1` (server environment) makes each edit
+that has a base also do a fresh parse and a fresh analysis and compare them
+(`first_tree_difference`, `first_analysis_difference`). On a difference the
+server logs `incremental mismatch, used the fresh result: ...`, uses the fresh
+result, and drops the memo. In `cfg!(test)` builds the same difference panics.
+The cost is one extra fresh parse and analysis per edit, so never time with it.
+
+Tests: `src/incremental_tests.rs` (47 library tests) and
+`tests/incremental_edits.rs` (seeded random edit sequences over `corpus/` and
+`bench/stress/`; after every edit the reparsed tree and the memo analysis must
+equal the fresh ones). The ignored
+`stress_main_two_thousand_chained_edits` runs 2,000 chained edits of the stress
+file in release (`NDIM_CHAIN_STEPS`, `NDIM_CHAIN_SEED`, `NDIM_CHAIN_TIMES`).
+
+Debounce and sync mode
+----------------------
+
+- `DEBOUNCE` in `src/main.rs` (150 ms) is the longest quiet time before a
+  change is analyzed. `Pace` (`src/sync.rs`) keeps, per document, the time of
+  the last change and a moving average (EWMA, alpha 0.5) of the wall time of
+  recent analyses.
+- A change within 400 ms of the previous one is typing and waits 150 ms. An
+  isolated change (400 ms or more after the previous one) of a document with a
+  known average waits `2 x average`, clamped to 20 ms through 150 ms. The first
+  change after open waits 150 ms. `didOpen` does not wait.
+- A cold run seeds the average. The first incremental run replaces it (no
+  averaging with the cold cost). A fallback run and a failed run reset it. So does
+  every re-analysis of the open documents (a root change, or a save or watched
+  file event that dropped cache entries); the run after it is not sampled.
+  After a reset the next edit waits 150 ms. A fast loop of edits right after each publication counts as typing.
+- The first call after a change waits out the debounce of its rev. Hover, inlay,
+  and other requests share that one analysis (single-flight per uri and rev,
+  one analysis at a time per URI).
+- Sync is INCREMENTAL. A position past the end of a line or of the text clamps to
+  that end, as the LSP spec says. A position inside a surrogate pair, or a range that does not fit the stored
+  text, drops the whole message and keeps the old text: the later changes are not applied to a text
+  the editor does not have. The document is then out of sync (`in_sync` is
+  false): it gets no analysis until a message with a full text arrives. The
+  server publishes no diagnostics for it and answers inlay requests with null,
+  and logs a warning. A stale version (older than the stored one) is ignored.
+
+Limits of the incremental path
+------------------------------
+
+- Hub edits (`edit_init_layer`, `paste_500_lines`) save only part of the cost.
+- A whole-file edit (`edit_char_start`) is a full run.
+- An unsaved helper buffer is ignored (imports come from disk).
+- Units with a syntax error are not reused.
+- Replay clones the segments and the final scope shapes for the output. A clean
+  group whose units did not move is shared by reference.
 
 Rule for agents working on this repo
 ------------------------------------
@@ -189,12 +348,36 @@ Current file layout
     - `FunctionShapeScope` (function-scoped shape map plus `dimension_sites`)
     - `AssignmentShape` (`line`, `name`, `shape`) — per-assignment record for inlay hints
     - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`, `assignment_shapes`)
+    - `ScopeIndex` — byte-to-scope lookup over nested or disjoint scope ranges,
+      built once per propagate pass (the old linear `scope_index_for_byte`
+      scan stays for other range sets)
   - Public helpers: `scope_for_byte`, `scope_index_for_byte`.
   - (`CoverageReport` / `DarkSpot` live in `src/analysis.rs`.)
 
 - `src/main.rs`
   - tower-lsp server binary: `initialize` options, diagnostics, hover, inlay
     hints, definition, code actions, workspace folders, site-packages lookup.
+  - Incremental flow: `change_document` applies a change message,
+    `run_analysis` takes the base from `parse_states`, `compute_analysis` /
+    `analyze_text` reparse and analyze (with the optional
+    `NDIM_VERIFY_INCREMENTAL=1` check), `commit` stores the result for the
+    newest rev only. See "Incremental analysis".
+
+- `src/sync.rs` (a module of the binary)
+  - `Pace` (adaptive debounce and the analysis-cost average) and
+    `apply_changes` (UTF-16 ranged changes to text).
+
+- `src/incremental.rs`, `src/incremental/names.rs`
+  - Incremental parse (`diff_edit`, `reparse`), the pre-pass memo (`UnitMemo`,
+    `PrePass`, `SyntaxRecord`, `LayerRecord`), position shifting (`Shift`,
+    `Delta`, `Remap`), the propagation plan (`PropPlan`, `PropRecord`,
+    `Segment`), and the equality checks (`first_tree_difference`,
+    `first_analysis_difference`). `names.rs` has the per-unit name sets and the
+    union-find that links units.
+  - Re-exported from `src/lib.rs`.
+
+- `src/incremental_tests.rs`
+  - Library tests for the above (47).
 
 - `src/known_functions/jax.rs`
   - `classify` and shape rules for the JAX 0.10/0.11 additions.
@@ -260,12 +443,23 @@ Current file layout
 - `src/analysis.rs`
   - High-level orchestration + the recursive shape evaluator.
   - Important functions:
-    - `analyze_layer_shapes` — full pipeline:
-      1. seed shapes from jaxtyping annotations (params + class fields)
-      2. build import map; extract layer + self-attr-layer assignments
-      3. `propagate_calls`: walk every assignment in source order, dispatching
-         each RHS to `shape_of_expression` (recursive); bind single + tuple
-         LHS; collect `ShapeError`s and per-assignment `AssignmentShape`s
+    - `analyze_layer_shapes` — full pipeline (a thin wrapper that runs the
+      pre-passes on the whole tree, then `finish_analysis`):
+      1. `PrePass`: seed shapes from jaxtyping annotations (params + class
+         fields); build the import map; extract layer + self-attr-layer
+         assignments and class summaries. Over the whole tree, or per
+         top-level unit from a `UnitMemo`.
+      2. `finish_analysis` runs `propagate_calls`: walk every assignment in
+         source order, dispatching each RHS to `shape_of_expression`
+         (recursive); bind single + tuple LHS; collect `ShapeError`s and
+         per-assignment `AssignmentShape`s. With a propagation plan the pass
+         runs only the dirty units (`propagate_planned`, `run_units`) and
+         replays the stored output of the clean ones.
+    - `analyze_layer_shapes_with_memo` — same result as `analyze_layer_shapes`,
+      with the pre-passes and the propagation taken from a `UnitMemo` for each
+      unchanged top-level statement. The memo becomes the memo for the next
+      call. Without a `ResolutionCache` nothing is kept, because a changed
+      file on disk could not be seen.
     - `shape_of_expression` and its arms (`shape_of_call`, `shape_of_attribute`,
       `shape_of_unary`, `shape_of_subscript` + `slice_dim`,
       `shape_of_binary_operator`, `shape_of_inline_vmap`, `apply_inline_vmap_layer`)
@@ -303,7 +497,7 @@ Current file layout
   - `jax_compat/` holds `cases.json`, `check.py`, `audit.py`, and its README.
   - `generate_stress.py` emits `stress/`, the end-to-end LSP stress project
     (see "End-to-end LSP stress benchmark" below).
-  - `stress/` holds `stress_main.py` (21,038 lines, generated), the imported
+  - `stress/` holds `stress_main.py` (21,518 lines, generated), the imported
     helper modules `stress_common.py`, `stress_jax.py`, and `stress_torch.py`,
     and `paste_block.txt` (500-line paste payload).
 
@@ -313,8 +507,14 @@ Current file layout
     `lsp_stress_benchmark` and `golden_dump`.
 
 - `tests/lsp_debounce.rs`, `tests/lsp_helper_save.rs`
-  - LSP-over-stdio tests for the debounce and single-flight publishing, and for
-    save and watched-file invalidation of imported helpers.
+  - LSP-over-stdio tests for the adaptive debounce, single-flight publishing,
+    incremental sync (ranges, UTF-16, CRLF, stale version, out-of-sync until a
+    full text), and for save and watched-file invalidation of imported helpers.
+
+- `tests/incremental_edits.rs`
+  - Seeded random edit sequences: the incremental tree and analysis must equal
+    the fresh ones after every edit. Also the reparse-after-syntax-error test
+    and the ignored 2,000-edit chain.
 
 - `README.md`
   - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
@@ -389,6 +589,26 @@ What works now
    - `broadcast_to`, `broadcast_arrays` / `broadcast_tensors`
    - `tile`, `repeat`
    - shape-preserving: `roll`, `flip`, `triu`, `tril`, `argsort`, `sort`, `cumsum`, `cumprod`, `array`, `asarray`, `*_like`
+   - elementwise functions (`is_shape_preserving_call`): the one-operand ones
+     (`exp`, `sqrt`, `abs`, `tanh`, ...) keep the shape. The two-operand ones
+     (`maximum`, `minimum`, `fmax`, `fmin`, `add`, `multiply`, `power`,
+     `arctan2`, `hypot`, `copysign`, the comparisons and logical functions in
+     numpy, jax and torch: `torch.add`, `sub`, `mul`, `div`, `pow`, ...)
+     broadcast both operands, and a Python scalar broadcasts against anything.
+     A mismatch, a third positional argument, or an operand passed by keyword
+     gives unknown. `torch.max` and `torch.min` have their own rule.
+   - `clip` / `clamp` (`KnownFunction::Clamp`, free and method form): the input
+     broadcasts with every array bound, so a larger `min` or `max` array makes
+     the result larger. Bounds that are `None` or provable scalars are removed
+     first. A bound with no known shape, or a mismatch, gives unknown.
+   - `torch.bmm`: both operands rank 3, equal batch dim (a batch of 1 does not
+     broadcast), equal contracted dim; result `[b, n, p]`.
+   - `F.cross_entropy` / `F.nll_loss`: the class dim is axis 0 for an
+     unbatched input and axis 1 otherwise. A target of the input's shape holds
+     probabilities (`cross_entropy` only), a target without the class dim holds
+     class indices. `reduction='none'` gives the input shape without the class
+     dim, any other valid reduction a scalar. A `weight` must be rank 1 with
+     one entry per class.
    - `where`
    - constructors: `zeros`, `ones`, `full`, `empty`, `arange`, `linspace`, `logspace`, `eye`, `identity`
    - diagonal/indexing basics: `diag`, `diagonal`, `trace`, `take`
@@ -417,6 +637,32 @@ What works now
      `compute_split_shapes`; `L, _ = x.shape` binds each dim as a zero-rank
      scalar (`_` skipped). Handled in source order, interleaved with single
      assignments, by `handle_tuple_assignment` / `tuple_rhs_shapes`.
+   - Tuple-literal right sides (`a, b = x, y`, `(a, b) = ...`, `[a, b] = ...`)
+     bind element by element (`tuple_literal_shapes`). Every element is
+     evaluated before any target is written, so `a, b = b, a` swaps and a
+     rotation of three names works. A starred target (`first, *rest = ...`)
+     takes its position; the starred name is always unknown (Python binds a
+     list). A duplicate target keeps the last element. Differing lengths, a
+     splat on the right, or two stars make every target unknown and evict
+     stale bindings. An element error is reported once.
+   - Unpacking a name (`a, b = x`) has two meanings. An array unpacks into its
+     rows: a literal leading dim must equal the target count (else unknown), a
+     symbolic leading dim is accepted, and each target gets the shape without
+     the leading dim. A tuple carry (a
+     `lax.scan` init tuple, a tuple literal bound to a name, a seeded carry
+     parameter such as `final_mean, final_var = final_carry`) gives each
+     target the one shared element shape, because only homogeneous carries are
+     tracked. The analyzer tells them apart: `tuple_carries` holds the names
+     whose current binding is a tuple carry, and any other name counts as an
+     array only when `name_is_array` proves it (a non-scalar shape annotation,
+     or every assignment to it in its scope is an array expression). A name
+     that cannot be told apart gives unknown targets. Never guess a row shape
+     for a tuple.
+   - Loops: a name that a `for` or `while` body both reads and writes
+     keeps its shape after the loop only if one pass leaves the shape unchanged
+     (`x = f(x)`). If the shape changes (`x, y = y, x`, a swap through a
+     temp), the iteration count decides, so the name and every name written
+     from it are unknown after the loop (`collect_outer_loops`, loop replay).
 
 14. vmap of attribute callables + inline vmap (issue #35)
    - `jax.vmap(self.layer)(x)` resolves `self.layer` to a layer built in
@@ -448,6 +694,66 @@ What works now
      counts real parses). Entries carry file stamps, failed lookups are cached,
      a changed file drops its entries, and the cache revalidates once per
      analysis (epoch). See `corpus`/cross-file integration tests.
+   - For the memo each path has a generation (a count of `revalidate` marks, kept
+     across `clear`), the cache has a clear count and an id, and
+     `record_deps` / `deps_valid` tell if the files a computation touched are
+     unchanged (see "Incremental analysis").
+
+17. Closures read enclosing variables at call time
+   - A closure that reads a variable of its enclosing function sees the shape
+     the variable has when the closure is called, as Python does, not the shape
+     at the definition. The body is evaluated at its own call, from inside the
+     enclosing function or from another closure being evaluated there. Outside
+     that, enclosing variables stay unknown (the whole-file pass evaluates a
+     closure body at its definition).
+   - Scope facts (`ScopeLinks`, lexical links between function scopes) cover only closures and
+     the functions that enclose them. A name the closure binds itself
+     (parameter, assignment, loop or `with` target, import, nested `def`,
+     `global`) is local and shadows the enclosing one. A name that a nested
+     closure rebinds with `nonlocal` is unknown. A call outside the enclosing
+     function, a `global` name, a comprehension body, and a method closure
+     through a class do not see function locals. Fully annotated closures read
+     the call-time value too, and a mismatch with it is a true error, reported
+     once.
+
+18. User submodules (`self.<attr> = Block(...)`)
+   - A field built from a class of the same file is a user module. Calling it
+     (`self.blk(x)`, `Block(features=64)(x)`, `jax.vmap(self.blk)(x)`) runs
+     the module's `__call__` (it wins) or `forward`, found through the class
+     MRO, on the argument shapes. The constructor arguments give the
+     `self.<attr>` fields and the parameters of `__init__` (or dataclass-style
+     fields) their values, so two call sites of one class get their own shapes.
+     A vmapped module peels and restores the batch dim.
+   - It stays unknown when the field is written with anything but one
+     constructor call of one class of the file, when a class between the field
+     and the method rebinds a field the method reads, when a base before the
+     method is unresolved, and past the depth bound (recursion terminates).
+     A same-named function never replaces an unresolved field.
+   - Annotated callee parameters are checked against the argument shapes: a
+     rank mismatch or an integer mismatch is a true error; a named dim against
+     an integer annotation, and a variadic annotation, are not errors.
+
+19. Scalar operands in binary operations
+   - A binary-op operand is a provable scalar (`2`, `math.sqrt(k)`, `len`,
+     `float`, `int`, `x.shape[<integer>]`, a numpy or jax elementwise function
+     of scalars, a name only ever bound to scalars, arithmetic on those, or a
+     scalar-typed parameter) or an array with a resolved shape. A scalar
+     broadcasts against any array. An operand that is neither stays unknown,
+     because it could be an array that broadcasts. The check is flow-insensitive
+     on purpose (`name_is_scalar`), so a reassignment in a loop or branch cannot
+     make an earlier read wrong.
+
+20. Internal names never reach the output
+   - The evaluator binds inline operands to synthetic names (`__synth_N`, text
+     kept in `synthetic_text`) and uses `__ellipsis` internally. A shape with a
+     dimension that holds an internal name is not stored. In error messages
+     `scrub_internal_names` puts the source text back; an error whose message
+     cannot be restored is dropped, because a garbled message is worse than
+     none. Names unpacked from `x.shape` (`a, b, c = x.shape`) stand for their
+     dims (`scalar_dims`), so `reshape(a * b, c)` shows real dims, and the
+     name stops standing for a dim when it is rebound.
+   - `golden_has_no_internal_names` and `internal_name_scan_detects_a_leak` in
+     `tests/lsp_stress.rs` check the rule over the stress project.
 
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
@@ -476,15 +782,21 @@ tuple returns kept element-wise for scan). Key invariants:
 Known limitations / important caveats
 -------------------------------------
 
-- `src/main.rs` is wired end-to-end: `republish_diagnostics` runs
-  `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as
-  LSP diagnostics; `on_hover` renders shape strings (markdown `MarkupContent`
-  with a fenced python block); inlay hints are emitted. `did_change` stores text/version
-  immediately and spawns a publish task. The task waits the `DEBOUNCE` window,
-  runs one analysis per (uri, rev), and skips if a newer rev arrived. A stale
-  request returns null. The server advertises UTF-16
-  `position_encoding` and converts every tree-sitter range by byte offset to
-  UTF-16 LSP positions.
+- `src/main.rs` is wired end-to-end: `publish_diagnostics_for` gets the
+  analysis of the newest text and publishes `ShapeError`s as LSP diagnostics;
+  `on_hover` renders shape strings (markdown `MarkupContent` with a fenced
+  python block); inlay hints are emitted. `did_open` stores the text and
+  analyzes it at once. `did_change` (INCREMENTAL sync) applies the ranged
+  changes to the stored text and version in message order, and spawns a
+  publish task. The task waits the debounce chosen for that rev (20 to 150 ms,
+  `Pace`), runs one analysis per (uri, rev) from the `parse_states` base, and
+  skips if a newer rev arrived. A stale request returns null. Only the
+  analysis of the newest rev is committed. The first analysis after open parses and
+  analyzes in full; later ones reuse the tree and the memo (a memo is valid
+  for one cache, one set of search roots, and one `max_depth`; another value
+  drops it) (see "Incremental analysis" and "Debounce and sync mode"). The
+  server advertises UTF-16 `position_encoding` and converts every tree-sitter
+  range by byte offset to UTF-16 LSP positions.
 - LSP also advertises `textDocument/definition` and quick-fix code actions.
   Go-to-definition takes a simple symbolic dimension token to its first
   annotation occurrence in the same function scope. A matmul diagnostic offers
@@ -500,7 +812,9 @@ Known limitations / important caveats
   (no Python call). The resolution cache is keyed by (path, name) and checks file
   stamps. `did_save` and watched `**/*.py` events (dynamic registration) drop
   the affected entries and analyze all open documents again. A workspace folder
-  change clears the cache. The server has no configuration handler.
+  change clears the cache. These events clear `analysis_cache` and give every open
+  document a new rev, but keep `parse_states`: the memo checks its own disk
+  dependencies. The server has no configuration handler.
   Severity options are read only in `initialize`, so a change needs a restart.
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
 - Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`,
@@ -550,6 +864,12 @@ cargo clippy --all-targets --all-features
 ```
 
 Clippy is fully clean (including `src/main.rs`); keep it that way.
+
+For a speed or incremental change also run the golden dump (byte-identical
+with the baseline) and the stress benchmark (0 marker failures, 0 scenario
+failures, no scenario slower than the 3 percent noise). See "End-to-end LSP
+stress benchmark". Only a change of analyzer behavior may change the golden
+dump; report each difference, then replace the baseline file.
 
 Recommended next implementation steps
 -------------------------------------

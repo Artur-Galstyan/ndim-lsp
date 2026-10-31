@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -55,6 +56,8 @@ pub struct ResolutionCache {
     /// Bumped by every drop. An insert whose resolution started before a
     /// drop is skipped: it may have read the old file.
     epoch: AtomicU64,
+    /// Tells this cache from another, for results that name a cache.
+    id: u64,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
     /// Number of implementation files parsed.
@@ -73,9 +76,71 @@ const MAX_PARSED_FILES: usize = 128;
 struct Tracked {
     stamps: HashMap<PathBuf, Stamp>,
     /// Paths each `map` entry looked at.
-    map_paths: HashMap<(Vec<String>, u64), Vec<PathBuf>>,
+    map_paths: HashMap<(Vec<String>, u64), Arc<[PathBuf]>>,
     /// The file each `signatures` entry was read from.
     signature_files: HashMap<(PathBuf, String), PathBuf>,
+    /// Number of times `revalidate` marked each path stale. A path never
+    /// marked has generation 0. Kept across `clear`.
+    generations: HashMap<PathBuf, u64>,
+    /// Number of times the whole cache was cleared.
+    clears: u64,
+}
+
+/// The disk state a computation looked at: every path it probed or read with
+/// the generation of the path then, and the cache and clear count it ran
+/// under. The computation's result is still valid while `ResolutionCache::deps_valid`
+/// holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Deps {
+    cache: u64,
+    clears: u64,
+    paths: Vec<(PathBuf, u64)>,
+}
+
+/// What the resolutions of one `ResolutionCache::record_deps` call touched.
+#[derive(Default)]
+struct Touches {
+    /// The paths of each resolution, shared with the cache entry.
+    paths: Vec<Arc<[PathBuf]>>,
+    /// A resolution whose paths the cache does not track, so a change to them
+    /// would go unseen.
+    untracked: bool,
+}
+
+thread_local! {
+    static TOUCHES: RefCell<Option<Touches>> = const { RefCell::new(None) };
+}
+
+/// Puts back the recording that was active before a nested one, also when
+/// the nested one panics.
+struct Restore(Option<Touches>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        TOUCHES.with(|t| *t.borrow_mut() = self.0.take());
+    }
+}
+
+fn recording() -> bool {
+    TOUCHES.with(|t| t.borrow().is_some())
+}
+
+fn touch(paths: &Arc<[PathBuf]>) {
+    TOUCHES.with(|t| {
+        if let Some(touches) = t.borrow_mut().as_mut()
+            && !touches.paths.iter().any(|seen| Arc::ptr_eq(seen, paths))
+        {
+            touches.paths.push(paths.clone());
+        }
+    });
+}
+
+fn touch_untracked() {
+    TOUCHES.with(|t| {
+        if let Some(touches) = t.borrow_mut().as_mut() {
+            touches.untracked = true;
+        }
+    });
 }
 
 /// Resolved implementation per (import segments, roots fingerprint).
@@ -134,6 +199,9 @@ impl ResolutionCache {
         }
         let mut tracked = self.tracked.write().unwrap();
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        for path in &stale {
+            *tracked.generations.entry(path.clone()).or_default() += 1;
+        }
         let mut map = self.map.write().unwrap();
         tracked.map_paths.retain(|key, paths| {
             let keep = !paths.iter().any(|p| stale.contains(p));
@@ -155,10 +223,71 @@ impl ResolutionCache {
         true
     }
 
+    /// Identifies this cache among others.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Run `f` and report the disk state its resolutions looked at. `None`
+    /// when the state is unsafe to rely on: a resolution the cache does not
+    /// track, or a drop of cache entries while `f` ran.
+    pub fn record_deps<T>(&self, f: impl FnOnce() -> T) -> (T, Option<Deps>) {
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let mut outer = Restore(TOUCHES.with(|t| t.borrow_mut().replace(Touches::default())));
+        let out = f();
+        let touches = TOUCHES.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        // What a nested recording touched, an enclosing one touched too.
+        if let Some(enclosing) = outer.0.as_mut() {
+            enclosing.paths.extend(touches.paths.iter().cloned());
+            enclosing.untracked |= touches.untracked;
+        }
+        drop(outer);
+        // A drop bumps the epoch before it bumps a generation, both under the
+        // write lock, so under the read lock the two agree.
+        let tracked = self.tracked.read().unwrap();
+        if touches.untracked || self.epoch.load(Ordering::SeqCst) != epoch {
+            return (out, None);
+        }
+        let mut paths: Vec<(PathBuf, u64)> = touches
+            .paths
+            .iter()
+            .flat_map(|set| set.iter())
+            .map(|p| {
+                let generation = tracked.generations.get(p).copied().unwrap_or(0);
+                (p.clone(), generation)
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let deps = Deps {
+            cache: self.id,
+            clears: tracked.clears,
+            paths,
+        };
+        (out, Some(deps))
+    }
+
+    /// Whether no path in `deps` was marked stale, and the cache was not
+    /// cleared, since `deps` was recorded.
+    pub fn deps_valid(&self, deps: &Deps) -> bool {
+        let tracked = self.tracked.read().unwrap();
+        deps.cache == self.id
+            && deps.clears == tracked.clears
+            && deps
+                .paths
+                .iter()
+                .all(|(p, generation)| tracked.generations.get(p).copied().unwrap_or(0) == *generation)
+    }
+
     fn clear(&self) {
         let mut tracked = self.tracked.write().unwrap();
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        *tracked = Tracked::default();
+        let (generations, clears) = (std::mem::take(&mut tracked.generations), tracked.clears + 1);
+        *tracked = Tracked {
+            generations,
+            clears,
+            ..Tracked::default()
+        };
         self.map.write().unwrap().clear();
         self.signatures.write().unwrap().clear();
         self.parsed.lock().unwrap().clear();
@@ -177,7 +306,9 @@ pub fn search_roots_fingerprint(search_roots: &[PathBuf]) -> u64 {
 
 /// Create a new empty resolution cache.
 pub fn new_resolution_cache() -> Arc<ResolutionCache> {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     Arc::new(ResolutionCache {
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         map: std::sync::RwLock::new(HashMap::new()),
         signatures: std::sync::RwLock::new(HashMap::new()),
         tracked: std::sync::RwLock::new(Tracked::default()),
@@ -430,9 +561,17 @@ where
     {
         let fingerprint = search_roots_fingerprint(search_roots);
         let key = (start.parts.clone(), fingerprint);
+        // Lock order: `tracked`, then `map`. The paths of an entry are read
+        // together with the entry.
+        let tracked = recording().then(|| cache.tracked.read().unwrap());
         let cache_map = cache.map.read().unwrap();
         if let Some(cached) = cache_map.get(&key) {
             cache.hits.fetch_add(1, Ordering::Relaxed);
+            match tracked.as_ref().map(|t| t.map_paths.get(&key)) {
+                Some(Some(paths)) => touch(paths),
+                Some(None) => touch_untracked(),
+                None => {}
+            }
             return Ok(cached.clone());
         }
         cache.misses.fetch_add(1, Ordering::Relaxed);
@@ -507,10 +646,15 @@ where
         let mut tracked = cache.tracked.write().unwrap();
         if cache.epoch.load(Ordering::SeqCst) == epoch {
             tracked.add_stamps(&probes);
-            let paths = probes.into_iter().map(|(path, _)| path).collect();
+            let paths: Arc<[PathBuf]> = probes.into_iter().map(|(path, _)| path).collect();
+            touch(&paths);
             tracked.map_paths.insert(key.clone(), paths);
             cache.map.write().unwrap().insert(key, resolved.clone());
+        } else {
+            touch_untracked();
         }
+    } else if start.dots == 0 && !start.parts.is_empty() && cache.is_some() {
+        touch_untracked();
     }
 
     result
@@ -2241,5 +2385,34 @@ mod cache_freshness_tests {
         let before = get();
         fs::write(&file, sig("b a")).unwrap();
         assert_ne!(get().return_shape, before.return_shape);
+    }
+}
+
+#[cfg(test)]
+mod record_deps_tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_a_recorded_computation_ends_the_recording() {
+        let cache = new_resolution_cache();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.record_deps(|| panic!("extractor failed"))
+        }));
+        assert!(caught.is_err());
+        assert!(!recording());
+    }
+
+    #[test]
+    fn a_nested_recording_counts_for_the_enclosing_one() {
+        let cache = new_resolution_cache();
+        let path: Arc<[PathBuf]> = Arc::from(vec![PathBuf::from("/outer.py")]);
+        let (_, outer) = cache.record_deps(|| {
+            cache.record_deps(|| touch(&Arc::from(vec![PathBuf::from("/inner.py")])));
+            touch(&path);
+        });
+        let outer = outer.unwrap();
+        let paths: Vec<_> = outer.paths.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(paths, ["/inner.py", "/outer.py"]);
+        assert!(cache.deps_valid(&outer));
     }
 }

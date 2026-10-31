@@ -181,8 +181,9 @@ Legend:
 | `jnp.trace` / `np.trace` | ✅ | ✅ | ✅ | Removes two axes, optional offset. |
 | `jnp.count_nonzero` / `np.count_nonzero` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis semantics). |
 | `jnp.ptp` / `np.ptp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Max`'s reduction rule (identical axis semantics). |
-| `jnp.clip` / `np.clip` / `torch.clip` | ✅ | ✅ | — | Already shape-preserving via `is_shape_preserving_call` (elementwise, not a `KnownFunction` table entry). Audit note: do not re-add as a gap. |
-| `jnp.nan_to_num` / `np.nan_to_num` | ✅ | ✅ | — | Added to `is_shape_preserving_call`'s numpy elementwise match list (shape-preserving, same path as `clip`). |
+| `jnp.clip` / `np.clip` / `torch.clip` / `torch.clamp` | ✅ | ✅ | ✅ | `KnownFunction::Clamp` (`apply_known_clamp`): the input broadcasts with every array bound (`min`, `max`, `a_min`, `a_max`, or positional), so a larger bound array makes the result larger. Bounds that are `None` or provable scalars are removed first. A bound with no known shape, or a mismatch, → `Ok(None)`. Audit note: do not re-add as a gap. |
+| `jnp.nan_to_num` / `np.nan_to_num` | ✅ | ✅ | — | Added to `is_shape_preserving_call`'s numpy elementwise match list (shape-preserving). |
+| `jnp.maximum` / `minimum` / `fmax` / `fmin` / `add` / `subtract` / `multiply` / `divide` / `power` / `arctan2` / `hypot` / `copysign` / comparisons / logical functions (and the `np.*` and `torch.*` forms, e.g. `torch.add`, `sub`, `mul`, `div`, `pow`, `atan2`, `fmod`, `eq`) | ✅ | ✅ | ✅ | Two-operand elementwise functions broadcast both operands (`is_binary_elementwise_call`); a Python scalar broadcasts against anything. A mismatch, a third positional argument, or an operand passed by keyword → `Ok(None)`. `torch.max` / `torch.min` keep their own rule. |
 | `jnp.fft.*` / `np.fft.*` | ✅ | ✅ | ✅ | `fft`/`ifft`/`fft2`/`ifft2`/`fftn`/`ifftn`/`fftshift`/`ifftshift` classified as shape-preserving (module-path check in `classify_known_function`, reuses the `Copy` shape-preserving arm). `rfft`/`irfft`/`hfft` variants (which change the last-axis length) are intentionally left unclassified. |
 
 ## Linear algebra
@@ -281,6 +282,8 @@ Legend:
 | `torch.nn.functional.conv1d` / `conv2d` / `conv3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalConv1d/2d/3d`; same conv formula as the layer forms, channels/kernel derived from the `weight` arg's shape (grouped-conv channel mismatch not validated, matching `jax.lax.conv_general_dilated`'s existing approximation). |
 | `torch.nn.functional.max_pool1d` / `max_pool2d` / `max_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalMaxPool1d/2d/3d`; `stride` defaults to `kernel_size` per torch convention; `dilation` not modelled. |
 | `torch.nn.functional.avg_pool1d` / `avg_pool2d` / `avg_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalAvgPool1d/2d/3d`; same pooling formula/helper as the max-pool functional forms. |
+| `torch.bmm` | ✅ | ✅ | ✅ | `KnownFunction::Bmm`: both operands rank 3, equal batch dim (a batch of 1 does not broadcast, unlike `matmul`), equal contracted dim → `[b, n, p]`. Rank or dim mismatch is an error. |
+| `torch.nn.functional.cross_entropy` / `nll_loss` | ✅ | ✅ | ✅ | `KnownFunction::CrossEntropy` / `NllLoss`: class dim is axis 0 for an unbatched input and axis 1 otherwise. A target of the input's shape holds probabilities (`cross_entropy` only); a target without the class dim holds class indices. `reduction='none'` → input shape without the class dim, any other valid reduction → scalar. `weight` must be rank 1 with one entry per class. A bad target shape is an error; an unknown shape → `Ok(None)`. |
 | `torch.nn.functional.softmax` / `log_softmax` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `torch.nn.functional.one_hot` | ✅ | ✅ | ✅ | Reuses `KnownFunction::OneHot` directly; the `num_classes=-1` "infer at runtime" sentinel is now treated as unknown (harmless no-op for `jax.nn.one_hot`, which never passes `-1`). |
 | `torch.combinations` | ✅ | ✅ | ✅ | `KnownFunction::Combinations`; `(nCr(n, r), r)` from a literal 1D input length; `with_replacement` not modelled. |
@@ -369,7 +372,7 @@ Legend:
 
 ## Method calls
 
-`shape_of_call` evaluates `var = receiver.method(args)` in the recursive evaluator. `classify_method_call` maps the method name to a `KnownFunction`. `apply_method_call` synthesises the receiver as positional[0] and dispatches into `apply_known_function`, collapsing multiple positionals into a tuple-string for `Reshape`/`Permute`/`Transpose`/`Tile`/`BroadcastTo`. `analyze_layer_shapes` walks every assignment in source order and propagates shapes through free calls and method calls.
+`shape_of_call` evaluates `var = receiver.method(args)` in the recursive evaluator. `classify_method_call` maps the method name to a `KnownFunction`. `apply_method_call` synthesises the receiver as positional[0] and dispatches into `apply_known_function`, collapsing multiple positionals into a tuple-string for `Reshape`/`Permute`/`Transpose`/`Tile`/`BroadcastTo`. `analyze_layer_shapes` still walks every assignment in source order in the propagate pass and propagates shapes through free calls and method calls. The pre-passes before it (annotations, imports, layer assignments) can come from a per-statement memo, and the propagate pass can replay the stored output of unchanged statements (see "Incremental analysis").
 
 | Method | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
@@ -427,7 +430,7 @@ Legend:
 | `x.clone(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.cpu(...)` / `x.cuda(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.float(...)` / `long(...)` / `int(...)` / `bool(...)` / `double(...)` / `half(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
-| `x.clamp(...)` / `x.clip(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.clamp(...)` / `x.clip(...)` | ✅ | ✅ | ✅ | `KnownFunction::Clamp`: same broadcast-with-bounds rule as `torch.clamp` (see the `jnp.clip` row). |
 | `x.softmax(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.norm(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (same convention as `jnp.linalg.norm`/`torch.linalg.norm`); no `dim` → scalar. |
 | `x.diagonal(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Diagonal`'s rule (method form of `torch.diagonal`). |
@@ -507,6 +510,25 @@ inference all went dark.
   same-file scopes, since `all_params`/`original_shapes`/`scope_function_
   nodes` are all keyed by the in-file `scopes` array.
 
+## Incremental analysis
+
+Done (design in `llm.txt`, "Incremental analysis"):
+
+- Incremental parse (`diff_edit`, `reparse`); a tree with a syntax error is parsed again from scratch, so the tree always equals a fresh parse.
+- Pre-pass memo per top-level statement (`UnitMemo`, `analyze_layer_shapes_with_memo`) and a propagate memo (`PropPlan`, `PropRecord`, name groups in `src/incremental/names.rs`).
+- `ScopeIndex` for byte-to-scope lookup in the propagate pass.
+- INCREMENTAL document sync (`apply_changes`) with out-of-sync handling, and an adaptive debounce of 20 to 150 ms (`Pace`).
+- Debug switches: `NDIM_VERIFY_INCREMENTAL=1` (compare each incremental result with a fresh one; the fresh result wins), `NDIM_NO_PROPAGATE_MEMO=1` (turn off the propagate replay).
+
+Open (measured limits, not planned work):
+
+- The name closure over-approximates, so hub names (`__init__`, `forward`) join most statements into one group and an edit there saves only part of the cost.
+- The propagate-pass setup (function nodes, scope links, submodules, `original_shapes`) runs over the whole file on every dirty edit (about 14 ms).
+- An edit that moves every position of the file, or dirties more than 60 percent of the bytes, runs in full.
+- The first edit after open builds the memo (about 4 ms more).
+- A file over 4 MiB or 100,000 statements has no memo.
+- An unsaved helper buffer is ignored.
+
 ## Open targets (current)
 
 The catalog pass is complete. The remaining ❌ rows need analysis beyond a single array-shape rule:
@@ -516,6 +538,8 @@ The catalog pass is complete. The remaining ❌ rows need analysis beyond a sing
 - Device collectives need mesh and named-axis state.
 - `broadcast_shapes` returns a shape tuple, not an array.
 - `einops.unpack` needs tracked literal values for the `ps` object, while `equinox.nn.Lambda` wraps an arbitrary callable.
+
+Done since the catalog pass (analysis behavior, not catalog rows): tuple-literal unpacking (`a, b = x, y`, swaps, starred targets); unpacking a name binds the rows of a provable array, gives each target the shared shape of a homogeneous tuple carry (`lax.scan` init, `final_a, final_b = final_carry`), and gives unknown for a name that is neither; closures read enclosing variables at call time; user submodules resolve through the class MRO; provable scalar operands broadcast; a name whose shape changes across a loop is unknown after it; internal names (`__synth_N`, `__ellipsis`) never reach the output. Still open: tuple unpacking of user-defined helper tuple returns, and heterogeneous tuple carries.
 
 Imported helpers with parameter and return annotations now propagate through `resolve_imported_function_shape` and its signature cache. Lazy body seeding remains same-file only, so imported helpers without return annotations stay unknown.
 

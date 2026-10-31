@@ -15,7 +15,9 @@
 //! `NDIM_GOLDEN_OUT` (golden dump path).
 //!
 //! Latency is reported as total = debounce + server compute + other. The
-//! debounce is the fixed 150 ms in `Backend::did_change` (0 for didOpen).
+//! debounce is the one the server chose, from the `debounce=` field of its
+//! `analysis:` log (0 for didOpen). It is 150 ms while typing and 20 to 150 ms
+//! after an idle pause.
 //! Server compute is parsed from the server's own `analysis: total=Nms` log
 //! (whole-millisecond resolution). Other is transport, JSON, diagnostic
 //! building and scheduling. Peak RSS is sampled with `ps` every 25 ms (and
@@ -196,9 +198,11 @@ impl Server {
                     version: p["version"].as_i64(),
                     diags: p["diagnostics"].as_array().cloned().unwrap_or_default(),
                 }),
-                "window/logMessage" => self
-                    .logs
-                    .push((m.at, p["message"].as_str().unwrap_or("").to_string())),
+                "window/logMessage" => {
+                    let msg = p["message"].as_str().unwrap_or("").to_string();
+                    assert!(!msg.starts_with("incremental mismatch"), "{msg}");
+                    self.logs.push((m.at, msg));
+                }
                 _ => {}
             }
         } else if let Some(id) = m.v.get("id").and_then(|x| x.as_i64()) {
@@ -293,6 +297,22 @@ impl Server {
             .unwrap_or(0.0)
     }
 
+    /// Debounce (ms) the server logged for the last `analysis:` in (t0, t1].
+    fn debounce_ms(&self, t0: Instant, t1: Instant) -> f64 {
+        self.logs
+            .iter()
+            .rev()
+            .find(|(at, m)| *at >= t0 && *at <= t1 && m.starts_with("analysis: total="))
+            .and_then(|(_, m)| {
+                m.rsplit_once(" debounce=")?
+                    .1
+                    .trim_end_matches("ms")
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(DEBOUNCE_MS)
+    }
+
     fn analyses_between(&self, t0: Instant, t1: Instant) -> usize {
         self.logs
             .iter()
@@ -371,7 +391,7 @@ fn change_doc(s: &mut Server, d: &mut Doc, text: String) -> Sample {
     Sample {
         total: at.saturating_duration_since(t0).as_secs_f64() * 1000.0,
         compute: s.compute_ms(t0, at),
-        debounce: DEBOUNCE_MS,
+        debounce: s.debounce_ms(t0, at),
     }
 }
 
@@ -785,10 +805,12 @@ fn one_run(run: usize, rec: &mut Recorder) {
         }
     }
 
-    // 3. debounce floor: change a 1-line document
+    // 3. debounce floor: change a 1-line document after an idle pause. The
+    // pause lets the debounce adapt, so the old 150 ms baseline is not like-for-like.
     let tiny_uri = format!("file://{}/tiny.py", root.display());
     let (mut tiny, _) = open_doc(&mut srv, &tiny_uri, "x = 1\n");
     for k in 0..5 {
+        srv.settle(450);
         let s = change_doc(&mut srv, &mut tiny, format!("x = {k}\n"));
         rec.sample("floor_tiny_doc_change", s);
     }
@@ -935,6 +957,14 @@ fn one_run(run: usize, rec: &mut Recorder) {
             );
         }
     }
+
+    // 6b. one edit after an idle pause: the debounce adapts to the cost.
+    srv.settle(450);
+    let s = change_doc(&mut srv, &mut doc, append_to_line(&base, last_row, "#"));
+    rec.sample("edit_after_idle", s);
+    srv.settle(450);
+    let s = change_doc(&mut srv, &mut doc, base.clone());
+    rec.sample("edit_after_idle_revert", s);
 
     // 7. keystroke burst: 50 changes faster than the debounce
     {

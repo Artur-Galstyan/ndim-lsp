@@ -636,6 +636,7 @@ pub enum KnownFunction {
     LinalgEig,
     Astype,
     Copy,
+    Clamp,
     Detach,
     Contiguous,
     To,
@@ -956,17 +957,200 @@ pub fn scope_for_byte(scopes: &[FunctionShapeScope], byte: usize) -> Option<&Fun
     scope_index_for_byte(scopes, byte).map(|i| &scopes[i])
 }
 
-pub fn scope_index_for_byte(scopes: &[FunctionShapeScope], byte: usize) -> Option<usize> {
+/// Fast `scope_index_for_byte` for scopes whose ranges are nested or disjoint
+/// (every parsed file). Other range sets use the linear scan. Built from the
+/// ranges only, so later changes to a scope's shapes leave it valid.
+#[derive(Default)]
+pub struct ScopeIndex {
+    ranges: Vec<(usize, usize)>,
+    /// Non-empty ranges ordered by start, then larger first, then lower index.
+    sorted: Vec<IndexedScope>,
+    nested: bool,
+}
+
+struct IndexedScope {
+    start: usize,
+    end: usize,
+    index: usize,
+    /// Position in `sorted` of the smallest range that encloses this one.
+    parent: Option<usize>,
+}
+
+impl ScopeIndex {
+    pub fn new(scopes: &[FunctionShapeScope]) -> Self {
+        let ranges: Vec<(usize, usize)> =
+            scopes.iter().map(|s| (s.start_byte, s.end_byte)).collect();
+        let mut order: Vec<usize> = (0..ranges.len())
+            .filter(|&i| ranges[i].0 < ranges[i].1)
+            .collect();
+        order.sort_by_key(|&i| (ranges[i].0, std::cmp::Reverse(ranges[i].1), i));
+        let mut sorted: Vec<IndexedScope> = Vec::with_capacity(order.len());
+        let mut open: Vec<usize> = Vec::new();
+        let mut nested = true;
+        for index in order {
+            let (start, end) = ranges[index];
+            while open.last().is_some_and(|&o| sorted[o].end <= start) {
+                open.pop();
+            }
+            let parent = open.last().copied();
+            if parent.is_some_and(|p| end > sorted[p].end) {
+                nested = false;
+                break;
+            }
+            open.push(sorted.len());
+            sorted.push(IndexedScope {
+                start,
+                end,
+                index,
+                parent,
+            });
+        }
+        Self {
+            ranges,
+            sorted,
+            nested,
+        }
+    }
+
+    /// Same answer as `scope_index_for_byte`: the smallest scope containing
+    /// `byte`, the later one when two have the same size.
+    pub fn lookup(&self, byte: usize) -> Option<usize> {
+        if !self.nested {
+            return linear_scope_index(self.ranges.iter().copied(), byte);
+        }
+        let mut cur = self
+            .sorted
+            .partition_point(|e| e.start <= byte)
+            .checked_sub(1);
+        while let Some(c) = cur {
+            let e = &self.sorted[c];
+            if byte < e.end {
+                return Some(e.index);
+            }
+            cur = e.parent;
+        }
+        None
+    }
+}
+
+fn linear_scope_index(ranges: impl Iterator<Item = (usize, usize)>, byte: usize) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
-    for (i, scope) in scopes.iter().enumerate() {
-        if scope.start_byte <= byte && byte < scope.end_byte {
-            let size = scope.end_byte - scope.start_byte;
-            match best {
-                None => best = Some((i, size)),
-                Some((_, prev_size)) if size <= prev_size => best = Some((i, size)),
-                _ => {}
+    for (i, (start, end)) in ranges.enumerate() {
+        if start <= byte && byte < end {
+            let size = end - start;
+            if best.is_none_or(|(_, prev)| size <= prev) {
+                best = Some((i, size));
             }
         }
     }
     best.map(|(i, _)| i)
+}
+
+pub fn scope_index_for_byte(scopes: &[FunctionShapeScope], byte: usize) -> Option<usize> {
+    linear_scope_index(scopes.iter().map(|s| (s.start_byte, s.end_byte)), byte)
+}
+
+#[cfg(test)]
+mod scope_index_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn python_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                python_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "py") {
+                out.push(p);
+            }
+        }
+    }
+
+    fn scopes_of(text: &str) -> Vec<FunctionShapeScope> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        crate::python_ast::extract_jaxtyping_shapes(tree.root_node(), text).unwrap()
+    }
+
+    /// Lookup is constant between scope boundaries, so the bytes next to every
+    /// boundary plus a stride cover each distinct answer; small files get
+    /// every byte.
+    fn bytes_to_check(scopes: &[FunctionShapeScope], len: usize) -> Vec<usize> {
+        if len <= 64 * 1024 {
+            return (0..=len).collect();
+        }
+        let mut bytes: Vec<usize> = (0..=len).step_by(97).collect();
+        for s in scopes {
+            for b in [s.start_byte, s.end_byte] {
+                bytes.extend([b.saturating_sub(1), b, b + 1]);
+            }
+        }
+        bytes.retain(|&b| b <= len);
+        bytes
+    }
+
+    #[test]
+    fn index_matches_linear_scan_on_all_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        python_files(&root.join("corpus"), &mut files);
+        python_files(&root.join("bench"), &mut files);
+        assert!(files.len() > 20);
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let scopes = scopes_of(&text);
+            let index = ScopeIndex::new(&scopes);
+            for byte in bytes_to_check(&scopes, text.len()) {
+                assert_eq!(
+                    index.lookup(byte),
+                    scope_index_for_byte(&scopes, byte),
+                    "{} byte {byte}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn scope(start_byte: usize, end_byte: usize) -> FunctionShapeScope {
+        FunctionShapeScope {
+            function_name: None,
+            start_byte,
+            end_byte,
+            shapes: HashMap::new(),
+            return_shape: None,
+            param_order: Vec::new(),
+            all_params: Vec::new(),
+            dimension_sites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn equal_size_scopes_resolve_to_the_later_one() {
+        let scopes = vec![scope(0, 100), scope(10, 50), scope(10, 50), scope(60, 70)];
+        let index = ScopeIndex::new(&scopes);
+        for byte in 0..110 {
+            assert_eq!(index.lookup(byte), scope_index_for_byte(&scopes, byte));
+        }
+        assert_eq!(index.lookup(20), Some(2));
+    }
+
+    #[test]
+    fn overlapping_or_unordered_scopes_match_linear_scan() {
+        let scopes = vec![
+            scope(40, 90),
+            scope(0, usize::MAX),
+            scope(10, 60),
+            scope(30, 30),
+            scope(20, 5),
+        ];
+        let index = ScopeIndex::new(&scopes);
+        for byte in (0..120).chain([usize::MAX - 1, usize::MAX]) {
+            assert_eq!(index.lookup(byte), scope_index_for_byte(&scopes, byte));
+        }
+    }
 }

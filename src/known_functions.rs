@@ -73,6 +73,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "moveaxis" => Some(KnownFunction::MoveAxis),
             "swapaxes" => Some(KnownFunction::SwapAxes),
             "where" => Some(KnownFunction::Where),
+            "clip" => Some(KnownFunction::Clamp),
             "zeros" => Some(KnownFunction::Zeros),
             "ones" => Some(KnownFunction::Ones),
             "full" => Some(KnownFunction::Full),
@@ -174,6 +175,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "flatten" => Some(KnownFunction::TorchFlatten),
             "ravel" => Some(KnownFunction::Ravel),
             "where" => Some(KnownFunction::Where),
+            "clip" | "clamp" => Some(KnownFunction::Clamp),
             "all" => Some(KnownFunction::All),
             "any" => Some(KnownFunction::Any),
             "argmax" => Some(KnownFunction::ArgMax),
@@ -743,7 +745,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "clone" => Some(KnownFunction::Copy),
         "cpu" | "cuda" => Some(KnownFunction::Copy),
         "float" | "long" | "int" | "bool" | "double" | "half" => Some(KnownFunction::Copy),
-        "clamp" | "clip" => Some(KnownFunction::Copy),
+        "clamp" | "clip" => Some(KnownFunction::Clamp),
         "softmax" => Some(KnownFunction::Copy),
         "norm" => Some(KnownFunction::Sum),
         "diagonal" => Some(KnownFunction::Diagonal),
@@ -898,6 +900,7 @@ pub fn apply_known_function(
         | KnownFunction::Detach
         | KnownFunction::Contiguous
         | KnownFunction::To => apply_known_shape_preserving(args, shapes),
+        KnownFunction::Clamp => apply_known_clamp(args, shapes),
         KnownFunction::Pad => apply_known_pad(args, shapes),
         KnownFunction::NumpyPad => apply_known_numpy_pad(args, shapes),
         KnownFunction::Rot90 => apply_known_rot90(args, shapes),
@@ -2735,6 +2738,41 @@ fn apply_known_shape_preserving(
         return Ok(None);
     };
     Ok(shapes.shape(input_name).cloned())
+}
+
+/// `clip` / `clamp` broadcast the input with every array bound, so
+/// `jnp.clip(x, lo, hi)` with a `lo` of a larger shape is bigger than `x`.
+/// The caller removes bounds that are scalars; a bound with no known shape
+/// leaves the result unknown, and so does a mismatch.
+fn apply_known_clamp(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(CallArgument::Positional { value: input }) = args.first() else {
+        return Ok(None);
+    };
+    let Some(mut output) = shapes.shape(input).cloned() else {
+        return Ok(None);
+    };
+    for arg in &args[1..] {
+        let value = match arg {
+            CallArgument::Positional { value } => value,
+            CallArgument::Keyword { name, value }
+                if matches!(name.as_str(), "min" | "max" | "a_min" | "a_max") =>
+            {
+                value
+            }
+            CallArgument::Keyword { .. } => continue,
+        };
+        let Some(bound) = shapes.shape(value) else {
+            return Ok(None);
+        };
+        match broadcast_two_shapes(&output, bound) {
+            Ok(broadcast) => output = broadcast,
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(output))
 }
 
 fn concat_shapes_along_axis(

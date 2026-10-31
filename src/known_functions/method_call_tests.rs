@@ -1044,8 +1044,8 @@ fn test_classify_new_misc_methods() {
     assert_eq!(classify_method_call("bool"), Some(KnownFunction::Copy));
     assert_eq!(classify_method_call("double"), Some(KnownFunction::Copy));
     assert_eq!(classify_method_call("half"), Some(KnownFunction::Copy));
-    assert_eq!(classify_method_call("clamp"), Some(KnownFunction::Copy));
-    assert_eq!(classify_method_call("clip"), Some(KnownFunction::Copy));
+    assert_eq!(classify_method_call("clamp"), Some(KnownFunction::Clamp));
+    assert_eq!(classify_method_call("clip"), Some(KnownFunction::Clamp));
     assert_eq!(classify_method_call("softmax"), Some(KnownFunction::Copy));
     assert_eq!(classify_method_call("norm"), Some(KnownFunction::Sum));
     assert_eq!(

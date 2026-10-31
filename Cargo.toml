@@ -13,3 +13,9 @@ tree-sitter-python = "0.25.0"
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
+
+[profile.dev.package.tree-sitter]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-python]
+opt-level = 3

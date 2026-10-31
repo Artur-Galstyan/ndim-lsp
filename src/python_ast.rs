@@ -898,6 +898,7 @@ pub(crate) fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> 
 }
 
 /// One class with its linearized method resolution order (itself first).
+#[derive(Debug, PartialEq)]
 struct ClassMro {
     range: (usize, usize),
     /// Every base in the MRO is defined in the file.
@@ -913,20 +914,39 @@ struct ClassMro {
 
 /// Same-file class hierarchy, built once per analysis, to resolve
 /// `self.<attr>` through own class first, then bases in MRO order.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct ClassHierarchy {
     classes: Vec<ClassMro>,
     /// Range of each class whose name the file defines exactly once.
     named: HashMap<String, (usize, usize)>,
 }
 
-impl ClassHierarchy {
-    pub(crate) fn new(root: Node, text: &str) -> Self {
-        let mut nodes = Vec::new();
+/// What `ClassHierarchy` reads from one `class_definition`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClassSummary {
+    pub(crate) name: Option<String>,
+    pub(crate) range: (usize, usize),
+    pub(crate) bases: Vec<BaseSummary>,
+    pub(crate) fields: Vec<String>,
+}
+
+/// One entry of the superclass list, by the kind of its node.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BaseSummary {
+    Identifier(String),
+    Attribute(String),
+    Other(String),
+}
+
+impl ClassSummary {
+    /// Every `class_definition` under `root`, nested ones included, in
+    /// source order.
+    pub(crate) fn collect(root: Node, text: &str) -> Vec<Self> {
+        let mut classes = Vec::new();
         let mut stack = vec![root];
         while let Some(n) = stack.pop() {
             if n.kind() == "class_definition" {
-                nodes.push(n);
+                classes.push(Self::of(n, text));
             }
             for i in (0..n.child_count()).rev() {
                 if let Some(c) = n.child(i as u32) {
@@ -934,15 +954,48 @@ impl ClassHierarchy {
                 }
             }
         }
-        let n = nodes.len();
-        let name_of = |c: Node| {
-            c.child_by_field_name("name")
+        classes
+    }
+
+    fn of(class: Node, text: &str) -> Self {
+        let mut bases = Vec::new();
+        if let Some(args) = class.child_by_field_name("superclasses") {
+            let mut cur = args.walk();
+            for b in args.named_children(&mut cur) {
+                let Ok(t) = b.utf8_text(text.as_bytes()) else {
+                    continue;
+                };
+                match b.kind() {
+                    "comment" | "keyword_argument" => {}
+                    "identifier" => bases.push(BaseSummary::Identifier(t.to_string())),
+                    "attribute" => bases.push(BaseSummary::Attribute(t.to_string())),
+                    _ => bases.push(BaseSummary::Other(t.to_string())),
+                }
+            }
+        }
+        Self {
+            name: class
+                .child_by_field_name("name")
                 .and_then(|x| x.utf8_text(text.as_bytes()).ok())
-        };
+                .map(str::to_string),
+            range: (class.start_byte(), class.end_byte()),
+            bases,
+            fields: class_body_fields(class, text),
+        }
+    }
+}
+
+impl ClassHierarchy {
+    pub(crate) fn new(root: Node, text: &str) -> Self {
+        Self::from_summaries(&ClassSummary::collect(root, text))
+    }
+
+    pub(crate) fn from_summaries(summaries: &[ClassSummary]) -> Self {
+        let n = summaries.len();
         // `None` marks a name defined more than once: ambiguous, so opaque.
         let mut by_name: HashMap<&str, Option<usize>> = HashMap::new();
-        for (i, c) in nodes.iter().enumerate() {
-            if let Some(name) = name_of(*c) {
+        for (i, c) in summaries.iter().enumerate() {
+            if let Some(name) = c.name.as_deref() {
                 by_name
                     .entry(name)
                     .and_modify(|v| *v = None)
@@ -952,29 +1005,22 @@ impl ClassHierarchy {
         // Ids `>= n` stand for bases the file does not define, one per name.
         let mut opaque: HashMap<&str, usize> = HashMap::new();
         let mut bases: Vec<Vec<usize>> = Vec::with_capacity(n);
-        for c in &nodes {
+        for c in summaries {
             let mut list = Vec::new();
-            if let Some(args) = c.child_by_field_name("superclasses") {
-                let mut cur = args.walk();
-                for b in args.named_children(&mut cur) {
-                    let Ok(t) = b.utf8_text(text.as_bytes()) else {
-                        continue;
-                    };
-                    match b.kind() {
-                        "comment" | "keyword_argument" => continue,
-                        "identifier" => match by_name.get(t) {
-                            Some(Some(i)) => list.push(*i),
-                            None if matches!(t, "object" | "Module" | "ABC") => {}
-                            _ => {
-                                let next = n + opaque.len();
-                                list.push(*opaque.entry(t).or_insert(next));
-                            }
-                        },
-                        "attribute" if t.ends_with(".Module") || t.ends_with(".ABC") => {}
+            for b in &c.bases {
+                match b {
+                    BaseSummary::Identifier(t) => match by_name.get(t.as_str()) {
+                        Some(Some(i)) => list.push(*i),
+                        None if matches!(t.as_str(), "object" | "Module" | "ABC") => {}
                         _ => {
                             let next = n + opaque.len();
                             list.push(*opaque.entry(t).or_insert(next));
                         }
+                    },
+                    BaseSummary::Attribute(t) if t.ends_with(".Module") || t.ends_with(".ABC") => {}
+                    BaseSummary::Attribute(t) | BaseSummary::Other(t) => {
+                        let next = n + opaque.len();
+                        list.push(*opaque.entry(t).or_insert(next));
                     }
                 }
             }
@@ -987,20 +1033,20 @@ impl ClassHierarchy {
             .map(|i| {
                 let lin = linearize(i, n, &bases, &mut memo, &mut visiting);
                 ClassMro {
-                    range: (nodes[i].start_byte(), nodes[i].end_byte()),
+                    range: summaries[i].range,
                     closed: lin.iter().all(|&j| j < n),
-                    fields: class_body_fields(nodes[i], text),
+                    fields: summaries[i].fields.clone(),
                     mro: lin
                         .into_iter()
                         .take_while(|&j| j < n)
-                        .map(|j| (nodes[j].start_byte(), nodes[j].end_byte()))
+                        .map(|j| summaries[j].range)
                         .collect(),
                 }
             })
             .collect();
         let named = by_name
             .into_iter()
-            .filter_map(|(name, i)| Some((name.to_string(), (nodes[i?].start_byte(), nodes[i?].end_byte()))))
+            .filter_map(|(name, i)| Some((name.to_string(), summaries[i?].range)))
             .collect();
         Self { classes, named }
     }

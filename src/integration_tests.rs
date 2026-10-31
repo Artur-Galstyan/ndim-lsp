@@ -11053,3 +11053,140 @@ mod bmm_and_cross_entropy_tests {
         assert_eq!(find_shape(&analysis, "per_item"), Some(&shape(&["n"])));
     }
 }
+
+#[cfg(test)]
+mod unpack_and_broadcast_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEADER: &str = "import math\nimport torch\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nfrom jaxtyping import Float, Array\n";
+
+    fn names(body: &str, wanted: &[&str]) -> Vec<Option<Vec<String>>> {
+        let code = format!(
+            "{HEADER}def f(ys: Float[Array, \"t d\"], zs: Float[Array, \"t\"], k, xs: Float[Array, \"seq 4\"]):\n{body}"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{body}: {:?}", analysis.errors);
+        wanted.iter().map(|n| find_shape(&analysis, n).cloned()).collect()
+    }
+
+    #[test]
+    fn test_unpacking_a_tensor_binds_its_rows() {
+        let row = Some(shape(&["4"]));
+        for body in [
+            "    x = torch.zeros(2, 4)\n    a, b = x\n",
+            "    x = jnp.ones((2, 4))\n    a, b = x\n",
+            "    x = np.zeros((2, 4)) * 2\n    a, b = x\n",
+            "    x = torch.zeros(2, 4)\n    y = x\n    a, b = y\n",
+        ] {
+            assert_eq!(names(body, &["a", "b"]), vec![row.clone(), row.clone()], "{body}");
+        }
+        let code = format!(
+            "{HEADER}def f(x: Float[Array, \"2 4\"], w: Float[Array, \"n 4\"]):\n    a, b = x\n    c, d = w\n"
+        );
+        let analysis = analyze(&code);
+        for n in ["a", "b", "c", "d"] {
+            assert_eq!(find_shape(&analysis, n), Some(&shape(&["4"])), "{n}");
+        }
+    }
+
+    #[test]
+    fn test_unpacking_a_tensor_with_a_wrong_or_unknown_count_stays_unknown() {
+        for body in [
+            "    x = torch.zeros(3, 4)\n    a, b = x\n",
+            "    x = torch.zeros(2, 4)\n    a, b, c = x\n",
+            "    x = torch.zeros(2, 4)\n    (a, b), c = x\n",
+            "    x = torch.zeros(())\n    a, b = x\n",
+            "    a, b = k\n",
+            "    x = helper(ys)\n    a, b = x\n",
+            "    x = torch.zeros(2, 4)\n    x = helper(ys)\n    a, b = x\n",
+        ] {
+            assert_eq!(names(body, &["a", "b"]), vec![None, None], "{body}");
+        }
+    }
+
+    #[test]
+    fn test_unpacking_a_seeded_untyped_parameter_stays_unknown() {
+        let code = format!(
+            "{HEADER}def g(p):\n    a, b = p\n    return a\n\ndef f(x: Float[Array, \"2 4\"]):\n    r = g(x)\n"
+        );
+        let analysis = analyze(&code);
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+    }
+
+    #[test]
+    fn test_unpacking_a_tuple_carry_keeps_the_shared_shape() {
+        let code = format!(
+            "{HEADER}def f(h0: Float[Array, \"hid\"], c0: Float[Array, \"hid\"], xs: Float[Array, \"seq hid\"]):\n    def body(carry, x):\n        h, c = carry\n        return (h, c), x\n    init = (h0, c0)\n    fc, ys = jax.lax.scan(body, init, xs)\n    a, b = fc\n    s = (h0, c0)\n    p, q = s\n"
+        );
+        let analysis = analyze(&code);
+        for n in ["fc", "a", "b", "p", "q", "h", "c"] {
+            assert_eq!(find_shape(&analysis, n), Some(&shape(&["hid"])), "{n}");
+        }
+    }
+
+    #[test]
+    fn test_two_operand_functions_broadcast_both_operands() {
+        for func in [
+            "jnp.maximum", "jnp.minimum", "np.maximum", "np.fmin", "jnp.add", "np.multiply",
+            "jnp.power", "np.arctan2", "jnp.copysign", "np.less", "jnp.logical_and",
+            "torch.add", "torch.mul", "torch.pow", "torch.maximum", "torch.minimum",
+            "torch.atan2", "torch.fmod", "torch.eq",
+        ] {
+            let lib = if func.starts_with("torch") { "torch" } else if func.starts_with("np") { "np" } else { "jnp" };
+            let zeros = if lib == "torch" { "torch.zeros(1)" } else { &format!("{lib}.zeros(1)") };
+            let body = format!("    out = {func}({zeros}, ys)\n    rev = {func}(ys, {zeros})\n");
+            let got = names(&body, &["out", "rev"]);
+            assert_eq!(got, vec![Some(shape(&["t", "d"])); 2], "{func}");
+        }
+        let got = names("    out = jnp.maximum(ys, zs)\n", &["out"]);
+        assert_eq!(got, vec![None], "t vs d does not broadcast");
+        let got = names("    out = jnp.maximum(jnp.zeros(1), zs)\n    s = torch.add(ys, 1.0)\n", &["out", "s"]);
+        assert_eq!(got, vec![Some(shape(&["t"])), Some(shape(&["t", "d"]))]);
+    }
+
+    #[test]
+    fn test_two_operand_functions_stay_unknown_when_unsure() {
+        for expr in [
+            "jnp.maximum(jnp.zeros(3), k)",
+            "jnp.maximum(ys, x2=zs)",
+            "jnp.maximum(ys)",
+            "jnp.maximum(ys, zs, ys)",
+            "torch.add(ys, other=jnp.zeros(3))",
+        ] {
+            assert_eq!(names(&format!("    out = {expr}\n"), &["out"]), vec![None], "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_clip_and_clamp_broadcast_array_bounds() {
+        let got = names(
+            "    a = jnp.clip(jnp.zeros(1), ys, 1.0)\n    b = ys.clamp(min=zs.unsqueeze(1))\n    c = jnp.clip(ys, 0.0, 1.0)\n    d = ys.clamp(0.0, 1.0)\n    e = torch.clip(ys, max=jnp.zeros(3))\n",
+            &["a", "b", "c", "d", "e"],
+        );
+        assert_eq!(
+            got,
+            vec![
+                Some(shape(&["t", "d"])),
+                Some(shape(&["t", "d"])),
+                Some(shape(&["t", "d"])),
+                Some(shape(&["t", "d"])),
+                None,
+            ]
+        );
+    }
+}

@@ -16,7 +16,7 @@ use tower_lsp::lsp_types::{
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
     InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, Range, Registration,
+    OptionalVersionedTextDocumentIdentifier, Position, TextDocumentContentChangeEvent, PositionEncodingKind, Range, Registration,
     ServerCapabilities, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
@@ -24,11 +24,17 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Parser, Tree};
 
 use ndim_lsp::{
-    LayerShapeAnalysis, ResolutionCache, ShapeError, ShapeErrorKind, analyze_layer_shapes,
-    clear_resolution_cache, new_resolution_cache,
+    LayerShapeAnalysis, ResolutionCache, ShapeError, ShapeErrorKind, UnitMemo,
+    analyze_layer_shapes, analyze_layer_shapes_with_memo, clear_resolution_cache,
+    first_analysis_difference, first_tree_difference, new_resolution_cache, reparse,
 };
 
-/// Quiet time after a change before its text is analyzed.
+mod sync;
+
+use sync::{Pace, Run, apply_changes};
+
+/// Longest quiet time after a change before its text is analyzed. `Pace`
+/// shortens it for an isolated edit of a document that is cheap to analyze.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Analysis plus the exact text/tree it was computed from, so hover and
@@ -38,6 +44,8 @@ pub struct CachedAnalysis {
     pub analysis: Arc<LayerShapeAnalysis>,
     pub text: Arc<str>,
     pub tree: Arc<Tree>,
+    /// The top-level statements this analysis left to the next one to reuse.
+    pub memo: Arc<UnitMemo>,
     pub version: i32,
     pub rev: u64,
 }
@@ -51,6 +59,28 @@ pub struct Document {
     rev: u64,
     /// Analysis of this text may start at this time (the debounce deadline).
     ready_at: Instant,
+    /// The quiet time chosen for this text.
+    debounce: Duration,
+    /// False after a change message was dropped: the text is not the editor's
+    /// text. It gives no analysis until a full-text change arrives.
+    in_sync: bool,
+}
+
+/// The text of the last analysis committed for a URI, its tree, and its memo:
+/// the base of the next incremental parse and analysis.
+#[derive(Clone)]
+pub struct ParsedText {
+    text: Arc<str>,
+    tree: Arc<Tree>,
+    memo: Arc<UnitMemo>,
+}
+
+/// What `Backend::change_document` did with a change message.
+enum Change {
+    Stored(u64),
+    Stale,
+    /// The message was dropped and the document is out of sync.
+    Unusable(u64),
 }
 
 type Inflight = Mutex<HashMap<(Url, u64), watch::Receiver<Option<Option<CachedAnalysis>>>>>;
@@ -67,12 +97,17 @@ pub struct Backend {
     /// Newest completed analysis per URI. Shared `Arc`s, so a hit clones
     /// pointers, not the whole analysis.
     pub analysis_cache: Arc<StdRwLock<HashMap<Url, CachedAnalysis>>>,
+    /// Base for the next incremental parse. Written only with a result for
+    /// the newest text, together with `analysis_cache`.
+    pub parse_states: Arc<StdRwLock<HashMap<Url, ParsedText>>>,
     /// Single-flight: one running analysis per (URI, rev); every caller for
     /// that text waits on it.
     pub inflight: Arc<Inflight>,
     /// One analysis runs at a time per URI. A later one waits here, and skips
     /// the work if newer text arrived meanwhile.
     pub gates: Arc<Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Change rhythm and analysis cost per URI, which set the debounce.
+    pub pace: Arc<Mutex<HashMap<Url, Pace>>>,
     /// Session-lifetime cache for resolved import targets.
     /// Keyed on (import-path-segments, search-roots-fingerprint).
     /// Invalidated when workspace folders change.
@@ -127,7 +162,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
                     },
@@ -184,6 +219,12 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         // The write comes first: no await may let a later change overtake it.
         let doc = params.text_document;
+        self.pace
+            .lock()
+            .unwrap()
+            .entry(doc.uri.clone())
+            .or_default()
+            .opened(Instant::now());
         if let Some(rev) = self.set_document(&doc.uri, doc.text, doc.version, Duration::ZERO, false)
         {
             self.spawn_publish(doc.uri, rev);
@@ -194,23 +235,23 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(change) = params.content_changes.into_iter().last() else {
-            return;
-        };
         let uri = params.text_document.uri;
         // No await before the write: handlers start in message order, so the
         // newest text always wins. The analysis runs in its own task after
         // the debounce, so this handler does not hold a concurrency slot.
-        let Some(rev) = self.set_document(
-            &uri,
-            change.text,
-            params.text_document.version,
-            DEBOUNCE,
-            true,
-        ) else {
-            return;
-        };
-        self.spawn_publish(uri, rev);
+        match self.change_document(&uri, params.text_document.version, &params.content_changes) {
+            Change::Stored(rev) => self.spawn_publish(uri, rev),
+            Change::Stale => {}
+            Change::Unusable(rev) => {
+                self.spawn_publish(uri, rev);
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        "change dropped: a range does not fit the stored text",
+                    )
+                    .await;
+            }
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -234,7 +275,9 @@ impl LanguageServer for Backend {
         // An analysis still running finds no matching text and drops itself.
         self.documents.write().unwrap().remove(uri);
         self.analysis_cache.write().unwrap().remove(uri);
+        self.parse_states.write().unwrap().remove(uri);
         self.gates.lock().unwrap().remove(uri);
+        self.pace.lock().unwrap().remove(uri);
         // Clear any diagnostics the client may still be showing.
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
@@ -340,6 +383,9 @@ impl Backend {
             doc.ready_at = now;
             revs.push((uri.clone(), doc.rev));
         }
+        for pace in self.pace.lock().unwrap().values_mut() {
+            pace.reset();
+        }
         // After the new revs: an analysis of an old rev can no longer fill it.
         self.analysis_cache.write().unwrap().clear();
         for (uri, rev) in revs {
@@ -367,6 +413,17 @@ impl Backend {
         if monotonic && docs.get(uri).is_some_and(|d| d.version > version) {
             return None;
         }
+        Some(self.store(&mut docs, uri, text, version, debounce))
+    }
+
+    fn store(
+        &self,
+        docs: &mut HashMap<Url, Document>,
+        uri: &Url,
+        text: String,
+        version: i32,
+        debounce: Duration,
+    ) -> u64 {
         let rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
         docs.insert(
             uri.clone(),
@@ -375,9 +432,51 @@ impl Backend {
                 version,
                 rev,
                 ready_at: Instant::now() + debounce,
+                debounce,
+                in_sync: true,
             },
         );
-        Some(rev)
+        rev
+    }
+
+    /// Apply a change message to the stored text, under the write lock.
+    /// A stale version, or a range that does not fit, leaves the document as
+    /// it was.
+    fn change_document(
+        &self,
+        uri: &Url,
+        version: i32,
+        changes: &[TextDocumentContentChangeEvent],
+    ) -> Change {
+        let mut docs = self.documents.write().unwrap();
+        let current = docs.get(uri);
+        if current.is_some_and(|d| d.version > version) {
+            return Change::Stale;
+        }
+        let resync = changes.iter().any(|c| c.range.is_none());
+        let text = if current.is_some_and(|d| !d.in_sync) && !resync {
+            None
+        } else {
+            apply_changes(current.map(|d| &*d.text), changes)
+        };
+        let Some(text) = text else {
+            let Some(doc) = current else {
+                return Change::Stale;
+            };
+            let text = doc.text.to_string();
+            let rev = self.store(&mut docs, uri, text, version, Duration::ZERO);
+            docs.get_mut(uri).unwrap().in_sync = false;
+            self.analysis_cache.write().unwrap().remove(uri);
+            return Change::Unusable(rev);
+        };
+        let debounce = self
+            .pace
+            .lock()
+            .unwrap()
+            .entry(uri.clone())
+            .or_default()
+            .changed(Instant::now());
+        Change::Stored(self.store(&mut docs, uri, text, version, debounce))
     }
 
     fn cache_hit(&self, uri: &Url, rev: u64) -> Option<CachedAnalysis> {
@@ -394,7 +493,7 @@ impl Backend {
     /// waited. A request that needs fresh data waits out the debounce, then
     /// shares the one analysis with the diagnostics task and other requests.
     async fn get_analysis(&self, uri: &Url) -> Option<CachedAnalysis> {
-        let doc = self.document(uri)?;
+        let doc = self.document(uri).filter(|d| d.in_sync)?;
         if let Some(hit) = self.cache_hit(uri, doc.rev) {
             return Some(hit);
         }
@@ -465,23 +564,47 @@ impl Backend {
         let roots = self.workspace_roots.read().unwrap().clone();
         let resolution_cache = self.resolution_cache.clone();
         let text = doc.text.clone();
-        let run =
-            tokio::task::spawn_blocking(move || compute_analysis(&text, &roots, &resolution_cache))
-                .await;
+        let base = self.parse_states.read().unwrap().get(&uri).cloned();
+        let had_base = base.is_some();
+        let run = tokio::task::spawn_blocking(move || {
+            compute_analysis(&text, base.as_ref(), &roots, &resolution_cache)
+        })
+        .await;
 
+        let mut sample = None;
         let result = match run {
             Ok(Ok(run)) => {
-                let total_ms = t_total.elapsed().as_millis();
+                if let Some(diff) = &run.mismatch {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("incremental mismatch, used the fresh result: {diff}"),
+                        )
+                        .await;
+                }
+                let wall = t_total.elapsed();
+                let total_ms = wall.as_millis();
+                let stats = run.memo.stats();
+                let kind = if !had_base {
+                    Run::Cold
+                } else if stats.propagate_full && stats.units > 1 {
+                    Run::Fallback
+                } else {
+                    Run::Incremental
+                };
+                sample = Some((wall, kind));
                 self.client
                     .log_message(
                         MessageType::INFO,
                         format!(
                             "analysis: total={}ms parse={}ms roots={}ms analyze={}ms \
-                             | text={}B/{}L roots={} reads={}/{}B res_cache_entries={} hits={} misses={}",
+                             | memo={}/{}u text={}B/{}L roots={} reads={}/{}B res_cache_entries={} hits={} misses={} debounce={}ms",
                             total_ms,
                             run.parse_ms,
                             run.roots_ms,
                             run.analyze_ms,
+                            run.memo.stats().syntax_hits,
+                            run.memo.stats().units,
                             doc.text.len(),
                             doc.text.lines().count(),
                             run.search_roots,
@@ -490,6 +613,7 @@ impl Backend {
                             self.resolution_cache.map.read().unwrap().len(),
                             self.resolution_cache.hits.load(Ordering::Relaxed),
                             self.resolution_cache.misses.load(Ordering::Relaxed),
+                            doc.debounce.as_secs_f64() * 1000.0,
                         ),
                     )
                     .await;
@@ -497,6 +621,7 @@ impl Backend {
                     analysis: Arc::new(run.analysis),
                     text: doc.text.clone(),
                     tree: Arc::new(run.tree),
+                    memo: Arc::new(run.memo),
                     version: doc.version,
                     rev: doc.rev,
                 })
@@ -512,17 +637,39 @@ impl Backend {
 
         // Cache only if this is still the newest text; a stale entry would
         // never be read and a closed document must not be re-populated.
-        if let Some(cached) = &result {
-            let docs = self.documents.read().unwrap();
-            if docs.get(&uri).is_some_and(|d| d.rev == doc.rev) {
-                self.analysis_cache
-                    .write()
-                    .unwrap()
-                    .insert(uri.clone(), cached.clone());
+        let committed = result.as_ref().is_some_and(|c| self.commit(&uri, c));
+        if let Some(pace) = self.pace.lock().unwrap().get_mut(&uri) {
+            match sample {
+                _ if result.is_none() => pace.failed(),
+                Some((wall, kind)) if committed => pace.sampled(wall, kind),
+                _ => {}
             }
         }
         self.inflight.lock().unwrap().remove(&(uri, doc.rev));
         let _ = tx.send(Some(result));
+    }
+
+    /// Keep `cached` as the newest result for `uri`, and as the base of the
+    /// next incremental parse, if its text is still the newest. A result for
+    /// old text, or for a closed document, changes no state.
+    fn commit(&self, uri: &Url, cached: &CachedAnalysis) -> bool {
+        let docs = self.documents.read().unwrap();
+        if docs.get(uri).is_some_and(|d| d.rev == cached.rev) {
+            self.parse_states.write().unwrap().insert(
+                uri.clone(),
+                ParsedText {
+                    text: cached.text.clone(),
+                    tree: cached.tree.clone(),
+                    memo: cached.memo.clone(),
+                },
+            );
+            self.analysis_cache
+                .write()
+                .unwrap()
+                .insert(uri.clone(), cached.clone());
+            return true;
+        }
+        false
     }
 
     /// Publish diagnostics for `rev` in a task of its own, after the debounce.
@@ -1078,6 +1225,10 @@ struct AnalysisRun {
     parse_ms: u128,
     roots_ms: u128,
     analyze_ms: u128,
+    memo: UnitMemo,
+    /// `NDIM_VERIFY_INCREMENTAL` found the incremental result unequal to the
+    /// fresh one: the first difference. The run holds the fresh result.
+    mismatch: Option<String>,
     search_roots: usize,
     read_count: usize,
     read_bytes: usize,
@@ -1087,21 +1238,52 @@ struct AnalysisRun {
 /// thread.
 fn compute_analysis(
     text: &str,
+    base: Option<&ParsedText>,
     workspace_roots: &[PathBuf],
     resolution_cache: &ResolutionCache,
 ) -> std::result::Result<AnalysisRun, String> {
+    let t_roots = Instant::now();
+    let mut search_roots = workspace_roots.to_vec();
+    search_roots.extend(python_site_packages_roots(workspace_roots));
+    let roots_ms = t_roots.elapsed().as_millis();
+    let verify = std::env::var_os("NDIM_VERIFY_INCREMENTAL").is_some_and(|v| v == "1");
+    let mut run = analyze_text(text, base, &search_roots, resolution_cache, verify)?;
+    run.roots_ms = roots_ms;
+    Ok(run)
+}
+
+/// Parse and analyze `text` from `base`. With `verify` (for a text that has a
+/// base) a fresh parse and a fresh analysis follow the incremental ones, and
+/// replace a result that differs.
+fn analyze_text(
+    text: &str,
+    base: Option<&ParsedText>,
+    search_roots: &[PathBuf],
+    resolution_cache: &ResolutionCache,
+    verify: bool,
+) -> std::result::Result<AnalysisRun, String> {
+    let verify = verify && base.is_some();
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .map_err(|e| e.to_string())?;
     let t_parse = Instant::now();
-    let tree = parser.parse(text, None).ok_or("parse failed")?;
+    let mut tree = base
+        .and_then(|b| reparse(&mut parser, &b.text, &b.tree, text))
+        .or_else(|| parser.parse(text, None))
+        .ok_or("parse failed")?;
+    let mut mismatch = None;
+    if verify {
+        let fresh = parser.parse(text, None).ok_or("parse failed")?;
+        mismatch = first_tree_difference(&tree, &fresh);
+        if let Some(diff) = &mismatch {
+            if cfg!(test) {
+                panic!("incremental parse differs from fresh: {diff}");
+            }
+            tree = fresh;
+        }
+    }
     let parse_ms = t_parse.elapsed().as_millis();
-
-    let t_roots = Instant::now();
-    let mut search_roots = workspace_roots.to_vec();
-    search_roots.extend(python_site_packages_roots(workspace_roots));
-    let roots_ms = t_roots.elapsed().as_millis();
 
     let read_count = AtomicUsize::new(0);
     let read_bytes = AtomicUsize::new(0);
@@ -1115,24 +1297,84 @@ fn compute_analysis(
     };
 
     let t_analyze = Instant::now();
-    let analysis = analyze_layer_shapes(
-        tree.root_node(),
-        text,
-        &search_roots,
-        read_file,
-        8,
-        Some(resolution_cache),
-    )?;
+    let mut memo = UnitMemo::default();
+    let mut analysis = match base {
+        // The first analysis of a text builds no memo: opening a file stays as
+        // fast as before. The first edit builds it, as it analyzes every unit.
+        None => analyze_layer_shapes(
+            tree.root_node(),
+            text,
+            search_roots,
+            read_file,
+            8,
+            Some(resolution_cache),
+        )?,
+        Some(base) => {
+            memo = UnitMemo::clone(&base.memo);
+            analyze_layer_shapes_with_memo(
+                tree.root_node(),
+                text,
+                search_roots,
+                read_file,
+                8,
+                Some(resolution_cache),
+                &mut memo,
+            )?
+        }
+    };
+    let analyze_ms = t_analyze.elapsed().as_millis();
+    let (read_count, read_bytes) = (read_count.load(Ordering::Relaxed), read_bytes.load(Ordering::Relaxed));
+    if verify {
+        let fresh_tree = parser.parse(text, None).ok_or("parse failed")?;
+        let fresh = analyze_layer_shapes(
+            fresh_tree.root_node(),
+            text,
+            search_roots,
+            read_file,
+            8,
+            Some(resolution_cache),
+        )?;
+        if let Some(diff) = first_analysis_difference(&analysis, &fresh) {
+            if cfg!(test) {
+                panic!("incremental analysis differs from fresh: {diff}");
+            }
+            mismatch.get_or_insert(format!("analysis {diff}"));
+            analysis = fresh;
+            tree = fresh_tree;
+            memo = UnitMemo::default();
+        }
+    }
     Ok(AnalysisRun {
         analysis,
         tree,
         parse_ms,
-        roots_ms,
-        analyze_ms: t_analyze.elapsed().as_millis(),
+        roots_ms: 0,
+        analyze_ms,
+        memo,
+        mismatch,
         search_roots: search_roots.len(),
-        read_count: read_count.load(Ordering::Relaxed),
-        read_bytes: read_bytes.load(Ordering::Relaxed),
+        read_count,
+        read_bytes,
     })
+}
+
+fn new_backend(client: Client) -> Backend {
+    Backend {
+        client,
+        documents: Default::default(),
+        next_rev: Default::default(),
+        workspace_roots: Default::default(),
+        analysis_cache: Default::default(),
+        parse_states: Default::default(),
+        inflight: Default::default(),
+        gates: Default::default(),
+        pace: Default::default(),
+        resolution_cache: new_resolution_cache(),
+        diagnostic_severity: Arc::new(RwLock::new(DiagnosticSeverity::ERROR)),
+        approximation_severity: Arc::new(RwLock::new(DiagnosticSeverity::WARNING)),
+        can_watch_files: Default::default(),
+        can_refresh_hints: Default::default(),
+    }
 }
 
 #[tokio::main]
@@ -1140,20 +1382,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        documents: Default::default(),
-        next_rev: Default::default(),
-        workspace_roots: Default::default(),
-        analysis_cache: Default::default(),
-        inflight: Default::default(),
-        gates: Default::default(),
-        resolution_cache: new_resolution_cache(),
-        diagnostic_severity: Arc::new(RwLock::new(DiagnosticSeverity::ERROR)),
-        approximation_severity: Arc::new(RwLock::new(DiagnosticSeverity::WARNING)),
-        can_watch_files: Default::default(),
-        can_refresh_hints: Default::default(),
-    });
+    let (service, socket) = LspService::new(new_backend);
 
     // Requests that wait for the debounce hold a slot: keep enough free for
     // notifications and shutdown.
@@ -1790,4 +2019,99 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         assert_eq!(lens.get(&3), None);
     }
 
+    fn parse_text(text: &str) -> ParsedText {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        ParsedText {
+            text: Arc::from(text),
+            tree: Arc::new(parser.parse(text, None).unwrap()),
+            memo: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn incremental_compute_equals_fresh_compute() {
+        let cache = new_resolution_cache();
+        let old = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 4))\n    return y\n";
+        let new = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 5))\n    z = y.T\n    return z\n";
+        let base = parse_text(old);
+        let inc = compute_analysis(new, Some(&base), &[], &cache).unwrap();
+        let fresh = compute_analysis(new, None, &[], &cache).unwrap();
+        assert_eq!(inc.analysis, fresh.analysis);
+        assert!(first_tree_difference(&inc.tree, &fresh.tree).is_none());
+        assert!(inc.mismatch.is_none());
+    }
+
+    #[test]
+    fn memoized_compute_equals_fresh_compute_along_edits() {
+        let cache = new_resolution_cache();
+        let texts = [
+            "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 4))\n    return y\n\ndef g(x):\n    z = jnp.ones((2, 2))\n    return z\n",
+            "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 5))\n    return y\n\ndef g(x):\n    z = jnp.ones((2, 2))\n    return z\n",
+            "import jax.numpy as jnp\n\ndef g(x):\n    z = jnp.ones((2, 2))\n    return z\n\ndef f(x):\n    y = jnp.zeros((3, 5))\n    return y\n",
+        ];
+        let mut base: Option<ParsedText> = None;
+        let mut hits = Vec::new();
+        for text in texts {
+            // Verified: a difference from the fresh analysis panics.
+            let run = analyze_text(text, base.as_ref(), &[], &cache, true).unwrap();
+            let fresh = compute_analysis(text, None, &[], &cache).unwrap();
+            assert_eq!(run.analysis, fresh.analysis);
+            assert!(run.mismatch.is_none());
+            hits.push(run.memo.stats().syntax_hits);
+            base = Some(ParsedText {
+                text: Arc::from(text),
+                tree: Arc::new(run.tree),
+                memo: Arc::new(run.memo),
+            });
+        }
+        // The first text builds no memo, the second builds it, and the third
+        // reuses both functions and the import, which only moved.
+        assert_eq!(hits, [0, 0, 3]);
+    }
+
+    fn cached(text: &str, rev: u64) -> CachedAnalysis {
+        let parsed = parse_text(text);
+        CachedAnalysis {
+            analysis: Arc::new(analyze(text)),
+            text: parsed.text,
+            tree: parsed.tree,
+            memo: parsed.memo,
+            version: 1,
+            rev,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_result_for_the_newest_text_commits_state() {
+        let mut backend = None;
+        let (_service, _socket) = LspService::new(|client| {
+            let b = new_backend(client);
+            backend = Some(b.clone());
+            b
+        });
+        let backend = backend.unwrap();
+        let uri = Url::parse("file:///a.py").unwrap();
+
+        let old_rev = backend.set_document(&uri, "x = 1\n".into(), 1, Duration::ZERO, true);
+        let new_rev = backend.set_document(&uri, "x = 2\n".into(), 2, Duration::ZERO, true);
+
+        backend.commit(&uri, &cached("x = 1\n", old_rev.unwrap()));
+        assert!(backend.parse_states.read().unwrap().is_empty());
+        assert!(backend.analysis_cache.read().unwrap().is_empty());
+
+        backend.commit(&uri, &cached("x = 2\n", new_rev.unwrap()));
+        assert_eq!(&*backend.parse_states.read().unwrap()[&uri].text, "x = 2\n");
+
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+        assert!(backend.parse_states.read().unwrap().is_empty());
+        backend.commit(&uri, &cached("x = 2\n", new_rev.unwrap()));
+        assert!(backend.parse_states.read().unwrap().is_empty());
+    }
 }
