@@ -181,10 +181,10 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "sort" => Some(KnownFunction::Sort),
             "cumsum" => Some(KnownFunction::Cumsum),
             "cumprod" => Some(KnownFunction::Cumprod),
-            "zeros" => Some(KnownFunction::Zeros),
-            "ones" => Some(KnownFunction::Ones),
+            "zeros" | "ones" | "empty" | "rand" | "randn" => {
+                Some(KnownFunction::TorchSizeConstructor)
+            }
             "full" => Some(KnownFunction::Full),
-            "empty" => Some(KnownFunction::Empty),
             "zeros_like" => Some(KnownFunction::ZerosLike),
             "ones_like" => Some(KnownFunction::OnesLike),
             "full_like" => Some(KnownFunction::FullLike),
@@ -727,7 +727,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "flip" => Some(KnownFunction::Flip),
         "roll" => Some(KnownFunction::Roll),
         "item" => Some(KnownFunction::Item),
-        "new_zeros" | "new_ones" | "new_full" | "new_empty" => Some(KnownFunction::NewConstructor),
+        "new_zeros" | "new_ones" | "new_empty" => Some(KnownFunction::NewSizeConstructor),
+        "new_full" => Some(KnownFunction::NewConstructor),
         "clone" => Some(KnownFunction::Copy),
         "cpu" | "cuda" => Some(KnownFunction::Copy),
         "float" | "long" | "int" | "bool" | "double" | "half" => Some(KnownFunction::Copy),
@@ -990,6 +991,8 @@ pub fn apply_known_function(
         KnownFunction::ShapeAs => apply_known_shape_as(args, shapes),
         KnownFunction::Item => Ok(Some(Vec::new())),
         KnownFunction::NewConstructor => apply_known_new_constructor(args),
+        KnownFunction::NewSizeConstructor => apply_known_torch_size(&args[args.len().min(1)..]),
+        KnownFunction::TorchSizeConstructor => apply_known_torch_size(args),
         KnownFunction::Chunk => {
             // Same "validate, but return None" reasoning as `Split`: the real
             // return is a tuple of N tensors, not expressible as a single
@@ -2053,6 +2056,72 @@ fn apply_known_shape_constructor(args: &[CallArgument]) -> Result<Option<Vec<Str
         CallArgument::Keyword { .. } => return Ok(None),
     };
     Ok(parse_shape_value(value))
+}
+
+/// Torch size constructors take the dims as varargs (`torch.zeros(4, 5)`)
+/// or as one tuple/list (`torch.zeros((4, 5))`, `size=(4, 5)`). Anything
+/// else (star args, shape attributes, mixed forms) stays unknown.
+fn apply_known_torch_size(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    let positional = positional_arg_values(args);
+    let size_keyword = args.iter().find_map(|arg| match arg {
+        CallArgument::Keyword { name, value } if name == "size" => Some(value),
+        _ => None,
+    });
+    let is_literal = |value: &String| value.starts_with(['(', '[']);
+    let dims = match (positional.as_slice(), size_keyword) {
+        ([], Some(value)) if is_pure_literal(value) => parse_shape_value(value),
+        ([value], None) if is_pure_literal(value) => parse_shape_value(value),
+        ([value], None) if value.parse::<usize>().is_ok() => Some(vec![value.clone()]),
+        ([_], None) => None,
+        (values, None) if !values.is_empty() => Some(values.to_vec()),
+        _ => None,
+    };
+    Ok(dims.filter(|dims| {
+        dims.iter().all(|dim| {
+            !dim.starts_with('*') && is_balanced(dim) && (dims.len() == 1 || !is_literal(dim))
+        })
+    }))
+}
+
+/// True when the text is one complete `(...)` or `[...]` group, so it is
+/// not an expression such as `(B, S) + (3,)`.
+fn is_pure_literal(value: &str) -> bool {
+    let value = value.trim();
+    if !value.starts_with(['(', '[']) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = match depth.checked_sub(1) {
+                    Some(depth) => depth,
+                    None => return false,
+                };
+                if depth == 0 && index + 1 != value.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn is_balanced(value: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {

@@ -897,12 +897,191 @@ pub(crate) fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> 
         .unwrap_or((0, usize::MAX))
 }
 
+/// One class with its linearized method resolution order (itself first).
+struct ClassMro {
+    range: (usize, usize),
+    /// Ranges of the class and its resolved bases in Python MRO order. It
+    /// stops before the first base the file does not define, since that base
+    /// could supply the attribute instead.
+    mro: Vec<(usize, usize)>,
+}
+
+/// Same-file class hierarchy, built once per analysis, to resolve
+/// `self.<attr>` through own class first, then bases in MRO order.
+#[derive(Default)]
+pub(crate) struct ClassHierarchy {
+    classes: Vec<ClassMro>,
+}
+
+impl ClassHierarchy {
+    pub(crate) fn new(root: Node, text: &str) -> Self {
+        let mut nodes = Vec::new();
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "class_definition" {
+                nodes.push(n);
+            }
+            for i in (0..n.child_count()).rev() {
+                if let Some(c) = n.child(i as u32) {
+                    stack.push(c);
+                }
+            }
+        }
+        let n = nodes.len();
+        let name_of = |c: Node| {
+            c.child_by_field_name("name")
+                .and_then(|x| x.utf8_text(text.as_bytes()).ok())
+        };
+        // `None` marks a name defined more than once: ambiguous, so opaque.
+        let mut by_name: HashMap<&str, Option<usize>> = HashMap::new();
+        for (i, c) in nodes.iter().enumerate() {
+            if let Some(name) = name_of(*c) {
+                by_name
+                    .entry(name)
+                    .and_modify(|v| *v = None)
+                    .or_insert(Some(i));
+            }
+        }
+        // Ids `>= n` stand for bases the file does not define, one per name.
+        let mut opaque: HashMap<&str, usize> = HashMap::new();
+        let mut bases: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for c in &nodes {
+            let mut list = Vec::new();
+            if let Some(args) = c.child_by_field_name("superclasses") {
+                let mut cur = args.walk();
+                for b in args.named_children(&mut cur) {
+                    let Ok(t) = b.utf8_text(text.as_bytes()) else {
+                        continue;
+                    };
+                    match b.kind() {
+                        "comment" | "keyword_argument" => continue,
+                        "identifier" => match by_name.get(t) {
+                            Some(Some(i)) => list.push(*i),
+                            None if matches!(t, "object" | "Module" | "ABC") => {}
+                            _ => {
+                                let next = n + opaque.len();
+                                list.push(*opaque.entry(t).or_insert(next));
+                            }
+                        },
+                        "attribute" if t.ends_with(".Module") || t.ends_with(".ABC") => {}
+                        _ => {
+                            let next = n + opaque.len();
+                            list.push(*opaque.entry(t).or_insert(next));
+                        }
+                    }
+                }
+            }
+            bases.push(list);
+        }
+
+        let mut memo: Vec<Option<Vec<usize>>> = vec![None; n];
+        let mut visiting = vec![false; n];
+        let classes = (0..n)
+            .map(|i| {
+                let lin = linearize(i, n, &bases, &mut memo, &mut visiting);
+                ClassMro {
+                    range: (nodes[i].start_byte(), nodes[i].end_byte()),
+                    mro: lin
+                        .into_iter()
+                        .take_while(|&j| j < n)
+                        .map(|j| (nodes[j].start_byte(), nodes[j].end_byte()))
+                        .collect(),
+                }
+            })
+            .collect();
+        Self { classes }
+    }
+
+    /// Test helper: classes with no bases.
+    #[cfg(test)]
+    pub(crate) fn standalone(ranges: &[(usize, usize)]) -> Self {
+        Self {
+            classes: ranges
+                .iter()
+                .map(|&r| ClassMro { range: r, mro: vec![r] })
+                .collect(),
+        }
+    }
+
+    /// First entry defined by the class enclosing `byte` or, failing that, by
+    /// its bases in MRO order. Outside every class only whole-file entries
+    /// match. Never picks an unrelated class.
+    pub(crate) fn resolve<'a, T>(
+        &self,
+        entries: &'a [T],
+        byte: usize,
+        range: impl Fn(&T) -> (usize, usize),
+    ) -> Option<&'a T> {
+        let own = self
+            .classes
+            .iter()
+            .filter(|c| c.range.0 <= byte && byte < c.range.1)
+            .min_by_key(|c| c.range.1 - c.range.0);
+        match own {
+            Some(c) => c
+                .mro
+                .iter()
+                .find_map(|r| entries.iter().find(|e| range(e) == *r)),
+            None => entries.iter().find(|e| range(e) == (0, usize::MAX)),
+        }
+    }
+}
+
+/// C3 linearization of class `i`. A failed merge or an inheritance cycle
+/// ends the list with `usize::MAX`, which callers treat as an unknown base.
+fn linearize(
+    i: usize,
+    n: usize,
+    bases: &[Vec<usize>],
+    memo: &mut [Option<Vec<usize>>],
+    visiting: &mut [bool],
+) -> Vec<usize> {
+    if i >= n {
+        return vec![i];
+    }
+    if let Some(done) = &memo[i] {
+        return done.clone();
+    }
+    if visiting[i] {
+        return vec![usize::MAX];
+    }
+    visiting[i] = true;
+    let mut seqs: Vec<Vec<usize>> = bases[i]
+        .iter()
+        .map(|&b| linearize(b, n, bases, memo, visiting))
+        .collect();
+    seqs.push(bases[i].clone());
+    let mut out = vec![i];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            break;
+        }
+        let pick = seqs
+            .iter()
+            .map(|s| s[0])
+            .find(|h| !seqs.iter().any(|s| s[1..].contains(h)));
+        let Some(h) = pick else {
+            out.push(usize::MAX);
+            break;
+        };
+        out.push(h);
+        for s in &mut seqs {
+            if s[0] == h {
+                s.remove(0);
+            }
+        }
+    }
+    visiting[i] = false;
+    memo[i] = Some(out.clone());
+    out
+}
+
 /// Like `extract_self_attr_aliases`, but each binding keeps the byte range of
 /// its enclosing `class_definition` (issue: the alias map was file-global,
 /// so same-named `self.<attr>` aliases in different classes collided
 /// last-wins), as `extract_self_attr_layers_by_class` in `layers.rs` does.
-/// Lookup goes through `ShapeCtx::self_attr_alias_at` (innermost class
-/// containing the use-site byte; lone-binding fallback).
+/// Lookup goes through `ClassHierarchy::resolve` (own class, then bases).
 pub fn extract_self_attr_aliases_by_class(
     node: Node,
     text: &str,

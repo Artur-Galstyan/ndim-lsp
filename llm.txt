@@ -7,11 +7,11 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified after the JAX 0.11.1 compatibility audit, on `9f7b734` plus uncommitted
-work (`ndim-lsp` 0.1.1). Update this baseline after the commit:
+Verified after the JAX 0.11.1 compatibility audit, on the defect-fix commit after `9573cc6` (`ndim-lsp` 0.1.1):
 
-- `cargo test --quiet` passes: 1,806 tests pass and four are ignored
-  (1,784 library/integration tests plus 22 LSP-server tests; the ignored
+- `cargo test --quiet` passes: 1,850 tests pass and four are ignored
+  (1,815 library/integration tests, 22 LSP-server tests, 6 in
+  `tests/lsp_debounce.rs`, 7 in `tests/lsp_helper_save.rs`; the ignored
   tests are the two timing harnesses below plus the two `lsp_stress` tests).
   The known-function tests live in `src/known_functions/*_tests.rs`.
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
@@ -92,7 +92,7 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 - `NDIM_STRESS_RUNS` (default 5) sets the runs per scenario.
 - `NDIM_BENCH_OUT` writes the JSON result. `NDIM_GOLDEN_OUT` writes the golden dump.
-- Latency is total = debounce (150 ms, `did_change` only) + server compute (from
+- Latency is total = debounce (the `DEBOUNCE` const in `src/main.rs`) + server compute (from
   the server's `analysis: total=Nms` log) + other (transport and scheduling).
   Peak RSS is sampled with `ps` every 25 ms, so it is a lower bound.
 
@@ -101,51 +101,50 @@ of the stress project. Dump before and after a change, then `cmp` the two files.
 A cleanup must give a byte-identical dump. Do not fix analyzer defects inside a
 cleanup, because the fix changes the dump.
 
-`lsp_stress_benchmark` FAILS ON PURPOSE. It asserts the expected markers and
-the scenario invariants, and the analyzer still has open defects. The current
-failure set is 524 marker failures and 3 scenario failures. Do not loosen the
-test to make it pass. The test passes only when the open targets below are fixed.
-When a change must keep this set unchanged (a cleanup), compare the failure
-list, not only the count.
+`lsp_stress_benchmark` passes: 0 marker failures and 0 scenario failures. It
+asserts the expected markers and the scenario invariants. Do not loosen the
+test to make it pass. A refactor must keep it green and keep the golden dump
+byte-identical.
 
-Baseline (9f7b734 plus uncommitted work, release, 10 CPUs, macOS, 5 runs, p50):
+Baseline (9573cc6 plus uncommitted work, release, 10 CPUs, macOS, 5 runs, p50):
 
-- One edit costs about 650 ms: 150 ms debounce plus about 490 ms server compute
+- One edit costs about 405 ms: 150 ms debounce plus about 242 ms server compute
   (full re-analysis of the 21,038-line file) plus about 11 ms other.
-- Compute p50 is 489-515 ms for every edit scenario. Total p50 is 650-677 ms.
-- `cold_open_first_diagnostics`: 728 ms compute, 734 ms total.
-- `inlay_full_cached` 8.7 ms, `inlay_full_first` 10.7 ms, `hover` 0.3 ms,
+- Compute p50 is 239-249 ms for every edit scenario. Total p50 is 401-413 ms.
+- `cold_open_first_diagnostics`: 329 ms compute, 335 ms total.
+- `main_after_helper_saved_to_disk`: 242 ms compute, 574 ms total.
+  `main_after_helper_restored`: 319 ms compute, 481 ms total. Both pay for
+  the cold re-read of the changed helper.
+- `inlay_full_cached` 9.1 ms, `inlay_full_first` 11.7 ms, `hover` 0.3 ms,
   `goto_definition` 0.2 ms.
-- Peak RSS 161.5 MB (52.4 MB after open). 22 diagnostics, 14,264 inlay hints.
+- Peak RSS 161.5 MB (53.0 MB after open). 22 diagnostics, 14,514 inlay hints.
 - Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
-- Results are in `/tmp/ndim-bench-baseline.json` (5 runs) and
-  `/tmp/ndim-run-C.json` (2 runs). These are local files, not in the repo.
+- Results are in `/tmp/ndim-bench-after.json` (5 runs, 0 failures). This is a
+  local file, not in the repo.
 
-Open targets found by the benchmark (all unfixed, listed so that they stay
-visible):
+Closed targets (found by the benchmark, fixed in the uncommitted work):
 
-1. Inherited layer lost with a same-named self attribute: 520 missing-shape
-   markers (`self.l#`, `self.act#`, `self.fc#`, `self.norm`, `self.proj`,
-   `self.qkv`, `F.gelu`). When an unrelated class assigns the same `self.<attr>`,
-   a subclass call to the attribute it inherits from its base class gets no
-   shape: the lone-binding fallback in `self_attr_layer_at` no longer applies.
-2. `torch.zeros` varargs: 4 wrong-shape markers.
-3. Burst debounce: a 50-change burst gives 12 publications and 12 full analyses;
-   only the last version should count (scenario `burst_50_changes`).
-4. Inlay requests bypass the debounce: 12 keystrokes 100 ms apart, each
-   followed by an inlay request, cause 12 full analyses and 12 publications.
-   Without inlay requests the same typing causes 1 (scenario
-   `typing_with_inlay_requests`).
-5. Stale cross-file state after save: the running server keeps the old helper
-   (`: [cb, ck]`), a fresh server reads the new one (`: [ck, cb]`). The server
-   has no `did_save` handler (scenario `helper_saved_to_disk`).
+1. Inherited layer lost with a same-named self attribute: `self_attr_layer_at`
+   now walks the class hierarchy (MRO) of the class that contains the call.
+   An unresolved base before the defining class gives no shape. Bare `Module`,
+   `object` and `ABC` bases are transparent. The lone-binding fallback is gone.
+2. `torch.zeros`, `ones`, `empty` read the shape from varargs, a tuple or list,
+   or `size=`. A single plain identifier gives `[n]`. A single arg with `.`, `(`
+   or `[` gives unknown. `x.new_zeros`, `new_ones`, `new_empty` follow the same
+   rule (`NewSizeConstructor`).
+3. Burst debounce: `did_change` spawns one publish task per (uri, rev),
+   single-flight. A superseded rev skips its work. A stale request returns null.
+4. Inlay and other requests wait out the remaining debounce on a cache miss, so
+   typing with inlay requests causes 1 analysis and 1 publication.
+5. Stale cross-file state: `did_save` and dynamic `workspace/didChangeWatchedFiles`
+   drop the affected cache entries, and all open documents are analyzed again.
+   `ResolutionCache` entries carry stamps (mtime and size), failed lookups are
+   cached, and an epoch revalidates once per analysis. A `parsed` text-keyed
+   tree cache (up to 128 files, counter `parses`) avoids re-parsing imported
+   files. `workspace/inlayHint/refresh` is sent if the client supports it.
 
-Failure breakdown: 40 `F.gelu`, 140 `self.act#`, 80 `self.fc#`, 140 `self.l#`,
-40 `self.norm`, 40 `self.proj`, 40 `self.qkv` (all missing-shape), 4 `torch.zeros`
-(wrong-shape). Scenario failures: `burst_50_changes` (intermediate-publications),
-`typing_with_inlay_requests` (debounce-bypassed), and `helper_saved_to_disk`
-(oracle-mismatch). `/tmp/ndim-bench-baseline.json` predates the typing scenarios
-and lists only the first and the last. `/tmp/ndim-run-C.json` lists all three.
+Open limit: an unsaved helper buffer is still ignored (the server reads
+imports from disk).
 
 Rule for agents working on this repo
 ------------------------------------
@@ -253,7 +252,8 @@ Current file layout
       (e.g. from `__init__`) to `{attr -> Vec<ScopedSelfAttrLayer>}`, each entry
       carrying its enclosing class byte range so same-named attrs in different
       classes don't collide. Lookup goes through `ShapeCtx::self_attr_layer_at`
-      (innermost class containing the call byte; lone-binding fallback).
+      (innermost class containing the call byte, then the base classes in MRO order
+      within the file).
     - `apply_layer_application`
     - `apply_layer_applications`
 
@@ -311,6 +311,10 @@ Current file layout
   - Integration test that spawns the built `ndim-lsp` binary and talks
     JSON-RPC over stdio against `bench/stress/`. Holds the two ignored tests
     `lsp_stress_benchmark` and `golden_dump`.
+
+- `tests/lsp_debounce.rs`, `tests/lsp_helper_save.rs`
+  - LSP-over-stdio tests for the debounce and single-flight publishing, and for
+    save and watched-file invalidation of imported helpers.
 
 - `README.md`
   - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
@@ -439,8 +443,11 @@ What works now
 16. Session-lifetime import-resolution cache (issue #36 / PR #38)
    - `ResolutionCache` keyed on `(import-path-segments, roots-fingerprint)` is
      shared across `analyze_layer_shapes` calls. Caches `ResolvedImplementation`
-     in `map` and the extracted cross-file helper `FunctionShapeScope`s in
-     `signatures`. See `corpus`/cross-file integration tests.
+     in `map`, the extracted cross-file helper `FunctionShapeScope`s in
+     `signatures`, and parsed trees in `parsed` (keyed by file text; `parses`
+     counts real parses). Entries carry file stamps, failed lookups are cached,
+     a changed file drops its entries, and the cache revalidates once per
+     analysis (epoch). See `corpus`/cross-file integration tests.
 
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
@@ -472,9 +479,10 @@ Known limitations / important caveats
 - `src/main.rs` is wired end-to-end: `republish_diagnostics` runs
   `analyze_layer_shapes` on document open/change and publishes `ShapeError`s as
   LSP diagnostics; `on_hover` renders shape strings (markdown `MarkupContent`
-  with a fenced python block); inlay hints are emitted. `did_change` debounces
-  analysis by 150 ms (stores text/version immediately, then bows out if a newer
-  version landed during the window). The server advertises UTF-16
+  with a fenced python block); inlay hints are emitted. `did_change` stores text/version
+  immediately and spawns a publish task. The task waits the `DEBOUNCE` window,
+  runs one analysis per (uri, rev), and skips if a newer rev arrived. A stale
+  request returns null. The server advertises UTF-16
   `position_encoding` and converts every tree-sitter range by byte offset to
   UTF-16 LSP positions.
 - LSP also advertises `textDocument/definition` and quick-fix code actions.
@@ -489,10 +497,10 @@ Known limitations / important caveats
   `Approximation` errors (default `WARNING`).
 - Import resolution searches the workspace roots, then site-packages found
   through `$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`
-  (no Python call). The resolution cache is keyed by (path, name) with no
-  file-time check and clears only when the workspace folders change. The server
-  has no `did_save`, watched-file, or configuration handler, so a saved edit to
-  an imported file stays cached until a workspace folder change or a restart.
+  (no Python call). The resolution cache is keyed by (path, name) and checks file
+  stamps. `did_save` and watched `**/*.py` events (dynamic registration) drop
+  the affected entries and analyze all open documents again. A workspace folder
+  change clears the cache. The server has no configuration handler.
   Severity options are read only in `initialize`, so a change needs a restart.
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
 - Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`,

@@ -73,9 +73,9 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 `golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
 
-Baseline: one edit takes about 650 ms, which is a 150 ms debounce plus about 490 ms for full re-analysis of the 21,038-line file. The numbers depend on the machine.
+Baseline: one edit takes about 410 ms, which is a 150 ms debounce plus about 245 ms for full re-analysis of the 21,038-line file. The numbers depend on the machine.
 
-`lsp_stress_benchmark` fails on purpose. It reports 524 marker failures and 3 scenario failures, which are open analyzer defects (see `llm.txt`). Do not change the test to make it pass. Fix the defects instead.
+`lsp_stress_benchmark` passes with 0 marker failures and 0 scenario failures. Do not loosen a marker or a scenario assert to keep it green.
 
 ## Features & Roadmap
 
@@ -148,5 +148,5 @@ Baseline: one edit takes about 650 ms, which is a 150 ms debounce plus about 490
 - [x] Resolve imported helpers from files under workspace roots and from site-packages (`$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`)
 - [ ] Track unsaved changes across imported workspace files
 - [x] Cache parsed trees and resolved shapes for repeated requests at the same document version
-- [x] Cache import resolution and function signatures across edits (limit: a saved change to an imported file stays cached until a workspace folder change or a server restart)
+- [x] Cache import resolution and function signatures across edits (a saved change to an imported file, or a watched-file event, drops the affected entries and republishes the open documents)
 - [ ] Reuse parsed trees and local shape analysis across document edits

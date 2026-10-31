@@ -232,10 +232,10 @@ Legend:
 |---|---:|---:|---:|---|
 | `torch.tensor` | ✅ | ✅ | ✅ | Shape-preserving for known input shape; literal inference later. |
 | `torch.as_tensor` | ✅ | ✅ | ✅ | Shape-preserving conversion. |
-| `torch.zeros` | ✅ | ✅ | ✅ | Output shape from args. |
-| `torch.ones` | ✅ | ✅ | ✅ | Output shape from args. |
+| `torch.zeros` | ✅ | ✅ | ✅ | Shape from varargs, a tuple or list, or `size=`. A single non-identifier arg is unknown. `torch.rand` and `torch.randn` use the same rule. |
+| `torch.ones` | ✅ | ✅ | ✅ | Same rule as `torch.zeros`. |
 | `torch.full` | ✅ | ✅ | ✅ | Output shape from args. |
-| `torch.empty` | ✅ | ✅ | ✅ | Output shape from args. |
+| `torch.empty` | ✅ | ✅ | ✅ | Same rule as `torch.zeros`. |
 | `torch.zeros_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.ones_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `torch.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
@@ -423,7 +423,7 @@ Legend:
 | `x.roll(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Roll`'s shape-preserving rule. |
 | `x.T` / `x.mT` (properties) | ✅ | ✅ | ✅ | Handled in `shape_of_attribute` (not a call): `x.T` reverses every dim (rank >= 1); `x.mT` swaps the last two dims (rank >= 2). |
 | `x.item()` | ✅ | ✅ | ✅ | `KnownFunction::Item`; always scalar (rank-0) output, independent of the receiver's shape. |
-| `x.new_zeros(...)` / `new_ones(...)` / `new_full(...)` / `new_empty(...)` | ✅ | ✅ | ✅ | `KnownFunction::NewConstructor`; shape from the `size` arg (receiver is only a dtype/device template), like the `torch.zeros` family. |
+| `x.new_zeros(...)` / `new_ones(...)` / `new_full(...)` / `new_empty(...)` | ✅ | ✅ | ✅ | `new_zeros`/`new_ones`/`new_empty` use `KnownFunction::NewSizeConstructor` (varargs, tuple or list, or `size=`); `new_full` stays `NewConstructor`. The receiver is only a dtype/device template. |
 | `x.clone(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.cpu(...)` / `x.cuda(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.float(...)` / `long(...)` / `int(...)` / `bool(...)` / `double(...)` / `half(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |

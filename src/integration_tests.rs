@@ -906,6 +906,80 @@ mod resolve_call_signature_tests {
 
         assert_eq!(resolve_first_call(source, &roots), None);
     }
+    fn call_site(source: &str) -> (tree_sitter::Tree, HashMap<String, ImportPath>, Vec<CallInfo>) {
+        let tree = parse(source);
+        let import_map = build_import_map(tree.root_node(), source).unwrap();
+        let calls = extract_calls(tree.root_node(), source).unwrap();
+        (tree, import_map, calls)
+    }
+
+    #[test]
+    fn implementation_file_is_parsed_once_for_many_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp, "class Linear:\n    def __init__(self, in_features, out_features): pass\n");
+        let roots = vec![tmp.path().to_path_buf()];
+        let source = "from equinox.nn import Linear\na = Linear(1, 2)\nb = Linear(3, 4)\nc = Linear(5, 6)\n";
+        let (tree, import_map, calls) = call_site(source);
+        let cache = new_resolution_cache();
+        for call in &calls {
+            let resolved = crate::resolution::resolve_call_signature_with_node(
+                call, Some(tree.root_node()), source, &import_map, &roots, read, 5, Some(&cache),
+            )
+            .unwrap();
+            assert!(resolved.is_some());
+        }
+        assert_eq!(cache.parses.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn modified_implementation_file_is_parsed_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp, "class Linear:\n    def __init__(self, in_features, out_features): pass\n");
+        let roots = vec![tmp.path().to_path_buf()];
+        let source = "from equinox.nn import Linear\na = Linear(1, 2)\n";
+        let (tree, import_map, calls) = call_site(source);
+        let cache = new_resolution_cache();
+        let resolve = || {
+            cache.revalidate(&[]);
+            crate::resolution::resolve_call_signature_with_node(
+                &calls[0], Some(tree.root_node()), source, &import_map, &roots, read, 5, Some(&cache),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(resolve().signature.params, ["self", "in_features", "out_features"]);
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, a, b, c): pass\n",
+        )
+        .unwrap();
+        assert_eq!(resolve().signature.params, ["self", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn edit_without_revalidate_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_equinox_linear(&tmp, "class Linear:\n    def __init__(self, ab): pass\n");
+        let roots = vec![tmp.path().to_path_buf()];
+        let source = "from equinox.nn import Linear\na = Linear(1)\n";
+        let (tree, import_map, calls) = call_site(source);
+        let cache = new_resolution_cache();
+        let resolve = || {
+            crate::resolution::resolve_call_signature_with_node(
+                &calls[0], Some(tree.root_node()), source, &import_map, &roots, read, 5, Some(&cache),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(resolve().signature.params, ["self", "ab"]);
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, cd): pass\n",
+        )
+        .unwrap();
+        assert_eq!(resolve().signature.params, ["self", "cd"]);
+    }
+
 }
 
 #[cfg(test)]
@@ -4664,6 +4738,121 @@ mod constructor_coverage_integration_tests {
     }
 }
 
+mod torch_varargs_size_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn y_shape(code: &str) -> Option<Vec<String>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let analysis =
+            analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+        assert!(analysis.errors.is_empty());
+        find_shape(&analysis, "y").cloned()
+    }
+
+    fn dims(dims: &[&str]) -> Option<Vec<String>> {
+        Some(dims.iter().map(|dim| dim.to_string()).collect())
+    }
+
+    fn torch(call: &str) -> Option<Vec<String>> {
+        y_shape(&format!("import torch\ndef f(B, x):\n    y = torch.{call}"))
+    }
+
+    fn numeric(call: &str) -> Option<Vec<String>> {
+        y_shape(&format!(
+            "import numpy as np\nimport jax.numpy as jnp\ndef f(B, x):\n    y = {call}"
+        ))
+    }
+
+    #[test]
+    fn varargs_form_gives_every_dim() {
+        assert_eq!(torch("zeros(4, 5)"), dims(&["4", "5"]));
+        assert_eq!(torch("ones(2, 3, 4)"), dims(&["2", "3", "4"]));
+        assert_eq!(torch("empty(3, 4)"), dims(&["3", "4"]));
+        assert_eq!(torch("rand(2, 3)"), dims(&["2", "3"]));
+        assert_eq!(torch("randn(2, 3, 4)"), dims(&["2", "3", "4"]));
+        assert_eq!(torch("zeros(4)"), dims(&["4"]));
+    }
+
+    #[test]
+    fn varargs_form_ignores_keywords() {
+        assert_eq!(
+            torch("zeros(4, 5, dtype=torch.float32)"),
+            dims(&["4", "5"])
+        );
+        assert_eq!(torch("randn(2, 3, requires_grad=True)"), dims(&["2", "3"]));
+    }
+
+    #[test]
+    fn tuple_list_and_size_keyword_forms() {
+        assert_eq!(torch("zeros((4, 5))"), dims(&["4", "5"]));
+        assert_eq!(torch("rand([2, 3])"), dims(&["2", "3"]));
+        assert_eq!(torch("zeros((4, 5), dtype=torch.float32)"), dims(&["4", "5"]));
+        assert_eq!(torch("zeros(size=(4, 5))"), dims(&["4", "5"]));
+        assert_eq!(torch("full((2, 3), 1.5)"), dims(&["2", "3"]));
+    }
+
+    #[test]
+    fn symbolic_sizes_match_tuple_form() {
+        assert_eq!(torch("zeros(B, 3)"), dims(&["B", "3"]));
+        assert_eq!(torch("zeros((B, 3))"), dims(&["B", "3"]));
+        assert_eq!(torch("randn(B, 3, 4)"), dims(&["B", "3", "4"]));
+    }
+
+    #[test]
+    fn unclear_sizes_stay_unknown() {
+        assert_eq!(torch("zeros(*x)"), None);
+        assert_eq!(torch("zeros(x.shape)"), None);
+        assert_eq!(torch("zeros(4, (5, 6))"), None);
+        assert_eq!(torch("zeros()"), None);
+    }
+
+    #[test]
+    fn size_expressions_and_single_names_stay_unknown() {
+        assert_eq!(torch("zeros(size=shp)"), None);
+        assert_eq!(torch("zeros(shp)"), None);
+        assert_eq!(torch("zeros((B, S) + (3,))"), None);
+        assert_eq!(torch("zeros((B, S) * 2)"), None);
+        assert_eq!(torch("zeros((f(a, b), 3))"), None);
+        assert_eq!(torch("zeros(size=(B, S) + (3,))"), None);
+        assert_eq!(torch("zeros(4)"), dims(&["4"]));
+        let method = |call: &str| {
+            y_shape(&format!("def f(x, shp):\n    y = x.{call}"))
+        };
+        assert_eq!(method("new_zeros(size=shp)"), None);
+        assert_eq!(method("new_zeros(shp)"), None);
+    }
+
+    #[test]
+    fn new_constructors_use_varargs() {
+        let method = |call: &str| {
+            y_shape(&format!(
+                "def f(x: Float[Array, \"4\"]):\n    y = x.{call}"
+            ))
+        };
+        assert_eq!(method("new_zeros(3, 4)"), dims(&["3", "4"]));
+        assert_eq!(method("new_ones(3, 4)"), dims(&["3", "4"]));
+        assert_eq!(method("new_empty(3, 4)"), dims(&["3", "4"]));
+        assert_eq!(method("new_zeros((3, 4))"), dims(&["3", "4"]));
+        assert_eq!(method("new_full((3, 4), 1.0)"), dims(&["3", "4"]));
+    }
+
+    #[test]
+    fn numpy_and_jax_second_positional_is_dtype() {
+        assert_eq!(numeric("np.zeros((4, 5), np.float32)"), dims(&["4", "5"]));
+        assert_eq!(numeric("jnp.ones((2, 3), jnp.float32)"), dims(&["2", "3"]));
+        assert_eq!(numeric("np.empty((3, 4), float)"), dims(&["3", "4"]));
+        assert_eq!(numeric("np.zeros(4, float)"), dims(&["4"]));
+        assert_eq!(numeric("jnp.zeros(B)"), dims(&["B"]));
+        assert_eq!(numeric("np.full((2, 3), 1.5)"), dims(&["2", "3"]));
+    }
+}
+
+
 /// Regression guard for venv-discovery wiring: given a site-packages
 /// directory in `search_roots`, layer-mismatch diagnostics fire through the
 /// on-disk resolution path. This complements the in-process builtin layer
@@ -6072,6 +6261,162 @@ class M(eqx.Module):
             analysis.errors[0].message,
             "Linear layer 'self.qkv' expected input last dim 8, got 7 for 'x'"
         );
+    }
+
+    fn inherit_h(code: &str, scope: &str) -> Option<Vec<String>> {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert!(analysis.errors.is_empty(), "errors: {:?}", analysis.errors);
+        find_shape_in_scope(&analysis, scope, "h").cloned()
+    }
+
+    #[test]
+    fn test_inherited_self_attr_layer_with_unrelated_same_name_class() {
+        let code = r#"
+import torch.nn as nn
+class Base(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(96)
+class Child(Base):
+    def forward(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+class Other(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(32)
+"#;
+        assert_eq!(inherit_h(code, "forward"), Some(shape(&["b", "96"])));
+    }
+
+    #[test]
+    fn test_inherited_self_attr_layer_multi_level() {
+        let code = r#"
+import torch.nn as nn
+class G(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(96)
+class Mid(G):
+    pass
+class Child(Mid):
+    def forward(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+class Other(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(32)
+"#;
+        assert_eq!(inherit_h(code, "forward"), Some(shape(&["b", "96"])));
+    }
+
+    #[test]
+    fn test_inherited_self_attr_layer_follows_mro_order() {
+        let code = r#"
+import torch.nn as nn
+class A(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(8)
+class B(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(16)
+class C(A, B):
+    def forward(self, x: Float[Array, "b 8"]):
+        h = self.norm(x)
+class D(B, A):
+    def forward2(self, x: Float[Array, "b 16"]):
+        h = self.norm(x)
+"#;
+        assert_eq!(inherit_h(code, "forward"), Some(shape(&["b", "8"])));
+        assert_eq!(inherit_h(code, "forward2"), Some(shape(&["b", "16"])));
+    }
+
+    #[test]
+    fn test_inherited_self_attr_layer_diamond_uses_c3() {
+        let code = r#"
+import torch.nn as nn
+class Top(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(1)
+class L(Top):
+    pass
+class R(Top):
+    def __init__(self):
+        self.norm = nn.LayerNorm(2)
+class D(L, R):
+    def forward(self, x: Float[Array, "b 2"]):
+        h = self.norm(x)
+"#;
+        assert_eq!(inherit_h(code, "forward"), Some(shape(&["b", "2"])));
+    }
+
+    #[test]
+    fn test_child_override_of_base_self_attr_layer() {
+        let code = r#"
+import torch.nn as nn
+class Base(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(96)
+class Child(Base):
+    def __init__(self):
+        self.norm = nn.LayerNorm(32)
+    def forward(self, x: Float[Array, "b 32"]):
+        h = self.norm(x)
+"#;
+        assert_eq!(inherit_h(code, "forward"), Some(shape(&["b", "32"])));
+    }
+
+    #[test]
+    fn test_unresolved_base_keeps_self_attr_layer_unknown() {
+        let code = r#"
+import torch.nn as nn
+from lib import Foreign
+class Base(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(96)
+class C1(Foreign):
+    def forward(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+class C2(Foreign, Base):
+    def forward2(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+class C3(Base, Foreign):
+    def forward3(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+"#;
+        assert_eq!(inherit_h(code, "forward"), None);
+        assert_eq!(inherit_h(code, "forward2"), None);
+        assert_eq!(inherit_h(code, "forward3"), Some(shape(&["b", "96"])));
+    }
+
+    #[test]
+    fn test_unrelated_class_does_not_borrow_lone_self_attr_layer() {
+        let code = r#"
+import torch.nn as nn
+class Other(nn.Module):
+    def __init__(self):
+        self.norm = nn.LayerNorm(32)
+class Child(nn.Module):
+    def forward(self, x: Float[Array, "b 96"]):
+        h = self.norm(x)
+"#;
+        assert_eq!(inherit_h(code, "forward"), None);
+    }
+
+    #[test]
+    fn test_inherited_self_attr_alias_with_unrelated_same_name_class() {
+        let code = r#"
+import jax.numpy as jnp
+import equinox as eqx
+class Base(eqx.Module):
+    def __init__(self, dt_rank):
+        self.rank = dt_rank
+class Child(Base):
+    def run(self, x: Float[Array, "seq combined"]):
+        h, rest = jnp.split(x, [self.rank], axis=-1)
+class Other(eqx.Module):
+    def __init__(self, other_rank):
+        self.rank = other_rank
+"#;
+        assert_eq!(inherit_h(code, "run"), Some(shape(&["seq", "dt_rank"])));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::layers::{
     extract_layer_assignments_scoped, extract_self_attr_layers_by_class,
 };
 use crate::python_ast::{
-    build_import_map, extract_call_arguments, extract_jaxtyping_shapes,
+    ClassHierarchy, build_import_map, extract_call_arguments, extract_jaxtyping_shapes,
     extract_self_attr_aliases_by_class,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
@@ -34,6 +34,9 @@ pub fn analyze_layer_shapes<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    if let Some(cache) = cache {
+        cache.revalidate(&[]);
+    }
     let mut scopes = extract_jaxtyping_shapes(node, text)?;
     let import_map = build_import_map(node, text)?;
     let layer_records = extract_layer_assignments_scoped(
@@ -55,6 +58,7 @@ where
         cache,
     )?;
     let self_attr_aliases = extract_self_attr_aliases_by_class(node, text)?;
+    let hierarchy = ClassHierarchy::new(node, text);
 
     let (applications, errors, assignment_shapes) = propagate_calls(
         node,
@@ -63,6 +67,7 @@ where
         &layer_records,
         &self_attr_layers,
         &self_attr_aliases,
+        &hierarchy,
         search_roots,
         &read_file,
         max_depth,
@@ -246,6 +251,7 @@ struct ShapeCtx<'a> {
     /// dims (`self.dt_rank` ≡ `dt_rank`) before storage, resolved by the
     /// call-site byte via `self_attr_alias_at` — mirrors `self_attr_layers`.
     aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    hierarchy: &'a ClassHierarchy,
     /// Workspace/site-packages search roots, for resolving imported helper
     /// functions on disk (cross-file return-type tracing).
     search_roots: &'a [PathBuf],
@@ -329,6 +335,7 @@ impl ShapeLookup for ScopeShapes<'_> {
 fn normalize_shape(
     shape: Vec<String>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    hierarchy: &ClassHierarchy,
     byte: usize,
 ) -> Vec<String> {
     if aliases.is_empty() {
@@ -336,25 +343,20 @@ fn normalize_shape(
     }
     shape
         .into_iter()
-        .map(|d| normalize_dim(&d, aliases, byte))
+        .map(|d| normalize_dim(&d, aliases, hierarchy, byte))
         .collect()
 }
 
-/// Resolve `self.<attr>`'s aliased identifier in the class enclosing `byte`.
-/// Falls back to a lone binding when the use site sits outside any class
-/// that defines the attr; ambiguous cross-class matches return `None`.
-/// Mirrors `ShapeCtx::self_attr_layer_at`.
+/// Resolve `self.<attr>`'s aliased identifier through the class enclosing
+/// `byte`, then its bases. Mirrors `ShapeCtx::self_attr_layer_at`.
 fn resolve_alias_at<'a>(
     aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    hierarchy: &ClassHierarchy,
     attr: &str,
     byte: usize,
 ) -> Option<&'a str> {
-    let entries = aliases.get(attr)?;
-    entries
-        .iter()
-        .filter(|e| e.class_start <= byte && byte < e.class_end)
-        .min_by_key(|e| e.class_end - e.class_start)
-        .or_else(|| (entries.len() == 1).then(|| &entries[0]))
+    hierarchy
+        .resolve(aliases.get(attr)?, byte, |e| (e.class_start, e.class_end))
         .map(|e| e.value.as_str())
 }
 
@@ -362,7 +364,12 @@ fn resolve_alias_at<'a>(
 /// (e.g. `self.dt_rank + self.d_state` → `dt_rank + d_state` when both attrs
 /// were assigned from same-named identifiers). Tokens whose attribute has no
 /// alias (in the class enclosing `byte`) are left untouched.
-fn normalize_dim(dim: &str, aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>, byte: usize) -> String {
+fn normalize_dim(
+    dim: &str,
+    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    hierarchy: &ClassHierarchy,
+    byte: usize,
+) -> String {
     if !dim.contains("self.") {
         return dim.to_string();
     }
@@ -376,7 +383,7 @@ fn normalize_dim(dim: &str, aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
             while j < dim.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
-            if let Some(val) = resolve_alias_at(aliases, &dim[attr_start..j], byte) {
+            if let Some(val) = resolve_alias_at(aliases, hierarchy, &dim[attr_start..j], byte) {
                 result.push_str(val);
                 i = j;
                 continue;
@@ -390,16 +397,14 @@ fn normalize_dim(dim: &str, aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
 }
 
 impl<'a> ShapeCtx<'a> {
-    /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`.
-    /// Falls back to a lone binding when the use site sits outside any class
-    /// that defines the attr; ambiguous cross-class matches return None.
+    /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`,
+    /// else in its bases (MRO order). Unrelated classes never match, and a
+    /// base the file does not define ends the search with None.
     fn self_attr_layer_at(&self, attr: &str, byte: usize) -> Option<&LayerKind> {
-        let entries = self.self_attr_layers.get(attr)?;
-        entries
-            .iter()
-            .filter(|e| e.class_start <= byte && byte < e.class_end)
-            .min_by_key(|e| e.class_end - e.class_start)
-            .or_else(|| (entries.len() == 1).then(|| &entries[0]))
+        self.hierarchy
+            .resolve(self.self_attr_layers.get(attr)?, byte, |e| {
+                (e.class_start, e.class_end)
+            })
             .map(|e| &e.kind)
     }
 
@@ -412,7 +417,7 @@ impl<'a> ShapeCtx<'a> {
     fn bind_synthetic(&mut self, shape: Vec<String>, scope_idx: usize, byte: usize) -> String {
         let name = format!("__synth_{}", self.synthetic_counter);
         self.synthetic_counter += 1;
-        let shape = normalize_shape(shape, self.aliases, byte);
+        let shape = normalize_shape(shape, self.aliases, self.hierarchy, byte);
         self.synthetics
             .entry(scope_idx)
             .or_default()
@@ -432,7 +437,7 @@ impl<'a> ShapeCtx<'a> {
         line: Option<u32>,
         byte: usize,
     ) {
-        let shape = normalize_shape(shape, self.aliases, byte);
+        let shape = normalize_shape(shape, self.aliases, self.hierarchy, byte);
         if let Some(line) = line {
             self.assignment_shapes.push(AssignmentShape {
                 line,
@@ -1841,6 +1846,7 @@ fn propagate_calls(
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    hierarchy: &ClassHierarchy,
     search_roots: &[PathBuf],
     read_file: &dyn Fn(&PathBuf) -> Option<String>,
     max_depth: usize,
@@ -1877,6 +1883,7 @@ fn propagate_calls(
         layer_records,
         self_attr_layers,
         aliases,
+        hierarchy,
         search_roots,
         read_file,
         max_depth,
@@ -4305,6 +4312,7 @@ mod shape_of_expression_tests {
             layer_records: &layer_records,
             self_attr_layers: &self_attr_layers,
             aliases: &aliases,
+            hierarchy: &ClassHierarchy::default(),
             search_roots: &search_roots,
             read_file,
             max_depth: 5,
@@ -4519,19 +4527,20 @@ def f(x: Float[Array, "3 5"]):
         let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
         aliases.insert("dt_rank".to_string(), lone_alias("dt_rank"));
         aliases.insert("d_state".to_string(), lone_alias("d_state"));
+        let h = ClassHierarchy::default();
         // single token
-        assert_eq!(normalize_dim("self.dt_rank", &aliases, 0), "dt_rank");
+        assert_eq!(normalize_dim("self.dt_rank", &aliases, &h, 0), "dt_rank");
         // inside an expression, multiple tokens
         assert_eq!(
-            normalize_dim("self.dt_rank + self.d_state", &aliases, 0),
+            normalize_dim("self.dt_rank + self.d_state", &aliases, &h, 0),
             "dt_rank + d_state"
         );
         // unaliased self.attr is left untouched
-        assert_eq!(normalize_dim("self.unknown", &aliases, 0), "self.unknown");
+        assert_eq!(normalize_dim("self.unknown", &aliases, &h, 0), "self.unknown");
         // prefix collision: self.dt_rank must not match self.dt_rank2
-        assert_eq!(normalize_dim("self.dt_rank2", &aliases, 0), "self.dt_rank2");
+        assert_eq!(normalize_dim("self.dt_rank2", &aliases, &h, 0), "self.dt_rank2");
         // no self. → unchanged
-        assert_eq!(normalize_dim("seq_length", &aliases, 0), "seq_length");
+        assert_eq!(normalize_dim("seq_length", &aliases, &h, 0), "seq_length");
     }
 
     #[test]
@@ -4557,10 +4566,11 @@ def f(x: Float[Array, "3 5"]):
             ],
         );
 
-        assert_eq!(normalize_dim("self.rank", &aliases, 50), "dt_rank");
-        assert_eq!(normalize_dim("self.rank", &aliases, 150), "other_rank");
-        // Outside every class range and not a lone binding: left untouched.
-        assert_eq!(normalize_dim("self.rank", &aliases, 250), "self.rank");
+        let h = ClassHierarchy::standalone(&[(0, 100), (100, 200)]);
+        assert_eq!(normalize_dim("self.rank", &aliases, &h, 50), "dt_rank");
+        assert_eq!(normalize_dim("self.rank", &aliases, &h, 150), "other_rank");
+        // Outside every class range: left untouched.
+        assert_eq!(normalize_dim("self.rank", &aliases, &h, 250), "self.rank");
     }
 
     #[test]

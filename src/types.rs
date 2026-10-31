@@ -571,6 +571,8 @@ pub enum KnownFunction {
     Zeros,
     Ones,
     Full,
+    /// `torch.zeros/ones/empty/rand/randn`: dims as varargs or one tuple/list.
+    TorchSizeConstructor,
     Arange,
     Eye,
     Vmap,
@@ -711,6 +713,8 @@ pub enum KnownFunction {
     ShapeAs,
     Item,
     NewConstructor,
+    /// `x.new_zeros/new_ones/new_empty`: like `TorchSizeConstructor` after the receiver.
+    NewSizeConstructor,
     // torch tuple-output methods
     TopK,
     Chunk,

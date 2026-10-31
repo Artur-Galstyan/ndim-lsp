@@ -1021,11 +1021,11 @@ fn test_classify_new_misc_methods() {
     assert_eq!(classify_method_call("item"), Some(KnownFunction::Item));
     assert_eq!(
         classify_method_call("new_zeros"),
-        Some(KnownFunction::NewConstructor)
+        Some(KnownFunction::NewSizeConstructor)
     );
     assert_eq!(
         classify_method_call("new_ones"),
-        Some(KnownFunction::NewConstructor)
+        Some(KnownFunction::NewSizeConstructor)
     );
     assert_eq!(
         classify_method_call("new_full"),
@@ -1033,7 +1033,7 @@ fn test_classify_new_misc_methods() {
     );
     assert_eq!(
         classify_method_call("new_empty"),
-        Some(KnownFunction::NewConstructor)
+        Some(KnownFunction::NewSizeConstructor)
     );
     assert_eq!(classify_method_call("clone"), Some(KnownFunction::Copy));
     assert_eq!(classify_method_call("cpu"), Some(KnownFunction::Copy));

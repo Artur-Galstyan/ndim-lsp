@@ -3,10 +3,11 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    time::SystemTime,
 };
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::python_ast::{
     extract_call_arguments, extract_callable_signature, extract_jaxtyping_shapes,
@@ -28,9 +29,17 @@ use crate::types::*;
 /// Note: only the final resolution result (start → ResolvedImplementation)
 /// is cached. Re-export chain intermediates are not cached individually,
 /// which is correct for the LSP workload (queries target first-class
-/// imports, not intermediate re-export hops).
+/// imports, not intermediate re-export hops). A resolution that found nothing
+/// is cached as `None`.
+///
+/// Every file or path a resolution looked at, including the ones that did not
+/// exist, has a stamp, and each entry knows which paths it looked at.
+/// `revalidate` compares the stamps with the disk and drops only the entries
+/// that looked at a changed path, so a saved, created, or deleted file never
+/// leaves a stale entry. Imports always read the disk, never an unsaved
+/// editor buffer.
 pub struct ResolutionCache {
-    pub map: std::sync::RwLock<HashMap<(Vec<String>, u64), ResolvedImplementation>>,
+    pub map: std::sync::RwLock<ResolvedMap>,
     /// Session-lifetime cache for extracted jaxtyping `FunctionShapeScope`s of
     /// cross-file helper functions (cross-file return-type tracing). Keyed by
     /// the resolved implementation's file path plus function name, since one
@@ -38,8 +47,122 @@ pub struct ResolutionCache {
     /// the function but no matching jaxtyping scope, so repeat calls to an
     /// unannotated cross-file helper don't re-parse the file.
     pub signatures: std::sync::RwLock<HashMap<(PathBuf, String), Option<FunctionShapeScope>>>,
+    /// Lock order: `tracked`, then `map`, then `signatures`.
+    tracked: std::sync::RwLock<Tracked>,
+    /// Disk state of each path an editor event already dropped entries for,
+    /// so a second event for the same change does not drop them again.
+    handled_events: std::sync::Mutex<HashMap<PathBuf, Stamp>>,
+    /// Bumped by every drop. An insert whose resolution started before a
+    /// drop is skipped: it may have read the old file.
+    epoch: AtomicU64,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
+    /// Number of implementation files parsed.
+    pub parses: AtomicUsize,
+    /// Last parse of each implementation file with the text it came from. A
+    /// tree is reused only when the text read now is identical, so it needs no
+    /// invalidation of its own. `Tree` is `Send + Sync`, and a clone is a cheap
+    /// reference-counted copy that does not borrow the cache.
+    parsed: std::sync::Mutex<HashMap<PathBuf, (Arc<str>, Tree)>>,
+}
+
+/// Parsed files kept at most. The map is emptied when it is full.
+const MAX_PARSED_FILES: usize = 128;
+
+#[derive(Default)]
+struct Tracked {
+    stamps: HashMap<PathBuf, Stamp>,
+    /// Paths each `map` entry looked at.
+    map_paths: HashMap<(Vec<String>, u64), Vec<PathBuf>>,
+    /// The file each `signatures` entry was read from.
+    signature_files: HashMap<(PathBuf, String), PathBuf>,
+}
+
+/// Resolved implementation per (import segments, roots fingerprint).
+pub type ResolvedMap = HashMap<(Vec<String>, u64), Option<ResolvedImplementation>>;
+
+/// Modification time and size, or `None` for a path that does not exist.
+type Stamp = Option<(Option<SystemTime>, u64)>;
+
+type Probes = Vec<(PathBuf, Stamp)>;
+
+fn stamp_of(path: &std::path::Path) -> Stamp {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))
+}
+
+impl Tracked {
+    fn add_stamps(&mut self, probes: &Probes) {
+        // The oldest stamp wins: it is the one the cached data may predate.
+        for (path, stamp) in probes {
+            self.stamps.entry(path.clone()).or_insert(*stamp);
+        }
+    }
+}
+
+impl ResolutionCache {
+    /// Drop the entries that looked at a path that changed on disk, or at one
+    /// of `changed` (an editor event, which counts even when the modification
+    /// time did not move). Returns whether it dropped anything.
+    pub fn revalidate(&self, changed: &[PathBuf]) -> bool {
+        let stale: HashSet<PathBuf> = {
+            let tracked = self.tracked.read().unwrap();
+            let mut handled = self.handled_events.lock().unwrap();
+            let mut stale = HashSet::new();
+            for p in changed.iter().filter(|p| tracked.stamps.contains_key(*p)) {
+                let now = stamp_of(p);
+                if handled.get(p) != Some(&now) {
+                    handled.insert(p.clone(), now);
+                    stale.insert(p.clone());
+                }
+            }
+            for (p, old) in &tracked.stamps {
+                if stamp_of(p) != *old {
+                    stale.insert(p.clone());
+                }
+            }
+            stale
+        };
+        if stale.is_empty() {
+            // A resolution that started before this event may have read the
+            // old file and not be tracked yet: it must not insert.
+            if !changed.is_empty() {
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+            }
+            return false;
+        }
+        let mut tracked = self.tracked.write().unwrap();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        let mut map = self.map.write().unwrap();
+        tracked.map_paths.retain(|key, paths| {
+            let keep = !paths.iter().any(|p| stale.contains(p));
+            if !keep {
+                map.remove(key);
+            }
+            keep
+        });
+        let mut signatures = self.signatures.write().unwrap();
+        tracked.signature_files.retain(|key, file| {
+            let keep = !stale.contains(file);
+            if !keep {
+                signatures.remove(key);
+            }
+            keep
+        });
+        self.parsed.lock().unwrap().retain(|p, _| !stale.contains(p));
+        tracked.stamps.retain(|p, _| !stale.contains(p));
+        true
+    }
+
+    fn clear(&self) {
+        let mut tracked = self.tracked.write().unwrap();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        *tracked = Tracked::default();
+        self.map.write().unwrap().clear();
+        self.signatures.write().unwrap().clear();
+        self.parsed.lock().unwrap().clear();
+    }
 }
 
 /// Compute a stable u64 fingerprint for an ordered list of search-root paths.
@@ -57,21 +180,41 @@ pub fn new_resolution_cache() -> Arc<ResolutionCache> {
     Arc::new(ResolutionCache {
         map: std::sync::RwLock::new(HashMap::new()),
         signatures: std::sync::RwLock::new(HashMap::new()),
+        tracked: std::sync::RwLock::new(Tracked::default()),
+        handled_events: std::sync::Mutex::new(HashMap::new()),
+        epoch: AtomicU64::new(0),
         hits: AtomicUsize::new(0),
         misses: AtomicUsize::new(0),
+        parses: AtomicUsize::new(0),
+        parsed: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
 /// Clear all entries from the resolution cache. Called when workspace
 /// folders change, since site-packages roots may shift.
 pub fn clear_resolution_cache(cache: &Arc<ResolutionCache>) {
-    cache.map.write().unwrap().clear();
-    cache.signatures.write().unwrap().clear();
+    cache.clear();
 }
 
 pub fn resolve_python_module_on_disk(
     module: &[String],
     search_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    resolve_module_probing(module, search_roots, &mut Vec::new())
+}
+
+/// Stat `path` and record the stamp, which is taken before any later read.
+fn probe(path: &std::path::Path, probes: &mut Probes) -> bool {
+    let stamp = stamp_of(path);
+    let exists = stamp.is_some();
+    probes.push((path.to_path_buf(), stamp));
+    exists
+}
+
+fn resolve_module_probing(
+    module: &[String],
+    search_roots: &[PathBuf],
+    probes: &mut Probes,
 ) -> Option<PathBuf> {
     if module.is_empty() {
         return None;
@@ -79,12 +222,12 @@ pub fn resolve_python_module_on_disk(
     for root in search_roots {
         let module_path = root.join(module.join("/"));
         let file_path = module_path.with_extension("py");
-        if file_path.exists() {
+        if probe(&file_path, probes) {
             return Some(file_path);
         }
 
         let package_path = module_path.join("__init__.py");
-        if package_path.exists() {
+        if probe(&package_path, probes) {
             return Some(package_path);
         }
     }
@@ -131,6 +274,14 @@ pub fn resolve_target_on_disk(
     target: &ResolvedTarget,
     search_roots: &[PathBuf],
 ) -> Option<ResolvedModuleTarget> {
+    resolve_target_probing(target, search_roots, &mut Vec::new())
+}
+
+fn resolve_target_probing(
+    target: &ResolvedTarget,
+    search_roots: &[PathBuf],
+    probes: &mut Probes,
+) -> Option<ResolvedModuleTarget> {
     if target.dots > 0 || target.parts.is_empty() {
         return None;
     }
@@ -139,7 +290,7 @@ pub fn resolve_target_on_disk(
         let module_parts = &target.parts[..len];
         let symbol_parts = &target.parts[len..];
 
-        if let Some(file_path) = resolve_python_module_on_disk(module_parts, search_roots) {
+        if let Some(file_path) = resolve_module_probing(module_parts, search_roots, probes) {
             return Some(ResolvedModuleTarget {
                 dots: target.dots,
                 module_parts: module_parts.to_vec(),
@@ -230,6 +381,37 @@ pub fn resolve_terminal_symbol_once(
     }
 }
 
+/// Parse `text` as the content of `path`, reusing the cached tree when the
+/// cache holds a parse of identical text.
+fn parse_implementation(
+    cache: Option<&ResolutionCache>,
+    path: &std::path::Path,
+    text: &str,
+) -> Result<Tree, String> {
+    if let Some(cache) = cache
+        && let Some((cached_text, tree)) = cache.parsed.lock().unwrap().get(path)
+        && &**cached_text == text
+    {
+        return Ok(tree.clone());
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let tree = parser
+        .parse(text, None)
+        .ok_or_else(|| "failed to parse file".to_string())?;
+    if let Some(cache) = cache {
+        cache.parses.fetch_add(1, Ordering::Relaxed);
+        let mut parsed = cache.parsed.lock().unwrap();
+        if parsed.len() >= MAX_PARSED_FILES && !parsed.contains_key(path) {
+            parsed.clear();
+        }
+        parsed.insert(path.to_path_buf(), (Arc::from(text), tree.clone()));
+    }
+    Ok(tree)
+}
+
 pub fn resolve_implementation<F>(
     start: ResolvedTarget,
     search_roots: &[PathBuf],
@@ -240,6 +422,7 @@ pub fn resolve_implementation<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
     // Cache lookup — only for absolute (dots==0) targets with non-empty parts.
     if start.dots == 0
         && !start.parts.is_empty()
@@ -250,26 +433,23 @@ where
         let cache_map = cache.map.read().unwrap();
         if let Some(cached) = cache_map.get(&key) {
             cache.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(cached.clone()));
+            return Ok(cached.clone());
         }
         cache.misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .map_err(|e| e.to_string())?;
-
     let mut current = start.clone();
 
     let mut visited = HashSet::new();
+    let mut probes = Probes::new();
+    let mut unreadable = false;
 
     let result = (|| {
         for _ in 0..max_depth {
             if !visited.insert(current.parts.clone()) {
                 return Ok(None);
             }
-            let Some(resolved) = resolve_target_on_disk(&current, search_roots) else {
+            let Some(resolved) = resolve_target_probing(&current, search_roots, &mut probes) else {
                 return Ok(None);
             };
 
@@ -281,12 +461,11 @@ where
             }
 
             let Some(text) = read_file(&resolved.file_path) else {
+                unreadable = true;
                 return Ok(None);
             };
 
-            let Some(tree) = parser.parse(&text, None) else {
-                return Err("failed to parse file".to_string());
-            };
+            let tree = parse_implementation(cache, &resolved.file_path, &text)?;
 
             let Some(symbol) = find_top_level_symbol(
                 tree.root_node(),
@@ -316,15 +495,22 @@ where
         Ok(None)
     })();
 
-    // Cache insert — only on successful resolution of absolute targets.
+    // Cache insert — absolute targets only, found or not found. A read that
+    // failed may succeed later, and an error is not a resolution result.
     if start.dots == 0
         && !start.parts.is_empty()
-        && let (Some(cache), Ok(Some(impl_result))) = (cache, &result)
+        && !unreadable
+        && let (Some(cache), Ok(resolved)) = (cache, &result)
     {
         let fingerprint = search_roots_fingerprint(search_roots);
         let key = (start.parts.clone(), fingerprint);
-        let mut cache_map = cache.map.write().unwrap();
-        cache_map.insert(key, impl_result.clone());
+        let mut tracked = cache.tracked.write().unwrap();
+        if cache.epoch.load(Ordering::SeqCst) == epoch {
+            tracked.add_stamps(&probes);
+            let paths = probes.into_iter().map(|(path, _)| path).collect();
+            tracked.map_paths.insert(key.clone(), paths);
+            cache.map.write().unwrap().insert(key, resolved.clone());
+        }
     }
 
     result
@@ -385,14 +571,8 @@ where
         return Ok(None);
     };
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .map_err(|e| e.to_string())?;
-
-    let Some(implementation_tree) = parser.parse(&implementation_text, None) else {
-        return Err("failed to parse implementation file".to_string());
-    };
+    let implementation_tree =
+        parse_implementation(cache, &implementation.target.file_path, &implementation_text)?;
 
     let Some(signature) = extract_callable_signature(
         implementation_tree.root_node(),
@@ -407,6 +587,10 @@ where
     let source_node = match source_node {
         Some(node) => node,
         None => {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .map_err(|e| e.to_string())?;
             source_tree = parser
                 .parse(source_text, None)
                 .ok_or_else(|| "failed to parse source file".to_string())?;
@@ -463,6 +647,7 @@ where
         return Ok(None);
     };
 
+    let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
     let cache_key = (implementation.target.file_path.clone(), name.clone());
     if let Some(cache) = cache
         && let Some(cached) = cache.signatures.read().unwrap().get(&cache_key)
@@ -470,17 +655,12 @@ where
         return Ok(cached.clone());
     }
 
+    let file_stamp = stamp_of(&implementation.target.file_path);
     let Some(text) = read_file(&implementation.target.file_path) else {
         return Ok(None);
     };
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .map_err(|e| e.to_string())?;
-    let Some(tree) = parser.parse(&text, None) else {
-        return Err("failed to parse implementation file".to_string());
-    };
+    let tree = parse_implementation(cache, &implementation.target.file_path, &text)?;
 
     let scopes = extract_jaxtyping_shapes(tree.root_node(), &text)?;
     let found = scopes
@@ -491,11 +671,14 @@ where
         .map(|(_, scope)| scope.clone());
 
     if let Some(cache) = cache {
-        cache
-            .signatures
-            .write()
-            .unwrap()
-            .insert(cache_key, found.clone());
+        let mut tracked = cache.tracked.write().unwrap();
+        if cache.epoch.load(Ordering::SeqCst) == epoch {
+            tracked.add_stamps(&vec![(cache_key.0.clone(), file_stamp)]);
+            tracked
+                .signature_files
+                .insert(cache_key.clone(), cache_key.0.clone());
+            cache.signatures.write().unwrap().insert(cache_key, found.clone());
+        }
     }
 
     Ok(found)
@@ -1680,7 +1863,7 @@ mod resolution_cache_tests {
         let cache = new_resolution_cache();
         cache.map.write().unwrap().insert(
             (parts(&["test"]), 0),
-            ResolvedImplementation {
+            Some(ResolvedImplementation {
                 target: ResolvedModuleTarget {
                     dots: 0,
                     module_parts: parts(&["test"]),
@@ -1688,7 +1871,7 @@ mod resolution_cache_tests {
                     symbol_parts: vec![],
                 },
                 symbol: None,
-            },
+            }),
         );
         assert_eq!(cache.map.read().unwrap().len(), 1);
         clear_resolution_cache(&cache);
@@ -1874,5 +2057,189 @@ mod resolve_imported_function_shape_tests {
             0,
             "second lookup should hit both the implementation and signature caches"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_freshness_tests {
+    use super::*;
+    use std::fs;
+
+    fn read(path: &PathBuf) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn target(parts: &[&str]) -> ResolvedTarget {
+        ResolvedTarget {
+            dots: 0,
+            parts: parts.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    fn resolve(roots: &[PathBuf], cache: &ResolutionCache) -> Option<ResolvedImplementation> {
+        cache.revalidate(&[]);
+        resolve_implementation(target(&["lib", "f"]), roots, read, 5, Some(cache)).unwrap()
+    }
+
+    fn symbol_name(found: &Option<ResolvedImplementation>) -> Option<&str> {
+        match found.as_ref()?.symbol.as_ref()? {
+            PythonSymbol::Function { name } | PythonSymbol::Class { name, .. } => Some(name),
+            PythonSymbol::Import { .. } => None,
+        }
+    }
+
+    #[test]
+    fn modified_file_is_resolved_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        fs::write(&file, "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        assert_eq!(symbol_name(&resolve(&roots, &cache)), Some("f"));
+
+        fs::write(&file, "x = 1\n").unwrap();
+        assert!(resolve(&roots, &cache).is_none());
+    }
+
+    #[test]
+    fn deleted_file_is_resolved_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        fs::write(&file, "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        assert!(resolve(&roots, &cache).is_some());
+
+        fs::remove_file(&file).unwrap();
+        assert!(resolve(&roots, &cache).is_none());
+    }
+
+    #[test]
+    fn failed_resolution_sees_a_created_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        assert!(resolve(&roots, &cache).is_none());
+        assert!(resolve(&roots, &cache).is_none());
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 1, "failure is cached");
+
+        fs::write(tmp.path().join("lib.py"), "def f(): pass\n").unwrap();
+        assert_eq!(symbol_name(&resolve(&roots, &cache)), Some("f"));
+    }
+
+    #[test]
+    fn created_file_in_an_earlier_root_wins() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(second.path().join("lib.py"), "def f(): pass\n").unwrap();
+        let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        let before = resolve(&roots, &cache).unwrap();
+        assert_eq!(before.target.file_path, second.path().join("lib.py"));
+
+        fs::write(first.path().join("lib.py"), "def f(): pass\n").unwrap();
+        let after = resolve(&roots, &cache).unwrap();
+        assert_eq!(after.target.file_path, first.path().join("lib.py"));
+    }
+
+    #[test]
+    fn unchanged_files_keep_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.py"), "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        resolve(&roots, &cache);
+        resolve(&roots, &cache);
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        assert!(!cache.revalidate(&[tmp.path().join("other.py")]));
+    }
+
+    #[test]
+    fn editor_event_drops_the_cache_without_a_stamp_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        fs::write(&file, "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        resolve(&roots, &cache);
+        assert!(cache.revalidate(&[file]));
+        assert!(cache.map.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn event_during_a_resolution_skips_its_insert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        fs::write(&file, "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        let read_then_event = |path: &PathBuf| {
+            let text = read(path);
+            assert!(!cache.revalidate(std::slice::from_ref(path)));
+            text
+        };
+        resolve_implementation(target(&["lib", "f"]), &roots, read_then_event, 5, Some(&cache))
+            .unwrap();
+        assert!(cache.map.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn change_drops_only_the_entries_that_looked_at_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.py"), "def f(): pass\n").unwrap();
+        fs::write(tmp.path().join("other.py"), "def g(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        resolve(&roots, &cache);
+        resolve_implementation(target(&["other", "g"]), &roots, read, 5, Some(&cache)).unwrap();
+
+        fs::write(tmp.path().join("lib.py"), "x = 1\n").unwrap();
+        assert!(cache.revalidate(&[]));
+        assert_eq!(cache.map.read().unwrap().len(), 1);
+        let hits = cache.hits.load(Ordering::Relaxed);
+        resolve_implementation(target(&["other", "g"]), &roots, read, 5, Some(&cache)).unwrap();
+        assert_eq!(cache.hits.load(Ordering::Relaxed), hits + 1);
+    }
+
+    #[test]
+    fn second_event_for_the_same_change_keeps_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        fs::write(&file, "def f(): pass\n").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cache = new_resolution_cache();
+        resolve(&roots, &cache);
+        assert!(cache.revalidate(std::slice::from_ref(&file)));
+        resolve(&roots, &cache);
+        assert!(!cache.revalidate(std::slice::from_ref(&file)));
+    }
+
+    #[test]
+    fn signature_cache_sees_a_modified_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.py");
+        let sig = |ret: &str| {
+            format!("def f(x: Float[Array, \"a b\"]) -> Float[Array, \"{ret}\"]:\n    pass\n")
+        };
+        fs::write(&file, sig("a b")).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let import_map = HashMap::from([(
+            "f".to_string(),
+            ImportPath {
+                dots: 0,
+                module: vec!["lib".to_string()],
+                name: "f".to_string(),
+            },
+        )]);
+        let cache = new_resolution_cache();
+        let get = || {
+            cache.revalidate(&[]);
+            resolve_imported_function_shape("f", &import_map, &roots, read, 5, Some(&cache))
+                .unwrap()
+                .unwrap()
+        };
+        let before = get();
+        fs::write(&file, sig("b a")).unwrap();
+        assert_ne!(get().return_shape, before.return_shape);
     }
 }

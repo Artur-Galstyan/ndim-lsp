@@ -570,10 +570,32 @@ known_case!(
 );
 known_case!(torch_ravel, ["torch", "ravel"], Some(KnownFunction::Ravel));
 known_case!(torch_where, ["torch", "where"], Some(KnownFunction::Where));
-known_case!(torch_zeros, ["torch", "zeros"], Some(KnownFunction::Zeros));
-known_case!(torch_ones, ["torch", "ones"], Some(KnownFunction::Ones));
+known_case!(
+    torch_zeros,
+    ["torch", "zeros"],
+    Some(KnownFunction::TorchSizeConstructor)
+);
+known_case!(
+    torch_ones,
+    ["torch", "ones"],
+    Some(KnownFunction::TorchSizeConstructor)
+);
+known_case!(
+    torch_rand,
+    ["torch", "rand"],
+    Some(KnownFunction::TorchSizeConstructor)
+);
+known_case!(
+    torch_randn,
+    ["torch", "randn"],
+    Some(KnownFunction::TorchSizeConstructor)
+);
 known_case!(torch_full, ["torch", "full"], Some(KnownFunction::Full));
-known_case!(torch_empty, ["torch", "empty"], Some(KnownFunction::Empty));
+known_case!(
+    torch_empty,
+    ["torch", "empty"],
+    Some(KnownFunction::TorchSizeConstructor)
+);
 known_case!(
     torch_linspace,
     ["torch", "linspace"],

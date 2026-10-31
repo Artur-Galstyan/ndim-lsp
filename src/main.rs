@@ -1,22 +1,24 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
+use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, Diagnostic, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges, GotoDefinitionParams,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentChanges, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
     InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, Range,
+    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, Range, Registration,
     ServerCapabilities, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Parser, Tree};
@@ -26,6 +28,9 @@ use ndim_lsp::{
     clear_resolution_cache, new_resolution_cache,
 };
 
+/// Quiet time after a change before its text is analyzed.
+const DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// Analysis plus the exact text/tree it was computed from, so hover and
 /// inlay hints reuse the parse instead of re-parsing per request.
 #[derive(Clone)]
@@ -33,28 +38,56 @@ pub struct CachedAnalysis {
     pub analysis: Arc<LayerShapeAnalysis>,
     pub text: Arc<str>,
     pub tree: Arc<Tree>,
+    pub version: i32,
+    pub rev: u64,
 }
 
+/// One text snapshot of an open document. `rev` is unique per text write, so
+/// results keyed on it can never belong to a closed or replaced text.
+#[derive(Clone)]
+pub struct Document {
+    text: Arc<str>,
+    version: i32,
+    rev: u64,
+    /// Analysis of this text may start at this time (the debounce deadline).
+    ready_at: Instant,
+}
+
+type Inflight = Mutex<HashMap<(Url, u64), watch::Receiver<Option<Option<CachedAnalysis>>>>>;
+
+/// Every field is shared, so a clone can move into a spawned task.
+#[derive(Clone)]
 pub struct Backend {
     pub client: Client,
-    pub document_text: RwLock<HashMap<Url, String>>,
-    pub workspace_roots: RwLock<Vec<PathBuf>>,
-    /// Cache: URI → (version, analysis+snapshot). Invalidated on text change.
-    /// Stored as `Arc`s so cache hits clone pointers, not the whole analysis.
-    pub analysis_cache: RwLock<HashMap<Url, (i32, CachedAnalysis)>>,
-    /// Current version for each URI (set on did_open/did_change).
-    pub document_version: RwLock<HashMap<Url, i32>>,
+    /// Text and version change together under one lock, in message order:
+    /// the handlers that write them never await.
+    pub documents: Arc<StdRwLock<HashMap<Url, Document>>>,
+    pub next_rev: Arc<AtomicU64>,
+    pub workspace_roots: Arc<StdRwLock<Vec<PathBuf>>>,
+    /// Newest completed analysis per URI. Shared `Arc`s, so a hit clones
+    /// pointers, not the whole analysis.
+    pub analysis_cache: Arc<StdRwLock<HashMap<Url, CachedAnalysis>>>,
+    /// Single-flight: one running analysis per (URI, rev); every caller for
+    /// that text waits on it.
+    pub inflight: Arc<Inflight>,
+    /// One analysis runs at a time per URI. A later one waits here, and skips
+    /// the work if newer text arrived meanwhile.
+    pub gates: Arc<Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session-lifetime cache for resolved import targets.
     /// Keyed on (import-path-segments, search-roots-fingerprint).
     /// Invalidated when workspace folders change.
     pub resolution_cache: Arc<ResolutionCache>,
     /// Severity for `ShapeErrorKind::Mismatch` diagnostics, set from
     /// `initializationOptions.diagnostic_severity`.
-    pub diagnostic_severity: RwLock<DiagnosticSeverity>,
+    pub diagnostic_severity: Arc<RwLock<DiagnosticSeverity>>,
     /// Severity for `ShapeErrorKind::Approximation` diagnostics, set from
     /// `initializationOptions.approximation_severity` (defaults to WARNING,
     /// independent of `diagnostic_severity`).
-    pub approximation_severity: RwLock<DiagnosticSeverity>,
+    pub approximation_severity: Arc<RwLock<DiagnosticSeverity>>,
+    /// The client accepts `workspace/didChangeWatchedFiles` registration.
+    pub can_watch_files: Arc<AtomicBool>,
+    /// The client accepts `workspace/inlayHint/refresh`.
+    pub can_refresh_hints: Arc<AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -66,8 +99,19 @@ impl LanguageServer for Backend {
                 .into_iter()
                 .filter_map(|f| f.uri.to_file_path().ok())
                 .collect();
-            let mut lock = self.workspace_roots.write().await;
-            *lock = roots;
+            *self.workspace_roots.write().unwrap() = roots;
+        }
+
+        if let Some(ws) = params.capabilities.workspace.as_ref() {
+            let watch = ws
+                .did_change_watched_files
+                .as_ref()
+                .and_then(|c| c.dynamic_registration);
+            self.can_watch_files
+                .store(watch == Some(true), Ordering::Relaxed);
+            let refresh = ws.inlay_hint.as_ref().and_then(|c| c.refresh_support);
+            self.can_refresh_hints
+                .store(refresh == Some(true), Ordering::Relaxed);
         }
 
         if let Some(opts) = params.initialization_options.as_ref() {
@@ -80,8 +124,13 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding: Some(PositionEncodingKind::UTF16),
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
@@ -106,21 +155,42 @@ impl LanguageServer for Backend {
         })
     }
 
+    async fn initialized(&self, _: InitializedParams) {
+        if !self.can_watch_files.load(Ordering::Relaxed) {
+            return;
+        }
+        let options = DidChangeWatchedFilesRegistrationOptions {
+            watchers: vec![FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/*.py".to_string()),
+                kind: None,
+            }],
+        };
+        let registration = Registration {
+            id: "ndim-watch-python".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(options).ok(),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(MessageType::WARNING, format!("file watch failed: {e}"))
+                .await;
+        }
+    }
+
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        // The write comes first: no await may let a later change overtake it.
+        let doc = params.text_document;
+        if let Some(rev) = self.set_document(&doc.uri, doc.text, doc.version, Duration::ZERO, false)
+        {
+            self.spawn_publish(doc.uri, rev);
+        }
         self.client
             .log_message(MessageType::INFO, "File opened")
             .await;
-
-        self.republish_diagnostics(
-            &params.text_document.uri,
-            &params.text_document.text,
-            params.text_document.version,
-        )
-        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -128,34 +198,43 @@ impl LanguageServer for Backend {
             return;
         };
         let uri = params.text_document.uri;
-        let version = params.text_document.version;
-        // Record the new text immediately so hover/inlay requests see it...
-        {
-            let mut doc_lock = self.document_text.write().await;
-            doc_lock.insert(uri.clone(), change.text);
+        // No await before the write: handlers start in message order, so the
+        // newest text always wins. The analysis runs in its own task after
+        // the debounce, so this handler does not hold a concurrency slot.
+        let Some(rev) = self.set_document(
+            &uri,
+            change.text,
+            params.text_document.version,
+            DEBOUNCE,
+            true,
+        ) else {
+            return;
+        };
+        self.spawn_publish(uri, rev);
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if let Ok(path) = params.text_document.uri.to_file_path() {
+            self.files_changed(&[path]);
         }
-        {
-            let mut ver_lock = self.document_version.write().await;
-            ver_lock.insert(uri.clone(), version);
-        }
-        // ...but debounce the analysis: if another keystroke lands during the
-        // window, this run bows out and the newer one does the work.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        {
-            let ver_lock = self.document_version.read().await;
-            if ver_lock.get(&uri).copied() != Some(version) {
-                return;
-            }
-        }
-        self.publish_diagnostics_for(&uri, version).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let paths: Vec<PathBuf> = params
+            .changes
+            .iter()
+            .filter_map(|c| c.uri.to_file_path().ok())
+            .collect();
+        self.files_changed(&paths);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
         // Evict all per-document state so long-lived sessions don't leak.
-        self.document_text.write().await.remove(uri);
-        self.document_version.write().await.remove(uri);
-        self.analysis_cache.write().await.remove(uri);
+        // An analysis still running finds no matching text and drops itself.
+        self.documents.write().unwrap().remove(uri);
+        self.analysis_cache.write().unwrap().remove(uri);
+        self.gates.lock().unwrap().remove(uri);
         // Clear any diagnostics the client may still be showing.
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
@@ -163,50 +242,48 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
-        let mut lock = self.workspace_roots.write().await;
+        {
+            let mut lock = self.workspace_roots.write().unwrap();
 
-        // Remove folders that were removed
-        for removed in &params.event.removed {
-            if let Ok(path) = removed.uri.to_file_path() {
-                lock.retain(|p| p != &path);
+            // Remove folders that were removed
+            for removed in &params.event.removed {
+                if let Ok(path) = removed.uri.to_file_path() {
+                    lock.retain(|p| p != &path);
+                }
             }
-        }
 
-        // Add folders that were added
-        for added in params.event.added {
-            if let Ok(path) = added.uri.to_file_path()
-                && !lock.contains(&path)
-            {
-                lock.push(path);
+            // Add folders that were added
+            for added in params.event.added {
+                if let Ok(path) = added.uri.to_file_path()
+                    && !lock.contains(&path)
+                {
+                    lock.push(path);
+                }
             }
         }
 
         // Workspace roots changed → site-packages may have shifted.
-        // Clear the resolution cache so stale entries don't survive.
+        // Clear the resolution cache so stale entries don't survive, and
+        // analyze the open documents again with the new roots.
         clear_resolution_cache(&self.resolution_cache);
+        self.reanalyze_open_documents();
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        // Verify doc exists
-        let doc_lock = self.document_text.read().await;
-        if !doc_lock.contains_key(&uri) {
+        if self.document(&uri).is_none() {
             return Ok(None);
         }
-        drop(doc_lock);
         self.on_hover(&uri, &pos).await
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let visible_range = params.range;
-        // Verify doc exists
-        let doc_lock = self.document_text.read().await;
-        if !doc_lock.contains_key(&uri) {
+        if self.document(&uri).is_none() {
             return Ok(None);
         }
-        drop(doc_lock);
         Ok(self.compute_inlay_hints(&uri, &visible_range).await)
     }
 
@@ -221,24 +298,14 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
-        let version = {
-            let versions = self.document_version.read().await;
-            versions.get(&uri).copied()
-        };
-        let Some(version) = version else {
+        let Some(cached) = self.get_current_analysis(&uri).await else {
             return Ok(None);
         };
-        let Some(cached) = self.get_analysis(&uri, version).await else {
-            return Ok(None);
-        };
-        if self.document_version.read().await.get(&uri).copied() != Some(version) {
-            return Ok(None);
-        }
         Ok(Some(transpose_quick_fixes(
             &cached.analysis,
             &cached.text,
             &uri,
-            version,
+            cached.version,
             &params.range,
             params.context.only.as_deref(),
         )))
@@ -246,177 +313,258 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    /// Run full analysis, or return cached result if version matches.
-    /// Populates the analysis cache on miss. Caller passes the version it
-    /// believes is current; if the document advances during analysis the
-    /// freshly-computed entry is dropped instead of poisoning a newer cached
-    /// result.
-    async fn get_analysis(&self, uri: &Url, version: i32) -> Option<CachedAnalysis> {
-        // Check cache hit first (read-only lock, cheap)
-        {
-            let cache = self.analysis_cache.read().await;
-            if let Some((cached_ver, cached)) = cache.get(uri)
-                && *cached_ver == version
-            {
-                return Some(cached.clone());
+    fn document(&self, uri: &Url) -> Option<Document> {
+        self.documents.read().unwrap().get(uri).cloned()
+    }
+
+    /// Files changed on disk. If an import resolution depended on one, the
+    /// cache is dropped and every open document is analyzed again: the cache
+    /// does not record which document used which file, so this is the safe set.
+    fn files_changed(&self, paths: &[PathBuf]) {
+        let dropped = self.resolution_cache.revalidate(paths);
+        // A resolution that is running may have read the old file before it
+        // was tracked: its analysis is stale even if nothing was dropped.
+        let running = !paths.is_empty() && !self.inflight.lock().unwrap().is_empty();
+        if dropped || running {
+            self.reanalyze_open_documents();
+        }
+    }
+
+    /// New revs for every open document, then an analysis and a publication
+    /// for each, so no result built before this call is used again.
+    fn reanalyze_open_documents(&self) {
+        let now = Instant::now();
+        let mut revs = Vec::new();
+        for (uri, doc) in self.documents.write().unwrap().iter_mut() {
+            doc.rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+            doc.ready_at = now;
+            revs.push((uri.clone(), doc.rev));
+        }
+        // After the new revs: an analysis of an old rev can no longer fill it.
+        self.analysis_cache.write().unwrap().clear();
+        for (uri, rev) in revs {
+            self.spawn_publish(uri, rev);
+        }
+        if self.can_refresh_hints.load(Ordering::Relaxed) {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let _ = client.inlay_hint_refresh().await;
+            });
+        }
+    }
+
+    /// Store new text. `monotonic` drops a version older than the stored one.
+    /// Returns the new rev, or `None` if the write was dropped.
+    fn set_document(
+        &self,
+        uri: &Url,
+        text: String,
+        version: i32,
+        debounce: Duration,
+        monotonic: bool,
+    ) -> Option<u64> {
+        let mut docs = self.documents.write().unwrap();
+        if monotonic && docs.get(uri).is_some_and(|d| d.version > version) {
+            return None;
+        }
+        let rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+        docs.insert(
+            uri.clone(),
+            Document {
+                text: Arc::from(text),
+                version,
+                rev,
+                ready_at: Instant::now() + debounce,
+            },
+        );
+        Some(rev)
+    }
+
+    fn cache_hit(&self, uri: &Url, rev: u64) -> Option<CachedAnalysis> {
+        let cache = self.analysis_cache.read().unwrap();
+        cache.get(uri).filter(|c| c.rev == rev).cloned()
+    }
+
+    fn is_current(&self, uri: &Url, rev: u64) -> bool {
+        self.document(uri).is_some_and(|d| d.rev == rev)
+    }
+
+    /// Analysis of the newest text, and nothing else: `None` if the document
+    /// is closed, the analysis failed, or newer text arrived while this call
+    /// waited. A request that needs fresh data waits out the debounce, then
+    /// shares the one analysis with the diagnostics task and other requests.
+    async fn get_analysis(&self, uri: &Url) -> Option<CachedAnalysis> {
+        let doc = self.document(uri)?;
+        if let Some(hit) = self.cache_hit(uri, doc.rev) {
+            return Some(hit);
+        }
+        let wait = doc.ready_at.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+            if !self.is_current(uri, doc.rev) {
+                return None;
             }
         }
+        self.join_analysis(uri, &doc).await
+    }
 
-        // Cache miss — run full analysis. Read text + version together so the
-        // value we cache can't disagree with the version it's keyed on.
+    /// `get_analysis`, but `None` if the text moved on before the caller can
+    /// use the result (its byte and line positions would be wrong).
+    async fn get_current_analysis(&self, uri: &Url) -> Option<CachedAnalysis> {
+        let cached = self.get_analysis(uri).await?;
+        self.is_current(uri, cached.rev).then_some(cached)
+    }
+
+    async fn join_analysis(&self, uri: &Url, doc: &Document) -> Option<CachedAnalysis> {
+        let mut rx = {
+            let mut inflight = self.inflight.lock().unwrap();
+            // Checked under the lock: a finished task fills the cache before it
+            // leaves `inflight`, so a miss here means no result exists yet.
+            if let Some(hit) = self.cache_hit(uri, doc.rev) {
+                return Some(hit);
+            }
+            let key = (uri.clone(), doc.rev);
+            match inflight.get(&key) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = watch::channel(None);
+                    inflight.insert(key, rx.clone());
+                    let this = self.clone();
+                    let (uri, doc) = (uri.clone(), doc.clone());
+                    tokio::spawn(async move { this.run_analysis(uri, doc, tx).await });
+                    rx
+                }
+            }
+        };
+        let done = rx.wait_for(|v| v.is_some()).await.ok()?.clone();
+        done.flatten()
+    }
+
+    /// The one analysis for (`uri`, `doc.rev`). CPU work runs on the blocking
+    /// pool so the runtime threads keep reading input.
+    async fn run_analysis(
+        self,
+        uri: Url,
+        doc: Document,
+        tx: watch::Sender<Option<Option<CachedAnalysis>>>,
+    ) {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap()
+            .entry(uri.clone())
+            .or_default()
+            .clone();
+        let _turn = gate.lock().await;
+        if !self.is_current(&uri, doc.rev) {
+            self.inflight.lock().unwrap().remove(&(uri, doc.rev));
+            let _ = tx.send(Some(None));
+            return;
+        }
         let t_total = Instant::now();
-        let (text, snapshot_version) = {
-            let doc_lock = self.document_text.read().await;
-            let ver_lock = self.document_version.read().await;
-            let text = doc_lock.get(uri)?.clone();
-            let snapshot_version = ver_lock.get(uri).copied()?;
-            (text, snapshot_version)
-        };
-        if snapshot_version != version {
-            // Document moved while we were waiting. Let the caller re-request
-            // with the current version rather than analyzing stale text.
-            return None;
-        }
-        let text_bytes = text.len();
-        let text_lines = text.lines().count();
+        let roots = self.workspace_roots.read().unwrap().clone();
+        let resolution_cache = self.resolution_cache.clone();
+        let text = doc.text.clone();
+        let run =
+            tokio::task::spawn_blocking(move || compute_analysis(&text, &roots, &resolution_cache))
+                .await;
 
-        let mut parser = Parser::new();
-        if parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .is_err()
-        {
-            return None;
-        }
-        let t_parse = Instant::now();
-        let tree = parser.parse(&text, None)?;
-        let parse_ms = t_parse.elapsed().as_millis();
-
-        let t_roots = Instant::now();
-        let workspace_roots = self.workspace_roots.read().await.clone();
-        let mut search_roots = workspace_roots.clone();
-        search_roots.extend(python_site_packages_roots(&workspace_roots));
-        let roots_ms = t_roots.elapsed().as_millis();
-        let search_roots_count = search_roots.len();
-
-        let read_count = AtomicUsize::new(0);
-        let read_bytes = AtomicUsize::new(0);
-        let read_file = |path: &PathBuf| {
-            let result = std::fs::read_to_string(path).ok();
-            if let Some(ref s) = result {
-                read_count.fetch_add(1, Ordering::Relaxed);
-                read_bytes.fetch_add(s.len(), Ordering::Relaxed);
+        let result = match run {
+            Ok(Ok(run)) => {
+                let total_ms = t_total.elapsed().as_millis();
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "analysis: total={}ms parse={}ms roots={}ms analyze={}ms \
+                             | text={}B/{}L roots={} reads={}/{}B res_cache_entries={} hits={} misses={}",
+                            total_ms,
+                            run.parse_ms,
+                            run.roots_ms,
+                            run.analyze_ms,
+                            doc.text.len(),
+                            doc.text.lines().count(),
+                            run.search_roots,
+                            run.read_count,
+                            run.read_bytes,
+                            self.resolution_cache.map.read().unwrap().len(),
+                            self.resolution_cache.hits.load(Ordering::Relaxed),
+                            self.resolution_cache.misses.load(Ordering::Relaxed),
+                        ),
+                    )
+                    .await;
+                Some(CachedAnalysis {
+                    analysis: Arc::new(run.analysis),
+                    text: doc.text.clone(),
+                    tree: Arc::new(run.tree),
+                    version: doc.version,
+                    rev: doc.rev,
+                })
             }
-            result
-        };
-
-        let t_analyze = Instant::now();
-        let analysis = match analyze_layer_shapes(
-            tree.root_node(),
-            &text,
-            &search_roots,
-            read_file,
-            8,
-            Some(&self.resolution_cache),
-        ) {
-            Ok(a) => a,
-            Err(msg) => {
+            Ok(Err(msg)) => {
                 self.client
                     .log_message(MessageType::WARNING, format!("analysis failed: {}", msg))
                     .await;
-                return None;
+                None
             }
+            Err(_) => None,
         };
-        let analyze_ms = t_analyze.elapsed().as_millis();
-        let total_ms = t_total.elapsed().as_millis();
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "analysis: total={}ms parse={}ms roots={}ms analyze={}ms \
-                     | text={}B/{}L roots={} reads={}/{}B res_cache_entries={} hits={} misses={}",
-                    total_ms,
-                    parse_ms,
-                    roots_ms,
-                    analyze_ms,
-                    text_bytes,
-                    text_lines,
-                    search_roots_count,
-                    read_count.load(Ordering::Relaxed),
-                    read_bytes.load(Ordering::Relaxed),
-                    self.resolution_cache.map.read().unwrap().len(),
-                    self.resolution_cache.hits.load(Ordering::Relaxed),
-                    self.resolution_cache.misses.load(Ordering::Relaxed),
-                ),
-            )
-            .await;
-
-        let cached = CachedAnalysis {
-            analysis: Arc::new(analysis),
-            text: Arc::from(text),
-            tree: Arc::new(tree),
-        };
-        // Only publish to the cache if the document hasn't advanced past the
-        // version we analyzed. Otherwise we'd overwrite a (potentially newer)
-        // entry with stale results.
-        {
-            let ver_lock = self.document_version.read().await;
-            let current = ver_lock.get(uri).copied();
-            drop(ver_lock);
-            if current == Some(version) {
-                let mut cache = self.analysis_cache.write().await;
-                cache.insert(uri.clone(), (version, cached.clone()));
+        // Cache only if this is still the newest text; a stale entry would
+        // never be read and a closed document must not be re-populated.
+        if let Some(cached) = &result {
+            let docs = self.documents.read().unwrap();
+            if docs.get(&uri).is_some_and(|d| d.rev == doc.rev) {
+                self.analysis_cache
+                    .write()
+                    .unwrap()
+                    .insert(uri.clone(), cached.clone());
             }
         }
-
-        Some(cached)
+        self.inflight.lock().unwrap().remove(&(uri, doc.rev));
+        let _ = tx.send(Some(result));
     }
 
-    async fn republish_diagnostics(&self, uri: &Url, text: &str, version: i32) {
-        // Store the document text and version. LSP versions are monotonic
-        // per did_change, so any existing cache entry for this URI will be
-        // at a strictly older version — `get_analysis` misses on the version
-        // check and overwrites, no explicit invalidation needed.
-        {
-            let mut doc_lock = self.document_text.write().await;
-            doc_lock.insert(uri.clone(), text.to_string());
-        }
-        {
-            let mut ver_lock = self.document_version.write().await;
-            ver_lock.insert(uri.clone(), version);
-        }
-        self.publish_diagnostics_for(uri, version).await;
+    /// Publish diagnostics for `rev` in a task of its own, after the debounce.
+    fn spawn_publish(&self, uri: Url, rev: u64) {
+        let this = self.clone();
+        tokio::spawn(async move { this.publish_diagnostics_for(&uri, rev).await });
     }
 
-    /// Analyze (or hit the cache) and publish diagnostics for `version`.
-    async fn publish_diagnostics_for(&self, uri: &Url, version: i32) {
-        let Some(cached) = self.get_analysis(uri, version).await else {
-            self.client
-                .publish_diagnostics(uri.clone(), Vec::new(), Some(version))
-                .await;
-            return;
-        };
-
+    /// Analyze (or hit the cache) and publish diagnostics, but only if `rev`
+    /// is still the newest text when the result is ready.
+    async fn publish_diagnostics_for(&self, uri: &Url, rev: u64) {
+        let cached = self.get_analysis(uri).await;
         let mismatch_severity = *self.diagnostic_severity.read().await;
         let approximation_severity = *self.approximation_severity.read().await;
-        let diagnostics: Vec<Diagnostic> = cached
-            .analysis
-            .errors
-            .iter()
-            .cloned()
-            .map(|e| {
-                shape_error_to_diagnostic(
-                    e,
-                    uri,
-                    &cached.text,
-                    mismatch_severity,
-                    approximation_severity,
-                )
-            })
-            .collect();
+        let Some(doc) = self.document(uri) else {
+            return;
+        };
+        if doc.rev != rev {
+            return;
+        }
+        let diagnostics: Vec<Diagnostic> = match &cached {
+            Some(cached) if cached.rev == rev => cached
+                .analysis
+                .errors
+                .iter()
+                .cloned()
+                .map(|e| {
+                    shape_error_to_diagnostic(
+                        e,
+                        uri,
+                        &cached.text,
+                        mismatch_severity,
+                        approximation_severity,
+                    )
+                })
+                .collect(),
+            Some(_) => return,
+            None => Vec::new(),
+        };
 
         self.client
-            .publish_diagnostics(uri.clone(), diagnostics, Some(version))
+            .publish_diagnostics(uri.clone(), diagnostics, Some(doc.version))
             .await;
     }
 
@@ -427,19 +575,14 @@ impl Backend {
     ) -> Option<Vec<InlayHint>> {
         let t_total = Instant::now();
 
-        let version = {
-            let ver_lock = self.document_version.read().await;
-            ver_lock.get(uri).copied()?
-        };
-
-        // Snapshot cache state *before* `get_analysis` populates it on miss,
-        // so the telemetry below actually distinguishes hits from misses.
+        // Snapshot cache state *before* `get_current_analysis` populates it on
+        // miss, so the telemetry below actually distinguishes hits from misses.
         let was_cached = {
-            let cache = self.analysis_cache.read().await;
-            cache.get(uri).is_some_and(|(v, _)| *v == version)
+            let doc = self.document(uri)?;
+            self.cache_hit(uri, doc.rev).is_some()
         };
 
-        let cached = self.get_analysis(uri, version).await?;
+        let cached = self.get_current_analysis(uri).await?;
         let analysis = &cached.analysis;
 
         // Line lengths (UTF-16) for the visible window, computed in one pass
@@ -516,29 +659,19 @@ impl Backend {
     async fn on_hover(&self, uri: &Url, pos: &Position) -> Result<Option<Hover>> {
         let t_total = Instant::now();
 
-        let version = {
-            let ver_lock = self.document_version.read().await;
-            ver_lock.get(uri).copied()
-        };
-
-        // If no version tracked, doc might not be open — fall back
-        let Some(version) = version else {
+        // Snapshot cache state *before* `get_current_analysis` may populate it
+        // on miss, so telemetry distinguishes hits from misses.
+        let Some(doc) = self.document(uri) else {
             return Ok(None);
         };
-
-        // Snapshot cache state *before* `get_analysis` may populate it on
-        // miss, so telemetry distinguishes hits from misses.
-        let was_cached = {
-            let cache = self.analysis_cache.read().await;
-            cache.get(uri).is_some_and(|(v, _)| *v == version)
-        };
+        let was_cached = self.cache_hit(uri, doc.rev).is_some();
 
         // The cached snapshot carries the text and tree the analysis was
         // computed from, so `cursor_byte` and `analysis.scopes` byte ranges
-        // are consistent by construction — no re-parse per hover.
-        let cached = match self.get_analysis(uri, version).await {
-            Some(c) => c,
-            None => return Ok(None),
+        // are consistent by construction — no re-parse per hover. A text
+        // change while waiting returns `None`; the editor will re-request.
+        let Some(cached) = self.get_current_analysis(uri).await else {
+            return Ok(None);
         };
         let root = cached.tree.root_node();
         let Some(cursor_byte) = lsp_position_to_byte(&cached.text, pos) else {
@@ -554,16 +687,6 @@ impl Backend {
             Ok(v) => v.to_string(),
             Err(_) => return Ok(None),
         };
-        // If the document advanced while we were waiting on `get_analysis`,
-        // `cursor_byte` points into stale text and `analysis.scopes` byte
-        // ranges may have moved. Bail; the editor will re-request.
-        {
-            let ver_lock = self.document_version.read().await;
-            if ver_lock.get(uri).copied() != Some(version) {
-                return Ok(None);
-            }
-        }
-
         let total_ms = t_total.elapsed().as_millis();
         self.client
             .log_message(
@@ -598,19 +721,9 @@ impl Backend {
         uri: &Url,
         position: &Position,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let version = {
-            let versions = self.document_version.read().await;
-            versions.get(uri).copied()
-        };
-        let Some(version) = version else {
+        let Some(cached) = self.get_current_analysis(uri).await else {
             return Ok(None);
         };
-        let Some(cached) = self.get_analysis(uri, version).await else {
-            return Ok(None);
-        };
-        if self.document_version.read().await.get(uri).copied() != Some(version) {
-            return Ok(None);
-        }
         let Some(range) = find_dimension_definition(
             &cached.analysis.scopes,
             &cached.text,
@@ -959,6 +1072,69 @@ fn python_site_packages_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
     result
 }
 
+struct AnalysisRun {
+    analysis: LayerShapeAnalysis,
+    tree: Tree,
+    parse_ms: u128,
+    roots_ms: u128,
+    analyze_ms: u128,
+    search_roots: usize,
+    read_count: usize,
+    read_bytes: usize,
+}
+
+/// Parse and analyze `text`. Pure CPU and file reads: call from a blocking
+/// thread.
+fn compute_analysis(
+    text: &str,
+    workspace_roots: &[PathBuf],
+    resolution_cache: &ResolutionCache,
+) -> std::result::Result<AnalysisRun, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let t_parse = Instant::now();
+    let tree = parser.parse(text, None).ok_or("parse failed")?;
+    let parse_ms = t_parse.elapsed().as_millis();
+
+    let t_roots = Instant::now();
+    let mut search_roots = workspace_roots.to_vec();
+    search_roots.extend(python_site_packages_roots(workspace_roots));
+    let roots_ms = t_roots.elapsed().as_millis();
+
+    let read_count = AtomicUsize::new(0);
+    let read_bytes = AtomicUsize::new(0);
+    let read_file = |path: &PathBuf| {
+        let result = std::fs::read_to_string(path).ok();
+        if let Some(ref s) = result {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            read_bytes.fetch_add(s.len(), Ordering::Relaxed);
+        }
+        result
+    };
+
+    let t_analyze = Instant::now();
+    let analysis = analyze_layer_shapes(
+        tree.root_node(),
+        text,
+        &search_roots,
+        read_file,
+        8,
+        Some(resolution_cache),
+    )?;
+    Ok(AnalysisRun {
+        analysis,
+        tree,
+        parse_ms,
+        roots_ms,
+        analyze_ms: t_analyze.elapsed().as_millis(),
+        search_roots: search_roots.len(),
+        read_count: read_count.load(Ordering::Relaxed),
+        read_bytes: read_bytes.load(Ordering::Relaxed),
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
@@ -966,16 +1142,27 @@ async fn main() {
 
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        document_text: Default::default(),
+        documents: Default::default(),
+        next_rev: Default::default(),
         workspace_roots: Default::default(),
         analysis_cache: Default::default(),
-        document_version: Default::default(),
+        inflight: Default::default(),
+        gates: Default::default(),
         resolution_cache: new_resolution_cache(),
-        diagnostic_severity: RwLock::new(DiagnosticSeverity::ERROR),
-        approximation_severity: RwLock::new(DiagnosticSeverity::WARNING),
+        diagnostic_severity: Arc::new(RwLock::new(DiagnosticSeverity::ERROR)),
+        approximation_severity: Arc::new(RwLock::new(DiagnosticSeverity::WARNING)),
+        can_watch_files: Default::default(),
+        can_refresh_hints: Default::default(),
     });
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    // Requests that wait for the debounce hold a slot: keep enough free for
+    // notifications and shutdown.
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(32)
+        .serve(service)
+        .await;
+    // Do not wait for a running analysis on the blocking pool.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
