@@ -7,7 +7,7 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified after the JAX 0.11.1 compatibility audit, on the defect-fix commit after `9573cc6` (`ndim-lsp` 0.1.1):
+Verified after the JAX 0.11.1 compatibility audit, on `f63b9b8` (`ndim-lsp` 0.1.1):
 
 - `cargo test --quiet` passes: 1,850 tests pass and four are ignored
   (1,815 library/integration tests, 22 LSP-server tests, 6 in
@@ -106,7 +106,7 @@ asserts the expected markers and the scenario invariants. Do not loosen the
 test to make it pass. A refactor must keep it green and keep the golden dump
 byte-identical.
 
-Baseline (9573cc6 plus uncommitted work, release, 10 CPUs, macOS, 5 runs, p50):
+Baseline (f63b9b8, release, 10 CPUs, macOS, 5 runs, p50):
 
 - One edit costs about 405 ms: 150 ms debounce plus about 242 ms server compute
   (full re-analysis of the 21,038-line file) plus about 11 ms other.
@@ -122,7 +122,7 @@ Baseline (9573cc6 plus uncommitted work, release, 10 CPUs, macOS, 5 runs, p50):
 - Results are in `/tmp/ndim-bench-after.json` (5 runs, 0 failures). This is a
   local file, not in the repo.
 
-Closed targets (found by the benchmark, fixed in the uncommitted work):
+Closed targets (found by the benchmark, fixed in f63b9b8):
 
 1. Inherited layer lost with a same-named self attribute: `self_attr_layer_at`
    now walks the class hierarchy (MRO) of the class that contains the call.
