@@ -225,8 +225,8 @@ fn find_scoped_layer<'a>(
 
 // ── Recursive shape evaluator (#34) ─────────────────────────────────────
 //
-// Replaces the flat query-based extraction (extract_calls /
-// extract_method_calls / extract_binary_ops) with a recursive tree walk.
+// Replaces the flat query-based extraction (extract_calls) with a
+// recursive tree walk.
 // For each assignment `lhs = rhs`, we call shape_of_expression(rhs) which
 // recurses into nested calls, chained methods, unary wraps, parenthesised
 // expressions, identifiers, and subscripts.
@@ -691,8 +691,8 @@ fn find_binary_op_text<'a>(
     None
 }
 
-/// Binary operator: delegates to the existing `apply_binary_op`-style logic
-/// but works on tree-sitter nodes directly rather than `BinaryOpInfo`.
+/// Binary operator: applies the matmul or elementwise shape rule to the
+/// operand nodes directly.
 /// A binary-op operand: a scalar literal (`2`, `1.0`) or an array with a
 /// resolved shape. Scalars broadcast trivially against any array.
 enum BinopOperand {
@@ -1375,16 +1375,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // 4. vmap *recording* (e.g. `vf = jax.vmap(f)`)
     if matches!(known.as_ref(), Some(KnownFunction::Vmap))
         && let Some(_info) = parse_vmap_call(&args) {
-            // The caller (propagate_calls) will handle binding the LHS
-            // variable name to the vmap target. For now we just signal
-            // that a vmap binding was recorded by returning None (vmap
-            // itself has no shape).
-            // We return the info via a side channel — but since
-            // propagate_calls handles the LHS binding, we use a special
-            // marker. Actually, we'll handle vmap recording in
-            // propagate_calls directly when we see the assignment.
-            // Here we just return None — the vmap binding is done by the
-            // caller which has the LHS variable name.
+            // propagate_calls records the vmap binding, so there is no shape here.
             return None;
         }
 
@@ -1654,7 +1645,6 @@ fn resolve_stack_args(
     Some(args)
 }
 
-/// Find the i-th positional argument node in an argument_list.
 /// Find the Nth positional argument node in an argument_list.
 ///
 /// Invariant: Python requires positional args to precede keyword args,

@@ -61,6 +61,22 @@ grep -n "<feature>" src/analysis.rs src/main.rs                  # analysis & LS
 
 If the feature is already implemented, **stop and report** — do not add adjacent work to justify the run. See `llm.txt` for the full agent handoff.
 
+## Stress benchmark
+
+`bench/generate_stress.py` writes `bench/stress/`: a 21,038-line Python file, three imported helper modules, and a 500-line paste payload. `tests/lsp_stress.rs` runs the built server against this project over stdio. Both tests are ignored in the normal suite:
+
+```sh
+python3 bench/generate_stress.py   # regenerate bench/stress/
+NDIM_STRESS_RUNS=3 NDIM_BENCH_OUT=/tmp/bench.json cargo test --release --test lsp_stress lsp_stress_benchmark -- --ignored --nocapture
+NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_dump -- --ignored --nocapture
+```
+
+`golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
+
+Baseline: one edit takes about 650 ms, which is a 150 ms debounce plus about 490 ms for full re-analysis of the 21,038-line file. The numbers depend on the machine.
+
+`lsp_stress_benchmark` fails on purpose. It reports 524 marker failures and 3 scenario failures, which are open analyzer defects (see `llm.txt`). Do not change the test to make it pass. Fix the defects instead.
+
 ## Features & Roadmap
 
 ### Type Annotations & Declarations

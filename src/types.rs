@@ -237,23 +237,6 @@ pub struct CallInfo {
     pub args_node_range: Range,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub struct MethodCallInfo {
-    pub variable: String,
-    pub receiver: String,
-    pub method: String,
-    pub args_node_range: Range,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct BinaryOpInfo {
-    pub variable: String,
-    pub left: String,
-    pub right: String,
-    pub op: BinaryOp,
-    pub range: tree_sitter::Range,
-}
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum BinaryOp {
     MatMul,

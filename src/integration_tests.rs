@@ -2472,6 +2472,58 @@ mod binary_op_propagation_tests {
     }
 
     #[test]
+    fn test_return_unary_negated_matmul_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    return -(x @ y)";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "got {:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_yield_from_matmul_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    yield from x @ y";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(analysis.errors.len(), 1, "got {:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_floor_division_not_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    z = x // y";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(analysis.errors.len(), 0, "got {:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_tuple_unpack_lhs_matmul() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code =
+            "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    p, q = x @ y";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert_eq!(analysis.errors.len(), 0, "got {:?}", analysis.errors);
+    }
+
+    #[test]
     fn test_elementwise_add_success() {
         let tmp = tempfile::tempdir().unwrap();
         let code = "def f(a: Float[Array, \"batch features\"], b: Float[Array, \"batch features\"]):\n    y = a + b";

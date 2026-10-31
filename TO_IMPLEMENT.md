@@ -369,7 +369,7 @@ Legend:
 
 ## Method calls
 
-`extract_method_calls` captures `var = receiver.method(args)`. `classify_method_call` maps the method name to a `KnownFunction`. `apply_method_call` synthesises the receiver as positional[0] and dispatches into `apply_known_function`, collapsing multiple positionals into a tuple-string for `Reshape`/`Permute`/`Transpose`/`Tile`/`BroadcastTo`. `analyze_layer_shapes` walks free calls + method calls in source order and propagates shapes through them.
+`shape_of_call` evaluates `var = receiver.method(args)` in the recursive evaluator. `classify_method_call` maps the method name to a `KnownFunction`. `apply_method_call` synthesises the receiver as positional[0] and dispatches into `apply_known_function`, collapsing multiple positionals into a tuple-string for `Reshape`/`Permute`/`Transpose`/`Tile`/`BroadcastTo`. `analyze_layer_shapes` walks every assignment in source order and propagates shapes through free calls and method calls.
 
 | Method | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|

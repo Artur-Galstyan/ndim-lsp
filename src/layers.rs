@@ -7,7 +7,8 @@ use tree_sitter::Range;
 
 use crate::known_functions::apply_known_einops;
 use crate::python_ast::{
-    build_import_map, extract_call_arguments, extract_calls, extract_self_attr_calls,
+    build_import_map, class_ranges, enclosing_class_range, extract_call_arguments, extract_calls,
+    extract_self_attr_calls,
 };
 use crate::resolution::{
     ResolutionCache, bind_call_arguments, resolve_call_signature_with_node, resolve_call_target,
@@ -1118,32 +1119,9 @@ where
 }
 
 /// Resolve `self.<attr> = <layer constructor>` assignments (typically in an
-/// `__init__`) to a map of bare attribute name → `LayerKind`. Mirrors the
-/// catalog-first / disk-fallback resolution of `extract_layer_assignments_scoped`.
-/// Flat last-wins view of `extract_self_attr_layers_by_class`.
-pub fn extract_self_attr_layers<F>(
-    node: Node,
-    text: &str,
-    import_map: &HashMap<String, ImportPath>,
-    search_roots: &[PathBuf],
-    read_file: F,
-    max_depth: usize,
-    cache: Option<&ResolutionCache>,
-) -> Result<HashMap<String, LayerKind>, String>
-where
-    F: Fn(&PathBuf) -> Option<String>,
-{
-    let by_class =
-        extract_self_attr_layers_by_class(node, text, import_map, search_roots, read_file, max_depth, cache)?;
-    Ok(by_class
-        .into_iter()
-        .filter_map(|(attr, mut entries)| entries.pop().map(|e| (attr, e.kind)))
-        .collect())
-}
-
-/// Like `extract_self_attr_layers`, but each binding keeps the byte range of
-/// its enclosing `class_definition`, so `self.fc` in class A and `self.fc` in
-/// class B resolve independently at their respective call sites.
+/// `__init__`), keeping for each binding the byte range of its enclosing
+/// `class_definition`, so `self.fc` in class A and `self.fc` in class B
+/// resolve independently at their respective call sites.
 pub fn extract_self_attr_layers_by_class<F>(
     node: Node,
     text: &str,
@@ -1184,34 +1162,6 @@ where
     }
 
     Ok(layers)
-}
-
-/// Byte ranges of every `class_definition` in the tree (DFS, includes nested).
-fn class_ranges(node: Node) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        if n.kind() == "class_definition" {
-            ranges.push((n.start_byte(), n.end_byte()));
-        }
-        for i in (0..n.child_count()).rev() {
-            if let Some(c) = n.child(i as u32) {
-                stack.push(c);
-            }
-        }
-    }
-    ranges
-}
-
-/// Innermost class range containing `byte`; whole file if none (module-level
-/// `self` is malformed Python anyway, but stay permissive).
-fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> (usize, usize) {
-    classes
-        .iter()
-        .filter(|(s, e)| *s <= byte && byte < *e)
-        .min_by_key(|(s, e)| e - s)
-        .copied()
-        .unwrap_or((0, usize::MAX))
 }
 
 pub fn extract_layer_applications(

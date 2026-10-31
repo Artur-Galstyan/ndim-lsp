@@ -10,8 +10,10 @@ Current validation baseline
 Verified after the JAX 0.11.1 compatibility audit, on `9f7b734` plus uncommitted
 work (`ndim-lsp` 0.1.1). Update this baseline after the commit:
 
-- `cargo test --quiet` passes: 1,839 tests pass and two benchmarks are ignored
-  (1,817 library/integration tests plus 22 LSP-server tests).
+- `cargo test --quiet` passes: 1,806 tests pass and four are ignored
+  (1,784 library/integration tests plus 22 LSP-server tests; the ignored
+  tests are the two timing harnesses below plus the two `lsp_stress` tests).
+  The known-function tests live in `src/known_functions/*_tests.rs`.
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
@@ -65,6 +67,86 @@ makes the whole call unknown. `block` with a tuple literal is unknown (NumPy
 and JAX reject it); einops `rearrange`/`reduce`/`repeat` with a tuple of
 tensors are unknown. `einops.pack` reads raw arguments and handles tuples.
 
+End-to-end LSP stress benchmark
+-------------------------------
+
+`bench/generate_stress.py` writes `bench/stress/` deterministically (fixed seed):
+a 21,038-line `stress_main.py`, three imported helper modules, and a 500-line
+`paste_block.txt`. Regenerate with `python3 bench/generate_stress.py`.
+`tests/lsp_stress.rs` spawns the built `ndim-lsp` binary, talks JSON-RPC over
+stdio, and runs about 35 scenarios (including `typing_plain` and
+`typing_with_inlay_requests`) (open, edits at line start/middle/end,
+50-change burst, 500-line paste and delete, inserted errors, helper-file edits,
+hover, definition, full inlay requests).
+
+Markers in the generated Python define the expected result and come from
+operation semantics, never from analyzer output:
+`# expected-error:`, `# expected-shape: a=[b, 4]`, `# stress-site: <name>`.
+
+Both tests are `#[ignore]`:
+
+```sh
+NDIM_STRESS_RUNS=3 NDIM_BENCH_OUT=/tmp/bench.json cargo test --release --test lsp_stress lsp_stress_benchmark -- --ignored --nocapture
+NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_dump -- --ignored --nocapture
+```
+
+- `NDIM_STRESS_RUNS` (default 5) sets the runs per scenario.
+- `NDIM_BENCH_OUT` writes the JSON result. `NDIM_GOLDEN_OUT` writes the golden dump.
+- Latency is total = debounce (150 ms, `did_change` only) + server compute (from
+  the server's `analysis: total=Nms` log) + other (transport and scheduling).
+  Peak RSS is sampled with `ps` every 25 ms, so it is a lower bound.
+
+Golden gate for refactors: `golden_dump` writes every diagnostic and inlay hint
+of the stress project. Dump before and after a change, then `cmp` the two files.
+A cleanup must give a byte-identical dump. Do not fix analyzer defects inside a
+cleanup, because the fix changes the dump.
+
+`lsp_stress_benchmark` FAILS ON PURPOSE. It asserts the expected markers and
+the scenario invariants, and the analyzer still has open defects. The current
+failure set is 524 marker failures and 3 scenario failures. Do not loosen the
+test to make it pass. The test passes only when the open targets below are fixed.
+When a change must keep this set unchanged (a cleanup), compare the failure
+list, not only the count.
+
+Baseline (9f7b734 plus uncommitted work, release, 10 CPUs, macOS, 5 runs, p50):
+
+- One edit costs about 650 ms: 150 ms debounce plus about 490 ms server compute
+  (full re-analysis of the 21,038-line file) plus about 11 ms other.
+- Compute p50 is 489-515 ms for every edit scenario. Total p50 is 650-677 ms.
+- `cold_open_first_diagnostics`: 728 ms compute, 734 ms total.
+- `inlay_full_cached` 8.7 ms, `inlay_full_first` 10.7 ms, `hover` 0.3 ms,
+  `goto_definition` 0.2 ms.
+- Peak RSS 161.5 MB (52.4 MB after open). 22 diagnostics, 14,264 inlay hints.
+- Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
+- Results are in `/tmp/ndim-bench-baseline.json` (5 runs) and
+  `/tmp/ndim-run-C.json` (2 runs). These are local files, not in the repo.
+
+Open targets found by the benchmark (all unfixed, listed so that they stay
+visible):
+
+1. Inherited layer lost with a same-named self attribute: 520 missing-shape
+   markers (`self.l#`, `self.act#`, `self.fc#`, `self.norm`, `self.proj`,
+   `self.qkv`, `F.gelu`). When an unrelated class assigns the same `self.<attr>`,
+   a subclass call to the attribute it inherits from its base class gets no
+   shape: the lone-binding fallback in `self_attr_layer_at` no longer applies.
+2. `torch.zeros` varargs: 4 wrong-shape markers.
+3. Burst debounce: a 50-change burst gives 12 publications and 12 full analyses;
+   only the last version should count (scenario `burst_50_changes`).
+4. Inlay requests bypass the debounce: 12 keystrokes 100 ms apart, each
+   followed by an inlay request, cause 12 full analyses and 12 publications.
+   Without inlay requests the same typing causes 1 (scenario
+   `typing_with_inlay_requests`).
+5. Stale cross-file state after save: the running server keeps the old helper
+   (`: [cb, ck]`), a fresh server reads the new one (`: [ck, cb]`). The server
+   has no `did_save` handler (scenario `helper_saved_to_disk`).
+
+Failure breakdown: 40 `F.gelu`, 140 `self.act#`, 80 `self.fc#`, 140 `self.l#`,
+40 `self.norm`, 40 `self.proj`, 40 `self.qkv` (all missing-shape), 4 `torch.zeros`
+(wrong-shape). Scenario failures: `burst_50_changes` (intermediate-publications),
+`typing_with_inlay_requests` (debounce-bypassed), and `helper_saved_to_disk`
+(oracle-mismatch). `/tmp/ndim-bench-baseline.json` predates the typing scenarios
+and lists only the first and the last. `/tmp/ndim-run-C.json` lists all three.
+
 Rule for agents working on this repo
 ------------------------------------
 
@@ -92,7 +174,6 @@ Current file layout
   - Important types:
     - `ImportPath`
     - `CallInfo`
-    - `MethodCallInfo`
     - `ResolvedTarget`
     - `ResolvedModuleTarget`
     - `PythonSymbol`
@@ -132,7 +213,6 @@ Current file layout
       source ranges
     - `find_top_level_symbol`
     - `extract_callable_signature`
-    - `extract_method_calls`
     - `extract_self_attr_calls` — `self.<attr> = call(...)` assignments
     - `extract_self_attr_aliases` — `self.<attr> = <ident>` → `{attr -> ident}`
 
@@ -159,7 +239,9 @@ Current file layout
     - `apply_known_function`
     - `classify_method_call`
     - `apply_method_call`
-  - This module contains the largest built-in function test matrix.
+  - The largest built-in function test matrix is in three `#[cfg(test)]`
+    submodules: `src/known_functions/known_function_tests.rs`,
+    `known_function_shape_rule_tests.rs`, and `method_call_tests.rs`.
 
 - `src/layers.rs`
   - Deep-learning layer handling.
@@ -172,7 +254,6 @@ Current file layout
       carrying its enclosing class byte range so same-named attrs in different
       classes don't collide. Lookup goes through `ShapeCtx::self_attr_layer_at`
       (innermost class containing the call byte; lone-binding fallback).
-      `extract_self_attr_layers` is an unused flat last-wins public wrapper.
     - `apply_layer_application`
     - `apply_layer_applications`
 
@@ -220,6 +301,16 @@ Current file layout
     plus deliberate `# expected-error:` blocks). Consumed by the ignored
     `bench_large_file` test in `src/integration_tests.rs`.
   - `jax_compat/` holds `cases.json`, `check.py`, `audit.py`, and its README.
+  - `generate_stress.py` emits `stress/`, the end-to-end LSP stress project
+    (see "End-to-end LSP stress benchmark" below).
+  - `stress/` holds `stress_main.py` (21,038 lines, generated), the imported
+    helper modules `stress_common.py`, `stress_jax.py`, and `stress_torch.py`,
+    and `paste_block.txt` (500-line paste payload).
+
+- `tests/lsp_stress.rs`
+  - Integration test that spawns the built `ndim-lsp` binary and talks
+    JSON-RPC over stdio against `bench/stress/`. Holds the two ignored tests
+    `lsp_stress_benchmark` and `golden_dump`.
 
 - `README.md`
   - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
