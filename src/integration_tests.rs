@@ -9786,3 +9786,1270 @@ def f(a: Float[Array, \"3 4\"]):
         assert_eq!(analysis.errors.len(), 2, "{:?}", analysis.errors);
     }
 }
+
+#[cfg(test)]
+mod tuple_literal_unpack_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn hint(analysis: &LayerShapeAnalysis, line: u32, name: &str) -> Option<Vec<String>> {
+        analysis
+            .assignment_shapes
+            .iter()
+            .find(|r| r.line == line && r.name == name)
+            .map(|r| r.shape.clone())
+    }
+
+    const HEAD: &str = "import jax.numpy as jnp\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"5\"], z: Float[Array, \"6\"], w: Float[Array, \"7\"]):\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEAD}{body}"))
+    }
+
+    #[test]
+    fn reshape_with_shape_unpack_product_names_no_internal_symbol() {
+        let code = "import torch\ndef f(x: Float[Array, \"b s c\"]):\n    a, b, c = x.shape\n    n2 = x.reshape(a * b, c)\n    n3 = torch.reshape(x, (a * b, c))\n    n4 = x.view(a * b, -1)\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        for r in &a.assignment_shapes {
+            for d in &r.shape {
+                assert!(!d.contains("__"), "{} -> {:?}", r.name, r.shape);
+            }
+        }
+        assert_eq!(hint(&a, 3, "n2"), Some(shape(&["b*s", "c"])));
+        assert_eq!(hint(&a, 4, "n3"), Some(shape(&["b*s", "c"])));
+        assert_eq!(hint(&a, 5, "n4"), None);
+    }
+
+    #[test]
+    fn unpacked_shape_names_stand_for_their_dims() {
+        let a = analyze("def f(x: Float[Array, \"b s\"], w: Float[Array, \"b s\"]):\n    a, b = x.shape\n    y = x.reshape(a, b)\n    z = y + w\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 2, "y"), Some(shape(&["b", "s"])));
+    }
+
+    #[test]
+    fn rebound_shape_name_stops_standing_for_a_dim() {
+        let a = analyze("import torch\ndef f(x: Float[Array, \"b s\"]):\n    a, b = x.shape\n    a = 7\n    y = x.reshape(a * b, 2)\n");
+        assert_eq!(hint(&a, 4, "y"), None);
+    }
+
+    #[test]
+    fn error_messages_show_source_text_for_inline_operands() {
+        let code = "import jax.numpy as jnp\nfrom einops import rearrange\nimport torch\ndef f(x: Float[Array, \"b s c\"], z: Float[Array, \"3 4\"]):\n    e1 = rearrange(jnp.exp(x), \"a b -> b a\")\n    e2 = torch.exp(z).permute(0, 1, 2)\n";
+        let a = analyze(code);
+        assert_eq!(a.errors.len(), 2, "{:?}", a.errors);
+        for e in &a.errors {
+            assert!(!e.message.contains("__"), "{}", e.message);
+        }
+        assert!(a.errors.iter().any(|e| e.message.contains("for 'jnp.exp(x)'")), "{:?}", a.errors);
+        assert!(a.errors.iter().any(|e| e.message.contains("transpose of 'torch.exp(z)'")), "{:?}", a.errors);
+    }
+
+    #[test]
+    fn plain_names_bind_elementwise() {
+        let a = run("    a, b = x, y\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["5"])));
+        assert_eq!(hint(&a, 2, "a"), Some(shape(&["3", "4"])));
+        assert_eq!(hint(&a, 2, "b"), Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn bracketed_forms_bind_elementwise() {
+        let a = run("    a, b = (x, y)\n    c, d = [x, y]\n    (e, g) = (y, x)\n    [h, i] = [y, x]\n    j, = x,\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "d"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "e"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "g"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "h"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "i"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "j"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn swap_reads_right_side_before_any_write() {
+        let a = run("    a, b = x, y\n    a, b = b, a\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 3, "a"), Some(shape(&["5"])));
+        assert_eq!(hint(&a, 3, "b"), Some(shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn rotation_of_three_names() {
+        let a = run("    a, b, c = x, y, z\n    a, b, c = b, c, a\n");
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["6"])));
+        assert_eq!(find_shape(&a, "c"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn swap_in_a_loop_is_unknown_after_the_loop() {
+        let a = run("    for i in range(2):\n        x, y = y, x\n    q = x + jnp.zeros(3)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "x"), None);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn swap_through_a_temp_in_a_loop_is_unknown_after_the_loop() {
+        let a = run("    for i in range(2):\n        t = x\n        x = y\n        y = t\n    q = x + jnp.zeros(3)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "x"), None);
+    }
+
+    #[test]
+    fn swap_in_a_while_loop_is_unknown_after_the_loop() {
+        let a = run("    while cond():\n        x, y = y, x\n");
+        assert_eq!(find_shape(&a, "x"), None);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn loop_carried_name_with_a_stable_shape_stays_known() {
+        let a = run("    for i in range(2):\n        x = jnp.exp(x)\n        t = x\n");
+        assert_eq!(find_shape(&a, "x"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "t"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn name_written_from_a_changing_loop_name_is_unknown_after_the_loop() {
+        let a = run("    for i in range(2):\n        t = x\n        x = y\n        y = t\n");
+        assert_eq!(find_shape(&a, "t"), None);
+    }
+
+    #[test]
+    fn unrelated_unpack_in_a_loop_keeps_its_shape() {
+        let a = run("    for i in range(2):\n        a, b = x, y\n");
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn swap_in_a_loop_inside_a_called_helper_is_unknown() {
+        let code = "def helper(a, b):\n    for i in range(2):\n        a, b = b, a\n    return a\ndef outer(x: Float[Array, \"3 4\"], y: Float[Array, \"5\"]):\n    r = helper(x, y)\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "r"), None);
+    }
+
+    #[test]
+    fn duplicate_target_keeps_the_last_element() {
+        let a = run("    a, a = x, y\n");
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["5"])));
+    }
+
+    #[test]
+    fn starred_target_takes_the_middle_and_is_never_a_tensor() {
+        let a = run("    rest = x\n    a, *rest, c = x, y, z, w\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "c"), Some(&shape(&["7"])));
+        assert_eq!(find_shape(&a, "rest"), None);
+    }
+
+    #[test]
+    fn starred_first_and_last_positions() {
+        let a = run("    *init, last = x, y, z\n    first, *tail = x, y, z\n");
+        assert_eq!(find_shape(&a, "init"), None);
+        assert_eq!(find_shape(&a, "last"), Some(&shape(&["6"])));
+        assert_eq!(find_shape(&a, "first"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "tail"), None);
+    }
+
+    #[test]
+    fn starred_target_may_be_empty() {
+        let a = run("    a, *mid, b = x, y\n");
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&a, "mid"), None);
+    }
+
+    #[test]
+    fn too_few_elements_for_a_starred_pattern_is_unknown() {
+        let a = run("    a = x\n    b = y\n    a, b, *m, c = x, y\n");
+        assert_eq!(find_shape(&a, "a"), None);
+        assert_eq!(find_shape(&a, "b"), None);
+        assert_eq!(find_shape(&a, "c"), None);
+    }
+
+    #[test]
+    fn differing_lengths_are_unknown_and_evict_stale_bindings() {
+        let a = run("    p = x\n    q = y\n    p, q = x, y, z\n    r = x\n    s = y\n    t = z\n    r, s, t = x, y\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        for name in ["p", "q", "r", "s", "t"] {
+            assert_eq!(find_shape(&a, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_element_leaves_only_its_own_target_unknown() {
+        let a = run("    b = y\n    a, b = x, mystery(y)\n    c, d = mystery(x), z\n");
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "b"), None);
+        assert_eq!(find_shape(&a, "c"), None);
+        assert_eq!(find_shape(&a, "d"), Some(&shape(&["6"])));
+    }
+
+    #[test]
+    fn integer_literals_stay_unknown() {
+        let a = run("    n, m = 3, 4\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "n"), None);
+        assert_eq!(find_shape(&a, "m"), None);
+    }
+
+    #[test]
+    fn element_expressions_are_evaluated() {
+        let a = run("    a, b = x.T, y * 2.0\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["4", "3"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["5"])));
+    }
+
+    #[test]
+    fn element_error_is_reported_once_and_named_after_its_target() {
+        let a = run("    a, b = x @ x, z\n");
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(a.errors[0].variable, "a");
+        assert_eq!(find_shape(&a, "a"), None);
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["6"])));
+    }
+
+    #[test]
+    fn splat_on_the_right_is_unknown() {
+        let a = run("    a = x\n    b = y\n    a, b = *x, y\n");
+        assert_eq!(find_shape(&a, "a"), None);
+        assert_eq!(find_shape(&a, "b"), None);
+    }
+
+    #[test]
+    fn nested_target_with_a_tuple_element() {
+        let a = run("    (a, b), c = (x, x), z\n    (d, e), g = (x, y), z\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "b"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "c"), Some(&shape(&["6"])));
+        assert_eq!(find_shape(&a, "d"), None);
+        assert_eq!(find_shape(&a, "e"), None);
+        assert_eq!(find_shape(&a, "g"), Some(&shape(&["6"])));
+    }
+
+    #[test]
+    fn nested_target_with_a_tensor_element_is_unknown() {
+        let a = run("    (a, b), c = x, z\n");
+        assert_eq!(find_shape(&a, "a"), None);
+        assert_eq!(find_shape(&a, "b"), None);
+        assert_eq!(find_shape(&a, "c"), Some(&shape(&["6"])));
+    }
+
+    #[test]
+    fn coverage_counts_a_literal_unpack_as_shaped() {
+        let code = format!("{HEAD}    a, b = x, y\n    c, d = b, a\n");
+        let tree = parse(&code);
+        let report = analyze_coverage(tree.root_node(), &code, &[], |_| None, 5, None).unwrap();
+        assert!(report.dark.is_empty(), "{:?}", report.dark);
+        assert_eq!(report.total, 2);
+        assert_eq!(report.shaped, 2);
+    }
+
+    #[test]
+    fn unpack_inside_a_nested_scope_uses_that_scope() {
+        let code = "def outer(x: Float[Array, \"3 4\"], y: Float[Array, \"5\"]):\n    def swap(a, b):\n        a, b = b, a\n        return a\n    r = swap(x, y)\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "r"), Some(&shape(&["5"])));
+    }
+}
+
+#[cfg(test)]
+mod closure_free_variable_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let tree = parse(code);
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEAD: &str = "import jax\nimport jax.numpy as jnp\ndef outer(x: Float[Array, \"n 4\"], w: Float[Array, \"4 6\"], v: Float[Array, \"4 5\"]):\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEAD}{body}"))
+    }
+
+    #[test]
+    fn closure_reads_enclosing_parameter() {
+        let a = run("    def level1(t):\n        u = t @ w\n        return u\n    y = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+        assert_eq!(find_shape(&a, "u"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn closure_reads_enclosing_local() {
+        let a = run("    k = jnp.zeros((4, 8))\n    def level1(t):\n        return t @ k\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn variable_is_read_at_call_time_not_definition_time() {
+        let a = run("    def level1(t):\n        return t @ w\n    w = jnp.zeros((4, 7))\n    y = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "7"])));
+    }
+
+    #[test]
+    fn each_call_sees_the_variable_as_it_is_then() {
+        let a = run("    def level1(t):\n        return t @ w\n    y1 = level1(x)\n    w = jnp.zeros((4, 7))\n    y2 = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y1"), Some(&shape(&["n", "6"])));
+        assert_eq!(find_shape(&a, "y2"), Some(&shape(&["n", "7"])));
+    }
+
+    #[test]
+    fn reassignment_to_unknown_does_not_leave_a_stale_shape() {
+        let a = run("    def level1(t):\n        return t @ w\n    w = mystery(w)\n    y = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn call_before_the_variable_exists_is_unknown() {
+        let a = run("    def level1(t):\n        return t @ late\n    y0 = level1(x)\n    late = jnp.zeros((4, 5))\n    y1 = level1(x)\n");
+        assert_eq!(find_shape(&a, "y0"), None);
+        assert_eq!(find_shape(&a, "y1"), Some(&shape(&["n", "5"])));
+    }
+
+    #[test]
+    fn definition_time_value_never_reaches_a_deferred_call() {
+        let a = run("    def f(t):\n        return t @ w\n    def g(t):\n        return f(t)\n    w = jnp.zeros((4, 9))\n    y = g(x)\n    w = jnp.zeros((4, 3))\n    y2 = g(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "9"])));
+        assert_eq!(find_shape(&a, "y2"), Some(&shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn annotated_closure_that_calls_a_closure_is_evaluated_at_its_own_call() {
+        let a = run("    def f(t):\n        return t @ w\n    def g(t: Float[Array, \"n 4\"]):\n        r = f(t)\n        return r\n    w = jnp.zeros((4, 9))\n    y = g(x)\n    w = jnp.zeros((4, 3))\n    y2 = g(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "9"])));
+        assert_eq!(find_shape(&a, "y2"), Some(&shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn local_assigned_later_shadows_the_enclosing_name() {
+        let a = run("    def level1(t):\n        u = t @ w\n        w = t.sum(axis=0)\n        return u\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn local_binding_wins_over_enclosing_name() {
+        let a = run("    def level1(t):\n        w = t.sum(axis=0)\n        return w\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["4"])));
+    }
+
+    #[test]
+    fn parameter_shadows_the_enclosing_name() {
+        let a = run("    def level1(t, w):\n        return t @ w\n    y = level1(x, v)\n    y_missing = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "5"])));
+        assert_eq!(find_shape(&a, "y_missing"), None);
+    }
+
+    #[test]
+    fn nonlocal_read_resolves_like_a_free_variable() {
+        let a = run("    def level1(t):\n        nonlocal w\n        return t @ w\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn nonlocal_rebinding_makes_the_enclosing_variable_unknown() {
+        let a = run("    def bump(t):\n        nonlocal w\n        w = w * 2.0\n        return t\n    z = bump(x)\n    y = x @ w\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn nonlocal_rebinding_hides_the_variable_from_sibling_closures() {
+        let a = run("    def bump(t):\n        nonlocal w\n        w = t\n        return t\n    def use(t):\n        return t @ w\n    bump(x)\n    y = use(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn nonlocal_assigned_name_is_usable_after_the_assignment() {
+        let a = run("    def reset(t):\n        nonlocal w\n        w = t\n        return w @ t.T\n    z = reset(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["n", "n"])));
+    }
+
+    #[test]
+    fn call_outside_the_enclosing_function_does_not_see_its_variables() {
+        let code = "def a(x: Float[Array, \"n 4\"], w: Float[Array, \"4 6\"]):\n    def helper(t):\n        return t @ w\n    return helper(x)\n\ndef b(x: Float[Array, \"m 4\"]):\n    r = helper(x)\n";
+        let an = analyze(code);
+        assert_eq!(find_shape(&an, "r"), None);
+    }
+
+    #[test]
+    fn comprehension_variable_does_not_shadow_the_enclosing_name() {
+        let a = run("    def level1(t, ws):\n        sq = [w for w in ws]\n        return t @ w\n    y = level1(x, v)\n");
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn comprehension_body_stays_unknown() {
+        let a = run("    def level1(ts):\n        outs = [t @ w for t in ts]\n        return outs\n    y = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+        assert_eq!(find_shape(&a, "outs"), None);
+    }
+
+    #[test]
+    fn fully_annotated_closure_reads_enclosing_variable() {
+        let a = run("    def level1(t: Float[Array, \"n 4\"]):\n        u = t @ w\n        return u\n    y1 = level1(x)\n    w = jnp.zeros((4, 7))\n    y2 = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y1"), Some(&shape(&["n", "6"])));
+        assert_eq!(find_shape(&a, "y2"), Some(&shape(&["n", "7"])));
+    }
+
+    #[test]
+    fn fully_annotated_closure_error_is_not_duplicated() {
+        let a = run("    def level1(t: Float[Array, \"n 4\"], q: Float[Array, \"5 6\"]):\n        bad = t @ q\n        u = t @ w\n        return u\n    p = jnp.zeros((5, 6))\n    y = level1(x, p)\n");
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn mismatch_with_the_call_time_value_is_a_true_error() {
+        let a = run("    def level1(t):\n        return t @ w\n    w = jnp.zeros((5, 6))\n    y = level1(x)\n");
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn two_level_closure_reaches_the_outermost_variable() {
+        let a = run("    def level1(t):\n        def level2(s):\n            return s @ w\n        return level2(t)\n    y = level1(x)\n");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn scan_body_reads_enclosing_variable() {
+        let code = "import jax\nimport jax.numpy as jnp\ndef outer(xs: Float[Array, \"t b d\"], W: Float[Array, \"d d\"], h0: Float[Array, \"b d\"]):\n    def step(c, x):\n        h = jnp.tanh(c @ W + x)\n        return h, h\n    hT, ys = jax.lax.scan(step, h0, xs)\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "ys"), Some(&shape(&["t", "b", "d"])));
+    }
+
+    #[test]
+    fn same_named_closures_in_different_functions_resolve_to_their_own() {
+        let code = "def a(x: Float[Array, \"n 4\"], w: Float[Array, \"4 6\"]):\n    def level1(t):\n        return t @ w\n    ya = level1(x)\n\ndef b(x: Float[Array, \"m 4\"]):\n    def level1(t):\n        return t * 2.0\n    yb = level1(x)\n";
+        let an = analyze(code);
+        assert_eq!(find_shape(&an, "ya"), Some(&shape(&["n", "6"])));
+        assert_eq!(find_shape(&an, "yb"), Some(&shape(&["m", "4"])));
+    }
+
+    #[test]
+    fn every_binding_form_makes_the_name_local() {
+        let forms = [
+            "with ctx() as w:\n            pass",
+            "for w in range(3):\n            pass",
+            "try:\n            pass\n        except Exception as w:\n            pass",
+            "import numpy as w",
+            "from numpy import ones as w",
+            "(w := mystery(t))",
+            "def w():\n            pass",
+            "class w:\n            pass",
+            "w: int",
+            "a, (b, *w) = mystery(t)",
+            "match mystery(t):\n                case [w, _]:\n                    pass",
+        ];
+        for form in forms {
+            let body = format!(
+                "    def level1(t):\n        if mystery(t):\n            {form}\n        return t @ w\n    y = level1(x)\n"
+            );
+            let a = run(&body);
+            assert_eq!(find_shape(&a, "y"), None, "{form}");
+        }
+        let a = run("    def level1(t):\n        if mystery(t):\n            pass\n        return t @ w\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "6"])));
+    }
+
+    #[test]
+    fn global_name_is_not_the_enclosing_variable() {
+        let a = run("    def level1(t):\n        global w\n        return t @ w\n    y = level1(x)\n");
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn method_closure_through_a_class_does_not_see_function_locals() {
+        let code = "def outer(x: Float[Array, \"n 4\"], w: Float[Array, \"4 6\"]):\n    class C:\n        def m(self, t):\n            return t @ w\n        def n(self, t):\n            r = self.m(t)\n            return r\n    return C\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "r"), None);
+    }
+}
+
+#[cfg(test)]
+mod user_submodule_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const EQX: &str = "import jax\nimport equinox as eqx\n";
+    const TORCH: &str = "import torch\nimport torch.nn as nn\n";
+    const FLAX: &str = "import flax.linen as nn\n";
+
+    fn eqx_block(call_def: &str, ret: &str) -> String {
+        format!(
+            "class Block(eqx.Module):\n    w: eqx.nn.Linear\n    def __init__(self, key):\n        self.w = eqx.nn.Linear(4, 8, key=key)\n    {call_def}\n        h = jax.vmap(self.w)(x)\n        {ret}\n"
+        )
+    }
+
+    fn eqx_model(call: &str) -> String {
+        format!(
+            "class Model(eqx.Module):\n    blk: Block\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n 4\"]):\n        {call}\n"
+        )
+    }
+
+    fn eqx_pair(call_def: &str, ret: &str, call: &str) -> LayerShapeAnalysis {
+        let code = format!("{EQX}{}{}", eqx_block(call_def, ret), eqx_model(call));
+        analyze(&code)
+    }
+
+    #[test]
+    fn annotated_call_with_expression_return() {
+        let a = eqx_pair(
+            "def __call__(self, x: Float[Array, \"s 4\"]):",
+            "return jax.nn.gelu(h)",
+            "out = self.blk(x)",
+        );
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "out"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn unannotated_call_is_seeded_from_the_argument() {
+        let a = eqx_pair("def __call__(self, x):", "return jax.nn.gelu(h)", "out = self.blk(x)");
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "out"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn return_annotation_is_bound_to_the_argument_dims() {
+        let a = eqx_pair(
+            "def __call__(self, x: Float[Array, \"s 4\"]) -> Float[Array, \"s 8\"]:",
+            "return h",
+            "out = self.blk(x)",
+        );
+        assert_eq!(find_shape(&a, "out"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn expression_argument_is_a_valid_call_argument() {
+        let a = eqx_pair(
+            "def __call__(self, x):",
+            "return h",
+            "out = self.blk(x + x)",
+        );
+        assert_eq!(find_shape(&a, "out"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn annotated_callee_hover_keeps_its_own_dims() {
+        let a = eqx_pair(
+            "def __call__(self, x: Float[Array, \"s 4\"]):",
+            "return h",
+            "out = self.blk(x)",
+        );
+        assert_eq!(find_shape(&a, "h"), Some(&shape(&["s", "8"])));
+        assert!(a.assignment_shapes.iter().all(|r| r.name != "h" || r.shape == shape(&["s", "8"])));
+    }
+
+    #[test]
+    fn argument_rank_mismatch_is_a_true_error() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"a b 4\"]):\n        out = self.blk(x)\n",
+            eqx_block("def __call__(self, x: Float[Array, \"s 4\"]):", "return h")
+        );
+        let a = analyze(&code);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "out"), None);
+    }
+
+    #[test]
+    fn named_argument_dim_against_an_integer_annotation_is_not_an_error() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n d\"]):\n        out = self.blk(x)\n",
+            eqx_block("def __call__(self, x: Float[Array, \"s 4\"]):", "return h")
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+    }
+
+    #[test]
+    fn variadic_annotation_is_not_a_rank_error() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n m 4\"]):\n        out = self.blk(x)\n",
+            eqx_block("def __call__(self, x: Float[Array, \"... 4\"]):", "return h")
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+    }
+
+    #[test]
+    fn integer_mismatch_against_the_annotation_is_a_true_error() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n 5\"]):\n        out = self.blk(x)\n",
+            eqx_block("def __call__(self, x: Float[Array, \"s 4\"]):", "return h")
+        );
+        let a = analyze(&code);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    const DIM_BLOCK: &str = "class Block(eqx.Module):\n    def __init__(self, dim, key):\n        self.lin = eqx.nn.Linear(dim, dim, key=key)\n    def __call__(self, x: Float[Array, \"dim\"]) -> Float[Array, \"dim\"]:\n        return self.lin(x)\n";
+
+    fn dim_block_call(arg: &str) -> LayerShapeAnalysis {
+        analyze(&format!(
+            "{EQX}import jax.numpy as jnp\n{DIM_BLOCK}class Net(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(8, key)\n    def __call__(self, x):\n        h = self.blk({arg})\n"
+        ))
+    }
+
+    #[test]
+    fn argument_conflicting_with_a_constructor_dim_is_unknown() {
+        let a = dim_block_call("jnp.zeros(9)");
+        assert_eq!(find_shape(&a, "h"), None);
+    }
+
+    #[test]
+    fn argument_matching_the_constructor_dim_is_known() {
+        let a = dim_block_call("jnp.zeros(8)");
+        assert_eq!(find_shape(&a, "h"), Some(&shape(&["8"])));
+    }
+
+    #[test]
+    fn two_call_sites_of_one_module_get_their_own_shapes() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n 4\"], z: Float[Array, \"m 4\"]):\n        first = self.blk(x)\n        second = self.blk(z)\n        third = self.blk(mystery)\n",
+            eqx_block("def __call__(self, x):", "return h")
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "first"), Some(&shape(&["n", "8"])));
+        assert_eq!(find_shape(&a, "second"), Some(&shape(&["m", "8"])));
+        assert_eq!(find_shape(&a, "third"), None);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+    }
+
+    #[test]
+    fn module_defined_after_its_user_is_resolved() {
+        let code = format!(
+            "{EQX}{}{}",
+            eqx_model("out = self.blk(x)"),
+            eqx_block("def __call__(self, x):", "return h")
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "out"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn torch_forward_is_the_call_target() {
+        let code = format!(
+            "{TORCH}class Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 8)\n    def forward(self, x):\n        return self.fc(x)\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Block()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+    }
+
+    const TORCH_BASE: &str = "class Base(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 8)\n    def forward(self, x):\n        return self.fc(x)\n";
+    const TORCH_NET: &str = "class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Wide()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.blk(x)\n";
+
+    #[test]
+    fn inherited_forward_is_found_through_the_mro() {
+        let code = format!("{TORCH}{TORCH_BASE}class Wide(Base):\n    pass\n{TORCH_NET}");
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+    }
+
+    #[test]
+    fn subclass_that_reassigns_a_field_of_the_base_stays_unknown() {
+        let code = format!(
+            "{TORCH}{TORCH_BASE}class Wide(Base):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 16)\n{TORCH_NET}"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn unknown_base_before_the_call_method_stays_unknown() {
+        let code = format!(
+            "{TORCH}class Wide(ExternalBase):\n    pass\n{TORCH_NET}"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn same_field_name_in_two_classes_uses_each_own_module() {
+        let code = format!(
+            "{TORCH}class P(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 8)\n    def forward(self, x):\n        return self.fc(x)\nclass Q(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 16)\n    def forward(self, x):\n        return self.fc(x)\nclass A(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = P()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        ya = self.blk(x)\nclass B(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Q()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        yb = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "ya"), Some(&shape(&["b", "8"])));
+        assert_eq!(find_shape(&a, "yb"), Some(&shape(&["b", "16"])));
+    }
+
+    #[test]
+    fn field_assigned_two_different_classes_stays_unknown() {
+        let code = format!(
+            "{TORCH}class P(nn.Module):\n    def forward(self, x):\n        return x\nclass Q(nn.Module):\n    def forward(self, x):\n        return x.T\nclass A(nn.Module):\n    def __init__(self, flag):\n        super().__init__()\n        if flag:\n            self.blk = P()\n        else:\n            self.blk = Q()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn field_with_unresolvable_value_never_falls_back_to_a_same_named_function() {
+        let code = format!(
+            "{TORCH}def blk(x):\n    return x.T\nclass A(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = make_block()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn recursive_module_terminates() {
+        let code = format!(
+            "{TORCH}class Rec(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.inner = Rec()\n    def forward(self, x):\n        return self.inner(x)\nclass Ping(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.o = Pong()\n    def forward(self, x):\n        return self.o(x)\nclass Pong(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.o = Ping()\n    def forward(self, x):\n        return self.o(x)\nclass Top(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.r = Rec()\n        self.p = Ping()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.r(x)\n        z = self.p(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+        assert_eq!(find_shape(&a, "z"), None);
+    }
+
+    #[test]
+    fn nested_modules_are_resolved_to_the_bounded_depth() {
+        let code = format!(
+            "{TORCH}class Leaf(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 8)\n    def forward(self, x):\n        return self.fc(x)\nclass Mid(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.leaf = Leaf()\n    def forward(self, x):\n        return self.leaf(x)\nclass Top(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.mid = Mid()\n    def forward(self, x: Float[Array, \"b 4\"]):\n        y = self.mid(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+    }
+
+    fn ctor_net(ctor: &str, init_sig: &str) -> String {
+        format!(
+            "{TORCH}class Block(nn.Module):\n    def __init__({init_sig}):\n        super().__init__()\n        self.dim = dim\n        self.fc = nn.Linear(dim, dim)\n    def forward(self, x):\n        return self.fc(x)\nclass Net(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.blk = {ctor}\n    def forward(self, x: Float[Array, \"b 8\"]):\n        y = self.blk(x)\n"
+        )
+    }
+
+    #[test]
+    fn constructor_argument_replaces_the_callee_parameter_name() {
+        let a = analyze(&ctor_net("Block(8)", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+        let a = analyze(&ctor_net("Block(dim=8)", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+        let a = analyze(&ctor_net("Block(d)", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "d"])));
+    }
+
+    #[test]
+    fn unbound_constructor_parameter_stays_unknown() {
+        let a = analyze(&ctor_net("Block()", "self, dim=8"));
+        assert_eq!(find_shape(&a, "y"), None);
+        let a = analyze(&ctor_net("Block(make_dim())", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn callee_name_is_not_confused_with_a_caller_dim_of_the_same_name() {
+        // The callee parameter `dim` is 8; the caller's own dim `dim` is a
+        // different quantity, so the result cannot be named by either.
+        let code = ctor_net("Block(8)", "self, dim").replace("\"b 8\"", "\"b dim\"");
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn vmapped_module_peels_and_restores_the_batch_dim() {
+        let code = format!(
+            "{EQX}class Block(eqx.Module):\n    w: eqx.nn.Linear\n    def __init__(self, key):\n        self.w = eqx.nn.Linear(4, 8, key=key)\n    def __call__(self, x):\n        return jax.nn.relu(self.w(x))\nclass Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n 4\"]):\n        y = jax.vmap(self.blk)(x)\n"
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn vmap_of_a_layer_accepts_an_expression_argument() {
+        let code = format!(
+            "{EQX}class M(eqx.Module):\n    norm: eqx.nn.LayerNorm\n    def __init__(self):\n        self.norm = eqx.nn.LayerNorm(4)\n    def __call__(self, h: Float[Array, \"s 4\"], x: Float[Array, \"s 4\"]):\n        y = jax.vmap(self.norm)(h + x)\n        z = jax.vmap(self.norm)(jax.nn.relu(h) * 2.0)\n"
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["s", "4"])));
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["s", "4"])));
+    }
+
+    #[test]
+    fn vmap_of_a_layer_reports_an_error_inside_the_expression_argument_once() {
+        let code = format!(
+            "{EQX}class M(eqx.Module):\n    norm: eqx.nn.LayerNorm\n    def __init__(self):\n        self.norm = eqx.nn.LayerNorm(4)\n    def __call__(self, h: Float[Array, \"s 4\"], x: Float[Array, \"s 5\"]):\n        y = jax.vmap(self.norm)(h + x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn vmap_of_a_function_accepts_an_expression_argument() {
+        let code = "import jax\ndef f(v: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return v\ndef g(a: Float[Array, \"n 3\"], b: Float[Array, \"n 3\"]):\n    y = jax.vmap(f)(a - b)\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn flax_inline_module_uses_its_keyword_field() {
+        let code = format!(
+            "{FLAX}class Block(nn.Module):\n    features: int\n    @nn.compact\n    def __call__(self, x):\n        return nn.Dense(self.features)(x)\nclass Net(nn.Module):\n    @nn.compact\n    def __call__(self, x: Float[Array, \"b 4\"]):\n        y = Block(features=16)(x)\n        z = Block(16)(x)\n"
+        );
+        let a = analyze(&code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "16"])));
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["b", "16"])));
+    }
+
+    #[test]
+    fn flax_positional_field_of_a_module_with_an_unknown_base_stays_unknown() {
+        let code = format!(
+            "{FLAX}class Block(ExternalBase):\n    features: int\n    @nn.compact\n    def __call__(self, x):\n        return nn.Dense(self.features)(x)\nclass Net(nn.Module):\n    @nn.compact\n    def __call__(self, x: Float[Array, \"b 4\"]):\n        y = Block(16)(x)\n        z = Block(features=16)(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["b", "16"])));
+    }
+
+    #[test]
+    fn attribute_computed_from_a_parameter_is_not_that_parameter() {
+        let code = format!(
+            "{TORCH}class Block(nn.Module):\n    def __init__(self, dim, hidden):\n        super().__init__()\n        self.hid = hidden * 2\n        self.up = nn.Linear(dim, self.hid)\n    def forward(self, x):\n        return self.up(x)\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Block(8, 32)\n    def forward(self, x: Float[Array, \"b 8\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn attribute_copied_from_a_parameter_takes_its_value() {
+        let code = format!(
+            "{TORCH}class Block(nn.Module):\n    def __init__(self, dim, hidden):\n        super().__init__()\n        self.hid = hidden\n        self.up = nn.Linear(dim, self.hid)\n    def forward(self, x):\n        return self.up(x)\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Block(8, 32)\n    def forward(self, x: Float[Array, \"b 8\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "32"])));
+    }
+
+    #[test]
+    fn flax_setup_submodule_is_resolved() {
+        let code = format!(
+            "{FLAX}class Block(nn.Module):\n    @nn.compact\n    def __call__(self, x):\n        return nn.Dense(8)(x)\nclass Net(nn.Module):\n    def setup(self):\n        self.blk = Block()\n    def __call__(self, x: Float[Array, \"b 4\"]):\n        y = self.blk(x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+    }
+
+    #[test]
+    fn star_arguments_make_the_binding_unknown() {
+        let a = analyze(&ctor_net("Block(*d, 8)", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), None);
+        let a = analyze(&ctor_net("Block(**d)", "self, dim"));
+        assert_eq!(find_shape(&a, "y"), None);
+        let a = analyze(&ctor_net("Block(8)", "self, dim").replace("self.blk(x)", "self.blk(*x)"));
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn lax_map_over_a_module_peels_the_leading_axis() {
+        let code = format!(
+            "{EQX}class Block(eqx.Module):\n    w: eqx.nn.Linear\n    def __init__(self, key):\n        self.w = eqx.nn.Linear(4, 8, key=key)\n    def __call__(self, x):\n        return self.w(x)\nclass Model(eqx.Module):\n    def __init__(self, key):\n        self.blk = Block(key)\n    def __call__(self, x: Float[Array, \"n 4\"]):\n        y = jax.lax.map(self.blk, x)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "8"])));
+    }
+
+    #[test]
+    fn vmapped_module_with_two_arguments_needs_one_batch_dim() {
+        let code = format!(
+            "{EQX}class Pair(eqx.Module):\n    def __call__(self, a: Float[Array, \"d\"], b: Float[Array, \"d\"]):\n        return a + b\nclass Model(eqx.Module):\n    def __init__(self):\n        self.p = Pair()\n    def __call__(self, x: Float[Array, \"n 4\"], y: Float[Array, \"n 4\"], z: Float[Array, \"m 4\"]):\n        ok = jax.vmap(self.p)(x, y)\n        bad = jax.vmap(self.p)(x, z)\n"
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "ok"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&a, "bad"), None);
+    }
+
+    #[test]
+    fn annotation_only_field_stays_unknown() {
+        let code = format!(
+            "{EQX}{}class Model(eqx.Module):\n    blk: Block\n    def __call__(self, x: Float[Array, \"n 4\"]):\n        out = self.blk(x)\n",
+            eqx_block("def __call__(self, x):", "return h")
+        );
+        let a = analyze(&code);
+        assert_eq!(find_shape(&a, "out"), None);
+    }
+}
+
+#[cfg(test)]
+mod scalar_operand_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEADER: &str = "import math\nimport torch\nimport jax.numpy as jnp\nimport numpy as np\nfrom jaxtyping import Float, Array\n";
+
+    /// `out = <expr>` inside a function with `ys: [t, d]` and `zs: [t]`.
+    fn out_of(setup: &str, expr: &str) -> (Option<Vec<String>>, usize) {
+        let code = format!(
+            "{HEADER}def f(ys: Float[Array, \"t d\"], zs: Float[Array, \"t\"], k, n: int):\n{setup}    out = {expr}\n"
+        );
+        let analysis = analyze(&code);
+        (find_shape(&analysis, "out").cloned(), analysis.errors.len())
+    }
+
+    #[test]
+    fn test_call_returning_a_known_scalar_keeps_the_array_shape() {
+        for expr in [
+            "ys / jnp.sqrt(2.0)",
+            "jnp.sqrt(2.0) * ys",
+            "ys / np.sqrt(2)",
+            "ys - jnp.exp(-1.0)",
+            "ys / jnp.sqrt(2.0 * math.pi)",
+            "ys / jnp.sqrt(jnp.sqrt(2.0))",
+            "ys / (2 * jnp.sqrt(2.0))",
+        ] {
+            assert_eq!(out_of("", expr), (Some(shape(&["t", "d"])), 0), "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_python_scalar_calls_and_constants_keep_the_array_shape() {
+        for expr in [
+            "ys / math.sqrt(2.0)",
+            "ys / math.sqrt(k)",
+            "ys * math.pi",
+            "ys / math.sqrt(n * 2)",
+            "ys / (2 * math.sqrt(k))",
+            "ys * (1.0 / math.sqrt(k))",
+            "ys / float(k)",
+            "ys / int(k)",
+            "ys / len(zs)",
+            "ys / ys.shape[-1]",
+            "ys / zs.shape[0]",
+            "ys + (-math.e)",
+            "ys / jnp.sqrt(ys.shape[-1])",
+        ] {
+            assert_eq!(out_of("", expr), (Some(shape(&["t", "d"])), 0), "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_names_bound_only_to_scalars_keep_the_array_shape() {
+        for setup in [
+            "    e = 1e-5\n",
+            "    e: float = 1e-5\n",
+            "    e = math.sqrt(k)\n",
+            "    e = 2.0 * math.pi\n",
+            "    d = ys.shape[-1]\n    e = 1.0 / math.sqrt(d)\n",
+            "    e = 1.0\n    e = e * 2\n",
+            "    e = 1.0\n    e *= 2\n",
+        ] {
+            assert_eq!(
+                out_of(setup, "ys / e"),
+                (Some(shape(&["t", "d"])), 0),
+                "{setup}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scalar_operand_still_reports_real_mismatches() {
+        let (out, errors) = out_of("", "(ys / math.sqrt(2.0)) * zs");
+        assert_eq!((out, errors), (None, 1));
+        let (out, errors) = out_of("", "(ys / jnp.sqrt(2.0)) @ ys");
+        assert_eq!((out, errors), (None, 1));
+    }
+
+    #[test]
+    fn test_unknown_operands_are_never_treated_as_scalars() {
+        for expr in [
+            "ys / k",
+            "ys / mystery",
+            "ys / helper(zs)",
+            "ys / zs.sum_all()",
+            "ys / ys.shape",
+            "ys / ys.shape[1:]",
+            "ys / torch.sqrt(2.0)",
+            "ys / jnp.sqrt(k)",
+            "ys / jnp.maximum(2.0, k)",
+            "ys / math.prod(zs)",
+            "ys / max(k, 1)",
+            "ys / abs(k)",
+            "ys / (2 * k)",
+            "ys / jnp.sqrt(2.0, where=zs)",
+            "ys / jnp.sqrt(x=2.0)",
+        ] {
+            assert_eq!(out_of("", expr), (None, 0), "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_names_with_a_non_scalar_binding_stay_unknown() {
+        for setup in [
+            "    e = 1.0\n    e = helper(zs)\n",
+            "    e = 1.0\n    for e in helper(zs):\n        pass\n",
+            "    e = 1.0\n    e += helper(zs)\n",
+            "    e, g = 1.0, helper(zs)\n",
+            "    e = 1.0\n    with open('x') as e:\n        pass\n",
+            "    e = 1.0\n    if (e := helper(zs)) is None:\n        pass\n",
+            "    e = 1.0\n    def e():\n        pass\n",
+            "    e = 1.0\n    import e\n",
+            "    e = 1.0\n    try:\n        pass\n    except ValueError as e:\n        pass\n",
+            "    e = 1.0\n    match zs:\n        case [e, *_]:\n            pass\n",
+            "    e = 1.0\n    del e\n",
+            "    e = mystery\n",
+            "    e = k\n",
+            "    e: float\n",
+            "    global e\n    e = 1.0\n",
+            "    e = 1.0\n    def bump():\n        nonlocal e\n        e = helper(zs)\n    bump()\n",
+        ] {
+            assert_eq!(out_of(setup, "ys / e"), (None, 0), "{setup}");
+        }
+    }
+
+    #[test]
+    fn test_module_constants_are_scalars_only_when_bound_once() {
+        let prefix = format!("{HEADER}EPS = 1e-5\nSCALE = 2.0\n");
+        let analyze_with = |tail: &str, body: &str| {
+            let code = format!(
+                "{prefix}{tail}def f(ys: Float[Array, \"t d\"]):\n{body}    out = ys / EPS\n"
+            );
+            find_shape(&analyze(&code), "out").cloned()
+        };
+        assert_eq!(analyze_with("", ""), Some(shape(&["t", "d"])));
+        assert_eq!(analyze_with("SCALE = 3.0\nEPS = 2 * SCALE\n", ""), Some(shape(&["t", "d"])));
+        assert_eq!(analyze_with("EPS = mystery()\n", ""), None);
+        assert_eq!(analyze_with("", "    global EPS\n"), None);
+        assert_eq!(analyze_with("", "    EPS = mystery(ys)\n"), None);
+        assert_eq!(analyze_with("from other import *\n", ""), None);
+        assert_eq!(analyze_with("def g():\n    global EPS\n    EPS = mystery()\n", ""), None);
+    }
+
+    #[test]
+    fn test_scalar_calls_bind_a_rank_0_shape() {
+        let code = format!("{HEADER}def f():\n    a = jnp.sqrt(2.0)\n    b = np.exp(1)\n    c = jnp.maximum(2.0, 3.0)\n    d = jnp.sqrt(torch)\n");
+        let analysis = analyze(&code);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "d"), None);
+    }
+
+    #[test]
+    fn test_torch_elementwise_functions_reject_python_scalars() {
+        let code = format!("{HEADER}def f():\n    a = torch.sqrt(2.0)\n    b = torch.add(1.0, 2.0)\n");
+        let analysis = analyze(&code);
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+    }
+
+    #[test]
+    fn test_shadowed_builtins_are_not_scalar_calls() {
+        let code = format!(
+            "{HEADER}def len(x):\n    return x\n\ndef f(ys: Float[Array, \"t d\"], zs: Float[Array, \"t\"]):\n    out = ys / len(zs)\n"
+        );
+        let analysis = analyze(&code);
+        assert_eq!(find_shape(&analysis, "out"), None);
+    }
+
+    #[test]
+    fn test_parameter_or_local_shadowing_a_builtin_is_not_a_scalar_call() {
+        for body in [
+            "def f(x: Float[Array, \"3 4\"], len):\n    y = x * len(x)\n",
+            "def f(x: Float[Array, \"3 4\"], k):\n    len = k\n    y = x * len(2)\n",
+        ] {
+            let analysis = analyze(&format!("{HEADER}{body}"));
+            assert_eq!(find_shape(&analysis, "y"), None, "{body}");
+        }
+        let code = format!("{HEADER}def f(x: Float[Array, \"3 4\"]):\n    y = x * len(x)\n");
+        assert_eq!(find_shape(&analyze(&code), "y"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_axis_reducing_jax_nn_functions_reject_scalars() {
+        let code = format!(
+            "{HEADER}import jax\nimport flax.linen as fnn\ndef f(x: Float[Array, \"3 4\"]):\n    a = x * jax.nn.softmax(2.0)\n    b = x * jax.nn.log_softmax(2.0)\n    c = x * fnn.softmax(2.0)\n    d = x * jax.nn.standardize(2.0)\n    e = x * jax.nn.relu(2.0)\n"
+        );
+        let analysis = analyze(&code);
+        for name in ["a", "b", "c", "d"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        assert_eq!(find_shape(&analysis, "e"), Some(&shape(&["3", "4"])));
+    }
+}
+
+#[cfg(test)]
+mod bmm_and_cross_entropy_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEADER: &str = "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom jaxtyping import Float, Array\n";
+
+    #[test]
+    fn test_bmm_function_method_and_keywords() {
+        let code = format!(
+            "{HEADER}def f(a: Float[Array, \"b n m\"], c: Float[Array, \"b m p\"]):\n    x = torch.bmm(a, c)\n    y = a.bmm(c)\n    z = torch.bmm(input=a, mat2=c)\n    w = torch.bmm(a, c.transpose(1, 2).transpose(1, 2))\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["x", "y", "z", "w"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["b", "n", "p"])), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_bmm_errors_for_rank_batch_and_inner_dim() {
+        for (decls, call, fragment) in [
+            ("a: Float[Array, \"n m\"], c: Float[Array, \"m p\"]", "torch.bmm(a, c)", "3D"),
+            ("a: Float[Array, \"b n m\"], c: Float[Array, \"1 m p\"]", "torch.bmm(a, c)", "batch"),
+            ("a: Float[Array, \"b n m\"], c: Float[Array, \"b k p\"]", "torch.bmm(a, c)", "dimension mismatch"),
+            ("a: Float[Array, \"b n m\"], c: Float[Array, \"b k p\"]", "a.bmm(c)", "dimension mismatch"),
+        ] {
+            let code = format!("{HEADER}def f({decls}):\n    x = {call}\n");
+            let analysis = analyze(&code);
+            assert_eq!(analysis.errors.len(), 1, "{call} {decls}");
+            assert!(analysis.errors[0].message.contains(fragment), "{:?}", analysis.errors[0]);
+            assert_eq!(find_shape(&analysis, "x"), None);
+        }
+    }
+
+    #[test]
+    fn test_bmm_with_unknown_operand_is_unknown() {
+        let code = format!("{HEADER}def f(a: Float[Array, \"b n m\"], c):\n    x = torch.bmm(a, c)\n");
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "x"), None);
+    }
+
+    #[test]
+    fn test_cross_entropy_through_every_import_spelling() {
+        let code = format!(
+            "{HEADER}def f(logits: Float[Array, \"n c\"], y: Float[Array, \"n\"]):\n    a = F.cross_entropy(logits, y)\n    b = torch.nn.functional.cross_entropy(logits, y, reduction='none')\n    c = F.cross_entropy(logits, y, reduction=\"sum\")\n    d = F.nll_loss(logits, y, reduction='none')\n    e = F.cross_entropy(logits, y, reduction=mode)\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["n"])));
+        assert_eq!(find_shape(&analysis, "e"), None);
+    }
+
+    #[test]
+    fn test_cross_entropy_with_probability_and_spatial_targets() {
+        let code = format!(
+            "{HEADER}def f(x: Float[Array, \"n c h w\"], idx: Float[Array, \"n h w\"], p: Float[Array, \"n c h w\"], v: Float[Array, \"c\"], q: Float[Array, \"c\"]):\n    a = F.cross_entropy(x, idx, reduction='none')\n    b = F.cross_entropy(x, p, reduction='none')\n    c = F.cross_entropy(v, q, reduction='none')\n    d = F.cross_entropy(x.permute(0, 2, 3, 1).reshape(-1, 5), idx.reshape(-1))\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "h", "w"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "h", "w"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&[])));
+    }
+
+    #[test]
+    fn test_cross_entropy_target_mismatch_is_an_error() {
+        for target in ["Float[Array, \"m\"]", "Float[Array, \"n 1\"]", "Float[Array, \"\"]"] {
+            let code = format!(
+                "{HEADER}def f(logits: Float[Array, \"n c\"], y: {target}):\n    loss = F.cross_entropy(logits, y)\n"
+            );
+            let analysis = analyze(&code);
+            let expected = usize::from(!target.ends_with("\"\"]"));
+            assert_eq!(analysis.errors.len(), expected, "{target}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "loss"), None);
+        }
+    }
+
+    #[test]
+    fn test_cross_entropy_chained_from_a_layer_output() {
+        let code = format!(
+            "{HEADER}def f(x: Float[Array, \"n 8\"], y: Float[Array, \"n\"]):\n    head = nn.Linear(8, 3)\n    logits = head(x)\n    loss = F.cross_entropy(logits, y)\n    per_item = F.cross_entropy(logits, y, reduction='none')\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "loss"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "per_item"), Some(&shape(&["n"])));
+    }
+}

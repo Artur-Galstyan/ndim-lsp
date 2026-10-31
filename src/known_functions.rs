@@ -158,6 +158,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "std" => Some(KnownFunction::Std),
             "var" => Some(KnownFunction::Var),
             "matmul" => Some(KnownFunction::Matmul),
+            "bmm" => Some(KnownFunction::Bmm),
             "dot" => Some(KnownFunction::Dot),
             "tensordot" => Some(KnownFunction::TensorDot),
             "outer" => Some(KnownFunction::Outer),
@@ -255,6 +256,8 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "avg_pool3d" => Some(KnownFunction::FunctionalAvgPool3d),
             "softmax" | "log_softmax" | "normalize" => Some(KnownFunction::Copy),
             "one_hot" => Some(KnownFunction::OneHot),
+            "cross_entropy" => Some(KnownFunction::CrossEntropy),
+            "nll_loss" => Some(KnownFunction::NllLoss),
             "embedding" => Some(KnownFunction::FunctionalEmbedding),
             // Full activation family: all shape-preserving (elementwise),
             // same rule as `softmax`/`log_softmax`/`normalize` above.
@@ -561,7 +564,15 @@ fn parse_shape_value(value: &str) -> Option<Vec<String>> {
         .map(|dim| dim.to_string())
         .collect::<Vec<_>>();
 
-    if dims.is_empty() { None } else { Some(dims) }
+    if dims.is_empty()
+        || dims
+            .iter()
+            .any(|dim| dim.starts_with("__synth_") || dim.contains(char::is_whitespace))
+    {
+        None
+    } else {
+        Some(dims)
+    }
 }
 
 fn dim_product(dims: &[String]) -> Option<usize> {
@@ -577,7 +588,7 @@ fn flattened_dim(dims: &[String]) -> String {
     dims.join("*")
 }
 
-fn multiply_dim(dim: &str, factor: &str) -> String {
+pub(crate) fn multiply_dim(dim: &str, factor: &str) -> String {
     if factor == "1" {
         return dim.to_string();
     }
@@ -740,6 +751,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "triu" => Some(KnownFunction::Triu),
         "chunk" => Some(KnownFunction::Chunk),
         "unbind" => Some(KnownFunction::Unbind),
+        "bmm" => Some(KnownFunction::Bmm),
         // Tensor method form: `x.split(size, dim=0)` — real torch semantics
         // (chunk size, not section count); see `KnownFunction::TorchSplit`.
         "split" => Some(KnownFunction::TorchSplit),
@@ -863,6 +875,7 @@ pub fn apply_known_function(
         KnownFunction::Linspace | KnownFunction::Logspace => apply_known_linspace(args),
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
+        KnownFunction::Bmm => apply_known_bmm(args, shapes),
         KnownFunction::Dot => apply_known_dot(args, shapes),
         KnownFunction::TensorDot => apply_known_tensordot(args, shapes),
         KnownFunction::Outer => apply_known_outer(args, shapes),
@@ -978,6 +991,8 @@ pub fn apply_known_function(
         KnownFunction::LinalgPinv => apply_known_linalg_pinv(args, shapes),
         KnownFunction::LinalgMatrixRank => apply_known_linalg_matrix_rank(args, shapes),
         KnownFunction::OneHot => apply_known_one_hot(args, shapes),
+        KnownFunction::CrossEntropy => apply_known_cross_entropy(args, shapes, true),
+        KnownFunction::NllLoss => apply_known_cross_entropy(args, shapes, false),
         KnownFunction::DotProductAttention => apply_known_dot_product_attention(args, shapes),
         KnownFunction::Gather => apply_known_gather(args, shapes),
         KnownFunction::Scatter | KnownFunction::MaskedFill => {
@@ -2224,6 +2239,150 @@ fn apply_known_matmul(
             }
             Ok(Some(output))
         }
+    }
+}
+
+/// `torch.bmm(input, mat2)`: both operands rank 3, equal batch dim (unlike
+/// `matmul`, a batch of 1 does not broadcast), equal contracted dim.
+fn apply_known_bmm(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(left) = nth_positional_or_keyword(args, 0, &["input"]).and_then(|n| shapes.shape(n))
+    else {
+        return Ok(None);
+    };
+    let Some(right) = nth_positional_or_keyword(args, 1, &["mat2"]).and_then(|n| shapes.shape(n))
+    else {
+        return Ok(None);
+    };
+    for (operand, dims) in [("input", left), ("mat2", right)] {
+        if dims.len() != 3 {
+            return Err(format!(
+                "bmm requires {} to be a 3D tensor, got rank {}",
+                operand,
+                dims.len()
+            ));
+        }
+    }
+    check_dim_match(&left[0], &right[0], "bmm batch")?;
+    check_dim_match(&left[2], &right[1], "bmm")?;
+    Ok(Some(vec![left[0].clone(), left[1].clone(), right[2].clone()]))
+}
+
+/// `F.cross_entropy` / `F.nll_loss`. The class dim is 0 for an unbatched
+/// input and 1 otherwise. A target of the input's own shape holds class
+/// probabilities (cross_entropy only); a target without the class dim holds
+/// class indices. `reduction='none'` returns the input shape without the
+/// class dim, any other valid reduction a scalar.
+fn apply_known_cross_entropy(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    probabilities: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let name = if probabilities { "cross_entropy" } else { "nll_loss" };
+    let Some(input) = nth_positional_or_keyword(args, 0, &["input"]).and_then(|n| shapes.shape(n))
+    else {
+        return Ok(None);
+    };
+    let Some(target) = nth_positional_or_keyword(args, 1, &["target"]).and_then(|n| shapes.shape(n))
+    else {
+        return Ok(None);
+    };
+    if input.is_empty() {
+        return Err(format!("{} requires input with at least 1 dimension", name));
+    }
+    let class_axis = usize::from(input.len() > 1);
+    let per_item: Vec<String> = input
+        .iter()
+        .enumerate()
+        .filter(|&(axis, _)| axis != class_axis)
+        .map(|(_, dim)| dim.clone())
+        .collect();
+
+    let reduction = loss_reduction(args)?;
+    let scalar_or_items = |reduction: Option<&str>| match reduction {
+        Some("none") => Some(per_item.clone()),
+        Some(_) => Some(Vec::new()),
+        None => None,
+    };
+
+    if let Some(weight) = nth_positional_or_keyword(args, 2, &["weight"])
+        .filter(|&w| w != "None")
+        .and_then(|w| shapes.shape(w))
+    {
+        if weight.len() != 1 {
+            return Err(format!(
+                "{} weight must be a 1D tensor with one entry per class, got rank {}",
+                name,
+                weight.len()
+            ));
+        }
+        check_dim_match(&input[class_axis], &weight[0], &format!("{} weight", name))?;
+    }
+
+    // Unbatched input: a rank-0 target is a class index, a rank-1 target of
+    // the input's shape holds probabilities, and a rank-1 target of size 1 is
+    // accepted as one class index (checked against torch 2.x).
+    if input.len() == 1 && target.len() == 1 {
+        if probabilities && dims_canonically_equal(&input[0], &target[0]) {
+            return Ok(scalar_or_items(reduction));
+        }
+        if target[0] == "1" {
+            return Ok(scalar_or_items(reduction));
+        }
+        if input[0].parse::<usize>().is_ok() && target[0].parse::<usize>().is_ok() {
+            return Err(format!(
+                "{} for a 1D input needs a target of size 1, got {}",
+                name, target[0]
+            ));
+        }
+        return Ok(None);
+    }
+
+    if probabilities && target.len() == input.len() {
+        for (input_dim, target_dim) in input.iter().zip(target) {
+            check_dim_match(input_dim, target_dim, &format!("{} target", name))?;
+        }
+        return Ok(scalar_or_items(reduction));
+    }
+    if target.len() + 1 != input.len() {
+        return Err(format!(
+            "{} target must have rank {} for input of rank {}, got rank {}",
+            name,
+            input.len() - 1,
+            input.len(),
+            target.len()
+        ));
+    }
+    for (input_dim, target_dim) in per_item.iter().zip(target) {
+        check_dim_match(input_dim, target_dim, &format!("{} target", name))?;
+    }
+    Ok(scalar_or_items(reduction))
+}
+
+/// The literal `reduction` of a loss call: `Some("mean" | "sum" | "none")`,
+/// or `None` when it depends on a value (a variable, or the deprecated
+/// `size_average` / `reduce` arguments, which override it). An invalid
+/// string literal is an error, as in torch.
+fn loss_reduction(args: &[CallArgument]) -> Result<Option<&str>, String> {
+    let given = |position, name| {
+        nth_positional_or_keyword(args, position, &[name]).is_some_and(|value| value != "None")
+    };
+    if given(3, "size_average") || given(5, "reduce") {
+        return Ok(None);
+    }
+    let Some(value) = nth_positional_or_keyword(args, 6, &["reduction"]) else {
+        return Ok(Some("mean"));
+    };
+    let value = value.trim();
+    let literal = [('\'', '\''), ('"', '"')]
+        .iter()
+        .find_map(|&(open, close)| value.strip_prefix(open)?.strip_suffix(close));
+    match literal {
+        Some(reduction @ ("mean" | "sum" | "none")) => Ok(Some(reduction)),
+        Some(other) => Err(format!("{} is not a valid value for reduction", other)),
+        None => Ok(None),
     }
 }
 

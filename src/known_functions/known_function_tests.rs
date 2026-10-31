@@ -1718,3 +1718,17 @@ known_case!(
     ["torch", "nn", "utils", "rnn", "pad_sequence"],
     Some(KnownFunction::PadSequence)
 );
+
+known_case!(torch_bmm, ["torch", "bmm"], Some(KnownFunction::Bmm));
+known_case!(numpy_bmm_is_not_known, ["numpy", "bmm"], None);
+known_case!(
+    torch_nn_functional_cross_entropy,
+    ["torch", "nn", "functional", "cross_entropy"],
+    Some(KnownFunction::CrossEntropy)
+);
+known_case!(
+    torch_nn_functional_nll_loss,
+    ["torch", "nn", "functional", "nll_loss"],
+    Some(KnownFunction::NllLoss)
+);
+known_case!(torch_cross_entropy_is_not_known, ["torch", "cross_entropy"], None);

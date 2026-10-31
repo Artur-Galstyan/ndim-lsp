@@ -551,6 +551,8 @@ pub enum KnownFunction {
     Std,
     Var,
     Matmul,
+    /// `torch.bmm` / `Tensor.bmm`: rank-3 operands, equal batch (no broadcast).
+    Bmm,
     Dot,
     Einsum,
     Split,
@@ -698,6 +700,9 @@ pub enum KnownFunction {
     EinopsPack,
     EinopsUnpack,
     EinopsParseShape,
+    // torch.nn.functional losses
+    CrossEntropy,
+    NllLoss,
     // jax.nn
     OneHot,
     DotProductAttention,

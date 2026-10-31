@@ -313,9 +313,9 @@ def t_eqx_block(i):
         f"        self.head = eqx.nn.Linear({D}, 10, key=k2)",
         "",
         f"    def __call__(self, x: {ann([s, D])}):",
-        "        h = self.blk(x)",
-        "        p = jax.vmap(self.head)(h)",
-        "        m = p.mean(axis=0)",
+        f"        h = self.blk(x){es(h=[s, D])}",
+        f"        p = jax.vmap(self.head)(h){es(p=[s, 10])}",
+        f"        m = p.mean(axis=0){es(m=[10])}",
         "        return m",
         "",
         "",
@@ -674,6 +674,224 @@ def t_unpack(i):
     ]
 
 
+def t_tuple_unpack(i):
+    b, n, d, k = f"b{i}", f"n{i}", f"d{i}", f"k{i}"
+    return [
+        f"def tuple_unpack_{i}(x: {ann([b, n, d])}, w: {ann([d, k])}, v: {ann([k])}):",
+        f"    a, c = x, w{es(a=[b, n, d], c=[d, k])}",
+        f"    a, c = c, a{es(a=[d, k], c=[b, n, d])}",
+        f"    u = c @ a{es(u=[b, n, k])}",
+        f"    first, *mid, last = x, w, v{es(first=[b, n, d], last=[k])}",
+        f"    (p, q) = (v, x){es(p=[k], q=[b, n, d])}",
+        f"    s, t = x @ w, v * 2.0{es(s=[b, n, k], t=[k])}",
+        "    return u, first, last, s, t",
+        "",
+        "",
+    ]
+
+
+def t_loop_carried(i):
+    # Two swaps return both names to their start, so `x + keep` is valid; a
+    # single replay of the swap would make it a false mismatch. `jnp.exp`
+    # keeps its operand's shape, so that loop-carried name stays known.
+    return [
+        f"def loop_carried_{i}(x: {ann([3])}, y: {ann([5])}):",
+        f"    keep = x{es(keep=[3])}",
+        "    for _ in range(2):",
+        "        x, y = y, x",
+        "    z = x + keep",
+        "    h = keep",
+        "    for _ in range(3):",
+        f"        h = jnp.exp(h){es(h=[3])}",
+        "    return z, h",
+        "",
+        "",
+    ]
+
+
+def t_shape_names(i):
+    # Names unpacked from `x.shape` stand for the dims of x, so a reshape that
+    # multiplies them shows the dims' product, never the names or an internal
+    # symbol. Division is not modelled, so a -1 next to a product stays unknown.
+    b, n, d = f"b{i}", f"n{i}", f"d{i}"
+    return [
+        f"def shape_names_{i}(x: {ann([b, n, d])}):",
+        "    p, q, r = x.shape",
+        f"    m2 = x.reshape(p * q, r){es(m2=[prod([b, n]), d])}",
+        f"    m3 = jnp.reshape(x, (p * q, r)){es(m3=[prod([b, n]), d])}",
+        f"    m4 = x.reshape(p, q * r){es(m4=[b, prod([n, d])])}",
+        f"    m5 = x.reshape(p * q * r){es(m5=[prod([b, n, d])])}",
+        f"    m6 = x.reshape(p, q, r){es(m6=[b, n, d])}",
+        f"    m7 = m6 + x{es(m7=[b, n, d])}",
+        f"    m8 = rearrange(jnp.exp(x), 'p q -> q p')  # expected-error: einops pattern has rank 2, the operand rank 3",
+        "    return m2, m3, m4, m5, m7, m8",
+        "",
+        "",
+    ]
+
+
+def t_scalar_operands(i):
+    # A provable scalar (a number, a `math` call or constant, `len`, a shape
+    # entry, a numpy/jax function of scalars, a name bound only to those) never
+    # changes the array operand's shape. `jnp.sqrt(2.0)` is itself rank 0.
+    t, d = f"t{i}", f"d{i}"
+    return [
+        f"STRESS_EPS_{i} = 1e-6",
+        "",
+        "",
+        f"def scalar_operands_{i}(ys: {ann([t, d])}, zs: {ann([t])}, k: int):",
+        f"    a = ys / jnp.sqrt(2.0){es(a=[t, d])}",
+        f"    b = ys / math.sqrt(k){es(b=[t, d])}",
+        f"    c = ys * math.pi{es(c=[t, d])}",
+        f"    e = ys / len(zs){es(e=[t, d])}",
+        f"    f = ys / (2 * jnp.sqrt(2.0)){es(f=[t, d])}",
+        f"    g = ys / ys.shape[-1]{es(g=[t, d])}",
+        f"    dk = ys.shape[-1]",
+        f"    inv = 1.0 / math.sqrt(dk)",
+        f"    h = ys * inv{es(h=[t, d])}",
+        f"    n = ys / (jnp.abs(ys) + STRESS_EPS_{i}){es(n=[t, d])}",
+        f"    r = jnp.sqrt(2.0){es(r=[])}",
+        f"    bad = (ys / math.sqrt(2.0)) * zs  # expected-error: {d} vs {t} (the scalar divisor is ignored)",
+        "    return a, b, c, e, f, g, h, n, r",
+        "",
+        "",
+    ]
+
+
+def t_bmm_cross_entropy(i):
+    # torch.bmm needs rank 3 and an equal batch dim (no broadcasting).
+    # F.cross_entropy: class dim is 1 (0 when unbatched); a target without the
+    # class dim holds indices, a target of the input's shape holds probabilities;
+    # reduction 'none' keeps the per-item shape, any other reduction is rank 0.
+    b, n, m, p, c = f"b{i}", f"n{i}", f"m{i}", f"p{i}", f"c{i}"
+    return [
+        f"def bmm_cross_entropy_{i}(q: {ann([b, n, m])}, w: {ann([b, m, p])}, logits: {ann([b, c])}, y: {ann([b])}, probs: {ann([b, c])}, tok: {ann([b, n, c])}, tgt: {ann([b, n])}, v: {ann([c])}):",
+        f"    s = torch.bmm(q, w){es(s=[b, n, p])}",
+        f"    s2 = q.bmm(w){es(s2=[b, n, p])}",
+        f"    s3 = torch.bmm(input=s, mat2=w.mT){es(s3=[b, n, m])}",
+        f"    loss = F.cross_entropy(logits, y){es(loss=[])}",
+        f"    per = F.cross_entropy(logits, y, reduction='none'){es(per=[b])}",
+        f"    soft = F.cross_entropy(logits, probs, reduction='none'){es(soft=[b])}",
+        f"    tok_loss = F.cross_entropy(tok.permute(0, 2, 1), tgt, reduction='none'){es(tok_loss=[b, n])}",
+        f"    one = torch.nn.functional.cross_entropy(v, probs[0], reduction='none'){es(one=[])}",
+        f"    nll = F.nll_loss(F.log_softmax(logits, dim=1), y, reduction='sum'){es(nll=[])}",
+        f"    unknown = F.cross_entropy(logits, y, reduction=STRESS_MODE_{i})",
+        f"    bad_bmm = torch.bmm(q, w[:1])  # expected-error: batch {b} vs 1 (bmm never broadcasts)",
+        f"    bad_ce = F.cross_entropy(logits, tgt)  # expected-error: target {b} {n} against input {b} {c}",
+        "    return s, s2, s3, loss, per, soft, tok_loss, one, nll, unknown",
+        "",
+        "",
+    ]
+
+
+def t_closure_capture(i):
+    # A closure reads the enclosing function's variables when it is called, so
+    # `level1` sees the reassigned `w` on its second call.
+    b, n, d, e, t = f"b{i}", f"n{i}", f"d{i}", f"e{i}", f"t{i}"
+    return [
+        f"def closure_capture_{i}(x: {ann([b, n, d])}, w: {ann([d, e])}, W: {ann([d, d])}, xs: {ann([t, b, d])}, h0: {ann([b, d])}):",
+        "    def level1(t):",
+        "        u = t @ w",
+        "        return u",
+        "",
+        f"    y = level1(x){es(y=[b, n, e])}",
+        f"    w = w[:, :4]{es(w=[d, 4])}",
+        f"    y2 = level1(x){es(y2=[b, n, 4])}",
+        "",
+        "    def level2(t):",
+        "        nonlocal W",
+        "        return t @ W",
+        "",
+        f"    z = level2(x){es(z=[b, n, d])}",
+        "",
+        "    def step(c, xt):",
+        f"        h = jnp.tanh(c @ W + xt){es(h=[b, d])}",
+        "        return h, h",
+        "",
+        f"    hT, ys = jax.lax.scan(step, h0, xs){es(hT=[b, d], ys=[t, b, d])}",
+        "    return y2, z, ys",
+        "",
+        "",
+    ]
+
+
+def t_submodule_calls(i):
+    # User modules held in fields: called directly, vmapped, mapped, and built
+    # inline (flax). Constructor values reach the callee through `dim` and
+    # `features`; the callee has no annotation, so it is evaluated per call.
+    d = 32 + 16 * (i % 3)
+    f = 2 * d
+    b, s = f"b{i}", f"s{i}"
+    return [
+        f"class SubFfn{i}(nn.Module):",
+        "    def __init__(self, dim):",
+        "        super().__init__()",
+        f"        self.up = nn.Linear(dim, {f})",
+        f"        self.down = nn.Linear({f}, dim)",
+        "",
+        "    def forward(self, x):",
+        "        return self.down(F.relu(self.up(x)))",
+        "",
+        "",
+        f"class SubNet{i}(nn.Module):",
+        "    def __init__(self):",
+        "        super().__init__()",
+        f"        self.ffn = SubFfn{i}({d})",
+        f"        self.norm = nn.LayerNorm({d})",
+        "",
+        f"    def forward(self, x: {ann([b, s, d])}):",
+        f"        h = self.ffn(x){es(h=[b, s, d])}",
+        f"        y = self.norm(h + x){es(y=[b, s, d])}",
+        "        return y",
+        "",
+        "",
+        f"class SubEqx{i}(eqx.Module):",
+        "    w: eqx.nn.Linear",
+        "    norm: eqx.nn.LayerNorm",
+        "",
+        "    def __init__(self, key):",
+        f"        self.w = eqx.nn.Linear({d}, {f}, key=key)",
+        f"        self.norm = eqx.nn.LayerNorm({f})",
+        "",
+        "    def __call__(self, x):",
+        f"        return self.norm(self.w(x))",
+        "",
+        "",
+        f"class SubEqxModel{i}(eqx.Module):",
+        f"    blk: SubEqx{i}",
+        "    norm: eqx.nn.LayerNorm",
+        "",
+        "    def __init__(self, key):",
+        f"        self.blk = SubEqx{i}(key)",
+        f"        self.norm = eqx.nn.LayerNorm({f})",
+        "",
+        f"    def __call__(self, x: {ann([s, d])}, r: {ann([s, f])}):",
+        f"        h = jax.vmap(self.blk)(x){es(h=[s, f])}",
+        f"        z = jax.vmap(self.norm)(h + r){es(z=[s, f])}",
+        f"        q = jax.vmap(self.norm)(jax.nn.gelu(h) * 2.0 + r){es(q=[s, f])}",
+        f"        u = jax.lax.map(self.blk, x){es(u=[s, f])}",
+        "        return z, q, u",
+        "",
+        "",
+        f"class SubFlaxBlock{i}(fnn.Module):",
+        "    features: int",
+        "",
+        "    @fnn.compact",
+        "    def __call__(self, x):",
+        "        return fnn.Dense(self.features)(x)",
+        "",
+        "",
+        f"class SubFlaxNet{i}(fnn.Module):",
+        "    @fnn.compact",
+        f"    def __call__(self, x: {ann([b, d])}):",
+        f"        y = SubFlaxBlock{i}(features={f})(x){es(y=[b, f])}",
+        f"        z = SubFlaxBlock{i}({d})(x){es(z=[b, d])}",
+        "        return y, z",
+        "",
+        "",
+    ]
+
+
 def t_filler(i):
     return [
         "@dataclass",
@@ -958,6 +1176,23 @@ def main():
             lines += ["", ""]
             placed = True
         lines += build_block(i)
+        i += 1
+    # Appended after the random blocks so every earlier line stays unchanged.
+    for _ in range(3):
+        lines += t_tuple_unpack(i)
+        lines += t_closure_capture(i)
+        i += 1
+    for _ in range(3):
+        lines += t_submodule_calls(i)
+        i += 1
+    for _ in range(3):
+        lines += t_scalar_operands(i)
+        lines += [f"STRESS_MODE_{i} = 'none'", "", ""]
+        lines += t_bmm_cross_entropy(i)
+        i += 1
+    for _ in range(3):
+        lines += t_shape_names(i)
+        lines += t_loop_carried(i)
         i += 1
     lines += SITES_AFTER.split("\n")
     # normalize: no trailing whitespace noise

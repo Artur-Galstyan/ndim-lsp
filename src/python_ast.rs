@@ -900,6 +900,11 @@ pub(crate) fn enclosing_class_range(classes: &[(usize, usize)], byte: usize) -> 
 /// One class with its linearized method resolution order (itself first).
 struct ClassMro {
     range: (usize, usize),
+    /// Every base in the MRO is defined in the file.
+    closed: bool,
+    /// Annotated names declared directly in the class body (`features: int`),
+    /// in order: the fields of a dataclass-style module. Not `ClassVar`s.
+    fields: Vec<String>,
     /// Ranges of the class and its resolved bases in Python MRO order. It
     /// stops before the first base the file does not define, since that base
     /// could supply the attribute instead.
@@ -911,6 +916,8 @@ struct ClassMro {
 #[derive(Default)]
 pub(crate) struct ClassHierarchy {
     classes: Vec<ClassMro>,
+    /// Range of each class whose name the file defines exactly once.
+    named: HashMap<String, (usize, usize)>,
 }
 
 impl ClassHierarchy {
@@ -981,6 +988,8 @@ impl ClassHierarchy {
                 let lin = linearize(i, n, &bases, &mut memo, &mut visiting);
                 ClassMro {
                     range: (nodes[i].start_byte(), nodes[i].end_byte()),
+                    closed: lin.iter().all(|&j| j < n),
+                    fields: class_body_fields(nodes[i], text),
                     mro: lin
                         .into_iter()
                         .take_while(|&j| j < n)
@@ -989,7 +998,38 @@ impl ClassHierarchy {
                 }
             })
             .collect();
-        Self { classes }
+        let named = by_name
+            .into_iter()
+            .filter_map(|(name, i)| Some((name.to_string(), (nodes[i?].start_byte(), nodes[i?].end_byte()))))
+            .collect();
+        Self { classes, named }
+    }
+
+    /// The class the file defines under `name`, unless the name is defined twice.
+    pub(crate) fn class_named(&self, name: &str) -> Option<(usize, usize)> {
+        self.named.get(name).copied()
+    }
+
+    /// Ranges of the class and its resolved bases in MRO order, stopping
+    /// before the first base the file does not define.
+    pub(crate) fn mro(&self, class: (usize, usize)) -> &[(usize, usize)] {
+        self.classes
+            .iter()
+            .find(|c| c.range == class)
+            .map_or(&[], |c| &c.mro)
+    }
+
+    /// Annotated fields declared in the body of `class` itself.
+    pub(crate) fn fields(&self, class: (usize, usize)) -> &[String] {
+        self.classes
+            .iter()
+            .find(|c| c.range == class)
+            .map_or(&[], |c| &c.fields)
+    }
+
+    /// Whether `mro` lists every base: none is undefined or in a cycle.
+    pub(crate) fn mro_is_closed(&self, class: (usize, usize)) -> bool {
+        self.classes.iter().any(|c| c.range == class && c.closed)
     }
 
     /// Test helper: classes with no bases.
@@ -998,8 +1038,14 @@ impl ClassHierarchy {
         Self {
             classes: ranges
                 .iter()
-                .map(|&r| ClassMro { range: r, mro: vec![r] })
+                .map(|&r| ClassMro {
+                    range: r,
+                    closed: true,
+                    fields: Vec::new(),
+                    mro: vec![r],
+                })
                 .collect(),
+            named: HashMap::new(),
         }
     }
 
@@ -1025,6 +1071,37 @@ impl ClassHierarchy {
             None => entries.iter().find(|e| range(e) == (0, usize::MAX)),
         }
     }
+}
+
+fn class_body_fields(class: Node, text: &str) -> Vec<String> {
+    let Some(body) = class.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    for i in 0..body.named_child_count() {
+        let Some(stmt) = body.named_child(i as u32) else {
+            continue;
+        };
+        let Some(assign) = stmt.named_child(0).filter(|a| {
+            stmt.kind() == "expression_statement" && a.kind() == "assignment"
+        }) else {
+            continue;
+        };
+        let (Some(name), Some(ty)) = (
+            assign.child_by_field_name("left").filter(|n| n.kind() == "identifier"),
+            assign.child_by_field_name("type"),
+        ) else {
+            continue;
+        };
+        let (Ok(name), Ok(ty)) = (name.utf8_text(text.as_bytes()), ty.utf8_text(text.as_bytes()))
+        else {
+            continue;
+        };
+        if !ty.starts_with("ClassVar") && !ty.starts_with("typing.ClassVar") {
+            fields.push(name.to_string());
+        }
+    }
+    fields
 }
 
 /// C3 linearization of class `i`. A failed merge or an inheritance cycle
@@ -1086,60 +1163,176 @@ pub fn extract_self_attr_aliases_by_class(
     node: Node,
     text: &str,
 ) -> Result<HashMap<String, Vec<ScopedSelfAttrAlias>>, String> {
-    let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
+    Ok(self_attr_aliases_from_writes(
+        &extract_self_attr_writes(node, text),
+        text,
+    ))
+}
+
+/// One write to a `self.<attr>` field, with the range of the class it sits in
+/// (the whole file outside every class).
+pub(crate) struct SelfAttrWrite<'t> {
+    pub(crate) attr: String,
+    pub(crate) class: (usize, usize),
+    /// Right-hand side of a plain `self.<attr> = value`. `None` for a write
+    /// whose value is not tracked: a tuple target or an augmented assignment.
+    pub(crate) value: Option<Node<'t>>,
+}
+
+/// Every `self.<attr>` write in the file, in source order.
+pub(crate) fn extract_self_attr_writes<'t>(node: Node<'t>, text: &str) -> Vec<SelfAttrWrite<'t>> {
     const QUERY_STRING: &str = r#"
         (assignment
-          left: (attribute
-            object: (identifier) @obj
-            attribute: (identifier) @attr)
-          right: (identifier) @val) @assign
+          left: (attribute object: (identifier) @obj attribute: (identifier) @attr)
+          right: (_) @val)
+        (augmented_assignment
+          left: (attribute object: (identifier) @obj attribute: (identifier) @attr))
+        (assignment
+          left: [(pattern_list (attribute object: (identifier) @obj attribute: (identifier) @attr))
+                 (tuple_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))
+                 (list_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))])
     "#;
 
     static QUERY: LazyLock<Query> = LazyLock::new(|| {
         Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
     });
     let query = &*QUERY;
-    let obj_idx = query.capture_index_for_name("obj").ok_or("obj not found")?;
-    let attr_idx = query.capture_index_for_name("attr").ok_or("attr not found")?;
-    let val_idx = query.capture_index_for_name("val").ok_or("val not found")?;
-    let assign_idx = query
-        .capture_index_for_name("assign")
-        .ok_or("assign not found")?;
+    let (Some(obj_idx), Some(attr_idx), Some(val_idx)) = (
+        query.capture_index_for_name("obj"),
+        query.capture_index_for_name("attr"),
+        query.capture_index_for_name("val"),
+    ) else {
+        return Vec::new();
+    };
 
-    let classes = class_ranges(node);
+    let mut writes = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, node, text.as_bytes());
-
-    while let Some(match_) = matches.next() {
+    while let Some(m) = matches.next() {
         let mut is_self = false;
-        let mut attr = String::new();
-        let mut val = String::new();
-        let mut assign_byte = 0usize;
-        for capture in match_.captures {
-            if capture.index == assign_idx {
-                assign_byte = capture.node.start_byte();
-                continue;
-            }
-            let t = node_text(capture.node, text)?;
+        let mut attr = None;
+        let mut value = None;
+        for capture in m.captures {
             if capture.index == obj_idx {
-                is_self = t == "self";
+                is_self = capture.node.utf8_text(text.as_bytes()) == Ok("self");
             } else if capture.index == attr_idx {
-                attr = t.to_string();
+                attr = Some(capture.node);
             } else if capture.index == val_idx {
-                val = t.to_string();
+                value = Some(capture.node);
             }
         }
-        if is_self && !attr.is_empty() {
-            let (class_start, class_end) = enclosing_class_range(&classes, assign_byte);
-            aliases.entry(attr).or_default().push(ScopedSelfAttrAlias {
-                class_start,
-                class_end,
-                value: val,
-            });
+        let Some(attr) = attr.filter(|_| is_self) else {
+            continue;
+        };
+        let Ok(name) = attr.utf8_text(text.as_bytes()) else {
+            continue;
+        };
+        let mut class = (0, usize::MAX);
+        let mut up = attr.parent();
+        while let Some(ancestor) = up {
+            if ancestor.kind() == "class_definition" {
+                class = (ancestor.start_byte(), ancestor.end_byte());
+                break;
+            }
+            up = ancestor.parent();
         }
+        writes.push(SelfAttrWrite {
+            attr: name.to_string(),
+            class,
+            value,
+        });
+    }
+    writes
+}
+
+/// The `self.<attr> = <ident>` writes among `writes`, keyed by attribute.
+pub(crate) fn self_attr_aliases_from_writes(
+    writes: &[SelfAttrWrite],
+    text: &str,
+) -> HashMap<String, Vec<ScopedSelfAttrAlias>> {
+    let mut aliases: HashMap<String, Vec<ScopedSelfAttrAlias>> = HashMap::new();
+    for write in writes {
+        let Some(value) = write.value.filter(|v| v.kind() == "identifier") else {
+            continue;
+        };
+        let Ok(value) = value.utf8_text(text.as_bytes()) else {
+            continue;
+        };
+        aliases
+            .entry(write.attr.clone())
+            .or_default()
+            .push(ScopedSelfAttrAlias {
+                class_start: write.class.0,
+                class_end: write.class.1,
+                value: value.to_string(),
+            });
+    }
+    aliases
+}
+
+#[cfg(test)]
+mod class_structure_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
     }
 
-    Ok(aliases)
+    #[test]
+    fn hierarchy_reports_fields_in_order_without_class_vars() {
+        let code = "class A:\n    x: int\n    LIMIT: ClassVar[int] = 3\n    y: float = 1.0\n    z = 2\n    def m(self):\n        w: int = 1\n";
+        let tree = parse(code);
+        let h = ClassHierarchy::new(tree.root_node(), code);
+        let class = h.class_named("A").unwrap();
+        assert_eq!(h.fields(class), ["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn hierarchy_names_only_classes_defined_once() {
+        let code = "class A:\n    pass\nclass B(A):\n    pass\ndef f():\n    class A:\n        pass\n";
+        let tree = parse(code);
+        let h = ClassHierarchy::new(tree.root_node(), code);
+        assert!(h.class_named("A").is_none());
+        let b = h.class_named("B").unwrap();
+        // The ambiguous base is opaque: the MRO stops before it.
+        assert_eq!(h.mro(b).len(), 1);
+        assert!(!h.mro_is_closed(b));
+    }
+
+    #[test]
+    fn hierarchy_marks_an_undefined_base_as_open() {
+        let code = "class B(Missing):\n    pass\nclass C(nn.Module):\n    pass\n";
+        let tree = parse(code);
+        let h = ClassHierarchy::new(tree.root_node(), code);
+        assert!(!h.mro_is_closed(h.class_named("B").unwrap()));
+        assert!(h.mro_is_closed(h.class_named("C").unwrap()));
+    }
+
+    #[test]
+    fn self_attr_writes_cover_plain_tuple_and_augmented_targets() {
+        let code = "class A:\n    def __init__(self, d):\n        self.a = Block(d)\n        self.b, self.c = 1, 2\n        self.n += 1\n        other.x = 1\n\nself.top = 1\n";
+        let tree = parse(code);
+        let writes = extract_self_attr_writes(tree.root_node(), code);
+        let seen: Vec<(&str, bool, bool)> = writes
+            .iter()
+            .map(|w| (w.attr.as_str(), w.value.is_some(), w.class == (0, usize::MAX)))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a", true, false),
+                ("b", false, false),
+                ("c", false, false),
+                ("n", false, false),
+                ("top", true, true),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

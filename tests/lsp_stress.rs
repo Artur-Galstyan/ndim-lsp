@@ -1506,6 +1506,30 @@ fn build_golden() -> String {
     serde_json::to_string_pretty(&Value::Object(out)).unwrap() + "\n"
 }
 
+const INTERNAL_PREFIXES: [&str; 2] = ["__synth_", "__ellipsis"];
+
+fn assert_no_internal_names(golden: &str) {
+    for prefix in INTERNAL_PREFIXES {
+        if let Some(at) = golden.find(prefix) {
+            let from = golden[..at].rfind('\n').map_or(0, |i| i + 1);
+            let to = golden[at..].find('\n').map_or(golden.len(), |i| at + i);
+            panic!("internal name `{prefix}` in output: {}", &golden[from..to]);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "internal name")]
+fn internal_name_scan_detects_a_leak() {
+    assert_no_internal_names("{\"shape\": [\"__synth_2\", \"c\"]}");
+}
+
+#[test]
+#[ignore]
+fn golden_has_no_internal_names() {
+    assert_no_internal_names(&build_golden());
+}
+
 #[test]
 #[ignore]
 fn golden_dump() {
@@ -1516,6 +1540,7 @@ fn golden_dump() {
         a == b,
         "two golden runs differ: the dump is not deterministic"
     );
+    assert_no_internal_names(&a);
     fs::write(&path, a.as_bytes()).unwrap();
     println!("wrote {path} ({} bytes)", a.len());
 }

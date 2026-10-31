@@ -1530,3 +1530,18 @@ fn test_apply_pad_sequence_default_seq_first() {
 
     assert_eq!(output, Some(shape(&["pad_len", "2", "8"])));
 }
+
+#[test]
+fn test_bmm_method_uses_receiver_as_first_operand() {
+    assert_eq!(classify_method_call("bmm"), Some(KnownFunction::Bmm));
+    let shapes = HashMap::from([
+        ("x".to_string(), shape(&["b", "n", "m"])),
+        ("y".to_string(), shape(&["b", "m", "p"])),
+    ]);
+
+    let output = apply_method_call(&KnownFunction::Bmm, "x", &[pos("y")], &shapes).unwrap();
+    assert_eq!(output, Some(shape(&["b", "n", "p"])));
+
+    let keyword = apply_method_call(&KnownFunction::Bmm, "x", &[kw("mat2", "y")], &shapes).unwrap();
+    assert_eq!(keyword, Some(shape(&["b", "n", "p"])));
+}

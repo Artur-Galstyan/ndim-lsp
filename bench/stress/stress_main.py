@@ -429,9 +429,9 @@ class EqxModel11(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s11 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s11, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s11, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -487,9 +487,9 @@ class EqxModel14(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s14 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s14, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s14, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -1919,9 +1919,9 @@ class EqxModel28(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s28 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s28, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s28, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -2093,9 +2093,9 @@ class EqxModel35(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s35 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s35, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s35, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -2149,9 +2149,9 @@ class EqxModel37(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s37 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s37, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s37, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -2339,9 +2339,9 @@ class EqxModel43(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s43 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s43, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s43, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -2651,9 +2651,9 @@ class EqxModel50(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s50 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s50, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s50, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -4722,9 +4722,9 @@ class EqxModel63(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s63 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s63, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s63, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -4942,9 +4942,9 @@ class EqxModel74(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s74 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s74, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s74, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -5017,9 +5017,9 @@ class EqxModel77(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s77 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s77, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s77, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -8606,9 +8606,9 @@ class EqxModel141(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s141 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s141, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s141, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -9039,9 +9039,9 @@ class EqxModel147(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s147 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s147, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s147, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -9126,9 +9126,9 @@ class EqxModel149(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s149 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s149, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s149, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -9354,9 +9354,9 @@ class EqxModel162(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s162 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s162, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s162, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -9524,9 +9524,9 @@ class EqxModel165(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s165 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s165, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s165, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -9922,9 +9922,9 @@ class EqxModel185(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s185 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s185, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s185, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -10196,9 +10196,9 @@ class EqxModel195(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s195 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s195, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s195, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -10358,9 +10358,9 @@ class EqxModel202(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s202 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s202, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s202, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -10735,9 +10735,9 @@ class EqxModel207(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s207 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s207, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s207, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -10771,9 +10771,9 @@ class EqxModel208(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s208 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s208, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s208, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -11052,9 +11052,9 @@ class EqxModel216(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s216 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s216, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s216, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -11198,9 +11198,9 @@ class EqxModel227(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s227 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s227, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s227, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -11725,9 +11725,9 @@ class EqxModel246(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s246 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s246, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s246, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -11761,9 +11761,9 @@ class EqxModel247(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s247 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s247, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s247, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -13032,9 +13032,9 @@ class EqxModel271(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s271 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s271, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s271, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -13487,9 +13487,9 @@ class EqxModel284(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s284 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s284, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s284, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -13543,9 +13543,9 @@ class EqxModel286(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s286 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s286, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s286, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -14927,9 +14927,9 @@ class EqxModel325(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s325 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s325, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s325, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -15244,9 +15244,9 @@ class EqxModel335(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s335 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s335, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s335, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -16683,9 +16683,9 @@ class EqxModel374(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s374 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s374, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s374, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -17664,9 +17664,9 @@ class EqxModel396(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s396 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s396, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s396, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -17715,9 +17715,9 @@ class EqxModel399(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s399 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s399, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s399, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -19300,9 +19300,9 @@ class EqxModel432(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s432 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s432, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s432, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -19676,9 +19676,9 @@ class EqxModel442(eqx.Module):
         self.head = eqx.nn.Linear(96, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s442 96"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s442, 96]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s442, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -19978,9 +19978,9 @@ class EqxModel458(eqx.Module):
         self.head = eqx.nn.Linear(32, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s458 32"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s458, 32]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s458, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -20399,9 +20399,9 @@ class EqxModel470(eqx.Module):
         self.head = eqx.nn.Linear(64, 10, key=k2)
 
     def __call__(self, x: Float[Array, "s470 64"]):
-        h = self.blk(x)
-        p = jax.vmap(self.head)(h)
-        m = p.mean(axis=0)
+        h = self.blk(x)  # expected-shape: h=[s470, 64]
+        p = jax.vmap(self.head)(h)  # expected-shape: p=[s470, 10]
+        m = p.mean(axis=0)  # expected-shape: m=[10]
         return m
 
 
@@ -21033,6 +21033,486 @@ class AttnBlock493(Attn493):
         qkv2 = self.qkv_493(h)  # expected-shape: qkv2=[b493, s493, 192]
         o = self.proj_493(h) + x  # expected-shape: o=[b493, s493, 64]
         return o
+
+
+def tuple_unpack_494(x: Float[Array, "b494 n494 d494"], w: Float[Array, "d494 k494"], v: Float[Array, "k494"]):
+    a, c = x, w  # expected-shape: a=[b494, n494, d494]; c=[d494, k494]
+    a, c = c, a  # expected-shape: a=[d494, k494]; c=[b494, n494, d494]
+    u = c @ a  # expected-shape: u=[b494, n494, k494]
+    first, *mid, last = x, w, v  # expected-shape: first=[b494, n494, d494]; last=[k494]
+    (p, q) = (v, x)  # expected-shape: p=[k494]; q=[b494, n494, d494]
+    s, t = x @ w, v * 2.0  # expected-shape: s=[b494, n494, k494]; t=[k494]
+    return u, first, last, s, t
+
+
+def closure_capture_494(x: Float[Array, "b494 n494 d494"], w: Float[Array, "d494 e494"], W: Float[Array, "d494 d494"], xs: Float[Array, "t494 b494 d494"], h0: Float[Array, "b494 d494"]):
+    def level1(t):
+        u = t @ w
+        return u
+
+    y = level1(x)  # expected-shape: y=[b494, n494, e494]
+    w = w[:, :4]  # expected-shape: w=[d494, 4]
+    y2 = level1(x)  # expected-shape: y2=[b494, n494, 4]
+
+    def level2(t):
+        nonlocal W
+        return t @ W
+
+    z = level2(x)  # expected-shape: z=[b494, n494, d494]
+
+    def step(c, xt):
+        h = jnp.tanh(c @ W + xt)  # expected-shape: h=[b494, d494]
+        return h, h
+
+    hT, ys = jax.lax.scan(step, h0, xs)  # expected-shape: hT=[b494, d494]; ys=[t494, b494, d494]
+    return y2, z, ys
+
+
+def tuple_unpack_495(x: Float[Array, "b495 n495 d495"], w: Float[Array, "d495 k495"], v: Float[Array, "k495"]):
+    a, c = x, w  # expected-shape: a=[b495, n495, d495]; c=[d495, k495]
+    a, c = c, a  # expected-shape: a=[d495, k495]; c=[b495, n495, d495]
+    u = c @ a  # expected-shape: u=[b495, n495, k495]
+    first, *mid, last = x, w, v  # expected-shape: first=[b495, n495, d495]; last=[k495]
+    (p, q) = (v, x)  # expected-shape: p=[k495]; q=[b495, n495, d495]
+    s, t = x @ w, v * 2.0  # expected-shape: s=[b495, n495, k495]; t=[k495]
+    return u, first, last, s, t
+
+
+def closure_capture_495(x: Float[Array, "b495 n495 d495"], w: Float[Array, "d495 e495"], W: Float[Array, "d495 d495"], xs: Float[Array, "t495 b495 d495"], h0: Float[Array, "b495 d495"]):
+    def level1(t):
+        u = t @ w
+        return u
+
+    y = level1(x)  # expected-shape: y=[b495, n495, e495]
+    w = w[:, :4]  # expected-shape: w=[d495, 4]
+    y2 = level1(x)  # expected-shape: y2=[b495, n495, 4]
+
+    def level2(t):
+        nonlocal W
+        return t @ W
+
+    z = level2(x)  # expected-shape: z=[b495, n495, d495]
+
+    def step(c, xt):
+        h = jnp.tanh(c @ W + xt)  # expected-shape: h=[b495, d495]
+        return h, h
+
+    hT, ys = jax.lax.scan(step, h0, xs)  # expected-shape: hT=[b495, d495]; ys=[t495, b495, d495]
+    return y2, z, ys
+
+
+def tuple_unpack_496(x: Float[Array, "b496 n496 d496"], w: Float[Array, "d496 k496"], v: Float[Array, "k496"]):
+    a, c = x, w  # expected-shape: a=[b496, n496, d496]; c=[d496, k496]
+    a, c = c, a  # expected-shape: a=[d496, k496]; c=[b496, n496, d496]
+    u = c @ a  # expected-shape: u=[b496, n496, k496]
+    first, *mid, last = x, w, v  # expected-shape: first=[b496, n496, d496]; last=[k496]
+    (p, q) = (v, x)  # expected-shape: p=[k496]; q=[b496, n496, d496]
+    s, t = x @ w, v * 2.0  # expected-shape: s=[b496, n496, k496]; t=[k496]
+    return u, first, last, s, t
+
+
+def closure_capture_496(x: Float[Array, "b496 n496 d496"], w: Float[Array, "d496 e496"], W: Float[Array, "d496 d496"], xs: Float[Array, "t496 b496 d496"], h0: Float[Array, "b496 d496"]):
+    def level1(t):
+        u = t @ w
+        return u
+
+    y = level1(x)  # expected-shape: y=[b496, n496, e496]
+    w = w[:, :4]  # expected-shape: w=[d496, 4]
+    y2 = level1(x)  # expected-shape: y2=[b496, n496, 4]
+
+    def level2(t):
+        nonlocal W
+        return t @ W
+
+    z = level2(x)  # expected-shape: z=[b496, n496, d496]
+
+    def step(c, xt):
+        h = jnp.tanh(c @ W + xt)  # expected-shape: h=[b496, d496]
+        return h, h
+
+    hT, ys = jax.lax.scan(step, h0, xs)  # expected-shape: hT=[b496, d496]; ys=[t496, b496, d496]
+    return y2, z, ys
+
+
+class SubFfn497(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.up = nn.Linear(dim, 128)
+        self.down = nn.Linear(128, dim)
+
+    def forward(self, x):
+        return self.down(F.relu(self.up(x)))
+
+
+class SubNet497(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ffn = SubFfn497(64)
+        self.norm = nn.LayerNorm(64)
+
+    def forward(self, x: Float[Array, "b497 s497 64"]):
+        h = self.ffn(x)  # expected-shape: h=[b497, s497, 64]
+        y = self.norm(h + x)  # expected-shape: y=[b497, s497, 64]
+        return y
+
+
+class SubEqx497(eqx.Module):
+    w: eqx.nn.Linear
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.w = eqx.nn.Linear(64, 128, key=key)
+        self.norm = eqx.nn.LayerNorm(128)
+
+    def __call__(self, x):
+        return self.norm(self.w(x))
+
+
+class SubEqxModel497(eqx.Module):
+    blk: SubEqx497
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.blk = SubEqx497(key)
+        self.norm = eqx.nn.LayerNorm(128)
+
+    def __call__(self, x: Float[Array, "s497 64"], r: Float[Array, "s497 128"]):
+        h = jax.vmap(self.blk)(x)  # expected-shape: h=[s497, 128]
+        z = jax.vmap(self.norm)(h + r)  # expected-shape: z=[s497, 128]
+        q = jax.vmap(self.norm)(jax.nn.gelu(h) * 2.0 + r)  # expected-shape: q=[s497, 128]
+        u = jax.lax.map(self.blk, x)  # expected-shape: u=[s497, 128]
+        return z, q, u
+
+
+class SubFlaxBlock497(fnn.Module):
+    features: int
+
+    @fnn.compact
+    def __call__(self, x):
+        return fnn.Dense(self.features)(x)
+
+
+class SubFlaxNet497(fnn.Module):
+    @fnn.compact
+    def __call__(self, x: Float[Array, "b497 64"]):
+        y = SubFlaxBlock497(features=128)(x)  # expected-shape: y=[b497, 128]
+        z = SubFlaxBlock497(64)(x)  # expected-shape: z=[b497, 64]
+        return y, z
+
+
+class SubFfn498(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.up = nn.Linear(dim, 64)
+        self.down = nn.Linear(64, dim)
+
+    def forward(self, x):
+        return self.down(F.relu(self.up(x)))
+
+
+class SubNet498(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ffn = SubFfn498(32)
+        self.norm = nn.LayerNorm(32)
+
+    def forward(self, x: Float[Array, "b498 s498 32"]):
+        h = self.ffn(x)  # expected-shape: h=[b498, s498, 32]
+        y = self.norm(h + x)  # expected-shape: y=[b498, s498, 32]
+        return y
+
+
+class SubEqx498(eqx.Module):
+    w: eqx.nn.Linear
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.w = eqx.nn.Linear(32, 64, key=key)
+        self.norm = eqx.nn.LayerNorm(64)
+
+    def __call__(self, x):
+        return self.norm(self.w(x))
+
+
+class SubEqxModel498(eqx.Module):
+    blk: SubEqx498
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.blk = SubEqx498(key)
+        self.norm = eqx.nn.LayerNorm(64)
+
+    def __call__(self, x: Float[Array, "s498 32"], r: Float[Array, "s498 64"]):
+        h = jax.vmap(self.blk)(x)  # expected-shape: h=[s498, 64]
+        z = jax.vmap(self.norm)(h + r)  # expected-shape: z=[s498, 64]
+        q = jax.vmap(self.norm)(jax.nn.gelu(h) * 2.0 + r)  # expected-shape: q=[s498, 64]
+        u = jax.lax.map(self.blk, x)  # expected-shape: u=[s498, 64]
+        return z, q, u
+
+
+class SubFlaxBlock498(fnn.Module):
+    features: int
+
+    @fnn.compact
+    def __call__(self, x):
+        return fnn.Dense(self.features)(x)
+
+
+class SubFlaxNet498(fnn.Module):
+    @fnn.compact
+    def __call__(self, x: Float[Array, "b498 32"]):
+        y = SubFlaxBlock498(features=64)(x)  # expected-shape: y=[b498, 64]
+        z = SubFlaxBlock498(32)(x)  # expected-shape: z=[b498, 32]
+        return y, z
+
+
+class SubFfn499(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.up = nn.Linear(dim, 96)
+        self.down = nn.Linear(96, dim)
+
+    def forward(self, x):
+        return self.down(F.relu(self.up(x)))
+
+
+class SubNet499(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ffn = SubFfn499(48)
+        self.norm = nn.LayerNorm(48)
+
+    def forward(self, x: Float[Array, "b499 s499 48"]):
+        h = self.ffn(x)  # expected-shape: h=[b499, s499, 48]
+        y = self.norm(h + x)  # expected-shape: y=[b499, s499, 48]
+        return y
+
+
+class SubEqx499(eqx.Module):
+    w: eqx.nn.Linear
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.w = eqx.nn.Linear(48, 96, key=key)
+        self.norm = eqx.nn.LayerNorm(96)
+
+    def __call__(self, x):
+        return self.norm(self.w(x))
+
+
+class SubEqxModel499(eqx.Module):
+    blk: SubEqx499
+    norm: eqx.nn.LayerNorm
+
+    def __init__(self, key):
+        self.blk = SubEqx499(key)
+        self.norm = eqx.nn.LayerNorm(96)
+
+    def __call__(self, x: Float[Array, "s499 48"], r: Float[Array, "s499 96"]):
+        h = jax.vmap(self.blk)(x)  # expected-shape: h=[s499, 96]
+        z = jax.vmap(self.norm)(h + r)  # expected-shape: z=[s499, 96]
+        q = jax.vmap(self.norm)(jax.nn.gelu(h) * 2.0 + r)  # expected-shape: q=[s499, 96]
+        u = jax.lax.map(self.blk, x)  # expected-shape: u=[s499, 96]
+        return z, q, u
+
+
+class SubFlaxBlock499(fnn.Module):
+    features: int
+
+    @fnn.compact
+    def __call__(self, x):
+        return fnn.Dense(self.features)(x)
+
+
+class SubFlaxNet499(fnn.Module):
+    @fnn.compact
+    def __call__(self, x: Float[Array, "b499 48"]):
+        y = SubFlaxBlock499(features=96)(x)  # expected-shape: y=[b499, 96]
+        z = SubFlaxBlock499(48)(x)  # expected-shape: z=[b499, 48]
+        return y, z
+
+
+STRESS_EPS_500 = 1e-6
+
+
+def scalar_operands_500(ys: Float[Array, "t500 d500"], zs: Float[Array, "t500"], k: int):
+    a = ys / jnp.sqrt(2.0)  # expected-shape: a=[t500, d500]
+    b = ys / math.sqrt(k)  # expected-shape: b=[t500, d500]
+    c = ys * math.pi  # expected-shape: c=[t500, d500]
+    e = ys / len(zs)  # expected-shape: e=[t500, d500]
+    f = ys / (2 * jnp.sqrt(2.0))  # expected-shape: f=[t500, d500]
+    g = ys / ys.shape[-1]  # expected-shape: g=[t500, d500]
+    dk = ys.shape[-1]
+    inv = 1.0 / math.sqrt(dk)
+    h = ys * inv  # expected-shape: h=[t500, d500]
+    n = ys / (jnp.abs(ys) + STRESS_EPS_500)  # expected-shape: n=[t500, d500]
+    r = jnp.sqrt(2.0)  # expected-shape: r=[]
+    bad = (ys / math.sqrt(2.0)) * zs  # expected-error: d500 vs t500 (the scalar divisor is ignored)
+    return a, b, c, e, f, g, h, n, r
+
+
+STRESS_MODE_500 = 'none'
+
+
+def bmm_cross_entropy_500(q: Float[Array, "b500 n500 m500"], w: Float[Array, "b500 m500 p500"], logits: Float[Array, "b500 c500"], y: Float[Array, "b500"], probs: Float[Array, "b500 c500"], tok: Float[Array, "b500 n500 c500"], tgt: Float[Array, "b500 n500"], v: Float[Array, "c500"]):
+    s = torch.bmm(q, w)  # expected-shape: s=[b500, n500, p500]
+    s2 = q.bmm(w)  # expected-shape: s2=[b500, n500, p500]
+    s3 = torch.bmm(input=s, mat2=w.mT)  # expected-shape: s3=[b500, n500, m500]
+    loss = F.cross_entropy(logits, y)  # expected-shape: loss=[]
+    per = F.cross_entropy(logits, y, reduction='none')  # expected-shape: per=[b500]
+    soft = F.cross_entropy(logits, probs, reduction='none')  # expected-shape: soft=[b500]
+    tok_loss = F.cross_entropy(tok.permute(0, 2, 1), tgt, reduction='none')  # expected-shape: tok_loss=[b500, n500]
+    one = torch.nn.functional.cross_entropy(v, probs[0], reduction='none')  # expected-shape: one=[]
+    nll = F.nll_loss(F.log_softmax(logits, dim=1), y, reduction='sum')  # expected-shape: nll=[]
+    unknown = F.cross_entropy(logits, y, reduction=STRESS_MODE_500)
+    bad_bmm = torch.bmm(q, w[:1])  # expected-error: batch b500 vs 1 (bmm never broadcasts)
+    bad_ce = F.cross_entropy(logits, tgt)  # expected-error: target b500 n500 against input b500 c500
+    return s, s2, s3, loss, per, soft, tok_loss, one, nll, unknown
+
+
+STRESS_EPS_501 = 1e-6
+
+
+def scalar_operands_501(ys: Float[Array, "t501 d501"], zs: Float[Array, "t501"], k: int):
+    a = ys / jnp.sqrt(2.0)  # expected-shape: a=[t501, d501]
+    b = ys / math.sqrt(k)  # expected-shape: b=[t501, d501]
+    c = ys * math.pi  # expected-shape: c=[t501, d501]
+    e = ys / len(zs)  # expected-shape: e=[t501, d501]
+    f = ys / (2 * jnp.sqrt(2.0))  # expected-shape: f=[t501, d501]
+    g = ys / ys.shape[-1]  # expected-shape: g=[t501, d501]
+    dk = ys.shape[-1]
+    inv = 1.0 / math.sqrt(dk)
+    h = ys * inv  # expected-shape: h=[t501, d501]
+    n = ys / (jnp.abs(ys) + STRESS_EPS_501)  # expected-shape: n=[t501, d501]
+    r = jnp.sqrt(2.0)  # expected-shape: r=[]
+    bad = (ys / math.sqrt(2.0)) * zs  # expected-error: d501 vs t501 (the scalar divisor is ignored)
+    return a, b, c, e, f, g, h, n, r
+
+
+STRESS_MODE_501 = 'none'
+
+
+def bmm_cross_entropy_501(q: Float[Array, "b501 n501 m501"], w: Float[Array, "b501 m501 p501"], logits: Float[Array, "b501 c501"], y: Float[Array, "b501"], probs: Float[Array, "b501 c501"], tok: Float[Array, "b501 n501 c501"], tgt: Float[Array, "b501 n501"], v: Float[Array, "c501"]):
+    s = torch.bmm(q, w)  # expected-shape: s=[b501, n501, p501]
+    s2 = q.bmm(w)  # expected-shape: s2=[b501, n501, p501]
+    s3 = torch.bmm(input=s, mat2=w.mT)  # expected-shape: s3=[b501, n501, m501]
+    loss = F.cross_entropy(logits, y)  # expected-shape: loss=[]
+    per = F.cross_entropy(logits, y, reduction='none')  # expected-shape: per=[b501]
+    soft = F.cross_entropy(logits, probs, reduction='none')  # expected-shape: soft=[b501]
+    tok_loss = F.cross_entropy(tok.permute(0, 2, 1), tgt, reduction='none')  # expected-shape: tok_loss=[b501, n501]
+    one = torch.nn.functional.cross_entropy(v, probs[0], reduction='none')  # expected-shape: one=[]
+    nll = F.nll_loss(F.log_softmax(logits, dim=1), y, reduction='sum')  # expected-shape: nll=[]
+    unknown = F.cross_entropy(logits, y, reduction=STRESS_MODE_501)
+    bad_bmm = torch.bmm(q, w[:1])  # expected-error: batch b501 vs 1 (bmm never broadcasts)
+    bad_ce = F.cross_entropy(logits, tgt)  # expected-error: target b501 n501 against input b501 c501
+    return s, s2, s3, loss, per, soft, tok_loss, one, nll, unknown
+
+
+STRESS_EPS_502 = 1e-6
+
+
+def scalar_operands_502(ys: Float[Array, "t502 d502"], zs: Float[Array, "t502"], k: int):
+    a = ys / jnp.sqrt(2.0)  # expected-shape: a=[t502, d502]
+    b = ys / math.sqrt(k)  # expected-shape: b=[t502, d502]
+    c = ys * math.pi  # expected-shape: c=[t502, d502]
+    e = ys / len(zs)  # expected-shape: e=[t502, d502]
+    f = ys / (2 * jnp.sqrt(2.0))  # expected-shape: f=[t502, d502]
+    g = ys / ys.shape[-1]  # expected-shape: g=[t502, d502]
+    dk = ys.shape[-1]
+    inv = 1.0 / math.sqrt(dk)
+    h = ys * inv  # expected-shape: h=[t502, d502]
+    n = ys / (jnp.abs(ys) + STRESS_EPS_502)  # expected-shape: n=[t502, d502]
+    r = jnp.sqrt(2.0)  # expected-shape: r=[]
+    bad = (ys / math.sqrt(2.0)) * zs  # expected-error: d502 vs t502 (the scalar divisor is ignored)
+    return a, b, c, e, f, g, h, n, r
+
+
+STRESS_MODE_502 = 'none'
+
+
+def bmm_cross_entropy_502(q: Float[Array, "b502 n502 m502"], w: Float[Array, "b502 m502 p502"], logits: Float[Array, "b502 c502"], y: Float[Array, "b502"], probs: Float[Array, "b502 c502"], tok: Float[Array, "b502 n502 c502"], tgt: Float[Array, "b502 n502"], v: Float[Array, "c502"]):
+    s = torch.bmm(q, w)  # expected-shape: s=[b502, n502, p502]
+    s2 = q.bmm(w)  # expected-shape: s2=[b502, n502, p502]
+    s3 = torch.bmm(input=s, mat2=w.mT)  # expected-shape: s3=[b502, n502, m502]
+    loss = F.cross_entropy(logits, y)  # expected-shape: loss=[]
+    per = F.cross_entropy(logits, y, reduction='none')  # expected-shape: per=[b502]
+    soft = F.cross_entropy(logits, probs, reduction='none')  # expected-shape: soft=[b502]
+    tok_loss = F.cross_entropy(tok.permute(0, 2, 1), tgt, reduction='none')  # expected-shape: tok_loss=[b502, n502]
+    one = torch.nn.functional.cross_entropy(v, probs[0], reduction='none')  # expected-shape: one=[]
+    nll = F.nll_loss(F.log_softmax(logits, dim=1), y, reduction='sum')  # expected-shape: nll=[]
+    unknown = F.cross_entropy(logits, y, reduction=STRESS_MODE_502)
+    bad_bmm = torch.bmm(q, w[:1])  # expected-error: batch b502 vs 1 (bmm never broadcasts)
+    bad_ce = F.cross_entropy(logits, tgt)  # expected-error: target b502 n502 against input b502 c502
+    return s, s2, s3, loss, per, soft, tok_loss, one, nll, unknown
+
+
+def shape_names_503(x: Float[Array, "b503 n503 d503"]):
+    p, q, r = x.shape
+    m2 = x.reshape(p * q, r)  # expected-shape: m2=[b503*n503, d503]
+    m3 = jnp.reshape(x, (p * q, r))  # expected-shape: m3=[b503*n503, d503]
+    m4 = x.reshape(p, q * r)  # expected-shape: m4=[b503, n503*d503]
+    m5 = x.reshape(p * q * r)  # expected-shape: m5=[b503*n503*d503]
+    m6 = x.reshape(p, q, r)  # expected-shape: m6=[b503, n503, d503]
+    m7 = m6 + x  # expected-shape: m7=[b503, n503, d503]
+    m8 = rearrange(jnp.exp(x), 'p q -> q p')  # expected-error: einops pattern has rank 2, the operand rank 3
+    return m2, m3, m4, m5, m7, m8
+
+
+def loop_carried_503(x: Float[Array, "3"], y: Float[Array, "5"]):
+    keep = x  # expected-shape: keep=[3]
+    for _ in range(2):
+        x, y = y, x
+    z = x + keep
+    h = keep
+    for _ in range(3):
+        h = jnp.exp(h)  # expected-shape: h=[3]
+    return z, h
+
+
+def shape_names_504(x: Float[Array, "b504 n504 d504"]):
+    p, q, r = x.shape
+    m2 = x.reshape(p * q, r)  # expected-shape: m2=[b504*n504, d504]
+    m3 = jnp.reshape(x, (p * q, r))  # expected-shape: m3=[b504*n504, d504]
+    m4 = x.reshape(p, q * r)  # expected-shape: m4=[b504, n504*d504]
+    m5 = x.reshape(p * q * r)  # expected-shape: m5=[b504*n504*d504]
+    m6 = x.reshape(p, q, r)  # expected-shape: m6=[b504, n504, d504]
+    m7 = m6 + x  # expected-shape: m7=[b504, n504, d504]
+    m8 = rearrange(jnp.exp(x), 'p q -> q p')  # expected-error: einops pattern has rank 2, the operand rank 3
+    return m2, m3, m4, m5, m7, m8
+
+
+def loop_carried_504(x: Float[Array, "3"], y: Float[Array, "5"]):
+    keep = x  # expected-shape: keep=[3]
+    for _ in range(2):
+        x, y = y, x
+    z = x + keep
+    h = keep
+    for _ in range(3):
+        h = jnp.exp(h)  # expected-shape: h=[3]
+    return z, h
+
+
+def shape_names_505(x: Float[Array, "b505 n505 d505"]):
+    p, q, r = x.shape
+    m2 = x.reshape(p * q, r)  # expected-shape: m2=[b505*n505, d505]
+    m3 = jnp.reshape(x, (p * q, r))  # expected-shape: m3=[b505*n505, d505]
+    m4 = x.reshape(p, q * r)  # expected-shape: m4=[b505, n505*d505]
+    m5 = x.reshape(p * q * r)  # expected-shape: m5=[b505*n505*d505]
+    m6 = x.reshape(p, q, r)  # expected-shape: m6=[b505, n505, d505]
+    m7 = m6 + x  # expected-shape: m7=[b505, n505, d505]
+    m8 = rearrange(jnp.exp(x), 'p q -> q p')  # expected-error: einops pattern has rank 2, the operand rank 3
+    return m2, m3, m4, m5, m7, m8
+
+
+def loop_carried_505(x: Float[Array, "3"], y: Float[Array, "5"]):
+    keep = x  # expected-shape: keep=[3]
+    for _ in range(2):
+        x, y = y, x
+    z = x + keep
+    h = keep
+    for _ in range(3):
+        h = jnp.exp(h)  # expected-shape: h=[3]
+    return z, h
 
 
 # stress-site: end

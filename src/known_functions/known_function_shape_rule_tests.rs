@@ -3210,3 +3210,269 @@ fn test_matrix_sqrth_keeps_only_square_matrix_shapes() {
     assert!(run("rect").unwrap_err().contains("linalg.matrix_sqrth"));
     assert_eq!(run("unknown").unwrap(), None);
 }
+
+fn run_bmm(args: Vec<CallArgument>, shapes: &[(&str, &[&str])]) -> Result<Option<Vec<String>>, String> {
+    let shapes: HashMap<String, Vec<String>> = shapes
+        .iter()
+        .map(|(name, dims)| (name.to_string(), shape(dims)))
+        .collect();
+    apply_known_function(&KnownFunction::Bmm, &args, &shapes)
+}
+
+#[test]
+fn test_bmm_rank3_batch_and_inner_dims() {
+    let operands: &[(&str, &[&str])] = &[("a", &["b", "n", "m"]), ("c", &["b", "m", "p"])];
+    assert_eq!(
+        run_bmm(vec![pos("a"), pos("c")], operands).unwrap(),
+        Some(shape(&["b", "n", "p"]))
+    );
+    assert_eq!(
+        run_bmm(vec![kw("input", "a"), kw("mat2", "c")], operands).unwrap(),
+        Some(shape(&["b", "n", "p"]))
+    );
+    let numeric: &[(&str, &[&str])] = &[("a", &["4", "3", "0"]), ("c", &["4", "0", "5"])];
+    assert_eq!(
+        run_bmm(vec![pos("a"), pos("c")], numeric).unwrap(),
+        Some(shape(&["4", "3", "5"]))
+    );
+}
+
+#[test]
+fn test_bmm_never_broadcasts_the_batch_dim() {
+    // torch.bmm(randn(4,3,4), randn(1,4,5)) raises, unlike torch.matmul.
+    let operands: &[(&str, &[&str])] = &[("a", &["4", "3", "4"]), ("c", &["1", "4", "5"])];
+    let error = run_bmm(vec![pos("a"), pos("c")], operands).unwrap_err();
+    assert!(error.contains("bmm batch"), "{error}");
+    let reversed: &[(&str, &[&str])] = &[("a", &["1", "3", "4"]), ("c", &["b", "4", "5"])];
+    assert!(run_bmm(vec![pos("a"), pos("c")], reversed).is_err());
+}
+
+#[test]
+fn test_bmm_inner_dim_mismatch_errors() {
+    let operands: &[(&str, &[&str])] = &[("a", &["b", "n", "m"]), ("c", &["b", "k", "p"])];
+    let error = run_bmm(vec![pos("a"), pos("c")], operands).unwrap_err();
+    assert!(error.contains("bmm") && error.contains("dimension mismatch"), "{error}");
+}
+
+#[test]
+fn test_bmm_requires_rank_3_operands() {
+    for (left, right) in [
+        (&["n", "m"][..], &["m", "p"][..]),
+        (&["b", "n", "m"][..], &["m", "p"][..]),
+        (&["b", "n", "m"][..], &["m"][..]),
+        (&["a", "b", "n", "m"][..], &["a", "b", "m", "p"][..]),
+        (&["m"][..], &["m"][..]),
+    ] {
+        let operands: &[(&str, &[&str])] = &[("a", left), ("c", right)];
+        let error = run_bmm(vec![pos("a"), pos("c")], operands).unwrap_err();
+        assert!(error.contains("bmm") && error.contains("3"), "{left:?} {right:?}: {error}");
+    }
+}
+
+#[test]
+fn test_bmm_unknown_operand_stays_unknown() {
+    let operands: &[(&str, &[&str])] = &[("a", &["b", "n", "m"])];
+    assert_eq!(run_bmm(vec![pos("a"), pos("c")], operands).unwrap(), None);
+    assert_eq!(run_bmm(vec![pos("a")], operands).unwrap(), None);
+}
+
+fn run_loss(
+    function: KnownFunction,
+    args: Vec<CallArgument>,
+    shapes: &[(&str, &[&str])],
+) -> Result<Option<Vec<String>>, String> {
+    let shapes: HashMap<String, Vec<String>> = shapes
+        .iter()
+        .map(|(name, dims)| (name.to_string(), shape(dims)))
+        .collect();
+    apply_known_function(&function, &args, &shapes)
+}
+
+#[test]
+fn test_cross_entropy_class_index_targets_per_reduction() {
+    let ce = |args: Vec<CallArgument>, shapes: &[(&str, &[&str])]| {
+        run_loss(KnownFunction::CrossEntropy, args, shapes)
+    };
+    let batched: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"])];
+    let unbatched: &[(&str, &[&str])] = &[("x", &["c"]), ("y", &[])];
+    let spatial: &[(&str, &[&str])] = &[("x", &["n", "c", "h", "w"]), ("y", &["n", "h", "w"])];
+    for (shapes, none) in [
+        (batched, shape(&["n"])),
+        (unbatched, shape(&[])),
+        (spatial, shape(&["n", "h", "w"])),
+    ] {
+        assert_eq!(ce(vec![pos("x"), pos("y")], shapes).unwrap(), Some(shape(&[])));
+        for reduction in ["'mean'", "\"sum\""] {
+            let args = vec![pos("x"), pos("y"), kw("reduction", reduction)];
+            assert_eq!(ce(args, shapes).unwrap(), Some(shape(&[])));
+        }
+        let args = vec![pos("x"), pos("y"), kw("reduction", "'none'")];
+        assert_eq!(ce(args, shapes).unwrap(), Some(none));
+    }
+    let keywords = vec![kw("input", "x"), kw("target", "y"), kw("reduction", "'none'")];
+    assert_eq!(ce(keywords, batched).unwrap(), Some(shape(&["n"])));
+}
+
+#[test]
+fn test_cross_entropy_probability_targets_per_reduction() {
+    let ce = |args: Vec<CallArgument>, shapes: &[(&str, &[&str])]| {
+        run_loss(KnownFunction::CrossEntropy, args, shapes)
+    };
+    let batched: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n", "c"])];
+    let unbatched: &[(&str, &[&str])] = &[("x", &["c"]), ("y", &["c"])];
+    let spatial: &[(&str, &[&str])] = &[("x", &["n", "c", "l"]), ("y", &["n", "c", "l"])];
+    assert_eq!(ce(vec![pos("x"), pos("y")], batched).unwrap(), Some(shape(&[])));
+    let none = |shapes| ce(vec![pos("x"), pos("y"), kw("reduction", "'none'")], shapes);
+    assert_eq!(none(batched).unwrap(), Some(shape(&["n"])));
+    assert_eq!(none(unbatched).unwrap(), Some(shape(&[])));
+    assert_eq!(none(spatial).unwrap(), Some(shape(&["n", "l"])));
+}
+
+#[test]
+fn test_cross_entropy_positional_reduction_and_label_smoothing() {
+    let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"])];
+    let positional = vec![
+        pos("x"), pos("y"), pos("None"), pos("None"), pos("-100"), pos("None"), pos("'none'"),
+    ];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, positional, shapes).unwrap(),
+        Some(shape(&["n"]))
+    );
+    let smoothed = vec![pos("x"), pos("y"), kw("reduction", "'none'"), kw("label_smoothing", "0.1")];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, smoothed, shapes).unwrap(),
+        Some(shape(&["n"]))
+    );
+}
+
+#[test]
+fn test_cross_entropy_value_dependent_reduction_stays_unknown() {
+    let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"])];
+    for extra in [
+        kw("reduction", "mode"),
+        kw("reduction", "None"),
+        kw("reduce", "False"),
+        kw("size_average", "False"),
+    ] {
+        let args = vec![pos("x"), pos("y"), extra];
+        assert_eq!(run_loss(KnownFunction::CrossEntropy, args, shapes).unwrap(), None);
+    }
+    // A legacy argument overrides `reduction`, even an invalid one.
+    let args = vec![pos("x"), pos("y"), kw("reduce", "False"), kw("reduction", "'Mean'")];
+    assert_eq!(run_loss(KnownFunction::CrossEntropy, args, shapes).unwrap(), None);
+    // Legacy arguments given as None change nothing.
+    let args = vec![
+        pos("x"), pos("y"), kw("size_average", "None"), kw("reduce", "None"), kw("reduction", "'none'"),
+    ];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, args, shapes).unwrap(),
+        Some(shape(&["n"]))
+    );
+}
+
+#[test]
+fn test_cross_entropy_invalid_reduction_string_errors() {
+    let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"])];
+    let args = vec![pos("x"), pos("y"), kw("reduction", "'Mean'")];
+    let error = run_loss(KnownFunction::CrossEntropy, args, shapes).unwrap_err();
+    assert!(error.contains("reduction"), "{error}");
+}
+
+#[test]
+fn test_cross_entropy_target_shape_errors() {
+    let bad: &[(&[&str], &[&str])] = &[
+        (&["n", "c"], &["m"]),
+        (&["n", "c"], &[]),
+        (&["n", "c"], &["n", "1"]),
+        (&["n", "c"], &["n", "c", "2"]),
+        (&["n", "c", "l"], &["n"]),
+        (&["n", "c", "l"], &["l"]),
+        (&["n", "c", "l"], &["n", "c", "l", "2"]),
+        (&["c"], &["2", "2"]),
+        (&["4", "c"], &["3", "c"]),
+        (&[], &[]),
+    ];
+    for function in [KnownFunction::CrossEntropy, KnownFunction::NllLoss] {
+        for (input, target) in bad {
+            let shapes: &[(&str, &[&str])] = &[("x", input), ("y", target)];
+            let result = run_loss(function.clone(), vec![pos("x"), pos("y")], shapes);
+            assert!(result.is_err(), "{function:?} {input:?} {target:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn test_unbatched_rank1_target_of_size_one_is_a_scalar_loss() {
+    // F.cross_entropy(randn(C), zeros(1, long), reduction='none') -> ().
+    let shapes: &[(&str, &[&str])] = &[("x", &["c"]), ("y", &["1"])];
+    let args = vec![pos("x"), pos("y"), kw("reduction", "'none'")];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, args.clone(), shapes).unwrap(),
+        Some(shape(&[]))
+    );
+    assert_eq!(run_loss(KnownFunction::NllLoss, args, shapes).unwrap(), Some(shape(&[])));
+    // Whether a symbolic size can be 1 depends on values.
+    let symbolic: &[(&str, &[&str])] = &[("x", &["c"]), ("y", &["k"])];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, vec![pos("x"), pos("y")], symbolic).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_cross_entropy_class_weight_must_cover_every_class() {
+    let ok: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"]), ("w", &["c"])];
+    let weighted = vec![pos("x"), pos("y"), kw("weight", "w")];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, weighted.clone(), ok).unwrap(),
+        Some(shape(&[]))
+    );
+    for weight in [&["k"][..], &["c", "1"][..], &[][..]] {
+        let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"]), ("w", weight)];
+        let error = run_loss(KnownFunction::CrossEntropy, weighted.clone(), shapes).unwrap_err();
+        assert!(error.contains("weight"), "{weight:?}: {error}");
+        assert!(run_loss(KnownFunction::NllLoss, weighted.clone(), shapes).is_err());
+    }
+    let positional = vec![pos("x"), pos("y"), pos("w")];
+    let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"]), ("w", &["k"])];
+    assert!(run_loss(KnownFunction::CrossEntropy, positional, shapes).is_err());
+    // An unknown weight stays unknown, and None is the default.
+    let none_weight = vec![pos("x"), pos("y"), kw("weight", "None")];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, none_weight, ok).unwrap(),
+        Some(shape(&[]))
+    );
+    let unknown = vec![pos("x"), pos("y"), kw("weight", "mystery")];
+    assert_eq!(
+        run_loss(KnownFunction::CrossEntropy, unknown, ok).unwrap(),
+        Some(shape(&[]))
+    );
+}
+
+#[test]
+fn test_cross_entropy_unknown_operand_stays_unknown() {
+    let shapes: &[(&str, &[&str])] = &[("x", &["n", "c"])];
+    for function in [KnownFunction::CrossEntropy, KnownFunction::NllLoss] {
+        assert_eq!(run_loss(function.clone(), vec![pos("x"), pos("y")], shapes).unwrap(), None);
+        assert_eq!(run_loss(function.clone(), vec![pos("z"), pos("x")], shapes).unwrap(), None);
+        assert_eq!(run_loss(function, vec![pos("x")], shapes).unwrap(), None);
+    }
+}
+
+#[test]
+fn test_nll_loss_takes_class_indices_only() {
+    let nll = |args: Vec<CallArgument>, shapes: &[(&str, &[&str])]| {
+        run_loss(KnownFunction::NllLoss, args, shapes)
+    };
+    let batched: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n"])];
+    let spatial: &[(&str, &[&str])] = &[("x", &["n", "c", "h"]), ("y", &["n", "h"])];
+    let unbatched: &[(&str, &[&str])] = &[("x", &["c"]), ("y", &[])];
+    let none = |shapes| nll(vec![pos("x"), pos("y"), kw("reduction", "'none'")], shapes);
+    assert_eq!(nll(vec![pos("x"), pos("y")], batched).unwrap(), Some(shape(&[])));
+    assert_eq!(none(batched).unwrap(), Some(shape(&["n"])));
+    assert_eq!(none(spatial).unwrap(), Some(shape(&["n", "h"])));
+    assert_eq!(none(unbatched).unwrap(), Some(shape(&[])));
+    // A target shaped like the input is a probability target: nll_loss rejects it.
+    let same: &[(&str, &[&str])] = &[("x", &["n", "c"]), ("y", &["n", "c"])];
+    assert!(nll(vec![pos("x"), pos("y")], same).is_err());
+}
