@@ -274,6 +274,10 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
         } else {
             return Ok(Vec::new());
         };
+        // A lone quote in broken text passes both the opening and closing checks.
+        if quoted.len() < quote_len * 2 {
+            return Ok(Vec::new());
+        }
         let unquoted = &quoted[quote_len..quoted.len() - quote_len];
         let base_byte = node.start_byte() + trim_start + quote_start + quote_len;
         let mut spans = Vec::new();

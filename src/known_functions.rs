@@ -1137,8 +1137,9 @@ pub(crate) fn apply_known_einops(
     };
 
     let trimmed = pattern_raw.trim();
-    let pattern = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    let pattern = if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
     {
         &trimmed[1..trimmed.len() - 1]
     } else {
@@ -1357,8 +1358,9 @@ fn apply_known_einsum(
     let equation_trimmed = equation.trim();
 
     // Remove quotes if present
-    let equation_str = if (equation_trimmed.starts_with('"') && equation_trimmed.ends_with('"'))
-        || (equation_trimmed.starts_with('\'') && equation_trimmed.ends_with('\''))
+    let equation_str = if equation_trimmed.len() >= 2
+        && ((equation_trimmed.starts_with('"') && equation_trimmed.ends_with('"'))
+            || (equation_trimmed.starts_with('\'') && equation_trimmed.ends_with('\'')))
     {
         &equation_trimmed[1..equation_trimmed.len() - 1]
     } else {
@@ -4901,8 +4903,9 @@ pub fn compute_einops_pack_shape(
         return Ok(None);
     };
     let trimmed = pattern_raw.trim();
-    let pattern = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    let pattern = if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
     {
         &trimmed[1..trimmed.len() - 1]
     } else {

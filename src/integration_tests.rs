@@ -11190,3 +11190,37 @@ mod unpack_and_broadcast_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lone_quote_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn broken_strings_do_not_panic() {
+        for code in [
+            "def f(x: Float[Array']) -> Float[Array, \"b\"]:\n    return x\n",
+            "def f(x) -> Float[Array d\"]:\n    return x\n",
+            "def f(x: Float[Array, \"",
+            "def f(x: Float[Array, \"\n    pass\n",
+            "def f(x: Float[Array, '):\n    pass\n",
+            "def f(x: Float[Array, \"\"\"):\n    pass\n",
+            "def f(x: Float[Array, \"\"\"\n",
+            "x: Float[Array, \"\n",
+            "import jax.numpy as jnp\ny = jnp.einsum(\"",
+            "import jax.numpy as jnp\ny = jnp.einsum(\",\n",
+            "import jax.numpy as jnp\ny = jnp.einsum(\"\n",
+            "import jax.numpy as jnp\nx: Float[Array, \"2 3\"] = g()\ny = x.reshape(\"\n",
+            "from einops import rearrange\ny = rearrange(x, \"\n",
+            "import torch.nn.functional as F\ny = F.cross_entropy(a, b, reduction=\"\n",
+            "import torch.nn.functional as F\ny = F.pad(x, \"\n",
+        ] {
+            let mut parser = Parser::new();
+            parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+            let tree = parser.parse(code, None).unwrap();
+            let read = |_: &PathBuf| -> Option<String> { None };
+            let roots: Vec<PathBuf> = Vec::new();
+            let _ = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None);
+        }
+    }
+}
