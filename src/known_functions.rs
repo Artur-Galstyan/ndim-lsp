@@ -151,13 +151,12 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "cat" | "concat" | "concatenate" => Some(KnownFunction::Concatenate),
             "stack" => Some(KnownFunction::Stack),
             "reshape" => Some(KnownFunction::Reshape),
-            "transpose" => Some(KnownFunction::Transpose),
+            "transpose" | "swapaxes" | "swapdims" => Some(KnownFunction::SwapAxes),
             "unsqueeze" => Some(KnownFunction::ExpandDims),
             "squeeze" => Some(KnownFunction::Squeeze),
             "sum" => Some(KnownFunction::Sum),
             "mean" => Some(KnownFunction::Mean),
-            "max" => Some(KnownFunction::Max),
-            "min" => Some(KnownFunction::Min),
+            "max" | "min" => Some(KnownFunction::TorchMaxMin),
             "prod" => Some(KnownFunction::Prod),
             "std" => Some(KnownFunction::Std),
             "var" => Some(KnownFunction::Var),
@@ -174,7 +173,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "tensor_split" => Some(KnownFunction::ArraySplit),
             "tile" => Some(KnownFunction::Tile),
             "repeat" => Some(KnownFunction::Repeat),
-            "flatten" => Some(KnownFunction::Flatten),
+            "flatten" => Some(KnownFunction::TorchFlatten),
             "ravel" => Some(KnownFunction::Ravel),
             "where" => Some(KnownFunction::Where),
             "all" => Some(KnownFunction::All),
@@ -691,7 +690,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "ravel" => Some(KnownFunction::Ravel),
         "transpose" => Some(KnownFunction::Transpose),
         "permute" => Some(KnownFunction::Permute),
-        "swapaxes" => Some(KnownFunction::SwapAxes),
+        "swapaxes" | "swapdims" => Some(KnownFunction::SwapAxes),
         "moveaxis" => Some(KnownFunction::MoveAxis),
         "squeeze" => Some(KnownFunction::Squeeze),
         "unsqueeze" | "expand_dims" => Some(KnownFunction::ExpandDims),
@@ -766,11 +765,22 @@ pub fn apply_method_call(
         .count();
     let method = if matches!(method, KnownFunction::Repeat) && positional_count >= 2 {
         &KnownFunction::Tile
+    } else if matches!(method, KnownFunction::Flatten) && is_torch_flatten_call(args) {
+        &KnownFunction::TorchFlatten
     } else {
         method
     };
     let synthesized = synthesize_method_args(method, receiver, args);
     apply_known_function(method, &synthesized, shapes)
+}
+
+/// `ndarray.flatten(order)` takes a string order; a positional non-string
+/// argument or a `start_dim`/`end_dim` keyword can only be `Tensor.flatten`.
+fn is_torch_flatten_call(args: &[CallArgument]) -> bool {
+    args.iter().any(|arg| match arg {
+        CallArgument::Positional { value } => !value.trim().starts_with(['\'', '"']),
+        CallArgument::Keyword { name, .. } => name == "start_dim" || name == "end_dim",
+    })
 }
 
 fn synthesize_method_args(
@@ -829,6 +839,7 @@ pub fn apply_known_function(
         KnownFunction::Stack => apply_known_stack(args, shapes),
         KnownFunction::Reshape => apply_known_reshape(args, shapes),
         KnownFunction::Flatten | KnownFunction::Ravel => apply_known_flatten(args, shapes),
+        KnownFunction::TorchFlatten => apply_known_torch_flatten(args, shapes),
         KnownFunction::Transpose | KnownFunction::Permute => apply_known_transpose(args, shapes),
         KnownFunction::SwapAxes => apply_known_swapaxes(args, shapes),
         KnownFunction::MoveAxis => apply_known_moveaxis(args, shapes),
@@ -895,6 +906,7 @@ pub fn apply_known_function(
         | KnownFunction::Any
         | KnownFunction::ArgMax
         | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
+        KnownFunction::TorchMaxMin => apply_known_torch_max_min(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgMatrixSqrth => {
             let Some(input_shape) =
@@ -1418,7 +1430,11 @@ fn apply_known_concatenate(
         return Ok(None);
     };
 
-    let axis = axis_arg(args, 0);
+    let Some(axis) = parse_axis(
+        nth_positional_or_keyword(args, 1, &["axis", "dim", "dimension"]).unwrap_or("0"),
+    ) else {
+        return Ok(None);
+    };
 
     let mut input_shapes = Vec::new();
     for input_name in &input_names {
@@ -1426,6 +1442,14 @@ fn apply_known_concatenate(
             return Ok(None);
         };
         input_shapes.push(shape.clone());
+    }
+
+    // torch.cat skips a 1-D empty tensor of any rank, so the ranks may differ.
+    let legacy_empty = |shape: &Vec<String>| shape.len() == 1 && shape[0] == "0";
+    if input_shapes.iter().any(legacy_empty)
+        && input_shapes.iter().any(|shape| shape.len() != 1)
+    {
+        return Ok(None);
     }
 
     let Some(first_shape) = input_shapes.first() else {
@@ -1656,6 +1680,48 @@ fn apply_known_flatten(
     };
 
     Ok(Some(vec![flattened_dim(input_shape)]))
+}
+
+fn apply_known_torch_flatten(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+
+    let dim_arg = |skip: usize, keyword: &str, default: isize| -> Option<isize> {
+        match nth_positional_or_keyword(args, skip, &[keyword]) {
+            Some(value) => parse_axis(value),
+            None => Some(default),
+        }
+    };
+    let (Some(start), Some(end)) = (dim_arg(1, "start_dim", 0), dim_arg(2, "end_dim", -1)) else {
+        return Ok(None);
+    };
+
+    // torch treats a scalar as rank 1 for dim wrapping and returns shape [1].
+    if input_shape.is_empty() {
+        return Ok(if matches!(start, 0 | -1) && matches!(end, 0 | -1) {
+            Some(vec!["1".to_string()])
+        } else {
+            None
+        });
+    }
+
+    let rank = input_shape.len() as isize;
+    let wrap = |dim: isize| (-rank..rank).contains(&dim).then(|| dim.rem_euclid(rank) as usize);
+    let (Some(start), Some(end)) = (wrap(start), wrap(end)) else {
+        return Ok(None);
+    };
+    if start > end {
+        return Ok(None);
+    }
+
+    let mut output = input_shape[..start].to_vec();
+    output.push(flattened_dim(&input_shape[start..=end]));
+    output.extend_from_slice(&input_shape[end + 1..]);
+    Ok(Some(output))
 }
 
 fn normalize_axis(axis: isize, rank: usize, context: &str) -> Result<usize, String> {
@@ -2616,7 +2682,9 @@ fn apply_known_pad(
         vec![values[0] + values[1]; input_shape.len()]
     } else if values.len() == input_shape.len() * 2 {
         values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[0] + pair[1])
             .collect::<Vec<_>>()
     } else {
@@ -2739,6 +2807,34 @@ fn apply_known_where(
         output = broadcast_two_shapes(&output, shape)?;
     }
     Ok(Some(output))
+}
+
+/// `torch.max(a, b)` broadcasts elementwise. A `dim` returns a
+/// `(values, indices)` namedtuple, which has no single shape. A broadcast
+/// mismatch stays unknown, like every other torch elementwise binary op.
+fn apply_known_torch_max_min(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let has_dim = args.iter().any(|arg| {
+        matches!(arg, CallArgument::Keyword { name, .. } if name == "dim" || name == "axis")
+    });
+    match nth_positional_or_keyword(args, 1, &["other"]) {
+        Some(other) if !has_dim => {
+            let (Some((_, input)), Some(other)) = (first_array_arg_shape(args, shapes), shapes.shape(other))
+            else {
+                return Ok(None);
+            };
+            // A scalar may be an int `dim`, which returns a tuple.
+            if other.is_empty() {
+                return Ok(None);
+            }
+            Ok(broadcast_two_shapes(input, other).ok())
+        }
+        Some(_) => Ok(None),
+        None if has_dim => Ok(None),
+        None => apply_known_reduction(args, shapes),
+    }
 }
 
 pub fn apply_known_reduction(
@@ -9130,7 +9226,12 @@ mod known_function_tests {
     known_case!(
         torch_transpose,
         ["torch", "transpose"],
-        Some(KnownFunction::Transpose)
+        Some(KnownFunction::SwapAxes)
+    );
+    known_case!(
+        torch_swapdims,
+        ["torch", "swapdims"],
+        Some(KnownFunction::SwapAxes)
     );
     known_case!(
         torch_unsqueeze,
@@ -9144,8 +9245,8 @@ mod known_function_tests {
     );
     known_case!(torch_sum, ["torch", "sum"], Some(KnownFunction::Sum));
     known_case!(torch_mean, ["torch", "mean"], Some(KnownFunction::Mean));
-    known_case!(torch_max, ["torch", "max"], Some(KnownFunction::Max));
-    known_case!(torch_min, ["torch", "min"], Some(KnownFunction::Min));
+    known_case!(torch_max, ["torch", "max"], Some(KnownFunction::TorchMaxMin));
+    known_case!(torch_min, ["torch", "min"], Some(KnownFunction::TorchMaxMin));
     known_case!(torch_prod, ["torch", "prod"], Some(KnownFunction::Prod));
     known_case!(torch_std, ["torch", "std"], Some(KnownFunction::Std));
     known_case!(torch_var, ["torch", "var"], Some(KnownFunction::Var));
@@ -9179,7 +9280,7 @@ mod known_function_tests {
     known_case!(
         torch_flatten,
         ["torch", "flatten"],
-        Some(KnownFunction::Flatten)
+        Some(KnownFunction::TorchFlatten)
     );
     known_case!(torch_ravel, ["torch", "ravel"], Some(KnownFunction::Ravel));
     known_case!(torch_where, ["torch", "where"], Some(KnownFunction::Where));
@@ -10404,6 +10505,104 @@ mod method_call_tests {
         let output = apply_method_call(&KnownFunction::Flatten, "x", &args, &shapes).unwrap();
 
         assert_eq!(output, Some(shape(&["24"])));
+    }
+
+    fn torch_flatten(args: Vec<CallArgument>, dims: &[&str]) -> Result<Option<Vec<String>>, String> {
+        let shapes = HashMap::from([("x".to_string(), shape(dims))]);
+        apply_known_function(&KnownFunction::TorchFlatten, &args, &shapes)
+    }
+
+    #[test]
+    fn test_torch_flatten_defaults_collapse_all() {
+        let out = torch_flatten(vec![pos("x")], &["2", "3", "4"]).unwrap();
+        assert_eq!(out, Some(shape(&["24"])));
+    }
+
+    #[test]
+    fn test_torch_flatten_start_dim_positional_and_keyword() {
+        let out = torch_flatten(vec![pos("x"), pos("1")], &["B", "C", "H"]).unwrap();
+        assert_eq!(out, Some(shape(&["B", "C*H"])));
+        let out = torch_flatten(vec![pos("x"), kw("start_dim", "1")], &["B", "C", "H"]).unwrap();
+        assert_eq!(out, Some(shape(&["B", "C*H"])));
+    }
+
+    #[test]
+    fn test_torch_flatten_start_and_end_dim() {
+        let out = torch_flatten(vec![pos("x"), pos("1"), pos("2")], &["2", "3", "4", "5"]).unwrap();
+        assert_eq!(out, Some(shape(&["2", "12", "5"])));
+        let out = torch_flatten(vec![pos("x"), kw("end_dim", "1")], &["2", "3", "4"]).unwrap();
+        assert_eq!(out, Some(shape(&["6", "4"])));
+    }
+
+    #[test]
+    fn test_torch_flatten_negative_dims() {
+        let out = torch_flatten(vec![pos("x"), pos("-2"), pos("-1")], &["2", "3", "4"]).unwrap();
+        assert_eq!(out, Some(shape(&["2", "12"])));
+        let out = torch_flatten(vec![pos("x"), pos("0"), pos("-2")], &["2", "3", "4"]).unwrap();
+        assert_eq!(out, Some(shape(&["6", "4"])));
+    }
+
+    #[test]
+    fn test_torch_flatten_single_dim_range_keeps_shape() {
+        let out = torch_flatten(vec![pos("x"), pos("1"), pos("1")], &["2", "3", "4"]).unwrap();
+        assert_eq!(out, Some(shape(&["2", "3", "4"])));
+    }
+
+    #[test]
+    fn test_torch_flatten_invalid_dims_are_unknown() {
+        assert_eq!(torch_flatten(vec![pos("x"), pos("3")], &["2", "3", "4"]), Ok(None));
+        assert_eq!(torch_flatten(vec![pos("x"), pos("-4")], &["2", "3", "4"]), Ok(None));
+        assert_eq!(
+            torch_flatten(vec![pos("x"), pos("0"), pos("5")], &["2", "3", "4"]),
+            Ok(None)
+        );
+        assert_eq!(
+            torch_flatten(vec![pos("x"), pos("2"), pos("1")], &["2", "3", "4"]),
+            Ok(None)
+        );
+        assert_eq!(torch_flatten(vec![pos("x"), pos("d")], &["2", "3", "4"]), Ok(None));
+    }
+
+    #[test]
+    fn test_torch_flatten_scalar() {
+        assert_eq!(torch_flatten(vec![pos("x")], &[]), Ok(Some(shape(&["1"]))));
+        assert_eq!(
+            torch_flatten(vec![pos("x"), pos("0"), pos("-1")], &[]),
+            Ok(Some(shape(&["1"])))
+        );
+        assert_eq!(torch_flatten(vec![pos("x"), pos("1")], &[]), Ok(None));
+    }
+
+    #[test]
+    fn test_method_flatten_start_dim_is_torch() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["B", "C", "H"]))]);
+        let out = apply_method_call(&KnownFunction::Flatten, "x", &[pos("1")], &shapes).unwrap();
+        assert_eq!(out, Some(shape(&["B", "C*H"])));
+        let out = apply_method_call(&KnownFunction::Flatten, "x", &[pos("0"), pos("-2")], &shapes)
+            .unwrap();
+        assert_eq!(out, Some(shape(&["B*C", "H"])));
+        let out = apply_method_call(&KnownFunction::Flatten, "x", &[kw("start_dim", "1")], &shapes)
+            .unwrap();
+        assert_eq!(out, Some(shape(&["B", "C*H"])));
+        let out = apply_method_call(&KnownFunction::Flatten, "x", &[pos("d")], &shapes).unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_method_flatten_order_is_not_a_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3", "4"]))]);
+        for args in [vec![pos("'F'")], vec![pos("\"C\"")], vec![kw("order", "'F'")]] {
+            let out = apply_method_call(&KnownFunction::Flatten, "x", &args, &shapes).unwrap();
+            assert_eq!(out, Some(shape(&["24"])));
+        }
+    }
+
+    #[test]
+    fn test_ravel_order_is_not_a_dim() {
+        let shapes = HashMap::from([("x".to_string(), shape(&["2", "3"]))]);
+        let args = [pos("x"), kw("order", "'F'")];
+        let out = apply_known_function(&KnownFunction::Ravel, &args, &shapes).unwrap();
+        assert_eq!(out, Some(shape(&["6"])));
     }
 
     #[test]

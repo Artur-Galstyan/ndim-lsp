@@ -560,6 +560,9 @@ pub enum KnownFunction {
     Mean,
     Max,
     Min,
+    /// `torch.max`/`torch.min`: two tensors broadcast elementwise, a `dim`
+    /// returns a `(values, indices)` namedtuple, otherwise a full reduction.
+    TorchMaxMin,
     MinMax,
     Prod,
     Std,
@@ -576,6 +579,8 @@ pub enum KnownFunction {
     Tile,
     Repeat,
     Flatten,
+    /// `torch.flatten(x, start_dim, end_dim)` / `Tensor.flatten(start_dim, end_dim)`.
+    TorchFlatten,
     Ravel,
     MoveAxis,
     SwapAxes,

@@ -914,37 +914,101 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
     }
 }
 
-/// Resolve a `call` node's shape.
-///
-/// This is the main dispatch point that handles:
-/// Build the `ShapeError` for a failed method-call shape rule, classifying
-/// it as `Approximation` for the one documented case where the rule is known
-/// to be unsound rather than genuinely contradictory: `x.transpose(i, j)`
-/// dispatches to the same axes-permutation rule as `jnp.transpose`/`.permute`
-/// (`apply_known_transpose`), but torch's 2-arg method form swaps exactly
-/// those two axes and leaves the rest alone — it's valid for *any* rank, not
-/// just rank 2 (see `llm.txt` "Known limitations"). `apply_known_transpose`
-/// can't tell the two call styles apart, so an "expected N axes, got 2"
-/// error from exactly 2 positional args is this approximation firing, not a
-/// real mismatch.
-fn shape_error_for_method(
+/// Which array library the file uses, judged from its imports alone.
+#[derive(PartialEq)]
+enum FileBackend {
+    Torch,
+    NumpyLike,
+    Unknown,
+}
+
+fn file_backend(import_map: &HashMap<String, ImportPath>) -> FileBackend {
+    let (mut torch, mut other) = (false, false);
+    for import in import_map.values() {
+        match import.module.first().unwrap_or(&import.name).as_str() {
+            "torch" => torch = true,
+            "jax" | "numpy" | "flax" | "equinox" | "haiku" | "optax" => other = true,
+            _ => {}
+        }
+    }
+    match (torch, other) {
+        (true, false) => FileBackend::Torch,
+        (false, true) => FileBackend::NumpyLike,
+        _ => FileBackend::Unknown,
+    }
+}
+
+/// `x.transpose(i, j)` swaps two dims in torch but is a full axes permutation
+/// in numpy/jax. `dim0`/`dim1` keywords only exist in torch. With two
+/// positional dims and no known backend, the result is kept only when both
+/// readings give the same shape.
+fn apply_method_call_for_backend(
     known: &KnownFunction,
+    receiver: &str,
     args: &[CallArgument],
-    variable: String,
-    message: String,
-    range: tree_sitter::Range,
-) -> ShapeError {
+    import_map: &HashMap<String, ImportPath>,
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    if matches!(known, KnownFunction::Max | KnownFunction::Min) {
+        return apply_max_min_method_for_backend(known, receiver, args, import_map, shapes);
+    }
+    if !matches!(known, KnownFunction::Transpose) {
+        return apply_method_call(known, receiver, args, shapes);
+    }
+    let torch_keywords = args.iter().any(|arg| {
+        matches!(arg, CallArgument::Keyword { name, .. } if name == "dim0" || name == "dim1")
+    });
+    if torch_keywords {
+        return apply_method_call(&KnownFunction::SwapAxes, receiver, args, shapes);
+    }
     let positional_count = args
         .iter()
         .filter(|a| matches!(a, CallArgument::Positional { .. }))
         .count();
-    if matches!(known, KnownFunction::Transpose) && positional_count == 2 {
-        ShapeError::approximation(variable, message, range)
-    } else {
-        ShapeError::mismatch(variable, message, range)
+    if positional_count != 2 {
+        return apply_method_call(known, receiver, args, shapes);
+    }
+    match file_backend(import_map) {
+        FileBackend::Torch => apply_method_call(&KnownFunction::SwapAxes, receiver, args, shapes),
+        FileBackend::NumpyLike => apply_method_call(known, receiver, args, shapes),
+        FileBackend::Unknown => {
+            let swapped = apply_method_call(&KnownFunction::SwapAxes, receiver, args, shapes);
+            let permuted = apply_method_call(known, receiver, args, shapes);
+            match (swapped, permuted) {
+                (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
+                _ => Ok(None),
+            }
+        }
     }
 }
 
+/// `x.max(y)` broadcasts and `x.max(dim)` returns a `(values, indices)`
+/// namedtuple in torch, while numpy/jax `x.max(axis)` reduces to an array.
+/// With no known backend, the result is kept only when both readings agree.
+fn apply_max_min_method_for_backend(
+    known: &KnownFunction,
+    receiver: &str,
+    args: &[CallArgument],
+    import_map: &HashMap<String, ImportPath>,
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    match file_backend(import_map) {
+        FileBackend::Torch => apply_method_call(&KnownFunction::TorchMaxMin, receiver, args, shapes),
+        FileBackend::NumpyLike => apply_method_call(known, receiver, args, shapes),
+        FileBackend::Unknown => {
+            let torch = apply_method_call(&KnownFunction::TorchMaxMin, receiver, args, shapes);
+            let numpy = apply_method_call(known, receiver, args, shapes);
+            match (torch, numpy) {
+                (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// Resolve a `call` node's shape.
+///
+/// This is the main dispatch point that handles:
 /// 1. Chained method calls (e.g. `x.reshape(3,4).sum(axis=1)`)
 /// 2. Free function calls (e.g. `jnp.exp(...)`)
 /// 3. Layer applications
@@ -1060,12 +1124,12 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
                 if let Some(known) = classify_method_call(&method_name) {
-                    let result = apply_method_call(&known, &receiver_name, &args, &ctx.scope_shapes(scope_idx));
+                    let result = apply_method_call_for_backend(&known, &receiver_name, &args, ctx.import_map, &ctx.scope_shapes(scope_idx));
                     return match result {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(shape_error_for_method(&known, &args, method_name, message, args_node.range()));
+                            ctx.errors.push(ShapeError::mismatch(method_name, message, args_node.range()));
                             None
                         }
                     };
@@ -1095,17 +1159,18 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
                 if let Some(known) = classify_method_call(&method_name) {
-                    let result = apply_method_call(
+                    let result = apply_method_call_for_backend(
                         &known,
                         &receiver_name,
                         &args,
+                        ctx.import_map,
                         &ctx.scope_shapes(scope_idx),
                     );
                     return match result {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(shape_error_for_method(&known, &args, receiver_name, message, args_node.range()));
+                            ctx.errors.push(ShapeError::mismatch(receiver_name, message, args_node.range()));
                             None
                         }
                     };
@@ -1144,6 +1209,11 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             *input = resolve_call_arg(input.clone(), args_node.named_child(i as u32)?, scope_idx, ctx)?;
         }
         args
+    } else if matches!(
+        known.as_ref().and_then(sequence_kind),
+        Some(SequenceArg::Elements | SequenceArg::Operands)
+    ) {
+        resolve_call_args_keeping_sequences(raw_args, args_node, scope_idx, ctx)?
     } else {
         resolve_call_args(raw_args, args_node, scope_idx, ctx)?
     };
@@ -1326,13 +1396,14 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         {
             return None;
         }
-        // A stack consumes a sequence, not one tensor. In particular, the
-        // homogeneous-tuple approximation used for scan carries must not
+        // Functions that consume a sequence must see every element: the
+        // homogeneous-tuple approximation used for scan carries would
         // collapse `(x, x)` into one operand. Share this rule across backends.
-        let args = if matches!(known, KnownFunction::Stack) {
-            resolve_stack_args(args_node, scope_idx, ctx)?
-        } else {
-            args
+        let args = match sequence_kind(&known) {
+            Some(SequenceArg::Elements) => resolve_stack_args(args_node, scope_idx, ctx)?,
+            Some(SequenceArg::Operands) if resolved.parts.first().map(String::as_str) == Some("torch") => resolve_einsum_args(args, args_node, scope_idx, ctx)?,
+            Some(SequenceArg::Opaque) if first_arg_is_tuple(args_node) => return None,
+            _ => args,
         };
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
@@ -1439,6 +1510,101 @@ fn resolve_call_args(
         .enumerate()
         .map(|(i, arg)| resolve_call_arg(arg, args_node.named_child(i as u32)?, scope_idx, ctx))
         .collect()
+}
+
+/// Tuple and list arguments are evaluated element by element by the
+/// sequence resolvers, so evaluating them here would report errors twice.
+fn resolve_call_args_keeping_sequences(
+    raw_args: Vec<CallArgument>,
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<CallArgument>> {
+    raw_args
+        .into_iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let arg_node = args_node.named_child(i as u32)?;
+            let value_node = match &arg {
+                CallArgument::Positional { .. } => arg_node,
+                CallArgument::Keyword { .. } => arg_node.child_by_field_name("value")?,
+            };
+            if matches!(value_node.kind(), "tuple" | "list") {
+                return Some(arg);
+            }
+            resolve_call_arg(arg, arg_node, scope_idx, ctx)
+        })
+        .collect()
+}
+
+enum SequenceArg {
+    /// A tuple or list of arrays in the first argument.
+    Elements,
+    /// A tuple or list of operands after the equation (torch.einsum).
+    Operands,
+    /// A sequence the rule cannot read from a tuple, so a tuple stays unknown.
+    Opaque,
+}
+
+fn sequence_kind(known: &KnownFunction) -> Option<SequenceArg> {
+    match known {
+        KnownFunction::Stack
+        | KnownFunction::Concatenate
+        | KnownFunction::Vstack
+        | KnownFunction::Hstack
+        | KnownFunction::Dstack
+        | KnownFunction::ColumnStack => Some(SequenceArg::Elements),
+        KnownFunction::Einsum => Some(SequenceArg::Operands),
+        KnownFunction::Block
+        | KnownFunction::EinopsRearrange
+        | KnownFunction::EinopsReduce
+        | KnownFunction::EinopsRepeat => Some(SequenceArg::Opaque),
+        _ => None,
+    }
+}
+
+fn first_arg_is_tuple(args_node: Node) -> bool {
+    find_positional_arg_node(args_node, 0).is_some_and(|node| node.kind() == "tuple")
+}
+
+fn resolve_einsum_args(
+    args: Vec<CallArgument>,
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<CallArgument>> {
+    let Some(sequence) = find_positional_arg_node(args_node, 1) else {
+        return Some(args);
+    };
+    if !matches!(sequence.kind(), "tuple" | "list") {
+        return Some(args);
+    }
+    let mut spliced = Vec::new();
+    let mut positional = 0;
+    for arg in args {
+        if !matches!(arg, CallArgument::Positional { .. }) {
+            spliced.push(arg);
+            continue;
+        }
+        positional += 1;
+        if positional != 2 {
+            spliced.push(arg);
+            continue;
+        }
+        let mut cursor = sequence.walk();
+        for element in sequence.named_children(&mut cursor) {
+            if element.kind() == "comment" {
+                continue;
+            }
+            let shape = match binop_operand(element, scope_idx, ctx)? {
+                BinopOperand::Scalar => Vec::new(),
+                BinopOperand::Shaped(shape) => shape,
+            };
+            let value = ctx.bind_synthetic(shape, scope_idx, element.start_byte());
+            spliced.push(CallArgument::Positional { value });
+        }
+    }
+    Some(spliced)
 }
 
 fn resolve_stack_args(

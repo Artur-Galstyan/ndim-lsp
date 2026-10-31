@@ -206,3 +206,100 @@ fn jax_new_names_do_not_match_unrelated_modules() {
         }
     }
 }
+
+#[test]
+fn lax_concatenate_reads_the_dimension_keyword() {
+    assert_eq!(
+        sequence_shape("jax.lax", "concatenate", "(x, u)", ", dimension=1"),
+        dims(&["3", "8"])
+    );
+}
+
+fn sequence_shape(module: &str, call: &str, sequence: &str, extra: &str) -> Option<Vec<String>> {
+    let code = format!(
+        "import {module} as lib\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    out = lib.{call}({sequence}{extra})\n"
+    );
+    let analysis = analyze(&code);
+    assert!(analysis.errors.is_empty(), "{code}: {:?}", analysis.errors);
+    find_shape(&analysis, "out").cloned()
+}
+
+fn dims(values: &[&str]) -> Option<Vec<String>> {
+    Some(values.iter().map(|d| d.to_string()).collect())
+}
+
+#[test]
+fn sequence_functions_keep_every_element_of_equal_shaped_tuples() {
+    let cases: [(&str, &str, &str, &[&str]); 12] = [
+        ("jax.numpy", "concatenate", "", &["6", "4"]),
+        ("numpy", "concatenate", "", &["6", "4"]),
+        ("torch", "cat", "", &["6", "4"]),
+        ("torch", "concat", "", &["6", "4"]),
+        ("jax.numpy", "vstack", "", &["6", "4"]),
+        ("numpy", "row_stack", "", &["6", "4"]),
+        ("torch", "vstack", "", &["6", "4"]),
+        ("jax.numpy", "hstack", "", &["3", "8"]),
+        ("torch", "hstack", "", &["3", "8"]),
+        ("jax.numpy", "dstack", "", &["3", "4", "2"]),
+        ("jax.numpy", "column_stack", "", &["3", "8"]),
+        ("torch", "column_stack", "", &["3", "8"]),
+    ];
+    for (module, call, extra, expected) in cases {
+        for sequence in ["(x, x)", "(x, u)", "[x, x]", "[x, u]", "(x, x + u)"] {
+            assert_eq!(
+                sequence_shape(module, call, sequence, extra),
+                dims(expected),
+                "{module}.{call}({sequence})"
+            );
+        }
+    }
+}
+
+#[test]
+fn sequence_functions_accept_keyword_and_axis_with_tuples() {
+    assert_eq!(
+        sequence_shape("jax.numpy", "concatenate", "(x, u)", ", axis=1"),
+        dims(&["3", "8"])
+    );
+    assert_eq!(
+        sequence_shape("torch", "cat", "(x, u)", ", dim=-1"),
+        dims(&["3", "8"])
+    );
+    assert_eq!(
+        sequence_shape("torch", "cat", "tensors=(x, u)", ""),
+        dims(&["6", "4"])
+    );
+}
+
+#[test]
+fn block_rejects_tuple_sequences() {
+    assert_eq!(sequence_shape("numpy", "block", "(x, u)", ""), None);
+    assert_eq!(sequence_shape("numpy", "block", "[x, u]", ""), dims(&["3", "8"]));
+}
+
+#[test]
+fn torch_einsum_tuple_operands_do_not_collapse() {
+    let code = "import torch\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    out = torch.einsum(\"ij,ij->ij\", (x, u))\n";
+    let analysis = analyze(code);
+    assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+}
+
+#[test]
+fn torch_einsum_list_and_tuple_operands_keep_each_operand() {
+    for sequence in ["(x, u)", "[x, u]"] {
+        let code = format!(
+            "import torch\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    out = torch.einsum(\"ij,ij->ij\", {sequence})\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{code}: {:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), dims(&["3", "4"]).as_ref(), "{code}");
+    }
+}
+
+#[test]
+fn einops_rearrange_tuple_input_stays_unknown() {
+    let code = "from einops import rearrange\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    a = rearrange((x, u), \"b h w -> b (h w)\")\n";
+    let analysis = analyze(code);
+    assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    assert_eq!(find_shape(&analysis, "a"), None);
+}

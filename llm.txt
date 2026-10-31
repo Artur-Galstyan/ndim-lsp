@@ -7,11 +7,11 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified after the JAX 0.11.1 compatibility audit based on `f2bcb7f`
-(`ndim-lsp` 0.1.1):
+Verified after the JAX 0.11.1 compatibility audit, on `9f7b734` plus uncommitted
+work (`ndim-lsp` 0.1.1). Update this baseline after the commit:
 
-- `cargo test --quiet` passes: 1,781 tests pass and two benchmarks are ignored
-  (1,759 library/integration tests plus 22 LSP-server tests).
+- `cargo test --quiet` passes: 1,839 tests pass and two benchmarks are ignored
+  (1,817 library/integration tests plus 22 LSP-server tests).
 - Corpus coverage is 100% (176/176) over 24 files in `corpus/`; the floor
   assert in the harness is 90%.
 - `cargo clippy --all-targets --all-features` is clean (no warnings).
@@ -55,10 +55,15 @@ Top-k and qr_multiply share validation between single-name and unpacked
 calls, but only unpacking exposes their component tensor shapes.
 Shape-changing options that are not static stay unknown.
 
-Stack arguments now preserve list/tuple elements (including inline array
-expressions) instead of collapsing a homogeneous tuple into one operand.
-This applies to JAX, NumPy, and PyTorch. General sequence variables remain
-unknown because the shape map does not represent container types.
+`stack`, `concatenate`/`cat`, `vstack`, `hstack`, `dstack`, and `column_stack`
+read each list/tuple element (including inline array expressions) as one
+operand, instead of collapsing a homogeneous tuple into one operand. This
+applies to JAX, NumPy, and PyTorch. A sequence that is not a tuple or list
+literal (for example a variable `xs`) makes the call unknown, because the shape
+map does not represent container types. An element with an unknown shape
+makes the whole call unknown. `block` with a tuple literal is unknown (NumPy
+and JAX reject it); einops `rearrange`/`reduce`/`repeat` with a tuple of
+tensors are unknown. `einops.pack` reads raw arguments and handles tuples.
 
 Rule for agents working on this repo
 ------------------------------------
@@ -106,6 +111,16 @@ Current file layout
     - `LayerShapeAnalysis` (`scopes`, `layers`, `applications`, `errors`, `assignment_shapes`)
   - Public helpers: `scope_for_byte`, `scope_index_for_byte`.
   - (`CoverageReport` / `DarkSpot` live in `src/analysis.rs`.)
+
+- `src/main.rs`
+  - tower-lsp server binary: `initialize` options, diagnostics, hover, inlay
+    hints, definition, code actions, workspace folders, site-packages lookup.
+
+- `src/known_functions/jax.rs`
+  - `classify` and shape rules for the JAX 0.10/0.11 additions.
+
+- `src/jax_compat_tests.rs`
+  - Analyzer tests over the `bench/jax_compat/` fixtures.
 
 - `src/python_ast.rs`
   - Pure tree-sitter Python extraction helpers.
@@ -157,7 +172,7 @@ Current file layout
       carrying its enclosing class byte range so same-named attrs in different
       classes don't collide. Lookup goes through `ShapeCtx::self_attr_layer_at`
       (innermost class containing the call byte; lone-binding fallback).
-      `extract_self_attr_layers` is the flat last-wins wrapper kept for tests.
+      `extract_self_attr_layers` is an unused flat last-wins public wrapper.
     - `apply_layer_application`
     - `apply_layer_applications`
 
@@ -204,6 +219,7 @@ Current file layout
     transformer/GRU/conv/numpy-soup/indexing blocks with unique per-block dims,
     plus deliberate `# expected-error:` blocks). Consumed by the ignored
     `bench_large_file` test in `src/integration_tests.rs`.
+  - `jax_compat/` holds `cases.json`, `check.py`, `audit.py`, and its README.
 
 - `README.md`
   - Human-facing project overview and roadmap. Keep it honest and less detailed than this file.
@@ -289,7 +305,8 @@ What works now
 11. Recursive shape evaluator (replaces flat query extraction)
    - `shape_of_expression` walks an assignment RHS bottom-up: `call`,
      `attribute`, `identifier`, `unary_operator`, `subscript`,
-     `parenthesized_expression`, `binary_operator`.
+     `parenthesized_expression`, `binary_operator`, `tuple` (a shape only
+     when all elements have the same shape).
    - Nested/chained calls in one expression now propagate, e.g.
      `jnp.exp(a @ b)`, `x.reshape(3,4).sum(axis=1)`,
      `jax.nn.softplus(jax.vmap(self.proj)(x))`.
@@ -308,7 +325,7 @@ What works now
 
 14. vmap of attribute callables + inline vmap (issue #35)
    - `jax.vmap(self.layer)(x)` resolves `self.layer` to a layer built in
-     `__init__` (`extract_self_attr_layers`) and applies it batched over the
+     `__init__` (`extract_self_attr_layers_by_class`) and applies it batched over the
      leading axis. `jax.vmap(f)(x)` inline form reuses `apply_vmap_call`.
 
 14b. Direct self-attribute layer application
@@ -331,7 +348,8 @@ What works now
 16. Session-lifetime import-resolution cache (issue #36 / PR #38)
    - `ResolutionCache` keyed on `(import-path-segments, roots-fingerprint)` is
      shared across `analyze_layer_shapes` calls. Caches `ResolvedImplementation`
-     (not signature extraction). See `corpus`/cross-file integration tests.
+     in `map` and the extracted cross-file helper `FunctionShapeScope`s in
+     `signatures`. See `corpus`/cross-file integration tests.
 
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
@@ -378,11 +396,25 @@ Known limitations / important caveats
   `initializationOptions.diagnostic_severity` for `Mismatch` errors (default
   `ERROR`) and `initializationOptions.approximation_severity` for
   `Approximation` errors (default `WARNING`).
+- Import resolution searches the workspace roots, then site-packages found
+  through `$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`
+  (no Python call). The resolution cache is keyed by (path, name) with no
+  file-time check and clears only when the workspace folders change. The server
+  has no `did_save`, watched-file, or configuration handler, so a saved edit to
+  an imported file stays cached until a workspace folder change or a restart.
+  Severity options are read only in `initialize`, so a change needs a restart.
 - Shape maps are now scoped per function. `extract_jaxtyping_shapes` returns `Vec<FunctionShapeScope>` (a module-level scope followed by one per `function_definition`), and `analyze_layer_shapes` routes each call to the smallest containing scope. `scope_for_byte` / `scope_index_for_byte` break size ties by preferring the later-pushed (inner) scope.
 - Method calls like `x.reshape(...)`, `x.sum(...)`, `x.transpose(...)`,
   `x.astype(...)`, `x.to(...)`, `x.repeat(...)`, and `x.expand(...)` are wired
-  end-to-end. `x.transpose(i, j)` torch-style two-axis swap is only correct for
-  rank-2 inputs.
+  end-to-end. `x.transpose(i, j)` is a torch two-axis swap but a numpy/jax
+  axes permutation, so the rule is chosen per file from its imports
+  (`file_backend`): torch only means swap, numpy/jax/flax/equinox/haiku/optax only means
+  permutation, and no import or both means unknown unless both readings agree.
+  `dim0`/`dim1` keywords always mean swap. `x.max(y)` and `x.max(dim)` follow the same per-file choice;
+  `torch.max(a, b)` broadcasts and `torch.max(x, dim)` (a tuple result) is
+  unknown. The backend is not tracked per receiver. `torch.flatten` and
+  `x.flatten(start_dim, end_dim)` honor the dims (a positional argument that is
+  not a string counts as torch); out-of-range dims are unknown.
 - Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
 - Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (numeric `a:b` and `:n` folded; others approximated by the original axis), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. Advanced/boolean array indexing is approximated as a single axis drop.
 - Multi-output tuple assignment covers `split`, default `meshgrid`, default
@@ -393,8 +425,9 @@ Known limitations / important caveats
   and literal factors, so `d_state*2` equals `2*d_state`. `self.<attr>` is
   canonicalized to an identifier alias from `__init__` before storage, and the
   alias lookup is class-scoped. Limitations: aliases still need an
-  identifier RHS; layer constructor arguments carrying `self.` (for example,
-  `Linear(self.d_inner, ...)`) are not normalized; and subtraction, division,
+  identifier RHS; layer constructor arguments have the `self.` token stripped
+  (for example, `Linear(self.d_inner, ...)`) but do not go through the alias
+  map, so a differently named attribute is not mapped; and subtraction, division,
   and arbitrary parenthesized expressions are not generally normalized.
 - `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
 - Higher-order functions: `vmap` is modeled (free/inline/attribute);
@@ -445,9 +478,9 @@ representative. Current open targets, in impact order:
    a narrowly scoped non-array literal value. Do not implement a low-value
    tracker row in isolation.
 
-3. Improve expression precision where it affects real code: normalize
-   `self.`-prefixed layer constructor arguments (`Linear(self.d_inner, ...)`)
-   and extend symbolic normalization beyond the supported flat
+3. Improve expression precision where it affects real code: map
+   `self.`-prefixed layer constructor arguments through the alias map for
+   differently named attributes, and extend symbolic normalization beyond the supported flat
    sum/product forms.
 
 4. Expand LSP presentation only after the underlying analysis proves the

@@ -2,6 +2,40 @@
 
 A Rust-based Language Server Protocol (LSP) for statically detecting tensor shape mismatches in Python deep learning code (NumPy, JAX, PyTorch, Equinox, etc.) using `tree-sitter` and type annotations.
 
+## Installation
+
+Build the server and put the `ndim-lsp` binary on your `PATH`:
+
+```sh
+cargo install --path .
+```
+
+An editor extension starts the server. Both extensions look for `ndim-lsp` on `PATH`.
+
+**VS Code** (extension `ndim-lsp`, in `../ndim-lsp-vscode`). Settings:
+
+- `ndim-lsp.serverPath`: path to the binary (default `ndim-lsp`).
+- `ndim-lsp.diagnosticSeverity`: severity of shape mismatches (default `error`).
+- `ndim-lsp.approximationSeverity`: severity of approximate rules (default `warning`).
+
+**Zed** (extension `ndim-lsp-zed`, in `../ndim-lsp-zed`). In your Zed settings:
+
+```json
+{
+  "lsp": {
+    "ndim-lsp": {
+      "binary": { "path": "/path/to/ndim-lsp" },
+      "initialization_options": {
+        "diagnostic_severity": "error",
+        "approximation_severity": "warning"
+      }
+    }
+  }
+}
+```
+
+Severity values are `error`, `warning`, `information`, and `hint`. The server reads them at start, so restart it after a change. An invalid value uses the default.
+
 ## Scoped shape support
 
 This pass covers selected JAX 0.11/0.12, NumPy 2.4/2.5, and Torch 2.14 shape rules. See the [JAX changelog](https://docs.jax.dev/en/latest/changelog.html), [NumPy 2.5 notes](https://numpy.org/doc/2.5/release/2.5.0-notes.html), and [Torch 2.14 release](https://github.com/pytorch/pytorch/releases/tag/v2.14.0). It is not complete framework coverage or a dependency upgrade.
@@ -20,7 +54,7 @@ This pass covers selected JAX 0.11/0.12, NumPy 2.4/2.5, and Torch 2.14 shape rul
 The roadmap below tracks broad support and lists important limits. **Authoritative state lives in `src/`.** Before adding any feature, grep for it first:
 
 ```sh
-grep -E "KnownFunction::|apply_known_" src/known_functions.rs   # built-in fns
+grep -rE "KnownFunction::|apply_known_" src/known_functions.rs src/known_functions/   # built-in fns
 grep -E "LayerKind::|\"<ClassName>\"" src/layers.rs              # layers
 grep -n "<feature>" src/analysis.rs src/main.rs                  # analysis & LSP wiring
 ```
@@ -47,13 +81,13 @@ If the feature is already implemented, **stop and report** — do not add adjace
 
 ### Framework Functions (JAX / NumPy)
 - [x] Import alias resolution (e.g., `import jax.numpy as jnp`)
-- [x] `jnp.concatenate` (dimension matching & concatenated axis modification)
+- [x] `jnp.concatenate` (dimension matching & concatenated axis modification; list and tuple literals only, a variable sequence is unknown)
 - [x] `jnp.transpose` (tuple axis permutation)
 - [x] `jnp.expand_dims` (multiple axes insertion, bounds checking)
 - [x] `jnp.squeeze` (multiple axes removal, `size == 1` validation)
 - [x] Reduction ops (`sum`, `mean`, `max`, `min`, `prod`, `std`, `var`) with `keepdims` and multiple axes support
 - [x] `jnp.reshape` (dimension flattening/unflattening tracking)
-- [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`)
+- [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`; list and tuple literals only)
 - [x] `jnp.einsum`
 - [x] `jnp.split`, `jnp.tile`, `jnp.repeat`, `jnp.flatten` (including tuple propagation for `split`)
 - [x] Dynamic `kwargs` handling in function parsing
@@ -66,6 +100,7 @@ If the feature is already implemented, **stop and report** — do not add adjace
 - [x] Convolutional layers (`Conv1d`, `Conv2d`, `Conv3d`) tracking spatial dimension reductions
 - [x] Attention mechanisms (`MultiheadAttention` for PyTorch and Equinox, plus functional attention rules)
 - [x] Shape-preserving layers (`Dropout{,1d,2d,3d}`, `BatchNorm{,1d,2d,3d}`, `LayerNorm`, `GroupNorm`, `ReLU`, `GELU`, etc.)
+- [x] More layers (transposed convolution, pooling, `Embedding`, RNN/LSTM/GRU, `Flatten`/`Unflatten`, `Upsample`, `Sequential`, einops layers): see `TO_IMPLEMENT.md`
 
 ### Static Analysis & AST Tracking
 - [x] Trace shapes through variable assignments (`z = x @ y`)
@@ -94,8 +129,8 @@ If the feature is already implemented, **stop and report** — do not add adjace
 - [x] `tower-lsp` async server backend
 - [x] Recursive AST shape resolution
 - [ ] Incremental AST parsing (reusing previous trees on document changes for performance)
-- [x] Resolve imported helpers from files under workspace roots
+- [x] Resolve imported helpers from files under workspace roots and from site-packages (`$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`)
 - [ ] Track unsaved changes across imported workspace files
 - [x] Cache parsed trees and resolved shapes for repeated requests at the same document version
-- [x] Cache import resolution and function signatures across edits
+- [x] Cache import resolution and function signatures across edits (limit: a saved change to an imported file stays cached until a workspace folder change or a server restart)
 - [ ] Reuse parsed trees and local shape analysis across document edits

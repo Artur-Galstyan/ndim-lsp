@@ -1880,6 +1880,23 @@ mod call_propagation_tests {
     }
 
     #[test]
+    fn test_torch_flatten_start_dim_function_and_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "import torch\ndef f(x: Float[Array, \"B C H\"]):\n    a = torch.flatten(x, 1)\n    b = x.flatten(1)\n    c = torch.flatten(x, start_dim=0, end_dim=-2)\n    d = x.flatten(end_dim=1)\n    e = x.flatten('F')";
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+
+        assert!(analysis.errors.is_empty());
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["B", "C*H"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["B", "C*H"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["B*C", "H"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["B*C", "H"])));
+        assert_eq!(find_shape(&analysis, "e"), Some(&shape(&["B*C*H"])));
+    }
+
+    #[test]
     fn test_propagates_method_sum_axis_kwarg() {
         let tmp = tempfile::tempdir().unwrap();
         let code = "def f(x: Float[Array, \"batch features\"]):\n    y = x.sum(axis=0)";
@@ -7366,9 +7383,7 @@ mod einops_tests {
 
     #[test]
     fn test_ellipsis_pattern_skips() {
-        // Ellipsis on only one side isn't modelled (symmetric `...` on both
-        // sides IS supported now — see `einops_ellipsis_tests` at the end of
-        // this file).
+        // Ellipsis on only one side isn't modelled.
         let code = "from einops import rearrange\ndef f(x: Float[Array, \"b s d\"]):\n    y = rearrange(x, \"... d -> d\")";
         let analysis = analyze(code);
 
@@ -8777,17 +8792,96 @@ mod shape_error_kind_tests {
         assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Mismatch);
     }
 
-    // Torch-style `x.transpose(dim0, dim1)` two-axis swap is valid for any
-    // rank, but `apply_known_transpose` (shared with `.permute`/`jnp.transpose`)
-    // treats 2 positional args as a full axes permutation, so it's only
-    // correct for rank-2 inputs — a documented approximation limitation.
-    #[test]
-    fn method_transpose_two_axis_rank_mismatch_is_classified_approximation() {
-        let code = "def f(x: Float[Array, \"a b c\"]):\n    y = x.transpose(0, 1)";
-        let analysis = analyze(code);
+    fn transpose_shape(imports: &str, params: &str, expr: &str) -> (Option<Vec<String>>, usize) {
+        let code = format!("{imports}def f({params}):\n    y = {expr}");
+        let analysis = analyze(&code);
+        (find_shape(&analysis, "y").cloned(), analysis.errors.len())
+    }
 
-        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
-        assert_eq!(analysis.errors[0].kind, ShapeErrorKind::Approximation);
+    fn dims(dims: &[&str]) -> Option<Vec<String>> {
+        Some(dims.iter().map(|d| d.to_string()).collect())
+    }
+
+    const ABC: &str = "x: Float[Array, \"a b c\"]";
+    const AB: &str = "x: Float[Array, \"a b\"]";
+
+    #[test]
+    fn torch_free_transpose_swaps_two_dims() {
+        let imp = "import torch\n";
+        assert_eq!(transpose_shape(imp, ABC, "torch.transpose(x, 0, 1)"), (dims(&["b", "a", "c"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "torch.transpose(x, -1, 0)"), (dims(&["c", "b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "torch.transpose(x, dim0=1, dim1=2)"), (dims(&["a", "c", "b"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "torch.swapdims(x, 0, 2)"), (dims(&["c", "b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "torch.swapaxes(x, 0, 2)"), (dims(&["c", "b", "a"]), 0));
+    }
+
+    #[test]
+    fn torch_free_transpose_unknown_dim_is_unknown() {
+        let (shape, errors) = transpose_shape("import torch\n", ABC, "torch.transpose(x, 0, d)");
+        assert_eq!((shape, errors), (None, 0));
+    }
+
+    #[test]
+    fn numpy_free_transpose_keeps_permutation() {
+        let imp = "import jax.numpy as jnp\n";
+        assert_eq!(transpose_shape(imp, ABC, "jnp.transpose(x, (2, 0, 1))"), (dims(&["c", "a", "b"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "jnp.transpose(x, [1, 0, 2])"), (dims(&["b", "a", "c"]), 0));
+        assert_eq!(transpose_shape(imp, AB, "jnp.swapaxes(x, 0, 1)"), (dims(&["b", "a"]), 0));
+    }
+
+    #[test]
+    fn torch_method_transpose_swaps_at_any_rank() {
+        let imp = "import torch\n";
+        assert_eq!(transpose_shape(imp, AB, "x.transpose(0, 1)"), (dims(&["b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.transpose(0, 1)"), (dims(&["b", "a", "c"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.transpose(-1, -2)"), (dims(&["a", "c", "b"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.swapdims(0, 2)"), (dims(&["c", "b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.swapaxes(0, 2)"), (dims(&["c", "b", "a"]), 0));
+    }
+
+    #[test]
+    fn method_transpose_dim_keywords_are_torch_swap() {
+        for imp in ["", "import jax.numpy as jnp\n"] {
+            assert_eq!(transpose_shape(imp, ABC, "x.transpose(dim0=0, dim1=1)"), (dims(&["b", "a", "c"]), 0));
+        }
+    }
+
+    #[test]
+    fn numpy_method_transpose_is_permutation() {
+        let imp = "import jax.numpy as jnp\n";
+        assert_eq!(transpose_shape(imp, AB, "x.transpose(0, 1)"), (dims(&["a", "b"]), 0));
+        assert_eq!(transpose_shape(imp, AB, "x.transpose(1, 0)"), (dims(&["b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.transpose(2, 0, 1)"), (dims(&["c", "a", "b"]), 0));
+        assert_eq!(transpose_shape(imp, AB, "x.transpose()"), (dims(&["b", "a"]), 0));
+        assert_eq!(transpose_shape(imp, ABC, "x.transpose((1, 0, 2))"), (dims(&["b", "a", "c"]), 0));
+    }
+
+    #[test]
+    fn numpy_method_transpose_wrong_rank_is_error() {
+        let (shape, errors) = transpose_shape("import numpy as np\n", ABC, "x.transpose(0, 1)");
+        assert_eq!((shape, errors), (None, 1));
+    }
+
+    #[test]
+    fn unknown_backend_method_transpose_never_errors() {
+        for imp in ["", "import torch\nimport numpy as np\n"] {
+            assert_eq!(transpose_shape(imp, ABC, "x.transpose(0, 1)"), (None, 0));
+            assert_eq!(transpose_shape(imp, AB, "x.transpose(0, 1)"), (None, 0));
+            assert_eq!(transpose_shape(imp, AB, "x.transpose(1, 0)"), (dims(&["b", "a"]), 0));
+        }
+    }
+
+    #[test]
+    fn unknown_backend_equal_dims_transpose_is_known() {
+        let (shape, errors) = transpose_shape("", "x: Float[Array, \"n n\"]", "x.transpose(0, 1)");
+        assert_eq!((shape, errors), (dims(&["n", "n"]), 0));
+    }
+
+    #[test]
+    fn transposed_properties_do_not_regress() {
+        let imp = "import torch\n";
+        assert_eq!(transpose_shape(imp, ABC, "x.mT"), (dims(&["a", "c", "b"]), 0));
+        assert_eq!(transpose_shape(imp, AB, "x.T"), (dims(&["b", "a"]), 0));
     }
 
     // `jnp.transpose`/`.permute`-style full-rank axis permutations with a
@@ -9161,5 +9255,137 @@ def f(a: Float[Array, \"3 4\"]):
         let analysis = analyze(code);
 
         assert_eq!(find_shape(&analysis, "out"), None);
+    }
+
+    #[test]
+    fn test_torch_max_two_tensors_broadcasts() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"3 1\"]):\n    r = torch.max(x, y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_torch_min_two_tensors_broadcasts() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"4\"]):\n    r = torch.min(x, other=y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_torch_max_min_mismatch_stays_unknown() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"5 4\"]):\n    r = torch.max(x, y)\n    s = torch.min(x, y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "r"), None);
+        assert_eq!(find_shape(&analysis, "s"), None);
+    }
+
+    #[test]
+    fn test_torch_max_dim_returns_tuple_so_unknown() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"]):\n    a = torch.max(x, 1)\n    b = torch.min(x, dim=1)\n    c = torch.max(x, 1)[0]\n    d = torch.max(x, dim=1).values\n    v, i = torch.max(x, 1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["a", "b", "c", "d", "v", "i"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_torch_max_no_dim_is_scalar() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"]):\n    r = torch.max(x)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&[])));
+    }
+
+    #[test]
+    fn test_tensor_max_min_methods_broadcast() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"3 1\"]):\n    a = x.max(y)\n    b = x.min(y)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_tensor_max_dim_method_returns_tuple_so_unknown() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"]):\n    a = x.max(1)\n    b = x.min(dim=1)\n    v, i = x.max(dim=1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["a", "b", "v", "i"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_numpy_like_max_axis_keeps_reduction() {
+        let code = "import jax.numpy as jnp\nimport numpy as np\ndef f(x: Float[Array, \"3 4\"]):\n    a = jnp.max(x, 1)\n    b = np.max(x, axis=1)\n    c = x.max(1)\n    d = jnp.min(x, axis=0)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["3"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["4"])));
+    }
+
+    #[test]
+    fn test_torch_max_scalar_dim_is_unknown() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"], n: int):\n    a = torch.max(x, n)\n    b = x.max(n)\n    c = torch.min(x, 1)";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["a", "b", "c"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_concatenate_unknown_axis_and_none_axis_are_not_axis_zero() {
+        let code = "import torch\nimport jax.numpy as jnp\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"], n: int):\n    a = torch.cat((x, u), n)\n    b = jnp.concatenate((x, u), axis=None)\n    c = jnp.concatenate([x, u], n)\n    d = torch.cat(dim=1, tensors=(x, u))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+        assert_eq!(find_shape(&analysis, "c"), None);
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["3", "8"])));
+    }
+
+    #[test]
+    fn test_einsum_sequence_operand_is_torch_only() {
+        let code = "import numpy as np\nimport torch\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    a = np.einsum('i,i->', [1,2,3], [4,5,6])\n    b = np.einsum('ij,ij->ij', (x, u))\n    c = torch.einsum('ij,ij->ij', [x, u])";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].variable, "b");
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn test_torch_cat_with_empty_vector_is_not_an_error() {
+        let code = "import torch\ndef f(x: Float[Array, \"3 4\"]):\n    a = torch.cat([x, torch.empty(0)])\n    b = torch.cat((x, torch.empty(0)))";
+        let analysis = analyze(code);
+
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    }
+
+    #[test]
+    fn test_concatenate_tuple_element_error_reported_once() {
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"3 4\"], u: Float[Array, \"3 4\"]):\n    a = jnp.concatenate((x @ x, u))\n    b = jnp.concatenate([x @ x, u])";
+        let analysis = analyze(code);
+
+        assert_eq!(analysis.errors.len(), 2, "{:?}", analysis.errors);
     }
 }
