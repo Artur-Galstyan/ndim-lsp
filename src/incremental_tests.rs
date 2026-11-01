@@ -1024,3 +1024,42 @@ fn an_edit_of_a_class_body_reaches_the_function_around_it() {
     assert_eq!(memoized, fresh);
     assert!(memoized.is_some());
 }
+
+/// Text that makes tree-sitter give up on the whole file when it follows a
+/// block: the root of the tree is an `ERROR` node, not a `module`.
+const ROOT_ERROR: &str = "xis=2)\n    v431 = jnp.expand_dims(v430, aimport os\n    z = x + y  # c: z=[b386, n386, d386]\n    values = [k * 2 for k in range(10) if k % 2 == 0]\n    table = {k: v for k, v in zip(range(5), values)}\n";
+
+const BRANCH: &str = "from jaxtyping import Float, Array\n\ndef f(z: Float[Array, \"a b\"], flag: bool):\n    if flag:\n        y = z.sum(axis=0)\n    elif not flag:\n        y = z.sum(axis=1)\n";
+
+fn memo_and_fresh(old: &str, new: &str) -> (LayerShapeAnalysis, LayerShapeAnalysis) {
+    let (cache, mut memo) = (new_resolution_cache(), UnitMemo::default());
+    let mut run = |text: &str| {
+        let tree = parse(text);
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &[], read, 5, Some(&cache), &mut memo).unwrap()
+    };
+    run(old);
+    let memoized = run(new);
+    let tree = parse(new);
+    (memoized, analyze_layer_shapes(tree.root_node(), new, &[], read, 5, None).unwrap())
+}
+
+#[test]
+fn a_root_error_node_keeps_the_branch_merge() {
+    let text = format!("{BRANCH}{ROOT_ERROR}");
+    assert_eq!(parse(&text).root_node().kind(), "ERROR");
+    let (memoized, fresh) = memo_and_fresh("", &text);
+    assert_eq!(first_analysis_difference(&memoized, &fresh), None);
+    assert_eq!(fresh.scopes.iter().find_map(|s| s.shapes.get("y")), None);
+}
+
+#[test]
+fn an_edit_that_changes_the_root_kind_reaches_every_unit() {
+    let clean = format!("G: Float[Array, \"2 3\"] = make()\n\ndef reader():\n    u = G\n    return u\n\n\n{BRANCH}");
+    let broken = format!("{clean}{ROOT_ERROR}");
+    assert_eq!(parse(&clean).root_node().kind(), "module");
+    assert_eq!(parse(&broken).root_node().kind(), "ERROR");
+    for (old, new) in [(&clean, &broken), (&broken, &clean)] {
+        let (memoized, fresh) = memo_and_fresh(old, new);
+        assert_eq!(first_analysis_difference(&memoized, &fresh), None, "{old}\n->\n{new}");
+    }
+}

@@ -703,6 +703,7 @@ fn run_semantic(file: &Path, original: String, steps: usize, seed: u64) -> Repla
         }
         if let Some(part) = first_analysis_difference(&got, &want) {
             std::fs::write(std::env::temp_dir().join("ndim-failing-step.py"), &text).ok();
+            std::fs::write(std::env::temp_dir().join("ndim-failing-prev.py"), &prev).ok();
             panic!("{label} step {step}: {part} differ");
         }
         let stats = memo.stats();

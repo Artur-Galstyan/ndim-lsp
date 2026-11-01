@@ -1133,7 +1133,7 @@ impl UnitMemo {
 
         let mut env = 0;
         let plan = if propagate_memo_enabled() {
-            let built = PropPlan::build(old, &mut units, &found, &layer_hit, digest, cache);
+            let built = PropPlan::build(old, &mut units, &found, &layer_hit, digest, root.is_error(), cache);
             stats.replayed_units = built.plan.replay.iter().flatten().count();
             stats.propagate_full = stats.replayed_units == 0;
             env = built.env;
@@ -1282,6 +1282,7 @@ impl PropPlan {
         found: &[Option<usize>],
         layer_hit: &[bool],
         digest: u64,
+        root_error: bool,
         cache: &ResolutionCache,
     ) -> BuiltPlan {
         let n = units.len();
@@ -1300,10 +1301,13 @@ impl PropPlan {
             .collect();
         clashes.sort_unstable();
         clashes.dedup();
+        // An `ERROR` root is no `module`, so the module scope reads differently
+        // for every unit (`module_global`, `nearest_binding`).
         let env = {
             let mut hasher = DefaultHasher::new();
             (
                 digest,
+                root_error,
                 &globals,
                 sets.iter().any(|s| s.wildcard),
                 &clashes,

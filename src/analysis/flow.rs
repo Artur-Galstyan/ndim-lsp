@@ -119,6 +119,11 @@ fn push<'t>(out: &mut Vec<Marked<'t>>, byte: usize, event: Event<'t>) {
 }
 
 fn visit<'t>(node: Node<'t>, src: &Source, out: &mut Vec<Marked<'t>>) {
+    // The root is an `ERROR` node when the parser gives up on the file. Its
+    // children are the same units as under a `module`.
+    if node.is_error() && node.parent().is_none() {
+        return visit_children(node, src, out);
+    }
     match node.kind() {
         "if_statement" => visit_if(node, src, out),
         "while_statement" | "for_statement" => visit_loop(node, src, out),

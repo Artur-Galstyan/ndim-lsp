@@ -12,8 +12,8 @@ across files, scoped bare names and `vmap` names (item 18a), and module-level
 rebinding of imports (item 22). Commit `c6f2860` is the last commit without
 these four items. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,474 tests pass and seven are ignored.
-  - 2,354 library tests (50 of them in `src/incremental_tests.rs`). Two
+- `cargo test --quiet` passes: 2,476 tests pass and seven are ignored.
+  - 2,356 library tests (52 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
   - 34 in `tests/incremental_edits.rs`. One ignored:
@@ -289,7 +289,13 @@ The result must always equal a fresh analysis of the same text. Three layers:
   holds the clash set: the annotation symbols that a unit assigns as an integer
   or reads. Add or remove such a symbol, and every group runs again, because
   `integer_constant` and `layer_at` treat the name differently (in `layer_at`
-  a parameter wins over an annotation). A `vmap` assignment has no edge of
+  a parameter wins over an annotation). The environment hash also holds
+  whether the root of the tree is an `ERROR` node, which tree-sitter gives
+  when it gives up on a whole file. Such a root is no `module`, so
+  `nearest_binding` and `module_global` read the module scope differently for
+  every unit, and a change of the root kind reruns all units. `flow::visit`
+  enters an `ERROR` root like a `module`, so the whole-tree pass and the
+  per-unit pass see the same branches. A `vmap` assignment has no edge of
   its own: a reader mentions the name, and `vmap_target` reads only the scope
   that owns it. A file that binds a tracked name again changes the
   `Rebound` list, so the first rebinding of a name reruns all units. Module
