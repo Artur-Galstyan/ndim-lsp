@@ -170,7 +170,7 @@ fn is_builtin_call(node: Node, name: &str, ctx: &ShapeCtx) -> bool {
         && node.child_by_field_name("function").is_some_and(|func| {
             func.kind() == "identifier"
                 && ctx.text.get(func.byte_range()) == Some(name)
-                && resolve_call_target(name, ctx.import_map).parts == [name]
+                && resolve_call_target(name, ctx.imports.at(node.start_byte())).parts == [name]
                 && matches!(nearest_binding(node, name, ctx).1, NameBinding::Unbound)
         })
 }

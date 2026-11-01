@@ -816,6 +816,8 @@ pub struct ScopedSelfAttrLayer {
     pub class_start: usize,
     pub class_end: usize,
     pub kind: LayerKind,
+    /// Where the constructor call stands.
+    pub byte: usize,
 }
 
 /// A `self.<attr> = <ident>` alias binding together with the byte range of

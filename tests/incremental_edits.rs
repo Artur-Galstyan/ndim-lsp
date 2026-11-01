@@ -1738,6 +1738,161 @@ fn independent_functions() -> String {
         .collect()
 }
 
+/// `Base.run` calls `self.helper`. Each edit is in another statement and
+/// changes which method that call runs: an override, a class attribute, the
+/// order of the bases, the kind of the method, a subclass that a mixin puts
+/// before the base.
+#[test]
+fn a_method_call_follows_the_classes_around_it() {
+    let base = format!(
+        "from jaxtyping import Float, Array\n\n\nclass Base:\n    def helper(self, v):\n        return v.T\n\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\n\n\nclass Sub(Base):\n    pass\n\n\nclass Other:\n    def helper(self, v):\n        return v\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("class Sub(Base):\n    pass", "class Sub(Base):\n    def helper(self, v):\n        return v"),
+        ("class Sub(Base):\n    def helper(self, v):\n        return v", "class Sub(Base):\n    pass"),
+        ("class Sub(Base):\n    pass", "class Sub(Base):\n    helper = None"),
+        ("    helper = None", "    pass"),
+        ("class Sub(Base):", "class Sub(Base, Other):"),
+        ("class Sub(Base, Other):", "class Sub(Other, Base):"),
+        ("class Sub(Other, Base):", "class Sub(Other):"),
+        ("class Sub(Other):\n    pass", "class Sub(Base):\n    def __init__(self):\n        self.helper = make()"),
+        ("    def __init__(self):\n        self.helper = make()", "    pass"),
+        ("class Base:\n    def helper(self, v):", "class Base:\n    @property\n    def helper(self):"),
+        ("    @property\n    def helper(self):", "    def helper(self, v):"),
+        ("class Base:\n    def helper(self, v):", "class Base:\n    def renamed(self, v):"),
+        ("class Base:\n    def renamed(self, v):", "class Base(Other):\n    def renamed(self, v):"),
+    ];
+    let t = dims(&["4", "3"]);
+    let same = dims(&["3", "4"]);
+    let none: Dims = None;
+    let want = [
+        t.clone(), none.clone(), t.clone(), none.clone(), t.clone(), t.clone(), none.clone(), t.clone(),
+        none.clone(), t.clone(), none.clone(), t.clone(), none, same,
+    ];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A function reads `k.zeros`. Each edit is in another statement and changes
+/// what `k` is there, or leaves it the same: a module import, an import in
+/// another function, a `global` import, and the alias of `vmap` and the
+/// backend that a function import gives to the whole file.
+#[test]
+fn an_import_binds_only_in_its_scope_across_edits() {
+    let base = format!(
+        "from jaxtyping import Float, Array\n\n\ndef writer():\n    return 1\n\n\ndef reader():\n    read_k = k.zeros((2, 3))\n\n\ndef param(q: Float[Array, \"3 4\"]):\n    read_q = q.reshape(4, 3)\n\n\nclass C:\n    pass\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("def writer():\n    return 1", "def writer():\n    import numpy as k\n    return 1"),
+        ("    import numpy as k\n", "    global k\n    import numpy as k\n"),
+        ("    global k\n    import numpy as k\n", ""),
+        ("def writer():", "import numpy as k\n\n\ndef writer():"),
+        ("def reader():\n", "def reader(k):\n"),
+        ("def reader(k):\n", "def reader():\n"),
+        ("def reader():\n", "def reader():\n    import os as k\n"),
+        ("def reader():\n    import os as k\n", "def reader():\n"),
+        ("import numpy as k\n\n\ndef writer():", "def writer():"),
+        ("class C:\n    pass", "class C:\n    import numpy as k"),
+        ("class C:\n    import numpy as k", "class C:\n    pass"),
+        ("def writer():", "import os as q\n\n\ndef writer():"),
+        ("import os as q\n\n\ndef writer():", "def writer():"),
+    ];
+    let two_three = dims(&["2", "3"]);
+    let none: Dims = None;
+    let want = [
+        none.clone(), none.clone(), two_three.clone(), none.clone(), two_three.clone(), none.clone(),
+        two_three.clone(), none.clone(), two_three, none.clone(), none.clone(), none.clone(), none.clone(),
+        none,
+    ];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "read_k"), want[step], "step {step}\n{text}");
+        assert_eq!(shape_named(analysis, "read_q"), dims(&["4", "3"]), "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A function import of `vmap` under another name binds the vmapped name for
+/// the whole file, and a function import of `torch` sets the backend of the
+/// file: both reach readers in other statements.
+#[test]
+fn a_function_import_of_vmap_or_a_backend_reaches_the_file() {
+    let base = format!(
+        "import jax\nfrom jaxtyping import Float, Array\n\n\ndef double(x: Float[Array, \"3\"]) -> Float[Array, \"3\"]:\n    return x\n\n\ndef writer():\n    from jax import jit as v\n    batched = v(double)\n\n\ndef reader(b: Float[Array, \"7 3\"]):\n    r = batched(b)\n\n\ndef maxes(x: Float[Array, \"3 4\"]):\n    m = x.max(0)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("from jax import jit as v", "from jax import vmap as v"),
+        ("from jax import vmap as v", "from jax import jit as v"),
+        ("def writer():\n", "def writer():\n    import torch\n"),
+        ("def writer():\n    import torch\n", "def writer():\n"),
+    ];
+    let want = [None, dims(&["7", "3"]), None, None, None];
+    let maxes = [dims(&["4"]), dims(&["4"]), dims(&["4"]), None, dims(&["4"])];
+    walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+        assert_eq!(shape_named(analysis, "m"), maxes[step], "step {step}\n{text}");
+    });
+}
+
+/// A layer takes its dim from a constant in another statement. Each edit is
+/// outside the class and changes what the dim is: the value, a second write, a
+/// write below the class, an annotation of the name, a write of the attribute
+/// in a subclass.
+#[test]
+fn a_layer_dim_follows_the_constant_and_the_statements_around_it() {
+    let base = format!(
+        "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nOUT = 4\nATTR = 6\n\n\nclass M(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.w = ATTR\n        self.fc = nn.Linear(8, OUT)\n        self.gc = nn.Linear(8, self.w)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        fc_out = self.fc(x)\n        gc_out = self.gc(x)\n\n\ndef other(t: Float[Array, \"a b\"]):\n    return t\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("OUT = 4\n", "OUT = 5\n"),
+        ("OUT = 5\n", "OUT = 4\nOUT = 7\n"),
+        ("OUT = 4\nOUT = 7\n", "OUT = 4\n"),
+        ("def other(", "OUT = 4\n\n\ndef other("),
+        ("OUT = 4\n\n\ndef other(", "def other("),
+        ("def other(t: Float[Array, \"a b\"])", "def other(t: Float[Array, \"a OUT\"])"),
+        ("def other(t: Float[Array, \"a OUT\"])", "def other(t: Float[Array, \"a b\"])"),
+        ("def other(", "class S(M):\n    def __init__(self):\n        self.w = 9\n\n\ndef other("),
+        ("        self.w = 9\n", "        self.w = ATTR\n"),
+        ("class S(M):\n    def __init__(self):\n        self.w = ATTR\n\n\n", ""),
+        ("ATTR = 6\n", "ATTR = load()\n"),
+        ("ATTR = load()\n", "ATTR = 6\n"),
+        ("OUT = 4\n", "OUT = load()\n"),
+        ("def other(t: Float[Array, \"a b\"])", "def other(t: Float[Array, \"a OUT\"])"),
+        ("def other(t: Float[Array, \"a OUT\"])", "def other(t: Float[Array, \"a b\"])"),
+    ];
+    let four = dims(&["n", "4"]);
+    let six = dims(&["n", "6"]);
+    let none: Dims = None;
+    let want: [(Dims, Dims); 16] = [
+        (four.clone(), six.clone()),
+        (dims(&["n", "5"]), six.clone()),
+        (none.clone(), six.clone()),
+        (four.clone(), six.clone()),
+        (none.clone(), six.clone()),
+        (four.clone(), six.clone()),
+        (dims(&["n", "OUT"]), six.clone()),
+        (four.clone(), six.clone()),
+        (four.clone(), none.clone()),
+        (four.clone(), six.clone()),
+        (four.clone(), six.clone()),
+        (four.clone(), none.clone()),
+        (four, six.clone()),
+        (none.clone(), six.clone()),
+        (dims(&["n", "OUT"]), six.clone()),
+        (none, six),
+    ];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "fc_out"), want[step].0, "step {step}\n{text}");
+        assert_eq!(shape_named(analysis, "gc_out"), want[step].1, "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
 /// A function builds a shape from the module constant `D`. An annotation
 /// anywhere in the file that uses `D` as a dim makes `D` a name, not 64: the
 /// memo must follow an edit of such an annotation in another statement.
@@ -1879,5 +2034,96 @@ fn a_context_manager_follows_the_import_it_is_called_by() {
     let want = [None, dims(&["4"]), None, dims(&["4"]), None];
     walk_edits(&base, &steps, |step, a, text| {
         assert_eq!(shape_named(a, "r"), want[step], "step {step}\n{text}");
+    });
+}
+
+/// A function has its own import of `k`, so the file map holds it whatever the
+/// module does. An edit of the module import changes the module map alone, and
+/// the readers in other statements must follow it.
+#[test]
+fn a_module_import_edit_reaches_the_readers_when_the_file_map_stays() {
+    let base = format!(
+        "import numpy as k\nimport torch.nn as nn\nfrom jaxtyping import Float, Array\n\n\ndef f(x):\n    import numpy as k\n    return x\n\n\ndef g():\n    a = k.zeros((2, 3))\n\n\nclass C(nn.Module):\n    def __init__(self):\n        self.l = k.Linear(8, 4)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("import numpy as k\nimport torch", "import torch"),
+        ("import torch.nn as nn\n", "import numpy as k\nimport torch.nn as nn\n"),
+        ("import numpy as k\nimport torch", "import os as k\nimport torch"),
+        ("    import numpy as k\n    return x", "    import os as k\n    return x"),
+        ("import os as k\nimport torch", "import numpy as k\nimport torch"),
+    ];
+    let two_three = dims(&["2", "3"]);
+    let want = [two_three.clone(), None, two_three.clone(), None, None, two_three];
+    walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "a"), want[step], "step {step}\n{text}");
+    });
+}
+
+/// `P(OUT)` takes its dim from a constant in another statement, and each edit
+/// is outside the statement of the call.
+#[test]
+fn a_constructor_argument_follows_the_constant_across_edits() {
+    let base = format!(
+        "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nOUT = 4\n\n\nclass P(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.l = nn.Linear(8, d)\n\n    def forward(self, x):\n        return self.l(x)\n\n\ndef use(x: Float[Array, \"n 8\"]):\n    r = P(OUT)(x)\n\n\nclass H(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.p = P(OUT)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        s = self.p(x)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("OUT = 4\n", "OUT = 5\n"),
+        ("OUT = 5\n", "OUT = load()\n"),
+        ("OUT = load()\n", "OUT = 4\nOUT = 7\n"),
+        ("OUT = 4\nOUT = 7\n", "OUT = 4\n"),
+        ("class P(nn.Module):", "OUT = 4\n\n\nclass P(nn.Module):"),
+    ];
+    let four = dims(&["n", "4"]);
+    let want = [four.clone(), dims(&["n", "5"]), None, None, four.clone(), four];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+        assert_eq!(shape_named(analysis, "s"), want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// `class B(P)` reads `P`, and another statement rebinds it or gives it back.
+#[test]
+fn a_base_follows_the_statements_that_rebind_its_name() {
+    let base = format!(
+        "from jaxtyping import Float, Array\n\n\nclass P:\n    def helper(self, v):\n        return v.T\n\n\ndef mid():\n    return 1\n\n\nclass B(P):\n    def go(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("def mid():", "P = other\n\n\ndef mid():"),
+        ("P = other\n\n\n", ""),
+        ("def mid():", "from e import P\n\n\ndef mid():"),
+        ("from e import P\n\n\n", ""),
+        ("def mid():", "def P():"),
+        ("def P():", "def mid():"),
+    ];
+    let t = dims(&["4", "3"]);
+    let want = [t.clone(), None, t.clone(), None, t.clone(), None, t];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A `self.<attr>` write through a `for` or `with` target is in another
+/// statement than the reader when a subclass makes it.
+#[test]
+fn a_loop_write_of_an_attribute_follows_edits() {
+    let base = format!(
+        "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\n\nclass M(nn.Module):\n    def __init__(self):\n        self.h = 4\n        self.l = nn.Linear(8, self.h)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        r = self.l(x)\n\n\nclass S(M):\n    def t(self):\n        pass\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("    def t(self):\n        pass", "    def t(self):\n        for self.h in (8, 9):\n            pass"),
+        ("        for self.h in (8, 9):\n            pass", "        pass"),
+        ("    def t(self):\n        pass", "    def t(self):\n        with a() as self.h:\n            pass"),
+        ("        with a() as self.h:\n            pass", "        pass"),
+    ];
+    let four = dims(&["n", "4"]);
+    let want = [four.clone(), None, four.clone(), None, four];
+    walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
     });
 }

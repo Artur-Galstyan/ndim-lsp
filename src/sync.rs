@@ -1,68 +1,61 @@
 //! Document sync: how long a change waits before analysis, and how an
 //! incremental change message becomes the new text.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
 use crate::DEBOUNCE;
 
-/// A change that follows the previous one within this time is typing.
-const TYPING_GAP: Duration = Duration::from_millis(400);
+/// The floor merges a burst: changes closer than this share one analysis.
 const MIN_DEBOUNCE_MS: f64 = 20.0;
+/// Quiet time per millisecond of a known incremental run.
+const WARM_FACTOR: f64 = 0.5;
+/// Quiet time per millisecond of a whole analysis: the next run can cost as
+/// much, so the machine gets twice that time free.
+const WHOLE_FACTOR: f64 = 2.0;
 const EWMA_ALPHA: f64 = 0.5;
 
 /// What kind of run a wall time came from.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Run {
-    /// No base to reuse: the cost of a whole analysis.
-    Cold,
+    /// No base to reuse, or an incremental run that had to recompute
+    /// everything: the cost of a whole analysis.
+    Whole,
     Incremental,
-    /// An incremental run that had to recompute everything.
-    Fallback,
 }
 
-/// The change rhythm and the analysis cost of one document.
+/// The analysis cost of one document.
 #[derive(Default)]
 pub struct Pace {
-    last_change: Option<Instant>,
     ewma_ms: Option<f64>,
     /// `ewma_ms` came from incremental runs, not from a whole analysis.
     warm: bool,
-    /// The next sample is not representative (a root change forced it).
-    skip_sample: bool,
+    /// Runs up to this rev are not representative (a root change forced them).
+    forced_rev: Option<u64>,
 }
 
 impl Pace {
-    pub fn opened(&mut self, now: Instant) {
-        *self = Pace {
-            last_change: Some(now),
-            ..Pace::default()
-        };
+    /// The quiet time a change waits for. No keystroke rhythm enters: a key
+    /// costs one analysis at most, and an estimate keeps that analysis cheap.
+    pub fn debounce(&self) -> Duration {
+        let max_ms = DEBOUNCE.as_secs_f64() * 1000.0;
+        let ms = self.ewma_ms.map_or(max_ms, |ms| {
+            let factor = if self.warm { WARM_FACTOR } else { WHOLE_FACTOR };
+            (factor * ms).clamp(MIN_DEBOUNCE_MS, max_ms)
+        });
+        Duration::from_secs_f64(ms / 1000.0)
     }
 
-    /// Record a change at `now` and return the quiet time it waits for.
-    pub fn changed(&mut self, now: Instant) -> Duration {
-        let typing = self
-            .last_change
-            .is_some_and(|t| now.saturating_duration_since(t) < TYPING_GAP);
-        self.last_change = Some(now);
-        match self.ewma_ms {
-            Some(ms) if !typing => Duration::from_secs_f64(
-                (2.0 * ms).clamp(MIN_DEBOUNCE_MS, DEBOUNCE.as_secs_f64() * 1000.0) / 1000.0,
-            ),
-            _ => DEBOUNCE,
-        }
-    }
-
-    pub fn sampled(&mut self, wall: Duration, run: Run) {
-        if std::mem::take(&mut self.skip_sample) {
+    /// Record the cost of the run for `rev`, also if newer text replaced that
+    /// text: a costly run must raise the debounce during typing.
+    pub fn sampled(&mut self, rev: u64, wall: Duration, run: Run) {
+        if self.forced_rev.is_some_and(|forced| rev <= forced) {
             return;
         }
         let ms = wall.as_secs_f64() * 1000.0;
         match run {
-            Run::Fallback => self.failed(),
-            Run::Cold => {
+            Run::Whole => {
                 self.ewma_ms = Some(ms);
                 self.warm = false;
             }
@@ -81,10 +74,11 @@ impl Pace {
         self.warm = false;
     }
 
-    /// The next analysis runs with new roots: its cost says nothing.
-    pub fn reset(&mut self) {
+    /// The runs up to `forced_rev` use old roots or fill a cache that a root
+    /// change emptied: their cost says nothing.
+    pub fn reset(&mut self, forced_rev: u64) {
         self.failed();
-        self.skip_sample = true;
+        self.forced_rev = Some(forced_rev);
     }
 }
 
@@ -243,30 +237,31 @@ mod tests {
     }
 
     #[test]
-    fn pace_follows_the_rule() {
-        let t0 = Instant::now();
+    fn pace_follows_the_cost() {
         let ms = Duration::from_millis;
         let mut p = Pace::default();
-        assert_eq!(p.changed(t0), DEBOUNCE, "no sample");
-        p.sampled(ms(10), Run::Cold);
-        assert_eq!(p.changed(t0 + ms(2000)), ms(20));
-        assert_eq!(p.changed(t0 + ms(2100)), DEBOUNCE, "typing");
-        p.sampled(ms(40), Run::Incremental);
-        assert_eq!(p.changed(t0 + ms(3000)), ms(80));
-        p.sampled(ms(20), Run::Incremental);
-        assert_eq!(p.changed(t0 + ms(4000)), ms(60), "average of 40 and 20");
-        p.sampled(ms(900), Run::Incremental);
-        assert_eq!(p.changed(t0 + ms(5000)), DEBOUNCE, "capped");
-        p.sampled(ms(1), Run::Fallback);
-        assert_eq!(p.changed(t0 + ms(6000)), DEBOUNCE, "fallback");
-        p.sampled(ms(1), Run::Incremental);
+        assert_eq!(p.debounce(), DEBOUNCE, "no sample");
+        p.sampled(1, ms(5), Run::Whole);
+        assert_eq!(p.debounce(), ms(20), "floor");
+        p.sampled(2, ms(60), Run::Whole);
+        assert_eq!(p.debounce(), ms(120), "a whole analysis counts twice");
+        p.sampled(3, ms(400), Run::Whole);
+        assert_eq!(p.debounce(), DEBOUNCE, "capped");
+        p.sampled(4, ms(80), Run::Incremental);
+        assert_eq!(p.debounce(), ms(40), "the first warm sample replaces whole");
+        p.sampled(5, ms(40), Run::Incremental);
+        assert_eq!(p.debounce(), ms(30), "half of the average of 80 and 40");
+        p.sampled(6, ms(900), Run::Incremental);
+        assert_eq!(p.debounce(), DEBOUNCE, "capped");
+        p.sampled(7, ms(1), Run::Incremental);
         p.failed();
-        assert_eq!(p.changed(t0 + ms(7000)), DEBOUNCE, "failure");
-        p.sampled(ms(1), Run::Incremental);
-        p.reset();
-        p.sampled(ms(1), Run::Incremental);
-        assert_eq!(p.changed(t0 + ms(8000)), DEBOUNCE, "root change");
-        p.sampled(ms(1), Run::Incremental);
-        assert_eq!(p.changed(t0 + ms(9000)), ms(20));
+        assert_eq!(p.debounce(), DEBOUNCE, "failure");
+        p.sampled(8, ms(1), Run::Incremental);
+        p.reset(10);
+        p.sampled(9, ms(1), Run::Incremental);
+        p.sampled(10, ms(1), Run::Incremental);
+        assert_eq!(p.debounce(), DEBOUNCE, "root change");
+        p.sampled(11, ms(1), Run::Incremental);
+        assert_eq!(p.debounce(), ms(20));
     }
 }

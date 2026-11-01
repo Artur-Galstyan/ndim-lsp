@@ -26,6 +26,8 @@ struct Client {
     next_id: i64,
     pubs: Vec<Pub>,
     analyses: usize,
+    /// The `debounce=` value of each `analysis:` log line.
+    debounces: Vec<f64>,
     resp: Vec<Value>,
 }
 
@@ -89,6 +91,7 @@ impl Client {
             next_id: 0,
             pubs: Vec::new(),
             analyses: 0,
+            debounces: Vec::new(),
             resp: Vec::new(),
         };
         let id = c.send_request(
@@ -127,11 +130,12 @@ impl Client {
                 diags: v["params"]["diagnostics"].as_array().map_or(0, |d| d.len()),
             }),
             Some("window/logMessage") => {
-                if v["params"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with("analysis: total="))
-                {
+                let message = v["params"]["message"].as_str().unwrap_or("");
+                if message.starts_with("analysis: total=") {
                     self.analyses += 1;
+                    let debounce = message.rsplit_once(" debounce=").map(|(_, d)| d);
+                    self.debounces
+                        .extend(debounce.and_then(|d| d.trim_end_matches("ms").parse::<f64>().ok()));
                 }
             }
             Some(_) => {}
@@ -237,7 +241,7 @@ fn burst_of_changes_runs_one_analysis_and_publishes_last_version() {
 }
 
 #[test]
-fn inlay_requests_while_typing_share_one_analysis() {
+fn inlay_requests_while_typing_add_no_analysis() {
     let mut c = Client::start();
     c.open();
     let before = c.analyses;
@@ -259,7 +263,7 @@ fn inlay_requests_while_typing_share_one_analysis() {
     }
     c.settle(400);
     assert!(
-        c.analyses - before <= 1,
+        c.analyses - before <= 12,
         "{} analyses for 12 keystrokes",
         c.analyses - before
     );
@@ -387,7 +391,7 @@ fn single_edit_after_idle_beats_the_old_window() {
 }
 
 #[test]
-fn twelve_plain_keys_100_ms_apart_run_one_analysis() {
+fn twelve_plain_keys_100_ms_apart_run_at_most_one_analysis_each() {
     let mut c = Client::start();
     c.open();
     let before = c.analyses;
@@ -397,7 +401,58 @@ fn twelve_plain_keys_100_ms_apart_run_one_analysis() {
     }
     c.wait_version(13);
     c.settle(400);
-    assert_eq!(c.analyses - before, 1);
+    assert!(c.analyses - before <= 12, "{}", c.analyses - before);
+}
+
+#[test]
+fn keys_faster_than_the_floor_share_one_analysis() {
+    let mut c = Client::start();
+    c.open();
+    c.settle(500);
+    let before = c.analyses;
+    for v in 2..=21 {
+        c.change(v);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    c.wait_version(21);
+    c.settle(400);
+    assert!(c.analyses - before <= 2, "{}", c.analyses - before);
+}
+
+#[test]
+fn key_while_typing_waits_for_the_cost_not_the_full_window() {
+    let mut c = Client::start();
+    c.open();
+    c.change(2);
+    c.wait_version(2);
+    for v in 3..=8 {
+        c.settle(100);
+        c.change(v);
+    }
+    c.settle(100);
+    let ms = c.publish_latency_ms(9, |c| c.change(9));
+    assert!(ms < 120.0, "a key of a cheap document took {ms} ms");
+}
+
+#[test]
+fn analyses_replaced_by_newer_keys_still_raise_the_debounce() {
+    let mut c = Client::start();
+    c.open();
+    let before = c.analyses;
+    let slow = slow_text();
+    let mut version = 1;
+    let end = Instant::now() + Duration::from_secs(60);
+    while c.analyses == before {
+        assert!(Instant::now() < end, "no analysis finished");
+        version += 1;
+        c.write(&Client::change_frame_of(&slow, version));
+        c.settle(200);
+    }
+    version += 1;
+    c.write(&Client::change_frame_of(&slow, version));
+    c.wait_version(version);
+    let last = *c.debounces.last().unwrap();
+    assert!(last >= 100.0, "the debounces were {:?}", c.debounces);
 }
 
 #[test]

@@ -5,9 +5,10 @@ use tree_sitter::Node;
 #[cfg(test)]
 use tree_sitter::Range;
 
+use crate::imports::ImportScopes;
 use crate::known_functions::{apply_known_einops, apply_loss_layer};
 use crate::python_ast::{
-    build_import_map, class_ranges, enclosing_class_range, extract_call_arguments, extract_calls,
+    class_ranges, enclosing_class_range, extract_call_arguments, extract_calls,
     extract_self_attr_calls,
 };
 use crate::resolution::{
@@ -15,7 +16,15 @@ use crate::resolution::{
 };
 use crate::types::*;
 
+/// Stands for a constructor dim whose value the file does not prove.
+pub(crate) const UNPROVEN_DIM: &str = "__unproven";
+
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
+    classify_layer_text(call).map(strip_self_prefixes)
+}
+
+/// The layer of a constructor call, with each dim as the text of its argument.
+fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
     let is_equinox_module = call.implementation.target.module_parts.len() >= 2
         && call.implementation.target.module_parts[0] == "equinox"
         && call.implementation.target.module_parts[1] == "nn";
@@ -42,7 +51,7 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
         return None;
     }
 
-    let kind = match owner {
+    match owner {
         "Linear" => Some(LayerKind::Linear {
             in_features: call.bindings.get("in_features")?.clone(),
             out_features: call.bindings.get("out_features")?.clone(),
@@ -369,19 +378,15 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
             })
         }
         _ => None,
-    };
-    // `Linear(self.d_inner, out_features)` binds `in_features` as the
-    // literal ctor text `"self.d_inner"`, which would never match a
-    // same-named `d_inner` jaxtyping annotation dim (a different
-    // vocabulary — see `dims_match`). Strip the `self.`-prefix here,
-    // centrally, right at classification, so every `LayerKind`'s dim
-    // fields (including nested `Sequential` children) get it for free.
-    kind.map(strip_self_prefixes)
+    }
 }
 
 /// Strip a `self.` prefix from a ctor-arg dim expression's identifier
 /// tokens (`"self.d_inner"` → `"d_inner"`, `"self.d_inner*2"` →
-/// `"d_inner*2"`). This only strips the token-level prefix; it does not
+/// `"d_inner*2"`). `"self.d_inner"` would never match a same-named `d_inner`
+/// jaxtyping annotation dim (a different vocabulary — see `dims_match`).
+/// The analysis keeps the prefix until `ShapeCtx::layer_at` knows the value of
+/// the attribute. This only strips the token-level prefix; it does not
 /// consult the `self.<attr> = <ident>` alias map (`extract_self_attr_aliases*`
 /// in `python_ast.rs`) the way `normalize_dim` in `analysis.rs` does, since
 /// that map isn't available at layer-classification time without threading
@@ -409,18 +414,22 @@ fn strip_self_prefix(dim: &str) -> String {
     result
 }
 
-/// Apply [`strip_self_prefix`] to every `String` dim field of a `LayerKind`,
+pub(crate) fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
+    map_layer_dims(kind, &strip_self_prefix)
+}
+
+/// Apply `f` to every `String` dim field of a `LayerKind`,
 /// recursing into `Sequential`'s children and `EinopsPattern`'s kwarg
 /// values. `name`/`pattern` fields (class names, einops pattern text) are
 /// left untouched — they aren't dim expressions.
-fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
+pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> LayerKind {
     match kind {
         LayerKind::Linear {
             in_features,
             out_features,
         } => LayerKind::Linear {
-            in_features: strip_self_prefix(&in_features),
-            out_features: strip_self_prefix(&out_features),
+            in_features: f(&in_features),
+            out_features: f(&out_features),
         },
         LayerKind::Conv1d {
             in_channels,
@@ -429,11 +438,11 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             stride,
             padding,
         } => LayerKind::Conv1d {
-            in_channels: strip_self_prefix(&in_channels),
-            out_channels: strip_self_prefix(&out_channels),
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
+            in_channels: f(&in_channels),
+            out_channels: f(&out_channels),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
         },
         LayerKind::Conv2d {
             in_channels,
@@ -442,11 +451,11 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             stride,
             padding,
         } => LayerKind::Conv2d {
-            in_channels: strip_self_prefix(&in_channels),
-            out_channels: strip_self_prefix(&out_channels),
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
+            in_channels: f(&in_channels),
+            out_channels: f(&out_channels),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
         },
         LayerKind::Conv3d {
             in_channels,
@@ -455,20 +464,20 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             stride,
             padding,
         } => LayerKind::Conv3d {
-            in_channels: strip_self_prefix(&in_channels),
-            out_channels: strip_self_prefix(&out_channels),
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
+            in_channels: f(&in_channels),
+            out_channels: f(&out_channels),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
         },
         LayerKind::Dense { features } => LayerKind::Dense {
-            features: strip_self_prefix(&features),
+            features: f(&features),
         },
         LayerKind::FlaxConv {
             features,
             spatial_rank,
         } => LayerKind::FlaxConv {
-            features: strip_self_prefix(&features),
+            features: f(&features),
             spatial_rank,
         },
         LayerKind::Pool {
@@ -480,9 +489,9 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
         } => LayerKind::Pool {
             name,
             spatial_rank,
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
         },
         LayerKind::AdaptivePool {
             name,
@@ -491,26 +500,26 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
         } => LayerKind::AdaptivePool {
             name,
             spatial_rank,
-            output_size: strip_self_prefix(&output_size),
+            output_size: f(&output_size),
         },
         LayerKind::MultiheadAttention { feature_dim } => LayerKind::MultiheadAttention {
-            feature_dim: strip_self_prefix(&feature_dim),
+            feature_dim: f(&feature_dim),
         },
         LayerKind::Embedding { embedding_size } => LayerKind::Embedding {
-            embedding_size: strip_self_prefix(&embedding_size),
+            embedding_size: f(&embedding_size),
         },
         LayerKind::ShapePreserving { name } => LayerKind::ShapePreserving { name },
         LayerKind::Flatten { start_dim, end_dim } => LayerKind::Flatten {
-            start_dim: strip_self_prefix(&start_dim),
-            end_dim: strip_self_prefix(&end_dim),
+            start_dim: f(&start_dim),
+            end_dim: f(&end_dim),
         },
         LayerKind::Unflatten { dim, sizes } => LayerKind::Unflatten {
-            dim: strip_self_prefix(&dim),
-            sizes: strip_self_prefix(&sizes),
+            dim: f(&dim),
+            sizes: f(&sizes),
         },
         LayerKind::Upsample { scale_factor, size } => LayerKind::Upsample {
-            scale_factor: scale_factor.map(|s| strip_self_prefix(&s)),
-            size: size.map(|s| strip_self_prefix(&s)),
+            scale_factor: scale_factor.map(|s| f(&s)),
+            size: size.map(|s| f(&s)),
         },
         LayerKind::ConvTranspose {
             spatial_rank,
@@ -521,11 +530,11 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             padding,
         } => LayerKind::ConvTranspose {
             spatial_rank,
-            in_channels: strip_self_prefix(&in_channels),
-            out_channels: strip_self_prefix(&out_channels),
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
+            in_channels: f(&in_channels),
+            out_channels: f(&out_channels),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
         },
         LayerKind::Rnn {
             name,
@@ -533,8 +542,8 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             hidden_size,
         } => LayerKind::Rnn {
             name,
-            input_size: strip_self_prefix(&input_size),
-            hidden_size: strip_self_prefix(&hidden_size),
+            input_size: f(&input_size),
+            hidden_size: f(&hidden_size),
         },
         LayerKind::RnnCell {
             name,
@@ -542,14 +551,14 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             hidden_size,
         } => LayerKind::RnnCell {
             name,
-            input_size: strip_self_prefix(&input_size),
-            hidden_size: strip_self_prefix(&hidden_size),
+            input_size: f(&input_size),
+            hidden_size: f(&hidden_size),
         },
         LayerKind::PixelShuffle { upscale_factor } => LayerKind::PixelShuffle {
-            upscale_factor: strip_self_prefix(&upscale_factor),
+            upscale_factor: f(&upscale_factor),
         },
         LayerKind::PixelUnshuffle { downscale_factor } => LayerKind::PixelUnshuffle {
-            downscale_factor: strip_self_prefix(&downscale_factor),
+            downscale_factor: f(&downscale_factor),
         },
         LayerKind::Pad {
             name,
@@ -558,23 +567,23 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
         } => LayerKind::Pad {
             name,
             spatial_rank,
-            padding: strip_self_prefix(&padding),
+            padding: f(&padding),
         },
         LayerKind::Bilinear {
             in1_features,
             in2_features,
             out_features,
         } => LayerKind::Bilinear {
-            in1_features: strip_self_prefix(&in1_features),
-            in2_features: strip_self_prefix(&in2_features),
-            out_features: strip_self_prefix(&out_features),
+            in1_features: f(&in1_features),
+            in2_features: f(&in2_features),
+            out_features: f(&out_features),
         },
         LayerKind::CosineSimilarity { dim } => LayerKind::CosineSimilarity {
-            dim: strip_self_prefix(&dim),
+            dim: f(&dim),
         },
         LayerKind::Mlp { in_size, out_size } => LayerKind::Mlp {
-            in_size: strip_self_prefix(&in_size),
-            out_size: strip_self_prefix(&out_size),
+            in_size: f(&in_size),
+            out_size: f(&out_size),
         },
         LayerKind::Unfold {
             kernel_size,
@@ -582,20 +591,20 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             padding,
             dilation,
         } => LayerKind::Unfold {
-            kernel_size: strip_self_prefix(&kernel_size),
-            stride: strip_self_prefix(&stride),
-            padding: strip_self_prefix(&padding),
-            dilation: strip_self_prefix(&dilation),
+            kernel_size: f(&kernel_size),
+            stride: f(&stride),
+            padding: f(&padding),
+            dilation: f(&dilation),
         },
         LayerKind::Fold {
             output_size,
             kernel_size,
         } => LayerKind::Fold {
-            output_size: strip_self_prefix(&output_size),
-            kernel_size: strip_self_prefix(&kernel_size),
+            output_size: f(&output_size),
+            kernel_size: f(&kernel_size),
         },
         LayerKind::Sequential { children } => LayerKind::Sequential {
-            children: children.into_iter().map(strip_self_prefixes).collect(),
+            children: children.into_iter().map(|child| map_layer_dims(child, f)).collect(),
         },
         LayerKind::EinopsPattern {
             name,
@@ -606,7 +615,7 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
             pattern,
             kwargs: kwargs
                 .into_iter()
-                .map(|(k, v)| (k, strip_self_prefix(&v)))
+                .map(|(k, v)| (k, f(&v)))
                 .collect(),
         },
         loss @ LayerKind::Loss { .. } => loss,
@@ -852,7 +861,7 @@ pub fn classify_inline_constructor(
         args_node_range: args_node.range(),
     };
     let resolved = try_catalog_signature(&call, ctor_call, text, import_map).ok()??;
-    classify_layer_call(&resolved)
+    classify_layer_text(&resolved)
 }
 
 pub fn extract_layer_assignments<F>(
@@ -865,11 +874,11 @@ pub fn extract_layer_assignments<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let import_map = build_import_map(node, text)?;
+    let imports = ImportScopes::new(node, text)?;
     let records = extract_layer_assignments_scoped(
         node,
         text,
-        &import_map,
+        &imports,
         search_roots,
         read_file,
         max_depth,
@@ -877,7 +886,7 @@ where
     )?;
     let mut layers = HashMap::new();
     for rec in records {
-        layers.insert(rec.name, rec.kind);
+        layers.insert(rec.name, strip_self_prefixes(rec.kind));
     }
     Ok(layers)
 }
@@ -948,7 +957,7 @@ where
     let Some(resolved_call) = resolved_call else {
         return Ok(None);
     };
-    Ok(classify_layer_call(&resolved_call))
+    Ok(classify_layer_text(&resolved_call))
 }
 
 /// Named children of a `nn.Sequential`/`SpectralNorm`/`WeightNorm` ctor's
@@ -1133,7 +1142,7 @@ where
 pub fn extract_layer_assignments_scoped<F>(
     node: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
@@ -1150,7 +1159,7 @@ where
             &call,
             node,
             text,
-            import_map,
+            imports.at(call.args_node_range.start_byte),
             search_roots,
             &read_file,
             max_depth,
@@ -1176,7 +1185,7 @@ where
 pub fn extract_self_attr_layers_by_class<F>(
     node: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     search_roots: &[PathBuf],
     read_file: F,
     max_depth: usize,
@@ -1194,7 +1203,7 @@ where
             &call,
             node,
             text,
-            import_map,
+            imports.at(call.args_node_range.start_byte),
             search_roots,
             &read_file,
             max_depth,
@@ -1209,6 +1218,7 @@ where
             class_start,
             class_end,
             kind: layer,
+            byte: call.args_node_range.start_byte,
         });
     }
 
@@ -1657,8 +1667,22 @@ pub fn apply_layer_application(
 /// `input`, the input's variable/label). Factored out of
 /// `apply_layer_application` so `LayerKind::Sequential` can thread a shape
 /// through each child's rule in turn without needing a `ShapeLookup`/
-/// `LayerApplication` for intermediate (unnamed) shapes.
+/// `LayerApplication` for intermediate (unnamed) shapes. An output or an error
+/// that depends on an `UNPROVEN_DIM` is unknown.
 pub(crate) fn apply_layer_kind(
+    kind: &LayerKind,
+    input_shape: &[String],
+    layer: &str,
+    input: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match apply_layer_rule(kind, input_shape, layer, input) {
+        Ok(Some(output)) if output.iter().any(|dim| dim.contains(UNPROVEN_DIM)) => Ok(None),
+        Err(message) if message.contains(UNPROVEN_DIM) => Ok(None),
+        result => result,
+    }
+}
+
+fn apply_layer_rule(
     kind: &LayerKind,
     input_shape: &[String],
     layer: &str,
@@ -2148,7 +2172,7 @@ pub(crate) fn apply_layer_kind(
             let mut current = input_shape.to_vec();
             for (i, child) in children.iter().enumerate() {
                 let child_layer = format!("{layer}[{i}]");
-                match apply_layer_kind(child, &current, &child_layer, input)? {
+                match apply_layer_rule(child, &current, &child_layer, input)? {
                     Some(shape) => current = shape,
                     None => return Ok(None),
                 }

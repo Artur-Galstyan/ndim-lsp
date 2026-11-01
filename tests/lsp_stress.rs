@@ -1009,7 +1009,7 @@ fn one_run(run: usize, rec: &mut Recorder) {
             Sample {
                 total: at.saturating_duration_since(t_sent).as_secs_f64() * 1000.0,
                 compute: srv.compute_ms(t_start, at),
-                debounce: DEBOUNCE_MS,
+                debounce: srv.debounce_ms(t_start, at),
             },
         );
         rec.scalar(
@@ -1054,7 +1054,8 @@ fn one_run(run: usize, rec: &mut Recorder) {
         rec.sample("burst_50_changes_revert", s);
     }
 
-    // 7b. realistic typing: one key every 100 ms (slower than the debounce).
+    // 7b. realistic typing: one key every 100 ms. The debounce follows the
+    // cost, so each key may run one analysis, never more.
     // Editors ask for inlay hints after every change; the control run does not.
     for (name, with_inlay) in [
         ("typing_plain", false),
@@ -1100,12 +1101,12 @@ fn one_run(run: usize, rec: &mut Recorder) {
             Sample {
                 total: at.saturating_duration_since(t_last).as_secs_f64() * 1000.0,
                 compute: srv.compute_ms(t_start, at),
-                debounce: DEBOUNCE_MS,
+                debounce: srv.debounce_ms(t_start, at),
             },
         );
-        if analyses > 1.0 {
+        if analyses > keys as f64 {
             rec.fail(name, "debounce-bypassed", format!(
-                "{keys} keystrokes 100 ms apart caused {analyses} full analyses and {published} publications; one is enough"));
+                "{keys} keystrokes 100 ms apart caused {analyses} full analyses and {published} publications; at most one per key is allowed"));
         }
         doc.version = last;
         doc.text = append_to_line(&base, hover_row, &"x".repeat(keys));

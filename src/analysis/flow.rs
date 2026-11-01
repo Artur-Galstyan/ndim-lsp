@@ -20,6 +20,7 @@ use super::modules::binders;
 use super::{
     Lhs, ShapeCtx, TupleTarget, collect_assignment_items, collect_global_names, insert_identifiers,
 };
+use crate::imports::ImportScopes;
 use crate::resolution::resolve_call_target;
 use crate::types::ImportPath;
 
@@ -88,7 +89,7 @@ const SWALLOWING: [&str; 7] = [
 /// What `visit` reads besides the tree.
 struct Source<'a> {
     text: &'a str,
-    import_map: &'a HashMap<String, ImportPath>,
+    imports: &'a ImportScopes,
     /// The statement that `visit` is at is in a class body, with no function
     /// between: the names it binds belong to the class.
     in_class: std::cell::Cell<bool>,
@@ -100,13 +101,13 @@ struct Source<'a> {
 pub(super) fn collect_flow<'t>(
     root: Node<'t>,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     in_class: bool,
 ) -> Vec<Marked<'t>> {
     let mut out = Vec::new();
     let src = Source {
         text,
-        import_map,
+        imports,
         in_class: std::cell::Cell::new(in_class),
     };
     visit(root, &src, &mut out);
@@ -525,7 +526,7 @@ fn swallows(node: Node, src: &Source) -> bool {
                     .child_by_field_name("function")
                     .and_then(|f| f.utf8_text(src.text.as_bytes()).ok())
                     .unwrap_or("");
-                if is_swallowing(callee, src.import_map) {
+                if is_swallowing(callee, src.imports.at(n.start_byte())) {
                     return true;
                 }
             }

@@ -73,7 +73,9 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 `golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
 
-Baseline (the work after the last commit, release, 5 runs, p50, 22,323-line file): an edit while typing takes about 200 to 235 ms, which is a 150 ms debounce plus about 30 to 70 ms of compute plus about 16 to 25 ms of transport. An edit after an idle pause waits 20 to 150 ms (for example 120 ms in total). The worst case is an edit that moves every position of the file (`edit_char_start`): about 435 ms, 269 ms of it compute. Cold open takes about 327 ms (316 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis). On the same input file, the code before this work needs 1 to 14 percent less compute for an edit (median about 8 percent) and 4 percent more for a cold open: the new work models more constructs. The numbers depend on the machine.
+Baseline (the code with the cost-based debounce of "Incremental analysis", release, 5 runs, p50, 22,323-line file): an edit takes about 50 to 75 ms, which is a 20 ms debounce plus about 16 to 40 ms of compute plus about 13 to 17 ms of transport. Typing runs one analysis for each key: `typing_plain` takes 58 ms for each key and gives 12 analyses and 12 publications for 12 keys. Some edits take more: `edit_after_idle` takes 88 ms (45 ms of compute). The worst case is an edit that moves every position of the file (`edit_char_start`): about 448 ms, 281 ms of it compute, with the full 150 ms debounce. The next edit also waits 150 ms (`edit_char_start_revert`, 203 ms). Cold open takes about 358 ms (347 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis).
+
+Control on one input, one 5-run benchmark after the other, against commit `025e7f2`, the commit before the cost-based debounce: `typing_plain` falls from 211 to 58 ms, and `edit_char_end` from 195 to 51 ms. The cost is CPU time: at 100 ms for each key, the commit ran 1 analysis for 12 keys and this code runs 12. Compute is 4 percent higher for a cold open (333 to 347 ms) and 6 percent higher for `edit_char_start` (265 to 281 ms), because the analysis does more work. The numbers depend on the machine.
 
 The debounce column of the benchmark is the value the server chose for the edit. Do not time with `NDIM_VERIFY_INCREMENTAL=1`: it adds a fresh parse and analysis to every edit.
 
@@ -84,7 +86,7 @@ The debounce column of the benchmark is the value the server chose for the edit.
 The server uses `TextDocumentSyncKind::INCREMENTAL`. After a change it reuses the previous syntax tree (a tree with a syntax error is parsed again from scratch, so the tree always equals a fresh parse) and reuses the analysis of the top-level statements that did not change. The result must equal a fresh analysis of the same text.
 
 - The first analysis after open runs in full. A change of the workspace folders drops the memo (it is valid for one set of search roots), so the next analysis redoes the statements, but it still reuses the tree.
-- The debounce is at most 150 ms. A change within 400 ms of the previous one waits 150 ms. An isolated change of a document with a known analysis cost waits twice that cost, between 20 and 150 ms.
+- The debounce depends on the analysis cost of the document, not on the rhythm of the keys. It is half of the average incremental run or twice the last whole analysis, between 20 and 150 ms. A document with no known cost waits 150 ms, also after a failed analysis or a change of the workspace folders. Each key can start one analysis, so typing uses more CPU than a fixed window, but a change waits less.
 - A change message that does not fit the stored text is dropped as a whole. The document then gives no diagnostics or hints until the editor sends a full text.
 - Limits: an edit in a hub (`__init__`, `forward`, other common names) reuses less. An edit that moves the whole file, an edit of an import line, and a statement with a syntax error recompute more. A file over 4 MiB or 100,000 statements runs without the memo.
 - Debug switches (server environment): `NDIM_VERIFY_INCREMENTAL=1` compares every incremental result with a fresh one and uses the fresh result on a difference (it logs `incremental mismatch`). `NDIM_NO_PROPAGATE_MEMO=1` turns off the reuse of the propagation pass.
@@ -143,6 +145,9 @@ See `llm.txt` for the design.
 - [x] Closures read enclosing variables at call time; `nonlocal` rebinding gives unknown
 - [x] User submodules (`self.blk = Block(...)`, `Block(...)(x)`, `vmap(self.blk)`) through the class MRO, including classes imported from other files, `nn.ModuleList` and `nn.Sequential` fields of user modules, and chain loops (`for l in self.layers: x = l(x)`)
 - [x] Module globals and integer constants read in a function (known only when all writes come before the reader and have one shape)
+- [x] Integer constants and `self.<attr>` constants in layer constructor dims (`nn.Linear(8, OUT)`); a dim with no proven value makes the layer output unknown
+- [x] Methods resolve by class: `self.m()`, `cls.m()`, and `super().m()` follow the MRO of the class of the call, and an override in the file gives unknown
+- [x] Imports follow Python scopes: a function-local import, a parameter, or a local name changes the meaning of a name only in its own scope
 - [x] Comprehensions and lambdas where the result is used (`stack` of a list comprehension, `sum`, `vmap`, `lax.map`, `lax.scan` and direct calls of a lambda)
 - [x] Provable scalar operands broadcast in binary operations
 - [x] A name whose shape changes across a loop (`x, y = y, x`) is unknown after the loop, and the hints of the first iteration are taken back
@@ -173,4 +178,4 @@ See `llm.txt` for the design.
 - [x] Cache parsed trees and resolved shapes for repeated requests at the same document version
 - [x] Cache import resolution and function signatures across edits (a saved change to an imported file, or a watched-file event, drops the affected entries and republishes the open documents)
 - [x] Reuse parsed trees and local shape analysis across document edits (per top-level statement memo and propagation replay; see "Incremental analysis")
-- [x] Incremental document sync and an adaptive debounce (20 to 150 ms)
+- [x] Incremental document sync and a cost-based debounce (20 to 150 ms)

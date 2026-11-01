@@ -34,7 +34,7 @@ mod sync;
 use sync::{Pace, Run, apply_changes};
 
 /// Longest quiet time after a change before its text is analyzed. `Pace`
-/// shortens it for an isolated edit of a document that is cheap to analyze.
+/// shortens it for a document with a known, low analysis cost.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Analysis plus the exact text/tree it was computed from, so hover and
@@ -106,7 +106,7 @@ pub struct Backend {
     /// One analysis runs at a time per URI. A later one waits here, and skips
     /// the work if newer text arrived meanwhile.
     pub gates: Arc<Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Change rhythm and analysis cost per URI, which set the debounce.
+    /// Analysis cost per URI, which sets the debounce.
     pub pace: Arc<Mutex<HashMap<Url, Pace>>>,
     /// Session-lifetime cache for resolved import targets.
     /// Keyed on (import-path-segments, search-roots-fingerprint).
@@ -222,9 +222,7 @@ impl LanguageServer for Backend {
         self.pace
             .lock()
             .unwrap()
-            .entry(doc.uri.clone())
-            .or_default()
-            .opened(Instant::now());
+            .insert(doc.uri.clone(), Pace::default());
         if let Some(rev) = self.set_document(&doc.uri, doc.text, doc.version, Duration::ZERO, false)
         {
             self.spawn_publish(doc.uri, rev);
@@ -383,8 +381,10 @@ impl Backend {
             doc.ready_at = now;
             revs.push((uri.clone(), doc.rev));
         }
-        for pace in self.pace.lock().unwrap().values_mut() {
-            pace.reset();
+        if let Some(forced_rev) = revs.iter().map(|(_, rev)| *rev).max() {
+            for pace in self.pace.lock().unwrap().values_mut() {
+                pace.reset(forced_rev);
+            }
         }
         // After the new revs: an analysis of an old rev can no longer fill it.
         self.analysis_cache.write().unwrap().clear();
@@ -475,7 +475,7 @@ impl Backend {
             .unwrap()
             .entry(uri.clone())
             .or_default()
-            .changed(Instant::now());
+            .debounce();
         Change::Stored(self.store(&mut docs, uri, text, version, debounce))
     }
 
@@ -585,10 +585,8 @@ impl Backend {
                 let wall = t_total.elapsed();
                 let total_ms = wall.as_millis();
                 let stats = run.memo.stats();
-                let kind = if !had_base {
-                    Run::Cold
-                } else if stats.propagate_full && stats.units > 1 {
-                    Run::Fallback
+                let kind = if !had_base || (stats.propagate_full && stats.units > 1) {
+                    Run::Whole
                 } else {
                     Run::Incremental
                 };
@@ -637,12 +635,14 @@ impl Backend {
 
         // Cache only if this is still the newest text; a stale entry would
         // never be read and a closed document must not be re-populated.
-        let committed = result.as_ref().is_some_and(|c| self.commit(&uri, c));
+        if let Some(cached) = &result {
+            self.commit(&uri, cached);
+        }
         if let Some(pace) = self.pace.lock().unwrap().get_mut(&uri) {
             match sample {
                 _ if result.is_none() => pace.failed(),
-                Some((wall, kind)) if committed => pace.sampled(wall, kind),
-                _ => {}
+                Some((wall, kind)) => pace.sampled(doc.rev, wall, kind),
+                None => {}
             }
         }
         self.inflight.lock().unwrap().remove(&(uri, doc.rev));
@@ -652,7 +652,7 @@ impl Backend {
     /// Keep `cached` as the newest result for `uri`, and as the base of the
     /// next incremental parse, if its text is still the newest. A result for
     /// old text, or for a closed document, changes no state.
-    fn commit(&self, uri: &Url, cached: &CachedAnalysis) -> bool {
+    fn commit(&self, uri: &Url, cached: &CachedAnalysis) {
         let docs = self.documents.read().unwrap();
         if docs.get(uri).is_some_and(|d| d.rev == cached.rev) {
             self.parse_states.write().unwrap().insert(
@@ -667,9 +667,7 @@ impl Backend {
                 .write()
                 .unwrap()
                 .insert(uri.clone(), cached.clone());
-            return true;
         }
-        false
     }
 
     /// Publish diagnostics for `rev` in a task of its own, after the debounce.

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use tree_sitter::Node;
 
+use crate::imports::{ImportScopes, is_imported};
 use crate::known_functions::{
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
     apply_known_reduction, apply_known_topk_shape, apply_method_call, classify_known_function,
@@ -14,9 +15,12 @@ use crate::known_functions::{
 use crate::incremental::{
     NodeRef, PrePass, PropPlan, PropagateOutput, Segment, UnitMemo, UnitRun, unit_nodes,
 };
-use crate::layers::{apply_layer_application, apply_layer_kind, classify_inline_constructor};
+use crate::layers::{
+    UNPROVEN_DIM, apply_layer_application, apply_layer_kind, classify_inline_constructor,
+    strip_self_prefixes,
+};
 use crate::python_ast::{
-    ClassHierarchy, SelfAttrWrite, build_import_map, dim_symbols, directly_in_class,
+    ClassHierarchy, SelfAttrWrite, dim_symbols, directly_in_class,
     extract_call_arguments, self_attr_aliases_from_writes,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
@@ -25,7 +29,10 @@ use crate::types::*;
 
 mod flow;
 mod inner;
+mod layer_dims;
 mod modules;
+
+pub(crate) use modules::LIBRARIES;
 use flow::{Marked, Replay, collect_flow};
 use modules::{
     Field, Module, apply_module, apply_sequence_call, changed_in_place, field_of, imported_class,
@@ -131,7 +138,7 @@ where
 {
     let PrePass {
         mut scopes,
-        import_map,
+        imports,
         layer_records,
         self_attr_layers,
         writes: self_attr_writes,
@@ -144,7 +151,7 @@ where
         (Some(plan), Some(next)) => propagate_planned(
             node,
             text,
-            &import_map,
+            &imports,
             &layer_records,
             &self_attr_layers,
             &self_attr_aliases,
@@ -161,7 +168,7 @@ where
         _ => propagate_calls(
             node,
             text,
-            &import_map,
+            &imports,
             &layer_records,
             &self_attr_layers,
             &self_attr_aliases,
@@ -177,7 +184,7 @@ where
 
     let mut layers = HashMap::new();
     for rec in &layer_records {
-        layers.insert(rec.name.clone(), rec.kind.clone());
+        layers.insert(rec.name.clone(), strip_self_prefixes(rec.kind.clone()));
     }
 
     Ok(LayerShapeAnalysis {
@@ -228,7 +235,7 @@ where
         .map(|r| (r.line, r.name.as_str()))
         .collect();
 
-    let import_map = build_import_map(node, text)?;
+    let imports = ImportScopes::new(node, text)?;
     let items = collect_assignment_items(node, text)?;
 
     let mut total = 0;
@@ -258,7 +265,7 @@ where
         } else {
             dark.push(DarkSpot {
                 line,
-                kind: dark_spot_kind(rhs, text, &import_map),
+                kind: dark_spot_kind(rhs, text, imports.at(rhs.start_byte())),
             });
         }
     }
@@ -307,7 +314,7 @@ fn find_scoped_layer<'a>(
     index: &ScopeIndex,
     call_byte: usize,
     target: &str,
-) -> Option<&'a LayerKind> {
+) -> Option<&'a LayerAssignment> {
     let mut best: Option<(usize, usize)> = None;
     for (i, rec) in records.iter().enumerate() {
         if rec.name != target {
@@ -326,7 +333,7 @@ fn find_scoped_layer<'a>(
             }
         }
     }
-    best.map(|(i, _)| &records[i].kind)
+    best.map(|(i, _)| &records[i])
 }
 
 // ── Recursive shape evaluator (#34) ─────────────────────────────────────
@@ -341,7 +348,7 @@ fn find_scoped_layer<'a>(
 /// propagate_calls pass.
 struct ShapeCtx<'a> {
     text: &'a str,
-    import_map: &'a HashMap<String, ImportPath>,
+    imports: &'a ImportScopes,
     layer_records: &'a [LayerAssignment],
     /// `self.<attr>` → layer bindings keyed by defining class range, from
     /// constructor assignments in `__init__`. Used to resolve
@@ -352,6 +359,12 @@ struct ShapeCtx<'a> {
     /// dims (`self.dt_rank` ≡ `dt_rank`) before storage, resolved by the
     /// call-site byte via `self_attr_alias_at` — mirrors `self_attr_layers`.
     aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    /// Every `self.<attr>` write of the file (`ShapeCtx::layer_at`).
+    attr_writes: &'a [SelfAttrWrite<'a>],
+    /// The dims of layer constructors written with their values: per place of
+    /// the constructor and dim text (`ShapeCtx::layer_at`).
+    layer_dims: std::cell::RefCell<HashMap<(usize, String), String>>,
+    root: Node<'a>,
     hierarchy: &'a ClassHierarchy,
     /// Workspace/site-packages search roots, for resolving imported helper
     /// functions on disk (cross-file return-type tracing).
@@ -476,6 +489,9 @@ struct ModuleWrites {
     shape: Option<Vec<String>>,
 }
 
+/// A class that defines a method, and the scope of the method.
+type MethodScope = ((usize, usize), usize);
+
 /// Lexical facts about function scopes, computed only for closures and the
 /// functions that enclose them (every other entry stays empty).
 #[derive(Default)]
@@ -496,6 +512,9 @@ struct ScopeLinks {
     /// Another function of the same name is defined in the same function or
     /// class body, or at module level.
     redefined: Vec<bool>,
+    /// The class whose body holds the definition of each scope.
+    class_of: Vec<Option<(usize, usize)>>,
+    methods: HashMap<String, Vec<MethodScope>>,
 }
 
 struct ScopeLevel<'c> {
@@ -616,12 +635,12 @@ impl<'a> ShapeCtx<'a> {
     /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`,
     /// else in its bases (MRO order). Unrelated classes never match, and a
     /// base the file does not define ends the search with None.
-    fn self_attr_layer_at(&self, attr: &str, byte: usize) -> Option<&LayerKind> {
+    fn self_attr_layer_at(&self, attr: &str, byte: usize) -> Option<LayerKind> {
         self.hierarchy
             .resolve(self.self_attr_layers.get(attr)?, byte, |e| {
                 (e.class_start, e.class_end)
             })
-            .map(|e| &e.kind)
+            .map(|e| self.layer_at(&e.kind, e.byte))
     }
 
     /// The `self.<attr>` field of the class enclosing `byte`, else of its
@@ -657,6 +676,115 @@ impl<'a> ShapeCtx<'a> {
             return None;
         }
         Some(method.scope)
+    }
+
+    /// The method that `receiver.<name>(...)` runs, when `receiver` is the
+    /// `self` or `cls` of the enclosing method, or a `super()` call. `None`
+    /// when no method of the file is sure to run.
+    fn method_callee(
+        &self,
+        receiver: Node,
+        is_super: bool,
+        name: &str,
+        call_byte: usize,
+    ) -> Option<usize> {
+        let word = if is_super { "super" } else { &self.text[receiver.byte_range()] };
+        if !matches!(word, "self" | "cls" | "super") {
+            return None;
+        }
+        let links = self.links;
+        let mut method = links.scope_index.lookup(call_byte)?;
+        while links.class_of[method].is_none() {
+            if self.scopes[method].all_params.iter().any(|p| p == word) {
+                return None;
+            }
+            method = links.parent[method]?;
+        }
+        let class = links.class_of[method]?;
+        let first = self.scopes[method].all_params.first()?.as_str();
+        let kind = method_kind(self.scope_function_nodes[method]?, self.text);
+        let on_class = match (word, first, kind) {
+            ("self" | "super", "self", MethodKind::Instance) => false,
+            ("cls" | "super", "cls", MethodKind::Class) => true,
+            _ => return None,
+        };
+        if is_super {
+            let args = receiver.child_by_field_name("arguments")?;
+            let mut cursor = args.walk();
+            let explicit: Vec<&str> = args
+                .named_children(&mut cursor)
+                .filter(|arg| arg.kind() != "comment")
+                .map(|arg| &self.text[arg.byte_range()])
+                .collect();
+            match explicit[..] {
+                [] => {}
+                [of, instance] if instance == first && self.hierarchy.class_named(of) == Some(class) => {}
+                _ => return None,
+            }
+        }
+
+        let methods = links.methods.get(name);
+        let callee = self.hierarchy.resolve_method(class, is_super, |c| {
+            if self.hierarchy.binds_attr(c, name) || self.class_writes(name, c) {
+                return Some(None);
+            }
+            methods?.iter().find(|m| m.0 == c).map(|m| Some(m.1))
+        })?;
+        let scope = &self.scopes[callee];
+        if links.redefined[callee]
+            || (scope.start_byte <= call_byte && call_byte < scope.end_byte)
+            || !self.receiver_holds(receiver, word)
+            || (is_super && !self.receiver_holds(receiver, first))
+        {
+            return None;
+        }
+        let receiver_param = matches!(scope.all_params.first().map(String::as_str), Some("self" | "cls"));
+        let kind = method_kind(self.scope_function_nodes[callee]?, self.text);
+        match kind {
+            MethodKind::Instance if !on_class && receiver_param => Some(callee),
+            MethodKind::Class if receiver_param => Some(callee),
+            MethodKind::Static if !receiver_param => Some(callee),
+            _ => None,
+        }
+    }
+
+    /// Whether no scope from `at` up to the method rebinds `word`, the `self`
+    /// or `cls` of the method. `super` must have no binding at all.
+    fn receiver_holds(&self, at: Node, word: &str) -> bool {
+        if word == "super" {
+            return matches!(nearest_binding(at, word, self).1, NameBinding::Unbound);
+        }
+        let mut up = at.parent();
+        while let Some(node) = up {
+            match node.kind() {
+                "lambda" | "list_comprehension" | "set_comprehension"
+                | "dictionary_comprehension" | "generator_expression"
+                    if inner_scope_binds(node, word, self.text) =>
+                {
+                    return false;
+                }
+                "function_definition" => {
+                    let (Some(scope), Some(body)) =
+                        (function_scope(node, self), node.child_by_field_name("body"))
+                    else {
+                        return false;
+                    };
+                    let (mut values, mut bound) = (Vec::new(), false);
+                    if self.links.poisoned[scope].contains(word)
+                        || !collect_name_values(body, word, self.text, &mut values, &mut bound)
+                        || bound
+                    {
+                        return false;
+                    }
+                    if self.links.class_of[scope].is_some() {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            up = node.parent();
+        }
+        false
     }
 
     /// Whether `class` itself writes `self.<attr>` as a layer, alias, or field.
@@ -717,7 +845,10 @@ impl<'a> ShapeCtx<'a> {
                 CallArgument::Keyword { name, value } => (name.as_str(), value),
             };
             let value = normalize_dim(value, self.aliases, self.hierarchy, module.byte);
-            if !value.is_empty() && value.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if let Some(value) = self.argument_value(&value, module.byte)
+                && !value.is_empty()
+                && value.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
                 given.insert(name.to_string(), value);
             }
         }
@@ -919,12 +1050,17 @@ impl<'a> ShapeCtx<'a> {
         let NameBinding::Values(values) = name_binding(root, 0, name, self) else {
             return None;
         };
-        let classes = self.class_body_names.get_or_init(|| {
-            let mut names = HashSet::new();
-            collect_class_body_names(root, self.text, &mut names);
-            names
-        });
-        (!classes.contains(name)).then(|| values.iter().map(|v| v.end_byte()).collect())
+        (!self.class_body_binds(root, name)).then(|| values.iter().map(|v| v.end_byte()).collect())
+    }
+
+    fn class_body_binds(&self, root: Node, name: &str) -> bool {
+        self.class_body_names
+            .get_or_init(|| {
+                let mut names = HashSet::new();
+                collect_class_body_names(root, self.text, &mut names);
+                names
+            })
+            .contains(name)
     }
 
     /// Look up a shape by name in the given scope, checking both real
@@ -1636,7 +1772,7 @@ fn is_scalar_expr(
         }
         "identifier" => name_is_scalar(node, text(node), ctx, visiting),
         "attribute" => {
-            let resolved = resolve_call_target(text(node), ctx.import_map);
+            let resolved = resolve_call_target(text(node), ctx.imports.at(node.start_byte()));
             let parts: Vec<&str> = resolved.parts.iter().map(String::as_str).collect();
             matches!(
                 parts.as_slice(),
@@ -1664,7 +1800,7 @@ fn is_scalar_expr(
                 return false;
             };
             let function_text = text(function);
-            let resolved = resolve_call_target(function_text, ctx.import_map);
+            let resolved = resolve_call_target(function_text, ctx.imports.at(node.start_byte()));
             if function.kind() == "identifier" {
                 return matches!(function_text, "len" | "float" | "int")
                     && resolved.parts == [function_text]
@@ -2067,7 +2203,6 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             && obj_node.utf8_text(ctx.text.as_bytes()).ok()? == "self"
             && let Some(layer) = ctx
                 .self_attr_layer_at(&method_name, attr_node.start_byte())
-                .cloned()
         {
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
             let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
@@ -2135,6 +2270,22 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             };
         }
 
+        // A method of the class of the call: `self.m(x)`, `cls.m(x)`,
+        // `super().m(x)`. A `super()` receiver is never an array.
+        let is_super = is_super_call(obj_node, ctx.text);
+        if method_name != "__init__"
+            && let Some(callee_idx) = ctx.method_callee(obj_node, is_super, &method_name, call_byte)
+        {
+            let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+            let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+            let display = ctx.text[func_node.byte_range()].to_string();
+            let call = UserCall { name: &method_name, display, args: &args, args_node, call_byte };
+            return apply_user_function(callee_idx, call, scope_idx, ctx).flatten();
+        }
+        if is_super {
+            return None;
+        }
+
         // Distinguish between:
         //   (a) Chained method call: x.reshape(3,4).sum(axis=1)
         //       where obj_node is itself a `call` node.
@@ -2170,7 +2321,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     } else {
                         args
                     };
-                    let result = apply_method_call_for_backend(&known, &receiver_name, &args, ctx.import_map, &ctx.scope_shapes(scope_idx));
+                    let result = apply_method_call_for_backend(&known, &receiver_name, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
                     return match result {
                         Ok(Some(shape)) => Some(shape),
                         Ok(None) => None,
@@ -2200,7 +2351,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
             // If the receiver is an import alias (like jnp), this is a
             // qualified free function — fall through.
-            if !ctx.import_map.contains_key(&receiver_name) {
+            if !is_imported(ctx.imports.at(obj_node.start_byte()), &receiver_name) {
                 let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
@@ -2214,7 +2365,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         &known,
                         &receiver_name,
                         &args,
-                        ctx.import_map,
+                        ctx.imports.file(),
                         &ctx.scope_shapes(scope_idx),
                     );
                     return match result {
@@ -2248,7 +2399,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // Resolve arguments — but first, recursively evaluate any inline
     // expression arguments (nested calls, unary ops, etc.) so they have
     // shapes in the scope.
-    let resolved = resolve_call_target(&target, ctx.import_map);
+    let imports = ctx.imports.at(func_node.start_byte());
+    let resolved = resolve_call_target(&target, imports);
     let known = classify_known_function(&resolved);
     let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
     let args = if matches!(known, Some(KnownFunction::LaxPolynomial)) {
@@ -2270,7 +2422,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     };
 
     // 1. Layer check
-    if let Some(kind) = find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, &target) {
+    if let Some(record) = find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, &target) {
+        let kind = ctx.layer_at(&record.kind, record.byte_position);
         let Some(CallArgument::Positional { value: input }) = args.first().cloned() else {
             return None;
         };
@@ -2281,8 +2434,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             variable: String::new(), // filled by caller
             layer: target.clone(),
             input,
-            extra_inputs: extra_layer_inputs(&args, kind),
-            kind: kind.clone(),
+            extra_inputs: extra_layer_inputs(&args, &kind),
+            kind,
             range: args_node.range(),
         };
         let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
@@ -2336,7 +2489,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             let callable = positionals.next()?;
             let rest: Vec<CallArgument> = args.iter().skip(1).cloned().collect();
             if let Some(attr) = callable.strip_prefix("self.")
-                && let Some(layer) = ctx.self_attr_layer_at(attr, call_byte).cloned()
+                && let Some(layer) = ctx.self_attr_layer_at(attr, call_byte)
             {
                 return apply_inline_vmap_layer(
                     (&callable, &layer),
@@ -2363,6 +2516,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     wrapped: callable,
                     in_axes: 0,
                     out_axes: 0,
+                    site: call_byte,
                 };
                 return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes) {
                     Ok(shape) => shape,
@@ -2376,82 +2530,25 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         }
     }
 
-    // 3. User-defined function propagation. `self.<method>(...)` resolves
-    // to the method's function scope by bare name — methods are function
-    // definitions like any other. When the callee has no `-> ReturnType`
-    // annotation (e.g. a typical `forward(self, x: Float[Array, "..."])`),
-    // `bind_user_function_args` falls back to tracing a bare `return <name>`
-    // statement against the callee's own already-computed body shapes.
-    //
-    // Gated on the callee being FULLY annotated (checked against the
-    // call-site-independent `original_shapes` snapshot, never the live,
-    // mutable `scopes[...].shapes`): the bare-return
-    // trace reads `callee.shapes.get(name)` directly, which is only sound
-    // when every one of the callee's params was statically annotated (so
-    // its body shapes are the same regardless of which call site asks) —
-    // once lazy call-site parameter seeding (3b) has ever specialized a
-    // partially-annotated callee, its `shapes` map holds a PARTICULAR call
-    // site's seeded values, and reusing them here for a call site with
-    // different argument shapes would silently propagate the wrong shape.
-    // Partially-annotated callees always go through 3b instead, which
-    // re-seeds fresh from `original_shapes` on every call.
-    let user_target = target.strip_prefix("self.").unwrap_or(&target);
-    if !user_target.contains('.') {
-        let callee_idx = find_callee_scope(user_target, Some(call_byte), ctx.links, ctx.scopes);
-        let fully_annotated = callee_idx.is_none_or(|idx| callee_all_params_annotated(idx, ctx));
-
-        // A closure that reads an enclosing function's variable has body
-        // shapes that depend on the call, like a partially annotated callee:
-        // only its `-> ReturnType` annotation is call-independent.
-        let captures = callee_idx.is_some_and(|idx| ctx.links.captures[idx]);
-
-        if fully_annotated {
-            if let Some(callee_idx) = callee_idx
-                && let Some(result) = bind_user_function_args(
-                    &ctx.scopes[callee_idx],
-                    user_target,
-                    &args,
-                    &ctx.scope_shapes(scope_idx),
-                    ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
-                )
-            {
-                match result {
-                    Ok(Some(shape))
-                        if !captures || ctx.scopes[callee_idx].return_shape.is_some() =>
-                    {
-                        return Some(shape);
-                    }
-                    Ok(Some(_)) | Ok(None) => {}
-                    Err(message) => {
-                        ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
-                        return None;
-                    }
-                }
-            }
-            if captures
-                && let Some(shape) =
-                    apply_seeded_user_function(user_target, call_byte, &args, scope_idx, ctx)
-            {
-                return Some(shape);
-            }
-        } else {
-            // 3b. Lazy call-site parameter seeding (`llm.txt`'s "Known
-            // architectural limit"): the callee is a same-file function,
-            // nested closure, or `self.<method>` with at least one
-            // un-annotated parameter. Seed the un-annotated params from
-            // this call site's resolved argument shapes and evaluate the
-            // callee's body on demand.
-            if let Some(shape) =
-                apply_seeded_user_function(user_target, call_byte, &args, scope_idx, ctx)
-            {
-                return Some(shape);
-            }
+    // 3. User-defined function propagation.
+    if !target.contains('.')
+        && let Some(callee_idx) = find_callee_scope(&target, call_byte, ctx.links, ctx.scopes)
+    {
+        let call = UserCall {
+            name: &target,
+            display: target.clone(),
+            args: &args,
+            args_node,
+            call_byte,
+        };
+        if let Some(result) = apply_user_function(callee_idx, call, scope_idx, ctx) {
+            return result;
         }
     }
 
     // 4. vmap *recording* (e.g. `vf = jax.vmap(f)`)
     if matches!(known.as_ref(), Some(KnownFunction::Vmap))
-        && let Some(_info) = parse_vmap_call(&args) {
+        && let Some(_info) = parse_vmap_call(&args, call_byte) {
             // propagate_calls records the vmap binding, so there is no shape here.
             return None;
         }
@@ -2529,7 +2626,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         &target,
         &args,
         &ctx.scope_shapes(scope_idx),
-        ctx.import_map,
+        imports,
         ctx.search_roots,
         ctx.read_file,
         ctx.max_depth,
@@ -2713,6 +2810,10 @@ fn integer_constant(at: Node, name: &str, ctx: &ShapeCtx) -> Option<String> {
     if !ctx.int_names.contains(name) || ctx.is_annotation_symbol(name) {
         return None;
     }
+    literal_constant(at, name, ctx)
+}
+
+fn literal_constant(at: Node, name: &str, ctx: &ShapeCtx) -> Option<String> {
     let mut up = at.parent();
     let mut owner = None;
     while let Some(node) = up {
@@ -3077,6 +3178,8 @@ struct VmapInfo {
     in_axes: isize,
     /// `out_axes` value — default 0. Only scalar integers are honoured in v1.
     out_axes: isize,
+    /// Where the `vmap` call is: the name means what it means there.
+    site: usize,
 }
 
 /// Parse a vmap/filter_vmap call's arguments into a `VmapInfo`.
@@ -3086,7 +3189,7 @@ struct VmapInfo {
 ///   not simple).
 /// - `in_axes` or `out_axes` is present but not a literal integer (tuple,
 ///   variable, `None`, etc.).
-fn parse_vmap_call(args: &[CallArgument]) -> Option<VmapInfo> {
+fn parse_vmap_call(args: &[CallArgument], site: usize) -> Option<VmapInfo> {
     // First positional arg = wrapped function name.
     let first_positional = args.iter().find_map(|arg| match arg {
         CallArgument::Positional { value } => Some(value.clone()),
@@ -3108,6 +3211,7 @@ fn parse_vmap_call(args: &[CallArgument]) -> Option<VmapInfo> {
         wrapped: first_positional,
         in_axes,
         out_axes,
+        site,
     })
 }
 
@@ -3312,8 +3416,6 @@ fn build_scope_links(
 ) -> ScopeLinks {
     let n = scopes.len();
     let class_index = ScopeIndex::from_ranges(class_ranges.to_vec());
-    // The class whose body holds the definition of each scope, if any.
-    let mut class_of: Vec<Option<usize>> = vec![None; n];
     let mut links = ScopeLinks {
         scope_index: ScopeIndex::new(scopes),
         parent: vec![None; n],
@@ -3321,6 +3423,8 @@ fn build_scope_links(
         poisoned: vec![HashSet::new(); n],
         captures: vec![false; n],
         redefined: vec![false; n],
+        class_of: vec![None; n],
+        methods: HashMap::new(),
     };
 
     let mut open: Vec<usize> = Vec::new();
@@ -3351,17 +3455,21 @@ fn build_scope_links(
                 has_closure = true;
             }
         }
-        class_of[i] = class_index.lookup(scopes[i].start_byte).filter(|&class| {
-            open.last().is_none_or(|&p| class_ranges[class].0 > scopes[p].start_byte)
-        });
+        links.class_of[i] = class_index
+            .lookup(scopes[i].start_byte)
+            .map(|class| class_ranges[class])
+            .filter(|class| open.last().is_none_or(|&p| class.0 > scopes[p].start_byte));
         open.push(i);
     }
     // The enclosing function, the enclosing class, and the name.
-    type Namespace<'a> = (Option<usize>, Option<usize>, &'a str);
+    type Namespace<'a> = (Option<usize>, Option<(usize, usize)>, &'a str);
     let mut defined: HashMap<Namespace, Vec<usize>> = HashMap::new();
     for (i, scope) in scopes.iter().enumerate().skip(1) {
         if let Some(name) = scope.function_name.as_deref() {
-            defined.entry((links.parent[i], class_of[i], name)).or_default().push(i);
+            defined.entry((links.parent[i], links.class_of[i], name)).or_default().push(i);
+            if let Some(class) = links.class_of[i] {
+                links.methods.entry(name.to_string()).or_default().push((class, i));
+            }
         }
     }
     for twins in defined.values().filter(|twins| twins.len() > 1) {
@@ -3509,7 +3617,7 @@ fn constructed_module(
         return None;
     }
     let name = name.utf8_text(text.as_bytes()).ok()?;
-    if import_map.contains_key(name) {
+    if is_imported(import_map, name) {
         return None;
     }
     Some(Submodule {
@@ -3522,7 +3630,7 @@ fn constructed_module(
 fn extract_submodules(
     root: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     hierarchy: &ClassHierarchy,
     writes: &[SelfAttrWrite],
     scopes: &[FunctionShapeScope],
@@ -3550,7 +3658,7 @@ fn extract_submodules(
     for write in writes.iter().filter(|w| w.class != (0, usize::MAX)) {
         let module = write
             .value
-            .and_then(|value| field_of(value, text, import_map, hierarchy));
+            .and_then(|value| field_of(value, text, imports.at(value.start_byte()), hierarchy));
         let fields = out.fields.entry(write.attr.clone()).or_default();
         match fields
             .iter_mut()
@@ -3615,7 +3723,7 @@ fn extract_submodules(
 fn propagate_calls(
     node: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
@@ -3630,7 +3738,7 @@ fn propagate_calls(
     let (output, ()) = with_propagation(
         node,
         text,
-        import_map,
+        imports,
         layer_records,
         self_attr_layers,
         aliases,
@@ -3669,7 +3777,7 @@ fn propagate_calls(
 fn propagate_planned(
     node: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
@@ -3688,7 +3796,7 @@ fn propagate_planned(
         with_propagation(
             node,
             text,
-            import_map,
+            imports,
             layer_records,
             self_attr_layers,
             aliases,
@@ -3753,7 +3861,7 @@ fn run_units(
                     let mut items = Vec::new();
                     failed |= collect_items_of_child(*node, ctx.text, &mut items).is_err();
                     items.sort_by_key(|(_, rhs, _)| rhs.start_byte());
-                    replay_items(collect_flow(*node, ctx.text, ctx.import_map, false), items, None, ctx);
+                    replay_items(collect_flow(*node, ctx.text, ctx.imports, false), items, None, ctx);
                 } else {
                     let mut statements = Vec::new();
                     failed |=
@@ -3814,7 +3922,7 @@ fn run_units(
 fn with_propagation<T>(
     node: Node,
     text: &str,
-    import_map: &HashMap<String, ImportPath>,
+    imports: &ImportScopes,
     layer_records: &[LayerAssignment],
     self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
     aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
@@ -3854,7 +3962,7 @@ fn with_propagation<T>(
     let submodules = extract_submodules(
         node,
         text,
-        import_map,
+        imports,
         hierarchy,
         self_attr_writes,
         scopes,
@@ -3863,10 +3971,13 @@ fn with_propagation<T>(
 
     let mut ctx = ShapeCtx {
         text,
-        import_map,
+        imports,
         layer_records,
         self_attr_layers,
         aliases,
+        attr_writes: self_attr_writes,
+        layer_dims: Default::default(),
+        root: node,
         hierarchy,
         search_roots,
         read_file,
@@ -3930,7 +4041,7 @@ fn process_assignment_items(
     ctx: &mut ShapeCtx,
 ) {
     let in_class = directly_in_class(root);
-    replay_items(collect_flow(root, ctx.text, ctx.import_map, in_class), items, only_scope, ctx);
+    replay_items(collect_flow(root, ctx.text, ctx.imports, in_class), items, only_scope, ctx);
 }
 
 /// `process_assignment_items`, with the branches and loops already found. A
@@ -4028,12 +4139,12 @@ fn process_assignment_item_inner(
     if rhs_node.kind() == "call"
         && let Some(func_node) = rhs_node.child_by_field_name("function") {
             let target = func_node.utf8_text(ctx.text.as_bytes()).ok().unwrap_or("");
-            let resolved = resolve_call_target(target, ctx.import_map);
+            let resolved = resolve_call_target(target, ctx.imports.at(func_node.start_byte()));
             if let Some(KnownFunction::Vmap) = classify_known_function(&resolved) {
                 let args_node = rhs_node.child_by_field_name("arguments");
                 if let Some(an) = args_node
                     && let Ok(args) = extract_call_arguments(an, ctx.text)
-                        && let Some(info) = parse_vmap_call(&args) {
+                        && let Some(info) = parse_vmap_call(&args, rhs_node.start_byte()) {
                             ctx.vmap_targets.insert(lhs_name.clone(), info);
                         }
                 // vmap binding has no output shape — skip to next assignment.
@@ -4055,9 +4166,10 @@ fn process_assignment_item_inner(
             let target = func_node.utf8_text(ctx.text.as_bytes()).ok().unwrap_or("");
             let call_byte = rhs_node.start_byte();
             if !ctx.is_loop_module(func_node, target)
-                && let Some(kind) =
+                && let Some(record) =
                     find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, target)
             {
+                let kind = ctx.layer_at(&record.kind, record.byte_position);
                 let args_node = rhs_node.child_by_field_name("arguments");
                 if let Some(an) = args_node
                     && let Ok(raw_args) = extract_call_arguments(an, ctx.text)
@@ -4073,8 +4185,8 @@ fn process_assignment_item_inner(
                                 variable: lhs_name.clone(),
                                 layer: target.to_string(),
                                 input,
-                                extra_inputs: extra_layer_inputs(&args, kind),
-                                kind: kind.clone(),
+                                extra_inputs: extra_layer_inputs(&args, &kind),
+                                kind,
                                 range: an.range(),
                             };
                             let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
@@ -4428,7 +4540,7 @@ fn scan_carry_is_tuple(rhs: Node, scope_idx: usize, ctx: &ShapeCtx) -> bool {
         return false;
     };
     matches!(
-        classify_known_function(&resolve_call_target(target, ctx.import_map)),
+        classify_known_function(&resolve_call_target(target, ctx.imports.at(func.start_byte()))),
         Some(KnownFunction::Scan)
     ) && rhs
         .child_by_field_name("arguments")
@@ -4507,7 +4619,7 @@ fn is_array_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>
             };
             if func.kind() == "attribute"
                 && let Some(obj) = func.child_by_field_name("object")
-                && !ctx.import_map.contains_key(text(obj))
+                && !is_imported(ctx.imports.at(obj.start_byte()), text(obj))
                 && is_array_expr(obj, ctx, visiting)
             {
                 return func.child_by_field_name("attribute").is_some_and(|method| {
@@ -4519,7 +4631,7 @@ fn is_array_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>
                     )
                 });
             }
-            let resolved = resolve_call_target(text(func), ctx.import_map);
+            let resolved = resolve_call_target(text(func), ctx.imports.at(func.start_byte()));
             let Some((name, module)) = resolved.parts.split_last() else {
                 return false;
             };
@@ -4706,7 +4818,7 @@ fn tuple_rhs_shapes(
                 && obj.kind() == "identifier"
                 && let Ok(receiver) = obj.utf8_text(ctx.text.as_bytes())
                 && receiver != "self"
-                && !ctx.import_map.contains_key(receiver)
+                && !is_imported(ctx.imports.at(obj.start_byte()), receiver)
                 && let Some(method_name_node) = func.child_by_field_name("attribute")
                 && let Ok(method_name) = method_name_node.utf8_text(ctx.text.as_bytes())
                 && let Some(known) = classify_method_call(method_name)
@@ -4792,11 +4904,11 @@ fn tuple_rhs_shapes(
             // Documented as an approximation in TO_IMPLEMENT.md.
             if let Some(attr) = target.strip_prefix("self.") {
                 let rnn_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
-                    Some(LayerKind::Rnn { hidden_size, .. }) => Some(hidden_size.clone()),
+                    Some(LayerKind::Rnn { hidden_size, .. }) => Some(hidden_size),
                     _ => None,
                 };
                 if let Some(hidden_size) = rnn_hidden_size {
-                    if n_targets != 2 {
+                    if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
                         return None;
                     }
                     let args_node = rhs.child_by_field_name("arguments")?;
@@ -4832,11 +4944,11 @@ fn tuple_rhs_shapes(
             // unbatched convention).
             if let Some(attr) = target.strip_prefix("self.") {
                 let cell_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
-                    Some(LayerKind::RnnCell { hidden_size, .. }) => Some(hidden_size.clone()),
+                    Some(LayerKind::RnnCell { hidden_size, .. }) => Some(hidden_size),
                     _ => None,
                 };
                 if let Some(hidden_size) = cell_hidden_size {
-                    if n_targets != 2 {
+                    if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
                         return None;
                     }
                     let args_node = rhs.child_by_field_name("arguments")?;
@@ -4856,7 +4968,7 @@ fn tuple_rhs_shapes(
                 }
             }
 
-            let resolved = resolve_call_target(target, ctx.import_map);
+            let resolved = resolve_call_target(target, ctx.imports.at(rhs.start_byte()));
             let known = classify_known_function(&resolved);
 
             // `final_carry, ys = jax.lax.scan(body, init, xs)` — the carry is
@@ -5482,6 +5594,7 @@ fn apply_vmap_call(
     apply_vmap_call_chain(
         &[(info.in_axes, info.out_axes)],
         &info.wrapped,
+        info.site,
         args,
         caller_shapes,
         links,
@@ -5562,6 +5675,7 @@ fn peel_vmap_args<'a>(
 fn apply_vmap_call_chain(
     axes: &[(isize, isize)],
     wrapped: &str,
+    site: usize,
     args: &[CallArgument],
     caller_shapes: &dyn ShapeLookup,
     links: &ScopeLinks,
@@ -5572,7 +5686,7 @@ fn apply_vmap_call_chain(
     };
 
     // Find the wrapped function's FunctionShapeScope.
-    let callee = match find_callee_scope(wrapped, None, links, scopes) {
+    let callee = match find_callee_scope(wrapped, site, links, scopes) {
         Some(idx) => &scopes[idx],
         None => return Ok(None), // wrapped function not found — skip silently
     };
@@ -5631,7 +5745,6 @@ fn shape_of_inline_vmap(
     if let Some(attr) = callable.strip_prefix("self.")
         && let Some(layer) = ctx
             .self_attr_layer_at(attr, outer_args_node.start_byte())
-            .cloned()
     {
         let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
         return apply_inline_vmap_layer_chain(
@@ -5664,6 +5777,7 @@ fn shape_of_inline_vmap(
         return match apply_vmap_call_chain(
             &axes,
             &callable,
+            inner_call.start_byte(),
             &outer_args,
             &ctx.scope_shapes(scope_idx),
             ctx.links,
@@ -5814,11 +5928,12 @@ fn shape_of_inline_module(
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let module = match constructed_module(ctor_call, ctx.text, ctx.import_map, ctx.hierarchy) {
+    let imports = ctx.imports.at(ctor_call.start_byte());
+    let module = match constructed_module(ctor_call, ctx.text, imports, ctx.hierarchy) {
         Some(module) => Module::Local(module),
         None => {
             // The arguments are evaluated once the callee is a class.
-            let module = imported_module_of(ctor_call, ctx.text, ctx.import_map)?;
+            let module = imported_module_of(ctor_call, ctx.text, imports)?;
             imported_class(&module, ctx)?;
             Module::Imported(module)
         }
@@ -5860,7 +5975,7 @@ fn collect_vmap_axes<'t>(
 ) -> Option<(Node<'t>, Vec<(isize, isize)>)> {
     let func_node = node.child_by_field_name("function")?;
     let target = func_node.utf8_text(ctx.text.as_bytes()).ok()?;
-    let resolved = resolve_call_target(target, ctx.import_map);
+    let resolved = resolve_call_target(target, ctx.imports.at(func_node.start_byte()));
     if !matches!(classify_known_function(&resolved), Some(KnownFunction::Vmap)) {
         return None;
     }
@@ -5906,7 +6021,8 @@ fn shape_of_inline_layer(
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let kind = classify_inline_constructor(ctor_call, ctx.text, ctx.import_map)?;
+    let kind = classify_inline_constructor(ctor_call, ctx.text, ctx.imports.at(ctor_call.start_byte()))?;
+    let kind = ctx.layer_at(&kind, ctor_call.start_byte());
     let raw_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
     let args = resolve_call_args(raw_args, outer_args_node, scope_idx, ctx)?;
     let CallArgument::Positional { value: input } = args.first()?.clone() else {
@@ -6006,61 +6122,152 @@ fn apply_inline_vmap_layer_chain(
     Some(output)
 }
 
-/// Search for a `FunctionShapeScope` whose `function_name` matches `target`,
-/// excluding the module scope (index 0) and optionally excluding scopes
-/// whose byte range contains `call_byte`.
+/// The function that the bare name `target` means at byte `call`: the closure
+/// of the nearest enclosing function that defines one, else the function of
+/// the module. A method is not visible through a bare name, and a closure is
+/// visible only inside its enclosing function.
 ///
-/// - `Some(call_byte)`: exclude scopes whose byte range contains this
-///   byte (used by user-function calls to avoid self-recursive binding) and
-///   closures defined in a function that does not enclose the call.
-/// - `None`: don't exclude any scope (used by vmap where the call is not
-///   inside the wrapped function).
-///
-/// Returns the index of the best (smallest-scope) matching scope, or `None`.
-/// A name that one scope defines twice (`ScopeLinks::redefined`) has no best
-/// scope: which definition runs depends on the path.
+/// `None` also when the name is defined twice in that place
+/// (`ScopeLinks::redefined`), when a class body holds the call and defines the
+/// name, and for a recursive call.
 fn find_callee_scope(
     target: &str,
-    call: Option<usize>,
+    call: usize,
     links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
 ) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None; // (scope index, scope size)
-    let mut call_scope = None;
-    for (i, scope) in scopes.iter().enumerate() {
-        if i == 0 {
-            continue; // skip module scope
-        }
-        if scope.function_name.as_deref() != Some(target) {
+    let call_scope = links.scope_index.lookup(call);
+    let in_body_of = |class: (usize, usize)| {
+        class.0 <= call
+            && call < class.1
+            && call_scope.is_none_or(|s| s == 0 || class.0 > scopes[s].start_byte)
+    };
+    if links.methods.get(target).is_some_and(|m| m.iter().any(|&(class, _)| in_body_of(class))) {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (enclosing levels to it, scope index)
+    for (i, scope) in scopes.iter().enumerate().skip(1) {
+        if scope.function_name.as_deref() != Some(target) || links.class_of[i].is_some() {
             continue;
         }
-        if links.redefined[i] {
-            return None;
-        }
-        if let Some(byte) = call {
-            // Don't bind a call to itself (recursive call in the same function body).
-            if scope.start_byte <= byte && byte < scope.end_byte {
-                continue;
-            }
-            // A closure can only be named from inside its enclosing function.
-            if let Some(parent) = links.parent[i] {
-                let mut up = *call_scope.get_or_insert_with(|| links.scope_index.lookup(byte));
-                while up.is_some_and(|u| u != parent) {
-                    up = links.parent[up.unwrap()];
-                }
-                if up.is_none() {
-                    continue;
+        let levels = match links.parent[i] {
+            None => usize::MAX,
+            Some(parent) => {
+                let mut chain = std::iter::successors(call_scope, |&up| links.parent[up]);
+                match chain.position(|up| up == parent) {
+                    Some(levels) => levels,
+                    None => continue,
                 }
             }
-        }
-        let size = scope.end_byte - scope.start_byte;
-        match best {
-            None => best = Some((i, size)),
-            Some((_, prev_size)) if size < prev_size => best = Some((i, size)),
-            _ => {} // keep first on tie
+        };
+        if best.is_none_or(|(nearest, _)| levels < nearest) {
+            best = Some((levels, i));
         }
     }
-    best.map(|(i, _)| i)
+    let (_, i) = best?;
+    let recursive = scopes[i].start_byte <= call && call < scopes[i].end_byte;
+    (!links.redefined[i] && !recursive).then_some(i)
+}
+
+/// `super()`, or `super(<class>, <receiver>)`.
+fn is_super_call(node: Node, text: &str) -> bool {
+    node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|f| &text[f.byte_range()] == "super")
+}
+
+/// How a `def` in a class body binds its first parameter.
+#[derive(Clone, Copy, PartialEq)]
+enum MethodKind {
+    Instance,
+    Class,
+    Static,
+    /// A descriptor that a call does not run like a function.
+    Property,
+}
+
+fn method_kind(function: Node, text: &str) -> MethodKind {
+    let Some(definition) = function.parent().filter(|p| p.kind() == "decorated_definition") else {
+        return MethodKind::Instance;
+    };
+    let mut kind = MethodKind::Instance;
+    let mut cursor = definition.walk();
+    for decorator in definition.named_children(&mut cursor).filter(|n| n.kind() == "decorator") {
+        let name = text[decorator.byte_range()].trim_start_matches('@').trim();
+        match name.rsplit('.').next().unwrap_or(name) {
+            "staticmethod" => kind = MethodKind::Static,
+            "classmethod" => kind = MethodKind::Class,
+            "property" | "cached_property" | "setter" | "getter" | "deleter" => {
+                return MethodKind::Property;
+            }
+            _ => {}
+        }
+    }
+    kind
+}
+
+/// One call of a function of this file.
+struct UserCall<'c, 't> {
+    /// The name of the function, for the argument errors.
+    name: &'c str,
+    /// The callee as the call writes it, for the error.
+    display: String,
+    args: &'c [CallArgument],
+    args_node: Node<'t>,
+    call_byte: usize,
+}
+
+/// Evaluate a call of the function or method `callee_idx`. `Some` when the
+/// call has an answer or an error, `None` when the caller can try other rules.
+///
+/// Gated on the callee being FULLY annotated (checked against the
+/// call-site-independent `original_shapes` snapshot, never the live, mutable
+/// `scopes[...].shapes`): the bare-return trace reads `callee.shapes.get(name)`
+/// directly, which is only sound when every one of the callee's params was
+/// statically annotated (so its body shapes are the same regardless of which
+/// call site asks). Once lazy call-site parameter seeding has ever specialized
+/// a partially-annotated callee, its `shapes` map holds a PARTICULAR call
+/// site's seeded values, and reusing them for a call site with different
+/// argument shapes would silently propagate the wrong shape.
+/// Partially-annotated callees always go through `apply_seeded_user_function`
+/// instead, which re-seeds fresh from `original_shapes` on every call.
+fn apply_user_function(
+    callee_idx: usize,
+    call: UserCall,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Option<Vec<String>>> {
+    let UserCall { name, display, args, args_node, call_byte } = call;
+    if !callee_all_params_annotated(callee_idx, ctx) {
+        return apply_seeded_user_function(callee_idx, call_byte, args, scope_idx, ctx).map(Some);
+    }
+    // A closure that reads an enclosing function's variable has body shapes
+    // that depend on the call, like a partially annotated callee: only its
+    // `-> ReturnType` annotation is call-independent.
+    let captures = ctx.links.captures[callee_idx];
+    if let Some(result) = bind_user_function_args(
+        &ctx.scopes[callee_idx],
+        name,
+        args,
+        &ctx.scope_shapes(scope_idx),
+        ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
+    ) {
+        match result {
+            Ok(Some(shape)) if !captures || ctx.scopes[callee_idx].return_shape.is_some() => {
+                return Some(Some(shape));
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(message) => {
+                ctx.errors.push(ShapeError::mismatch(display, message, args_node.range()));
+                return Some(None);
+            }
+        }
+    }
+    if captures {
+        return apply_seeded_user_function(callee_idx, call_byte, args, scope_idx, ctx).map(Some);
+    }
+    None
 }
 
 /// Bind a callee's parameter dims to provided arg shapes and substitute
@@ -6527,13 +6734,12 @@ fn seed_params_from_call(
 /// callees use `bind_user_function_args` instead; this returns `None` for
 /// them rather than redoing the annotation/bare-return-trace work.
 fn apply_seeded_user_function(
-    target: &str,
+    callee_idx: usize,
     call_byte: usize,
     args: &[CallArgument],
     caller_scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let callee_idx = find_callee_scope(target, Some(call_byte), ctx.links, ctx.scopes)?;
     let all_params = ctx.scopes[callee_idx].all_params.clone();
     let (seeded, carries) = seed_params_from_call(&all_params, args, caller_scope_idx, ctx);
     let result = specialize_callee_call(callee_idx, seeded, carries, call_byte, false, ctx)?;
@@ -6784,7 +6990,7 @@ fn scan_body_ys_shape(
     let leading = leading.clone();
     let rest = rest.to_vec();
 
-    let callee_idx = find_callee_scope(body_name, Some(scan_call_byte), ctx.links, ctx.scopes)?;
+    let callee_idx = find_callee_scope(body_name, scan_call_byte, ctx.links, ctx.scopes)?;
     let all_params = ctx.scopes[callee_idx].all_params.clone();
     let mut seeded = HashMap::new();
     let mut carries = Vec::new();
@@ -7159,7 +7365,7 @@ mod shape_of_expression_tests {
 
     fn analyze_simple(code: &str) -> LayerShapeAnalysis {
         let tree = parse(code);
-        let import_map = build_import_map(tree.root_node(), code).unwrap();
+        let imports = ImportScopes::new(tree.root_node(), code).unwrap();
         let layer_records = Vec::new();
         let mut scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
 
@@ -7188,10 +7394,13 @@ mod shape_of_expression_tests {
 
         let mut ctx = ShapeCtx {
             text: code,
-            import_map: &import_map,
+            imports: &imports,
             layer_records: &layer_records,
             self_attr_layers: &self_attr_layers,
             aliases: &aliases,
+            attr_writes: &[],
+            layer_dims: Default::default(),
+            root: tree.root_node(),
             hierarchy: &ClassHierarchy::default(),
             search_roots: &search_roots,
             read_file,

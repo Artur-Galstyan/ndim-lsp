@@ -596,6 +596,20 @@ pub fn find_top_level_symbol(
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
+    let mut import_map = HashMap::new();
+    visit_imports(node, text, |_, alias, path| {
+        import_map.insert(alias, path);
+    })?;
+    Ok(import_map)
+}
+
+/// Calls `found` with a node of each import statement under `node`, the name
+/// that it binds, and the path of the name.
+pub(crate) fn visit_imports<'t>(
+    node: Node<'t>,
+    text: &str,
+    mut found: impl FnMut(Node<'t>, String, ImportPath),
+) -> Result<(), String> {
     fn plain_import_dotted_name_to_vec(
         dotted_name: &str,
     ) -> Result<(Vec<String>, String, String), String> {
@@ -636,8 +650,6 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, node, text.as_bytes());
 
-    let mut import_map: HashMap<String, ImportPath> = HashMap::new();
-
     while let Some(match_) = matches.next() {
         if match_.pattern_index == 0 {
             for capture in match_.captures {
@@ -648,7 +660,8 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                             let (module, name, first) =
                                 plain_import_dotted_name_to_vec(&dotted_name)
                                     .map_err(|e| e.to_string())?;
-                            import_map.insert(
+                            found(
+                                capture.node,
                                 first.to_string(),
                                 ImportPath {
                                     dots: 0,
@@ -669,7 +682,8 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                             };
                             let alias = node_text(alias_node, text)?;
 
-                            import_map.insert(
+                            found(
+                                capture.node,
                                 alias,
                                 ImportPath {
                                     dots: 0,
@@ -738,11 +752,11 @@ pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, Import
                 }
             }
 
-            import_map.insert(alias, ImportPath { dots, module, name });
+            found(match_.captures[0].node, alias, ImportPath { dots, module, name });
         }
     }
 
-    Ok(import_map)
+    Ok(())
 }
 
 pub fn extract_calls(node: Node, text: &str) -> Result<Vec<CallInfo>, String> {
@@ -953,10 +967,16 @@ struct ClassMro {
     /// Annotated names declared directly in the class body (`features: int`),
     /// in order: the fields of a dataclass-style module. Not `ClassVar`s.
     fields: Vec<String>,
+    /// Names the class body binds with anything but a `def`.
+    attrs: Vec<String>,
     /// Ranges of the class and its resolved bases in Python MRO order. It
     /// stops before the first base the file does not define, since that base
     /// could supply the attribute instead.
     mro: Vec<(usize, usize)>,
+    /// `mro` that continues past the bases the file does not define.
+    known_mro: Vec<(usize, usize)>,
+    /// The classes of the file with this class in their `known_mro`.
+    subclasses: Vec<usize>,
 }
 
 /// Same-file class hierarchy, built once per analysis, to resolve
@@ -975,6 +995,7 @@ pub(crate) struct ClassSummary {
     pub(crate) range: (usize, usize),
     pub(crate) bases: Vec<BaseSummary>,
     pub(crate) fields: Vec<String>,
+    pub(crate) attrs: Vec<String>,
 }
 
 /// One entry of the superclass list, by the kind of its node.
@@ -1028,16 +1049,19 @@ impl ClassSummary {
             range: (class.start_byte(), class.end_byte()),
             bases,
             fields: class_body_fields(class, text),
+            attrs: class_body_attrs(class, text),
         }
     }
 }
 
 impl ClassHierarchy {
     pub(crate) fn new(root: Node, text: &str) -> Self {
-        Self::from_summaries(&ClassSummary::collect(root, text))
+        Self::from_summaries(&ClassSummary::collect(root, text), &module_binds(root, text))
     }
 
-    pub(crate) fn from_summaries(summaries: &[ClassSummary]) -> Self {
+    /// `module_names` are the names that a module statement binds to something
+    /// that is not a class. Such a name does not mean a class of the file.
+    pub(crate) fn from_summaries(summaries: &[ClassSummary], module_names: &[String]) -> Self {
         let n = summaries.len();
         // `None` marks a name defined more than once: ambiguous, so opaque.
         let mut by_name: HashMap<&str, Option<usize>> = HashMap::new();
@@ -1047,6 +1071,11 @@ impl ClassHierarchy {
                     .entry(name)
                     .and_modify(|v| *v = None)
                     .or_insert(Some(i));
+            }
+        }
+        for name in module_names {
+            if let Some(class) = by_name.get_mut(name.as_str()) {
+                *class = None;
             }
         }
         // Ids `>= n` stand for bases the file does not define, one per name.
@@ -1076,21 +1105,39 @@ impl ClassHierarchy {
 
         let mut memo: Vec<Option<Vec<usize>>> = vec![None; n];
         let mut visiting = vec![false; n];
-        let classes = (0..n)
+        let mut classes: Vec<ClassMro> = (0..n)
             .map(|i| {
                 let lin = linearize(i, n, &bases, &mut memo, &mut visiting);
                 ClassMro {
                     range: summaries[i].range,
                     closed: lin.iter().all(|&j| j < n),
                     fields: summaries[i].fields.clone(),
+                    attrs: summaries[i].attrs.clone(),
                     mro: lin
-                        .into_iter()
-                        .take_while(|&j| j < n)
-                        .map(|j| summaries[j].range)
+                        .iter()
+                        .take_while(|&&j| j < n)
+                        .map(|&j| summaries[j].range)
                         .collect(),
+                    known_mro: lin
+                        .iter()
+                        .filter(|&&j| j < n)
+                        .map(|&j| summaries[j].range)
+                        .collect(),
+                    subclasses: Vec::new(),
                 }
             })
             .collect();
+        let index: HashMap<(usize, usize), usize> =
+            summaries.iter().enumerate().map(|(i, c)| (c.range, i)).collect();
+        let edges: Vec<(usize, usize)> = classes
+            .iter()
+            .enumerate()
+            .flat_map(|(sub, c)| c.known_mro[1..].iter().map(move |b| (b, sub)))
+            .map(|(base, sub)| (index[base], sub))
+            .collect();
+        for (base, sub) in edges {
+            classes[base].subclasses.push(sub);
+        }
         let named = by_name
             .into_iter()
             .filter_map(|(name, i)| Some((name.to_string(), summaries[i?].range)))
@@ -1125,6 +1172,57 @@ impl ClassHierarchy {
         self.classes.iter().any(|c| c.range == class && c.closed)
     }
 
+    /// Whether the body of `class` binds `name` with anything but a `def`.
+    pub(crate) fn binds_attr(&self, class: (usize, usize), name: &str) -> bool {
+        self.classes
+            .iter()
+            .any(|c| c.range == class && c.attrs.iter().any(|a| a == name))
+    }
+
+    /// What `self.<name>` means in a method of `class`, or `super().<name>`
+    /// when `after_class`: the value `lookup` gives for the first class in MRO
+    /// order for which it gives one. `lookup` gives `Some(None)` for a class
+    /// that binds the name to something that is not a method.
+    ///
+    /// The receiver can be an instance of any subclass, so each subclass of
+    /// the file must give the same answer, or there is none.
+    pub(crate) fn resolve_method<T: Copy + PartialEq>(
+        &self,
+        class: (usize, usize),
+        after_class: bool,
+        lookup: impl Fn((usize, usize)) -> Option<Option<T>>,
+    ) -> Option<T> {
+        let first = |order: &[(usize, usize)]| {
+            let start = if after_class {
+                order.iter().position(|&c| c == class)? + 1
+            } else {
+                0
+            };
+            order[start..].iter().find_map(|&c| lookup(c))
+        };
+        let own = self.classes.iter().find(|c| c.range == class)?;
+        let found = first(&own.mro)??;
+        own.subclasses
+            .iter()
+            .all(|&s| first(&self.classes[s].known_mro) == Some(Some(found)))
+            .then_some(found)
+    }
+
+    /// The classes an instance whose methods include those of `class` can
+    /// take an attribute from: `class`, its subclasses, and all their bases.
+    pub(crate) fn family(&self, class: (usize, usize)) -> Vec<(usize, usize)> {
+        let Some(own) = self.classes.iter().find(|c| c.range == class) else {
+            return vec![class];
+        };
+        let mut family = own.mro.clone();
+        for &sub in &own.subclasses {
+            family.extend_from_slice(&self.classes[sub].known_mro);
+        }
+        family.sort_unstable();
+        family.dedup();
+        family
+    }
+
     /// Test helper: classes with no bases.
     #[cfg(test)]
     pub(crate) fn standalone(ranges: &[(usize, usize)]) -> Self {
@@ -1135,7 +1233,10 @@ impl ClassHierarchy {
                     range: r,
                     closed: true,
                     fields: Vec::new(),
+                    attrs: Vec::new(),
                     mro: vec![r],
+                    known_mro: vec![r],
+                    subclasses: Vec::new(),
                 })
                 .collect(),
             named: HashMap::new(),
@@ -1195,6 +1296,54 @@ fn class_body_fields(class: Node, text: &str) -> Vec<String> {
         }
     }
     fields
+}
+
+/// Names a class body binds, not entering a `def` or a lambda: `def` names
+/// are not here, a nested class is. A target like `a[i]` also gives `a`.
+fn class_body_attrs(class: Node, text: &str) -> Vec<String> {
+    class.child_by_field_name("body").map_or_else(Vec::new, |body| scope_binds(body, text, false))
+}
+
+/// The names that the module statements under `node` bind, except with `class`.
+pub(crate) fn module_binds(node: Node, text: &str) -> Vec<String> {
+    scope_binds(node, text, true)
+}
+
+fn scope_binds(node: Node, text: &str, module: bool) -> Vec<String> {
+    fn identifiers(node: Node, text: &str, out: &mut Vec<String>) {
+        if node.kind() == "identifier" {
+            out.extend(node.utf8_text(text.as_bytes()).ok().map(str::to_string));
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            identifiers(child, text, out);
+        }
+    }
+    let mut attrs = Vec::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "lambda" => continue,
+            "function_definition" | "class_definition" => {
+                let named = (n.kind() == "function_definition") == module;
+                if let Some(name) = n.child_by_field_name("name").filter(|_| named) {
+                    identifiers(name, text, &mut attrs);
+                }
+                continue;
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(left) = n.child_by_field_name("left") {
+                    identifiers(left, text, &mut attrs);
+                }
+            }
+            "import_statement" | "import_from_statement" | "with_item" | "as_pattern"
+            | "named_expression" | "delete_statement" => identifiers(n, text, &mut attrs),
+            _ => {}
+        }
+        let mut cursor = n.walk();
+        stack.extend(n.named_children(&mut cursor));
+    }
+    attrs
 }
 
 /// C3 linearization of class `i`. A failed merge or an inheritance cycle
@@ -1268,7 +1417,8 @@ pub(crate) struct SelfAttrWrite<'t> {
     pub(crate) attr: String,
     pub(crate) class: (usize, usize),
     /// Right-hand side of a plain `self.<attr> = value`. `None` for a write
-    /// whose value is not tracked: a tuple target or an augmented assignment.
+    /// whose value is not tracked: a tuple target, an augmented assignment, or
+    /// a `for` or `with` target.
     pub(crate) value: Option<Node<'t>>,
 }
 
@@ -1284,6 +1434,14 @@ pub(crate) fn extract_self_attr_writes<'t>(node: Node<'t>, text: &str) -> Vec<Se
           left: [(pattern_list (attribute object: (identifier) @obj attribute: (identifier) @attr))
                  (tuple_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))
                  (list_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))])
+        (for_statement
+          left: [(attribute object: (identifier) @obj attribute: (identifier) @attr)
+                 (pattern_list (attribute object: (identifier) @obj attribute: (identifier) @attr))
+                 (tuple_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))
+                 (list_pattern (attribute object: (identifier) @obj attribute: (identifier) @attr))])
+        (as_pattern_target (attribute object: (identifier) @obj attribute: (identifier) @attr))
+        (as_pattern_target (tuple (attribute object: (identifier) @obj attribute: (identifier) @attr)))
+        (as_pattern_target (list (attribute object: (identifier) @obj attribute: (identifier) @attr)))
     "#;
 
     static QUERY: LazyLock<Query> = LazyLock::new(|| {

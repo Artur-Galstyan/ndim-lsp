@@ -56,7 +56,7 @@ fn write_view(w: &SelfAttrWrite) -> WriteView {
 
 fn assert_same_prepass(label: &str, got: &PrePass, want: &PrePass) {
     assert_eq!(got.scopes, want.scopes, "{label}: scopes");
-    assert_eq!(got.import_map, want.import_map, "{label}: import_map");
+    assert_eq!(got.imports, want.imports, "{label}: imports");
     assert_eq!(
         got.layer_records, want.layer_records,
         "{label}: layer_records"
@@ -210,7 +210,7 @@ fn the_last_import_and_the_last_layer_win() {
         .memo
         .prepass(tree.root_node(), new, &[], &read, 8, &cache)
         .unwrap();
-    assert_eq!(pre.import_map["t"].name, "X");
+    assert_eq!(pre.imports.file()["t"].name, "X");
     assert_eq!(
         pre.layer_records.last().unwrap().kind,
         LayerKind::Linear {
@@ -518,7 +518,8 @@ mod shift {
             in_features: "2".into(),
             out_features: "3".into(),
         };
-        let layer = |class_start, class_end| ScopedSelfAttrLayer {
+        let layer = |class_start, class_end, byte| ScopedSelfAttrLayer {
+            byte,
             class_start,
             class_end,
             kind: kind.clone(),
@@ -528,11 +529,11 @@ mod shift {
             class_end,
             value: "v".into(),
         };
-        assert_eq!(shifted(&layer(10, 90), BY), layer(110, 190));
-        assert_eq!(shifted(&layer(0, usize::MAX), BY), layer(0, usize::MAX));
+        assert_eq!(shifted(&layer(10, 90, 20), BY), layer(110, 190, 120));
+        assert_eq!(shifted(&layer(0, usize::MAX, 20), BY), layer(0, usize::MAX, 120));
         assert_eq!(shifted(&alias(10, 90), BY), alias(110, 190));
         assert_eq!(shifted(&alias(0, usize::MAX), BY), alias(0, usize::MAX));
-        round_trip(&layer(10, 90));
+        round_trip(&layer(10, 90, 20));
         round_trip(&alias(10, 90));
     }
 
@@ -625,6 +626,7 @@ mod shift {
             range: (10, 90),
             bases: Vec::new(),
             fields: vec!["f".into()],
+            attrs: vec!["a".to_string()],
         };
         assert_eq!(shifted(&class, BY).range, (110, 190));
         round_trip(&class);

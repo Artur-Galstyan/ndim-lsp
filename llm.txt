@@ -7,20 +7,18 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified on the last commit plus the work made after it: branch merge
-(`src/analysis/flow.rs`), module globals and integer constants,
-comprehensions and lambdas (`src/analysis/inner.rs`), module containers,
-imported module classes and loss layers (`src/analysis/modules.rs`), and the
-repair pass. That work is not committed yet. After the next commit, read this
-as "verified on that commit". `ndim-lsp` is 0.1.1.
+Verified on the code with method resolution by class, constant layer dims
+(`src/analysis/layer_dims.rs`), scoped imports (`src/imports.rs`), and the
+cost-based debounce (`src/sync.rs`). Commit `025e7f2` is the last commit
+without these four items. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,245 tests pass and six are ignored.
-  - 2,169 library tests (47 of them in `src/incremental_tests.rs`). Two
+- `cargo test --quiet` passes: 2,309 tests pass and six are ignored.
+  - 2,222 library tests (47 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
-  - 18 in `tests/incremental_edits.rs`. One ignored:
+  - 26 in `tests/incremental_edits.rs`. One ignored:
     `stress_main_two_thousand_chained_edits`.
-  - 16 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 1 in
+  - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 1 in
     `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
     `golden_dump`, `golden_has_no_internal_names`.
   The known-function tests live in `src/known_functions/*_tests.rs`. The dev
@@ -112,13 +110,10 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 - Latency is total = debounce + server compute (from the server's
   `analysis: total=Nms` log) + other (transport and scheduling). The debounce
   column is the value the server chose for that edit, read from the
-  `debounce=` field of the same log line: 150 ms while typing, 20 to 150 ms
-  after an idle pause (see "Incremental analysis"), 0 for `didOpen`.
-- A fast loop that sends each edit right after the previous publication counts
-  as typing, so it gets 150 ms. The `floor_tiny_doc_change` scenario therefore
-  waits (`settle(450)`) before each edit, to measure an edit after idle. The
-  old 155 ms figure for it measured back-to-back edits, so it is not
-  comparable.
+  `debounce=` field of the same log line: 20 to 150 ms from the analysis cost
+  of the document (see "Debounce and sync mode"), 0 for `didOpen`.
+- The rhythm of the edits does not change the debounce. The
+  `floor_tiny_doc_change` scenario still waits (`settle(450)`) before each edit.
 - Peak RSS is sampled with `ps` every 25 ms, so it is a lower bound.
 - The harness sends full text with no range, so it does not measure the saving
   of incremental sync transport.
@@ -142,37 +137,47 @@ asserts the expected markers and the scenario invariants. Do not loosen the
 test to make it pass. A refactor must keep it green and keep the golden dump
 byte-identical.
 
-Baseline (the last commit plus the work after it, release, 10 CPUs, macOS,
+Baseline (the code with the cost-based debounce, release, 10 CPUs, macOS,
 5 runs, p50, 22,323-line file):
 
-- One edit while typing costs about 200 to 235 ms: 150 ms debounce plus
-  about 30 to 70 ms server compute plus about 16 to 25 ms other. Examples:
-  `edit_char_end` 203.9 ms total (33 ms compute), `edit_char_middle` 212.5
-  (41), `edit_unannotated_helper_body` 200.9 (31), `error_insert_matmul` 200.4
-  (30), `edit_base_class_init_layer` 218.5 (51), `paste_500_lines` 226.1 (60),
-  `edit_init_layer` 235.9 (68), `typing_plain` 222.9 (48),
-  `burst_50_changes` 197.6 (30). The old full re-analysis baseline was about
-  405 to 420 ms per edit (150 ms debounce plus about 242 ms compute).
-- `edit_char_start` is the worst case: 435.5 ms total, 269 ms compute. The
-  edit moves every position of the file, so the analysis runs in full
-  (a "fallback" run).
-- An edit after an idle pause waits less than 150 ms: `edit_after_idle` 120.2 ms
-  total (47 ms debounce, 48 ms compute). `floor_tiny_doc_change` 31.9 ms total
-  (20 ms debounce, 8 ms compute).
-- `cold_open_first_diagnostics`: 316 ms compute, 327.1 ms total. The first
+- One edit costs about 50 to 75 ms: 20 ms debounce plus about 16 to 40 ms
+  server compute plus about 13 to 17 ms other. Examples: `edit_char_end`
+  51.1 ms total (16 ms compute), `edit_char_middle` 55.8 (20),
+  `edit_unannotated_helper_body` 49.7 (16), `error_insert_matmul` 52.0 (16),
+  `edit_base_class_init_layer` 66.9 (31), `paste_500_lines` 75.2 (40),
+  `edit_init_layer` 75.0 (39), `burst_50_changes` 49.8 (16). The old full
+  re-analysis baseline was about 405 to 420 ms per edit (150 ms debounce plus
+  about 242 ms compute).
+- `typing_plain` 58.0 ms (21 ms compute), `typing_with_inlay_requests` 60.6
+  (19). 12 keys, 100 ms apart, give 12 analyses and 12 publications, also with
+  inlay requests.
+- `edit_after_idle` 88.0 ms and `typing_plain_revert` 88.4 ms are the slow side
+  of a normal edit: the debounce is 20 ms, and compute is 45 to 48 ms.
+- `edit_char_start` is the worst case: 448.3 ms total, 281 ms compute, 150 ms
+  debounce. The edit moves every position of the file, so the analysis runs in
+  full (a "fallback" run). The next edit also waits 150 ms
+  (`edit_char_start_revert`, 202.7 ms total, 35 ms compute).
+- `floor_tiny_doc_change` 29.2 ms total (20 ms debounce, 6 ms compute).
+- `cold_open_first_diagnostics`: 347 ms compute, 357.9 ms total. The first
   analysis builds no memo.
-- `main_after_helper_saved_to_disk`: 37 ms compute, 204.4 ms total.
-  `main_after_helper_restored`: 139 ms compute, 304.3 ms total. Both pay for
-  the re-read of the changed helper.
-- `inlay_full_cached` 9.4 ms, `inlay_full_first` 11.7 ms, `hover` 0.3 ms,
+- `main_after_helper_saved_to_disk`: 39 ms compute, 206.3 ms total (150 ms
+  debounce, because the save reset the cost). `main_after_helper_restored`:
+  122 ms compute, 156.5 ms total. Both pay for the re-read of the changed
+  helper.
+- `inlay_full_cached` 9.6 ms, `inlay_full_first` 12.2 ms, `hover` 0.2 ms,
   `goto_definition` 0.2 ms.
-- Peak RSS 167.2 MB (57.6 MB after open). 54 diagnostics, 15,496 inlay hints.
-- Control on the same input file: the code of the last commit, run on this
-  22,323-line file, needs 1 to 14 percent less compute for an edit (median
-  about 8 percent, 2 to 4 ms) and 4 percent more for a cold open (329 ms). The
-  extra edit cost is the work for the newly modelled constructs. The older
-  297 ms cold figure belonged to the smaller 21,518-line file and does not
-  compare. Measure a speed change against a control on one input.
+- Peak RSS 157.0 MB (58.1 MB after open). 54 diagnostics, 15,496 inlay hints.
+- Control on one input: commit `025e7f2`, the commit before the cost-based
+  debounce, one 5-run benchmark directly after the other. `typing_plain` 210.9
+  to 58.0 ms, `edit_char_end` 195.0 to 51.1 ms, `edit_init_layer` 224.2 to 75.0
+  ms. CPU time is the cost: the commit ran 1 analysis for the 12 keys of
+  `typing_plain`, and this code runs 12. The compute of the small edits also
+  fell (`edit_char_end` 26 to 16 ms). The cause is not measured, and a short
+  debounce changes the timing of the run, so do not read that as a speed gain.
+  The runs that do more work cost more: cold open 333 to 347 ms compute (4
+  percent), `edit_char_start` 265 to 281 ms (6 percent), and `edit_after_idle`
+  40 to 45 ms (the import scan is about 9 ms of the cold pass). Peak RSS 166.2
+  to 157.0 MB. Measure a speed change against a control on one input.
 - Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
   If numbers look shifted, run an interleaved control of the old and the new
   binary before you decide.
@@ -192,7 +197,7 @@ Closed targets (found by the benchmark, fixed in f63b9b8):
 3. Burst debounce: `did_change` spawns one publish task per (uri, rev),
    single-flight. A superseded rev skips its work. A stale request returns null.
 4. Inlay and other requests wait out the remaining debounce on a cache miss, so
-   typing with inlay requests causes 1 analysis and 1 publication.
+   an inlay request adds no analysis to the one that the change starts.
 5. Stale cross-file state: `did_save` and dynamic `workspace/didChangeWatchedFiles`
    drop the affected cache entries, and all open documents are analyzed again.
    `ResolutionCache` entries carry stamps (mtime and size), failed lookups are
@@ -233,9 +238,13 @@ The result must always equal a fresh analysis of the same text. Three layers:
      (`SyntaxRecord`, `LayerRecord`), and shifted to the new positions with the
      `Shift` trait, `Delta`, and `Remap`.
    - A unit with the same text reuses its `SyntaxRecord`. A `LayerRecord` also
-     needs the same import map (a digest of the whole import map, so an edit
-     of any import line recomputes the layer records of all units) and valid
-     disk dependencies (`ResolutionCache::record_deps`, `deps_valid`).
+     needs the same imports (`import_digest`, a digest of the file map and the
+     module map, so an edit of any import line recomputes the layer records of
+     all units) and valid disk dependencies (`ResolutionCache::record_deps`,
+     `deps_valid`). A `RegionRecord` holds the import regions of the unit
+     (`ImportRegion`, unit-relative) and needs the same digest. A layer record keeps the raw text of each dim, so that
+     it does not depend on a constant of another unit. `ShapeCtx::layer_at`
+     writes the values at each lookup.
    - A unit with a syntax error is never reused, because its parse can depend
      on the text after it.
    - The first analysis of a text builds no memo, so opening a file is as fast as
@@ -268,7 +277,9 @@ The result must always equal a fresh analysis of the same text. Three layers:
   the global through the shared/reads edge of `names.rs` (a reader mentions
   the name, and a module write, a class body write, and a `global` statement
   all join one group), so no new edge type exists. The environment hash also
-  holds the clash set (integer names that annotations use as dims). Module
+  holds the clash set: the annotation symbols that a unit assigns as an integer
+  or reads. Add or remove such a symbol, and every group runs again, because
+  `integer_constant` and `layer_at` treat the name differently. Module
   classes of other files record a probe dependency (`Deps` per probe, class
   source cache), and in-place changes of a field are found by name in the
   whole file. Comprehension and lambda bodies run inside their unit, and
@@ -306,15 +317,27 @@ Debounce and sync mode
   change is analyzed. `Pace` (`src/sync.rs`) keeps, per document, the time of
   the last change and a moving average (EWMA, alpha 0.5) of the wall time of
   recent analyses.
-- A change within 400 ms of the previous one is typing and waits 150 ms. An
-  isolated change (400 ms or more after the previous one) of a document with a
-  known average waits `2 x average`, clamped to 20 ms through 150 ms. The first
-  change after open waits 150 ms. `didOpen` does not wait.
-- A cold run seeds the average. The first incremental run replaces it (no
-  averaging with the cold cost). A fallback run and a failed run reset it. So does
-  every re-analysis of the open documents (a root change, or a save or watched
-  file event that dropped cache entries); the run after it is not sampled.
-  After a reset the next edit waits 150 ms. A fast loop of edits right after each publication counts as typing.
+- The debounce is a function of the cost only (`Pace::debounce`). No keystroke
+  rhythm enters. After an incremental run a change waits `0.5 x average`; after
+  a whole analysis (a cold run or a fallback run) it waits `2 x last cost`,
+  because the next run can cost as much and the machine gets free time. The
+  result is clamped to 20 ms through 150 ms. A document with no known cost
+  waits 150 ms. `didOpen` does not wait.
+- The first incremental run replaces the cost of a whole analysis (no averaging
+  with it). A whole analysis replaces the average. A failed run clears it. Every
+  re-analysis of the open documents (a root change, or a save or watched file
+  event that dropped cache entries) clears it too, and the runs up to that
+  forced rev give no sample (`Pace::reset`). The next edit then waits 150 ms.
+- A run that a newer key replaced still gives a sample (`Pace::sampled`), also
+  when its result is not committed. So a costly run raises the debounce during
+  typing, and analyses cannot pile up. The floor of 20 ms merges a burst, and
+  the gate runs one analysis at a time for each URI. If debounce plus compute is
+  longer than the gap between keys, the next key replaces the run and the run
+  gives no result.
+- The ceiling stays 150 ms. On a file with a very long analysis, steady typing
+  can keep one core busy, and no result is published until the typing stops.
+  At 100 ms for each key on the stress file, 12 keys cost about 240 ms of CPU
+  time, about 20 percent of one core, and every run gives a publication.
 - The first call after a change waits out the debounce of its rev. Hover, inlay,
   and other requests share that one analysis (single-flight per uri and rev,
   one analysis at a time per URI).
@@ -418,10 +441,20 @@ Current file layout
     and `with`. Each arm starts from the entry state; the live paths join.
 - `src/analysis/inner.rs`
   - `Frame` model for lambda and comprehension bodies.
+- `src/analysis/layer_dims.rs`
+  - The values of the names in the dims of a layer constructor (`layer_at`,
+    `argument_value`). See item 18b.
 - `src/analysis/modules.rs`
   - Module fields (`ModuleList`, `Sequential`, lists, comprehensions, chain
     loops, indexing), module probes for classes of other files, and loss
     layers (`LayerKind::Loss`, `LayerApplication.extra_inputs`).
+
+- `src/imports.rs`
+  - What an imported name means at a place of the file. `ImportScopes` holds
+    the module map, the file map (`file()`, for the file-wide backend and vmap
+    decisions), and the `ImportRegion` list. `ImportScopes::at(byte)` gives the
+    map of a place. Function bodies, lambdas, and comprehensions that change a
+    name get a region. See item 22.
 
 - `src/known_functions/jax.rs`
   - `classify` and shape rules for the JAX 0.10/0.11 additions.
@@ -432,7 +465,7 @@ Current file layout
 - `src/python_ast.rs`
   - Pure tree-sitter Python extraction helpers.
   - Important functions:
-    - `build_import_map`
+    - `build_import_map` (scopes: `src/imports.rs`), `module_binds`
     - `extract_calls`
     - `extract_call_arguments`
     - `extract_jaxtyping_shapes` — jaxtyping/NumPy-style dimensions and their
@@ -472,7 +505,9 @@ Current file layout
 - `src/layers.rs`
   - Deep-learning layer handling.
   - Important functions:
-    - `classify_layer_call`
+    - `classify_layer_call` — public entry that strips `self.` from the dims.
+      The analysis uses `classify_layer_text` and keeps the raw dim text until
+      `ShapeCtx::layer_at`
     - `extract_layer_assignments`
     - `extract_layer_applications`
     - `extract_self_attr_layers_by_class` — resolves `self.<attr> = <constructor>`
@@ -490,7 +525,8 @@ Current file layout
     - `analyze_layer_shapes` — full pipeline (a thin wrapper that runs the
       pre-passes on the whole tree, then `finish_analysis`):
       1. `PrePass`: seed shapes from jaxtyping annotations (params + class
-         fields); build the import map; extract layer + self-attr-layer
+         fields); build the scoped imports (`ImportScopes`); extract layer +
+         self-attr-layer
          assignments and class summaries. Over the whole tree, or per
          top-level unit from a `UnitMemo`.
       2. `finish_analysis` runs `propagate_calls`: walk every assignment in
@@ -579,7 +615,9 @@ What works now
    - Skips tuple unpacking, attribute assignment, bare calls, non-call assignments.
 
 3. Import/call target resolution
-   - `resolve_call_target` combines call target text with import map.
+   - `resolve_call_target` combines call target text with an import map. The
+     analyzer takes that map from `imports.at(byte)`, so it fits the place of
+     the call (item 22).
    - Example:
      - `import equinox as eqx`
      - `eqx.nn.Linear` -> `ResolvedTarget { parts: ["equinox", "nn", "Linear"] }`
@@ -772,8 +810,8 @@ What works now
      before the top-level statement of the reader and have one shape (a
      global that a class body also binds is unknown; constants must be one
      decimal literal or int-annotated; a function above the constant stays
-     unknown). Integer constants resolve to the integer in call dims.
-     Comprehension and lambda bodies read the live shapes of the scope where
+     unknown). Integer constants resolve to the integer in call dims and in
+     layer constructor dims (item 18b). Comprehension and lambda bodies read the live shapes of the scope where
      they stand (see item 21). Fully annotated closures read
      the call-time value too, and a mismatch with it is a true error, reported
      once.
@@ -785,6 +823,8 @@ What works now
      MRO, on the argument shapes. The constructor arguments give the
      `self.<attr>` fields and the parameters of `__init__` (or dataclass-style
      fields) their values, so two call sites of one class get their own shapes.
+     A proven constant argument gives its value. An argument that the file does
+     not prove gives unknown for an output that reads it (`P(cfg.hidden)(x)`).
      A vmapped module peels and restores the batch dim.
    - It stays unknown when the field is written with anything but one
      constructor call of one class of the file, when a class between the field
@@ -793,7 +833,9 @@ What works now
      A same-named function never replaces an unresolved field.
    - Classes imported from other files run through a probe (depth 2, never
      for site-packages or library roots). Constructor arguments reach it only
-     as literals, plain names, or simple arithmetic. Errors show at the call.
+     as literals, plain names, or simple arithmetic. A proven value reaches the
+     probe as that value, and a name with no proven value becomes a parameter
+     of the probe. Errors show at the call.
      Fields that are `nn.ModuleList`, `nn.Sequential`, a list of modules, or a
      comprehension of modules, indexing, and chain loops (`x = layer(x)` as
      the only body statement) are tracked; a repeat count that is not literal
@@ -808,6 +850,53 @@ What works now
    - Annotated callee parameters are checked against the argument shapes: a
      rank mismatch or an integer mismatch is a true error; a named dim against
      an integer annotation, and a variadic annotation, are not errors.
+   - A name that a module statement binds (`P = load()`, `import`, `with ... as`,
+     a walrus, `del`: `module_binds`, which over-counts on purpose) is not a
+     class of the file, so a base with that name is opaque.
+
+18a. Method calls (`ShapeCtx::method_callee`)
+   - `self.m(x)`, `cls.m(x)`, and `super().m(x)` resolve through the MRO of the
+     class of the method that holds the call. The result is one method of one
+     class, never the smallest scope of that name. `super()` starts after the
+     class of the call. `super(C, self)` needs the class of the call and the
+     first parameter of the method.
+   - An override in a subclass or a mixin of the file gives unknown at
+     `self.m(x)` in the base class, also with a return annotation. A subclass in
+     another file is not visible. An opaque base before the known base gives
+     unknown.
+   - It is unknown when: the first parameter of the caller is not `self` or
+     `cls`; the name is a property or a field; the caller is a staticmethod or
+     a free function with a parameter named `self`; `cls.m()` reaches an
+     instance method (the call shifts the arguments); the method is defined
+     twice; the call is recursive; or a scope rebinds the receiver
+     (`receiver_holds`). Decorators other than staticmethod, classmethod, and
+     the property family are ignored, the same as for free functions.
+   - A bare name (`find_callee_scope`) reaches the nearest closure or the module
+     function, never a method, and a closure only inside its enclosing
+     function. A recursive bare call is unknown. `vmap(f)` resolves `f` at the
+     vmap site. A parameter or a local that shadows the name is not checked yet.
+   - `vmap(self.helper)`, `lax.map(self.helper, xs)`, `lax.scan(self.step, ...)`,
+     `A.helper(self, x)`, and `p, q = self.helper(x)` stay unknown. `super().__init__()`
+     is not evaluated, because the result has no use.
+
+18b. Layer constructor dims (`src/analysis/layer_dims.rs`)
+   - A layer keeps the text of each dim, and `layer_at` writes the values at
+     each lookup. Each name of a dim becomes one of three things:
+     - Its integer, when the file proves one: every write gives the same
+       literal and, at module level, every write stands before the top-level
+       statement of the reader. So `OUT = 4` with `nn.Linear(8, OUT)` gives
+       `[n, 4]`. Integer arithmetic folds (`2 * OUT`).
+     - Itself, for a parameter, a dataclass field, a name that an annotation
+       uses as a dim, or a name with no binding. A symbol still differs from an
+       integer, so `def __init__(self, d): nn.Linear(8, d)` gives `[n, d]`, and
+       an add with `[n, 4]` still gives a false error.
+     - `UNPROVEN_DIM` otherwise. The output of the layer is unknown, because
+       the value can be any integer: `OUT = load()`, an imported name,
+       `cfg.size`, `n = x.shape[0]`, or a constant below its reader.
+   - `self.<attr>` uses every write in the class family, in any method and in
+     class bodies, and all writes must agree. `self.a = self.b` is unproven. A
+     write outside the class (`m.out = 9`) or in another file is not visible.
+     `M.OUT` through the class name is unproven.
 
 19. Scalar operands in binary operations
    - A binary-op operand is a provable scalar (`2`, `math.sqrt(k)`, `len`,
@@ -845,6 +934,25 @@ What works now
    - Dependency note: `names.rs` counts every identifier token as a read, so
      targets over-approximate; lambda parameters are skipped as reads.
 
+22. Scoped imports (`src/imports.rs`)
+   - An import binds in the scope of its statement. A function-local
+     `import os as k` changes `k` only in that function, so `k.reshape(...)`
+     elsewhere keeps its meaning. A parameter, a local, a loop target, a lambda
+     parameter, or a comprehension target that uses an imported name makes the
+     name a value in that scope (the `SHADOWED` entry), so `torch.zeros` for a
+     parameter `torch` is not a library call.
+   - A function that both imports and assigns a name gives unknown in the full
+     function. A function does not see an import of another function, because
+     the read is a NameError at run time. A library name still classifies as in
+     a file with no import. The last function import of a name wins. A nested
+     `global` reads the module map, and `global k` makes a function import a
+     module import.
+   - A comprehension region covers the full node, so the first iterable also
+     sees the comprehension names. The scan skips `string` and `type` nodes.
+     Module-level rebinding is not tracked: `import numpy as k` then `k = load()`
+     at module level, or `global k; k = load()`, still reads `k` as the import.
+   - `file_backend` and the vmap names stay file-wide (`ImportScopes::file`).
+
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
 The former single-pass limit is fixed. When a call resolves to a same-file
@@ -878,7 +986,7 @@ Known limitations / important caveats
   python block); inlay hints are emitted. `did_open` stores the text and
   analyzes it at once. `did_change` (INCREMENTAL sync) applies the ranged
   changes to the stored text and version in message order, and spawns a
-  publish task. The task waits the debounce chosen for that rev (20 to 150 ms,
+  publish task. The task waits the debounce chosen from the cost (20 to 150 ms,
   `Pace`), runs one analysis per (uri, rev) from the `parse_states` base, and
   skips if a newer rev arrived. A stale request returns null. Only the
   analysis of the newest rev is committed. The first analysis after open parses and
@@ -928,9 +1036,8 @@ Known limitations / important caveats
   and literal factors, so `d_state*2` equals `2*d_state`. `self.<attr>` is
   canonicalized to an identifier alias from `__init__` before storage, and the
   alias lookup is class-scoped. Limitations: aliases still need an
-  identifier RHS; layer constructor arguments have the `self.` token stripped
-  (for example, `Linear(self.d_inner, ...)`) but do not go through the alias
-  map, so a differently named attribute is not mapped; and subtraction, division,
+  identifier RHS; layer constructor dims read `self.<attr>` through
+  `layer_at` (item 18b), not through the alias map; and subtraction, division,
   and arbitrary parenthesized expressions are not generally normalized.
 - `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
 - Higher-order functions: `vmap` is modeled (free/inline/attribute, named

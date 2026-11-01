@@ -10,10 +10,11 @@ mod names;
 
 use names::{Dsu, NameSet, link_units, name_hash, vmap_names};
 
+use crate::imports::{ImportMap, ImportRegion, ImportScopes, import_maps, import_regions};
 use crate::layers::{extract_layer_assignments_scoped, extract_self_attr_layers_by_class};
 use crate::python_ast::{
-    ClassHierarchy, ClassSummary, SelfAttrWrite, build_import_map, dim_symbols,
-    extract_jaxtyping_shapes, extract_self_attr_writes,
+    ClassHierarchy, ClassSummary, SelfAttrWrite, dim_symbols,
+    extract_jaxtyping_shapes, extract_self_attr_writes, module_binds,
 };
 use crate::resolution::{Deps, ResolutionCache, search_roots_fingerprint};
 use crate::types::*;
@@ -360,8 +361,10 @@ impl Shift for ScopedSelfAttrLayer {
             class_start,
             class_end,
             kind: _,
+            byte,
         } = self;
         by.class(class_start, class_end);
+        by.byte(byte);
     }
 }
 
@@ -543,6 +546,7 @@ impl Shift for ClassSummary {
             range,
             bases: _,
             fields: _,
+            attrs: _,
         } = self;
         by.class(&mut range.0, &mut range.1);
     }
@@ -556,7 +560,7 @@ const MAX_MEMO_UNITS: usize = 100_000;
 /// What the pre-passes found in a file, before the propagation pass.
 pub(crate) struct PrePass<'t> {
     pub(crate) scopes: Vec<FunctionShapeScope>,
-    pub(crate) import_map: HashMap<String, ImportPath>,
+    pub(crate) imports: ImportScopes,
     pub(crate) layer_records: Vec<LayerAssignment>,
     pub(crate) self_attr_layers: HashMap<String, Vec<ScopedSelfAttrLayer>>,
     pub(crate) writes: Vec<SelfAttrWrite<'t>>,
@@ -580,11 +584,11 @@ impl<'t> PrePass<'t> {
         F: Fn(&PathBuf) -> Option<String>,
     {
         let scopes = extract_jaxtyping_shapes(root, text)?;
-        let import_map = build_import_map(root, text)?;
+        let imports = ImportScopes::new(root, text)?;
         let layer_records = extract_layer_assignments_scoped(
             root,
             text,
-            &import_map,
+            &imports,
             search_roots,
             read_file,
             max_depth,
@@ -593,7 +597,7 @@ impl<'t> PrePass<'t> {
         let self_attr_layers = extract_self_attr_layers_by_class(
             root,
             text,
-            &import_map,
+            &imports,
             search_roots,
             read_file,
             max_depth,
@@ -601,7 +605,7 @@ impl<'t> PrePass<'t> {
         )?;
         Ok(Self {
             scopes,
-            import_map,
+            imports,
             layer_records,
             self_attr_layers,
             writes: extract_self_attr_writes(root, text),
@@ -664,9 +668,14 @@ impl Span {
 struct SyntaxRecord {
     /// The first scope is the unit's own copy of the module scope.
     scopes: Vec<FunctionShapeScope>,
-    imports: HashMap<String, ImportPath>,
+    /// Every import of the unit, in any scope.
+    imports: ImportMap,
+    /// The imports of the unit that bind at module level.
+    module_imports: ImportMap,
     writes: Vec<WriteRecord>,
     classes: Vec<ClassSummary>,
+    /// The module names of the unit that a statement binds, except `class`.
+    module_binds: Vec<String>,
     names: NameSet,
     /// Hashes of the names the annotations of the unit use as dims.
     symbols: Vec<u64>,
@@ -683,14 +692,17 @@ impl SyntaxRecord {
             .collect();
         symbols.sort_unstable();
         symbols.dedup();
+        let (imports, module_imports) = import_maps(unit, text)?;
         let mut record = Self {
             scopes,
-            imports: build_import_map(unit, text)?,
+            imports,
+            module_imports,
             writes: extract_self_attr_writes(unit, text)
                 .iter()
                 .map(WriteRecord::of)
                 .collect(),
             classes: ClassSummary::collect(unit, text),
+            module_binds: module_binds(unit, text),
             names: NameSet::of(unit, text),
             symbols,
         };
@@ -704,8 +716,10 @@ impl Shift for SyntaxRecord {
         let SyntaxRecord {
             scopes,
             imports: _,
+            module_imports: _,
             writes,
             classes,
+            module_binds: _,
             names: _,
             symbols: _,
         } = self;
@@ -715,8 +729,21 @@ impl Shift for SyntaxRecord {
     }
 }
 
-/// What depends on the text of one unit, the import map, and the files on
-/// disk the unit resolved names to.
+impl Shift for ImportRegion {
+    fn shift(&mut self, by: Delta<'_>) {
+        by.byte(&mut self.start);
+        by.byte(&mut self.end);
+    }
+}
+
+/// What depends on the text of one unit and the imports of the file.
+struct RegionRecord {
+    import_digest: u64,
+    regions: Vec<ImportRegion>,
+}
+
+/// What depends on the text of one unit, the imports of the file, and the
+/// files on disk the unit resolved names to.
 struct LayerRecord {
     import_digest: u64,
     assignments: Vec<LayerAssignment>,
@@ -744,6 +771,7 @@ struct Unit {
     span: Span,
     hash: u64,
     syntax: Arc<SyntaxRecord>,
+    regions: Option<Arc<RegionRecord>>,
     layers: Option<Arc<LayerRecord>>,
     /// What the propagation pass made of the unit, in the positions of the
     /// text of the memo.
@@ -778,12 +806,15 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn import_digest(import_map: &HashMap<String, ImportPath>) -> u64 {
-    let mut entries: Vec<_> = import_map.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
+fn import_digest(file: &ImportMap, module: &ImportMap) -> u64 {
     let mut hasher = DefaultHasher::new();
-    for (alias, ImportPath { dots, module, name }) in entries {
-        (alias, dots, module, name).hash(&mut hasher);
+    for map in [file, module] {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries.len().hash(&mut hasher);
+        for (alias, ImportPath { dots, module, name }) in entries {
+            (alias, dots, module, name).hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -917,6 +948,7 @@ impl UnitMemo {
                         span: *span,
                         hash: reused.hash,
                         syntax: reused.syntax.clone(),
+                        regions: reused.regions.clone(),
                         layers: reused.layers.clone(),
                         prop: reused.prop.clone(),
                         comp: 0,
@@ -927,6 +959,7 @@ impl UnitMemo {
                     hash: *hashes[i]
                         .get_or_insert_with(|| hash_bytes(&text.as_bytes()[span.start..span.end])),
                     syntax: Arc::new(SyntaxRecord::extract(nodes[i], text, *span)?),
+                    regions: None,
                     layers: None,
                     prop: None,
                     comp: 0,
@@ -945,9 +978,11 @@ impl UnitMemo {
             all_params: Vec::new(),
             dimension_sites: Vec::new(),
         }];
-        let mut import_map = HashMap::new();
+        let mut file_imports = HashMap::new();
+        let mut module_imports = HashMap::new();
         let mut writes = Vec::new();
         let mut classes = Vec::new();
+        let mut module_names = Vec::new();
         for (unit, node) in units.iter().zip(&nodes) {
             let by = unit.span.to_new_file();
             let record = &*unit.syntax;
@@ -964,7 +999,9 @@ impl UnitMemo {
                 scope.shift(by);
                 scopes.push(scope);
             }
-            import_map.extend(record.imports.clone());
+            module_names.extend_from_slice(&record.module_binds);
+            file_imports.extend(record.imports.clone());
+            module_imports.extend(record.module_imports.clone());
             for write in &record.writes {
                 let mut write = write.clone();
                 write.shift(by);
@@ -977,7 +1014,27 @@ impl UnitMemo {
             }
         }
 
-        let digest = import_digest(&import_map);
+        let digest = import_digest(&file_imports, &module_imports);
+        let mut regions = Vec::new();
+        for (unit, node) in units.iter_mut().zip(&nodes) {
+            if unit.regions.as_ref().is_none_or(|rec| rec.import_digest != digest) {
+                let mut found = import_regions(*node, text, &module_imports, &file_imports)?;
+                found.shift(unit.span.to_new_file().inverse());
+                unit.regions = Some(Arc::new(RegionRecord {
+                    import_digest: digest,
+                    regions: found,
+                }));
+            }
+            let by = unit.span.to_new_file();
+            let record = unit.regions.as_ref().expect("invariant: set above");
+            for region in &record.regions {
+                let mut region = region.clone();
+                region.shift(by);
+                regions.push(region);
+            }
+        }
+        let imports = ImportScopes::from_parts(module_imports, file_imports, regions);
+
         let mut layer_records = Vec::new();
         let mut self_attr_layers: HashMap<String, Vec<ScopedSelfAttrLayer>> = HashMap::new();
         let mut layer_hit = Vec::with_capacity(units.len());
@@ -995,7 +1052,7 @@ impl UnitMemo {
                         extract_layer_assignments_scoped(
                             *node,
                             text,
-                            &import_map,
+                            &imports,
                             search_roots,
                             read_file,
                             max_depth,
@@ -1004,7 +1061,7 @@ impl UnitMemo {
                         extract_self_attr_layers_by_class(
                             *node,
                             text,
-                            &import_map,
+                            &imports,
                             search_roots,
                             read_file,
                             max_depth,
@@ -1041,7 +1098,7 @@ impl UnitMemo {
 
         let mut env = 0;
         let plan = if propagate_memo_enabled() {
-            let built = PropPlan::build(old, &mut units, &found, &layer_hit, &import_map, cache);
+            let built = PropPlan::build(old, &mut units, &found, &layer_hit, imports.file(), digest, cache);
             stats.replayed_units = built.plan.replay.iter().flatten().count();
             stats.propagate_full = stats.replayed_units == 0;
             env = built.env;
@@ -1059,11 +1116,11 @@ impl UnitMemo {
         };
         let pre = PrePass {
             scopes,
-            import_map,
+            imports,
             layer_records,
             self_attr_layers,
             writes,
-            hierarchy: ClassHierarchy::from_summaries(&classes),
+            hierarchy: ClassHierarchy::from_summaries(&classes, &module_names),
             plan,
         };
         Ok((pre, next))
@@ -1190,6 +1247,7 @@ impl PropPlan {
         found: &[Option<usize>],
         layer_hit: &[bool],
         import_map: &HashMap<String, ImportPath>,
+        digest: u64,
         cache: &ResolutionCache,
     ) -> BuiltPlan {
         let n = units.len();
@@ -1198,20 +1256,20 @@ impl PropPlan {
         let mut globals: Vec<u64> = sets.iter().flat_map(|s| s.globals.iter().copied()).collect();
         globals.sort_unstable();
         globals.dedup();
-        // A name that a plain assignment gives an integer and an annotation
-        // uses as a dim is not read as the integer (`integer_constant`).
-        let ints: HashSet<u64> = sets.iter().flat_map(|s| s.ints.iter().copied()).collect();
-        let mut clashes: Vec<u64> = units
+        // A name that an annotation uses as a dim is not read as an integer
+        // (`integer_constant`), and stays a name in a layer dim (`layer_at`).
+        let symbols: HashSet<u64> = units.iter().flat_map(|u| u.syntax.symbols.iter().copied()).collect();
+        let mut clashes: Vec<u64> = sets
             .iter()
-            .flat_map(|u| u.syntax.symbols.iter().copied())
-            .filter(|symbol| ints.contains(symbol))
+            .flat_map(|s| s.ints.iter().chain(&s.reads).copied())
+            .filter(|name| symbols.contains(name))
             .collect();
         clashes.sort_unstable();
         clashes.dedup();
         let env = {
             let mut hasher = DefaultHasher::new();
             (
-                import_digest(import_map),
+                digest,
                 &globals,
                 sets.iter().any(|s| s.wildcard),
                 &clashes,

@@ -30,6 +30,7 @@ use super::{
     ShapeCtx, Submodule, apply_submodule_call, constructed_module, extra_layer_inputs,
     insert_identifiers, normalize_dim, resolve_call_args,
 };
+use crate::imports::is_imported;
 use crate::layers::{apply_layer_application, classify_inline_constructor};
 use crate::python_ast::{ClassHierarchy, dim_symbols, dynamic_attribute, extract_call_arguments};
 use crate::resolution::{
@@ -47,14 +48,14 @@ const MAX_PROBE_DEPTH: usize = 2;
 const MAX_PROBE_FILE: usize = 512 << 10;
 
 /// Python keywords: an expression with one of them is not copied to a probe.
-const KEYWORDS: [&str; 30] = [
+pub(super) const KEYWORDS: [&str; 30] = [
     "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
     "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda",
     "nonlocal", "not", "or", "pass", "raise", "return", "while", "yield",
 ];
 
 /// Packages whose classes are not user modules.
-const LIBRARIES: [&str; 18] = [
+pub(crate) const LIBRARIES: [&str; 18] = [
     "torch",
     "jax",
     "flax",
@@ -102,7 +103,8 @@ pub(super) enum Module {
 #[derive(Clone)]
 pub(super) enum Held {
     Module(Module),
-    Layer(LayerKind),
+    /// A layer and where its constructor call stands.
+    Layer(LayerKind, usize),
 }
 
 #[derive(Clone)]
@@ -146,7 +148,7 @@ impl Held {
     fn same(&self, other: &Held) -> bool {
         match (self, other) {
             (Held::Module(a), Held::Module(b)) => a.same(b),
-            (Held::Layer(a), Held::Layer(b)) => a == b,
+            (Held::Layer(a, _), Held::Layer(b, _)) => a == b,
             _ => false,
         }
     }
@@ -227,7 +229,11 @@ pub(super) fn imported_module_of(
         return None;
     }
     // A framework or standard-library callee is not a user module.
-    let root = import_map.get(names.next()?)?;
+    let root = names.next()?;
+    if !is_imported(import_map, root) {
+        return None;
+    }
+    let root = import_map.get(root)?;
     if LIBRARIES.contains(&root.module.first().unwrap_or(&root.name).as_str()) {
         return None;
     }
@@ -248,7 +254,7 @@ fn held_of(
         return None;
     }
     if let Some(kind) = classify_inline_constructor(node, text, import_map) {
-        return Some(Held::Layer(kind));
+        return Some(Held::Layer(kind, node.start_byte()));
     }
     module_of(node, text, import_map, hierarchy).map(Held::Module)
 }
@@ -912,16 +918,17 @@ fn apply_held(
 ) -> Option<Vec<String>> {
     match held {
         Held::Module(module) => apply_module(module, display, args, call_byte, scope, range, ctx),
-        Held::Layer(kind) => {
+        Held::Layer(kind, byte) => {
             let Some(CallArgument::Positional { value: input }) = args.first() else {
                 return None;
             };
+            let kind = ctx.layer_at(kind, *byte);
             let application = LayerApplication {
                 variable: String::new(),
                 layer: display.to_string(),
                 input: input.clone(),
-                extra_inputs: extra_layer_inputs(args, kind),
-                kind: kind.clone(),
+                extra_inputs: extra_layer_inputs(args, &kind),
+                kind,
                 range,
             };
             match apply_layer_application(&application, &ctx.scope_shapes(scope)) {
@@ -1323,7 +1330,7 @@ pub(super) fn imported_class(
     module: &ImportedModule,
     ctx: &ShapeCtx,
 ) -> Option<(std::path::PathBuf, String)> {
-    let target = resolve_call_target(&module.callee, ctx.import_map);
+    let target = resolve_call_target(&module.callee, ctx.imports.at(module.byte));
     let implementation = resolve_implementation(
         target,
         ctx.search_roots,
@@ -1363,6 +1370,17 @@ fn probe_module(
             CallArgument::Keyword { name, value } => (Some(name), value),
         };
         let value = normalize_dim(value, ctx.aliases, ctx.hierarchy, module.byte);
+        probe_expression(&value)?;
+        // A probe name keeps an unproven value out of the result.
+        let Some(value) = ctx.argument_value(&value, module.byte) else {
+            let parameter = format!("__ndim_u{}__", parameters.len());
+            constructor.push(match keyword {
+                Some(name) => format!("{name}={parameter}"),
+                None => parameter.clone(),
+            });
+            parameters.push(parameter);
+            continue;
+        };
         let (source, names) = probe_expression(&value)?;
         for name in names {
             if name == class {

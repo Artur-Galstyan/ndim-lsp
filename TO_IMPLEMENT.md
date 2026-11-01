@@ -22,7 +22,7 @@ Legend:
 | `jax.jacrev` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad`. |
 | `jax.hessian` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (two derivative dimension groups). |
 | `jax.pmap` | ❌ | ❌ | ❌ | Out of scope: device-mesh/axis semantics, not statically derivable with the current design. |
-| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant). `init` is evaluated as a real expression node, so a homogeneous-shape tuple carry (`(a, b)` with equal element shapes, inline at the call site or via a previously-bound tuple-literal variable — `shape_of_tuple`) resolves the same way as a plain single-array carry; heterogeneous-shape tuple carries stay `Ok(None)`. Stacked `ys` is now modelled too, via lazy call-site parameter seeding (see "Lazy call-site parameter seeding" below): when `body` is a same-file function/closure, its params are seeded (`carry` <- `init`'s shape, the per-step element <- `xs`'s shape minus its leading axis) and its body evaluated on demand (`scan_body_ys_shape` in analysis.rs); `ys` is the body's second return element with `xs`'s leading dim prepended back on. A qualified (`module.func`) or `self.<method>` body still isn't traced this way. |
+| `jax.lax.scan` | ✅ | ✅ | ✅ | Tuple LHS: final carry gets init's shape (carry invariant). `init` is evaluated as a real expression node, so a homogeneous-shape tuple carry (`(a, b)` with equal element shapes, inline at the call site or via a previously-bound tuple-literal variable — `shape_of_tuple`) resolves the same way as a plain single-array carry; heterogeneous-shape tuple carries stay `Ok(None)`. Stacked `ys` is now modelled too, via lazy call-site parameter seeding (see "Lazy call-site parameter seeding" below): when `body` is a same-file function/closure, its params are seeded (`carry` <- `init`'s shape, the per-step element <- `xs`'s shape minus its leading axis) and its body evaluated on demand (`scan_body_ys_shape` in analysis.rs); `ys` is the body's second return element with `xs`'s leading dim prepended back on. A qualified (`module.func`) or `self.<method>` body still isn't traced this way, and a bare body name never reaches a method, or a closure that the call cannot see. |
 | `jax.lax.map` | ✅ | ✅ | ✅ | Maps over the leading axis like `vmap(f)(xs)` with `in_axes=out_axes=0`; reuses `apply_vmap_call`/`apply_inline_vmap_layer` (bare user function or `self.<attr>` layer). Special-cased in `shape_of_call` (needs the callee-scope lookup machinery, not just `args`+`shapes`). |
 | `jax.lax.cond` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — branch output shape isn't derivable without analyzing both branch functions (out of scope for now). |
 | `jax.lax.switch` | ✅ | ❌ | ✅ | Same as `cond` — classified, conservatively `Ok(None)`. |
@@ -462,7 +462,9 @@ destructuring their carry, nested closures, and helper functions relying on
 inference all went dark.
 
 - **Mechanism** (`analysis.rs`): when a call resolves to a same-file
-  function scope (top-level function, nested closure, or `self.<method>`)
+  function scope (top-level function, nested closure, or a method through
+  `self`, `cls`, or `super()` by the MRO of the calling class, unknown when the
+  file overrides the method: `llm.txt`, item 18a)
   that isn't FULLY annotated (checked against `original_shapes`, an
   immutable snapshot of every scope's annotations taken before any
   assignment/specialization runs — never the live, mutable `scopes[...].
@@ -520,7 +522,7 @@ Done (design in `llm.txt`, "Incremental analysis"):
 - Incremental parse (`diff_edit`, `reparse`); a tree with a syntax error is parsed again from scratch, so the tree always equals a fresh parse.
 - Pre-pass memo per top-level statement (`UnitMemo`, `analyze_layer_shapes_with_memo`) and a propagate memo (`PropPlan`, `PropRecord`, name groups in `src/incremental/names.rs`).
 - `ScopeIndex` for byte-to-scope lookup in the propagate pass.
-- INCREMENTAL document sync (`apply_changes`) with out-of-sync handling, and an adaptive debounce of 20 to 150 ms (`Pace`).
+- INCREMENTAL document sync (`apply_changes`) with out-of-sync handling, and a cost-based debounce of 20 to 150 ms (`Pace`): half of the average incremental run, twice the last whole analysis, and no input from the rhythm of the keys.
 - Debug switches: `NDIM_VERIFY_INCREMENTAL=1` (compare each incremental result with a fresh one; the fresh result wins), `NDIM_NO_PROPAGATE_MEMO=1` (turn off the propagate replay).
 
 Open (measured limits, not planned work):
@@ -531,6 +533,7 @@ Open (measured limits, not planned work):
 - The first edit after open builds the memo (about 4 ms more).
 - A file over 4 MiB or 100,000 statements has no memo.
 - An unsaved helper buffer is ignored.
+- Each key can start one analysis, so typing uses more CPU (about 20 percent of one core at 100 ms for each key on the stress file). On a very long analysis the 150 ms ceiling does not stop steady typing from using one core.
 
 ## Open targets (current)
 
@@ -542,17 +545,19 @@ The catalog pass is complete. The remaining ❌ rows need analysis beyond a sing
 - `broadcast_shapes` returns a shape tuple, not an array.
 - `einops.unpack` needs tracked literal values for the `ps` object, while `equinox.nn.Lambda` wraps an arbitrary callable.
 
-Done since the catalog pass (analysis behavior, not catalog rows): tuple-literal unpacking (`a, b = x, y`, swaps, starred targets); unpacking a name binds the rows of a provable array, gives each target the shared shape of a homogeneous tuple carry (`lax.scan` init, `final_a, final_b = final_carry`), and gives unknown for a name that is neither; closures read enclosing variables at call time; user submodules resolve through the class MRO; provable scalar operands broadcast; a name whose shape changes across a loop is unknown after it; internal names (`__synth_N`, `__ellipsis`) never reach the output; branch merge for `if`/`elif`/`else`, `match`, `try`, loops, and `with` (`src/analysis/flow.rs`: each arm starts from the entry state and the live paths join, a name with different shapes is unknown, and walrus names, `case` captures, `del`, `def`, `class`, and imports are binding events); module globals and integer constants read in a function (known only when all writes come before the reader and have one shape; integer constants resolve to the integer in call dims); comprehensions and lambdas where the result is used (`stack`/`concatenate` of a list comprehension, `sum`, `vmap`, `lax.map`, `lax.scan`, and direct lambda calls: `src/analysis/inner.rs`); user module containers and classes of other files (`nn.ModuleList`, `nn.Sequential`, lists and comprehensions of modules, indexing, chain loops, probe depth 2); loss layers (rows above); the einops two-sided ellipsis tests.
+Done since the catalog pass (analysis behavior, not catalog rows): tuple-literal unpacking (`a, b = x, y`, swaps, starred targets); unpacking a name binds the rows of a provable array, gives each target the shared shape of a homogeneous tuple carry (`lax.scan` init, `final_a, final_b = final_carry`), and gives unknown for a name that is neither; closures read enclosing variables at call time; user submodules resolve through the class MRO; provable scalar operands broadcast; a name whose shape changes across a loop is unknown after it; internal names (`__synth_N`, `__ellipsis`) never reach the output; branch merge for `if`/`elif`/`else`, `match`, `try`, loops, and `with` (`src/analysis/flow.rs`: each arm starts from the entry state and the live paths join, a name with different shapes is unknown, and walrus names, `case` captures, `del`, `def`, `class`, and imports are binding events); module globals and integer constants read in a function (known only when all writes come before the reader and have one shape; integer constants resolve to the integer in call dims); comprehensions and lambdas where the result is used (`stack`/`concatenate` of a list comprehension, `sum`, `vmap`, `lax.map`, `lax.scan`, and direct lambda calls: `src/analysis/inner.rs`); user module containers and classes of other files (`nn.ModuleList`, `nn.Sequential`, lists and comprehensions of modules, indexing, chain loops, probe depth 2); loss layers (rows above); the einops two-sided ellipsis tests; method calls through the class MRO (`self`, `cls`, `super()`); integer and `self.<attr>` constants in layer constructor dims (`src/analysis/layer_dims.rs`); imports by scope (`src/imports.rs`); a debounce from the analysis cost.
 
 Still open: tuple unpacking of user-defined helper tuple returns, and heterogeneous tuple carries. Also open from the work above:
 
-- A global or constant below its reader (source order) stays unknown. A shape assigned in a global by several writes stays unknown.
+- A global or constant below its reader (source order) stays unknown, also in a layer dim. A shape assigned in a global by several writes stays unknown.
 - A comprehension or lambda stored in a name (`ys = [f(x) for x in xs]`, `f = lambda ...`) is not evaluated, nor are set and dict comprehensions, filters or several `for` clauses in `stack`, symbolic lengths, generators, and tuple results of a lambda (`vmap`, `lax.map`, `lax.scan` with a tuple carry).
 - `self.layers.append(...)` in a loop makes the field unknown. Modules in local variables, `zip`, `reversed`, slices, and `nn.ModuleDict` stay unknown.
 - Functional losses (`F.mse_loss`, `F.l1_loss`, `F.binary_cross_entropy`, ...) are not classified. A loss `weight` is not checked.
 - Value statements (`return`, `assert`, bare calls) read the state at the end of the scope, not at their own position. Literal conditions (`while True`, `if TYPE_CHECKING`) are not folded. A context manager that swallows errors is found by name only. A walrus value is not evaluated (its name is unknown).
-- `self.helper(x)` picks the same-named method of the nearest class that defines it (smallest scope across classes) and can pick the wrong class. A function-local `import os as k` makes `k.reshape(...)` read as a module call in the whole file.
-- A same-file constant used as a layer constructor dim (`nn.Linear(8, OUT)`) keeps the symbol `OUT` (the symbol policy).
+- `resolve_imported_function_shape` picks the smallest scope of a name across the imported file, so a method of the same name can win. A bare name that a parameter or a local shadows still resolves to a function of the same name. `vmap_targets` is global to the file.
+- A subclass in another file is not visible, so a base-class `self.m(x)` can show the shape of the base method. `vmap(self.helper)`, `lax.map(self.helper, xs)`, `lax.scan(self.step, ...)`, `A.helper(self, x)`, and `p, q = self.helper(x)` stay unknown.
+- A parameter or dataclass-field layer dim keeps its symbol: `def __init__(self, d): nn.Linear(8, d)` gives `[n, d]`, and an add with `[n, 4]` gives a false error. A constant named like an annotation symbol also stays a name. `nn.Linear(8, M.OUT)` is unknown.
+- Module-level rebinding of an import (`import numpy as k` then `k = load()`, or `global k; k = load()`) still reads `k` as the import. `global P; P = ...` in a function does not make a base `P` opaque.
 - Comment lines make the analysis slow (2,000 comment lines cost about 100 ms).
 - An unsaved buffer of an imported file is ignored.
 

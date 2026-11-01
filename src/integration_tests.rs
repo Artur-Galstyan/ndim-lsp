@@ -12732,7 +12732,7 @@ mod imported_module_tests {
     }
 
     #[test]
-    fn a_name_of_the_class_file_does_not_reach_the_caller() {
+    fn a_constant_of_the_class_file_gives_its_value_to_the_caller() {
         let dir = tempfile::tempdir().unwrap();
         write(
             &dir,
@@ -12742,7 +12742,8 @@ mod imported_module_tests {
         let code = "import torch.nn as nn\nfrom fixed import Fixed, Literal\nfrom jaxtyping import Float, Array\n\n\ndef g(x: Float[Array, \"n 8\"], y: Float[Array, \"n 4\"]):\n    f1 = Fixed()(x)\n    z = f1 + y\n    f2 = Literal()(x)\n    w = f2 + y\n";
         let analysis = analyze_in(dir.path(), code, None);
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "f1"), None);
+        assert_eq!(find_shape(&analysis, "f1"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n", "4"])));
         assert_eq!(find_shape(&analysis, "f2"), Some(&shape(&["n", "4"])));
         assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["n", "4"])));
     }
@@ -13246,5 +13247,782 @@ mod rebinding_tests {
         let a = analyze(apart);
         assert_eq!(find_shape(&a, "r"), Some(&shape(&["4", "3"])));
         assert_eq!(find_shape(&a, "s"), Some(&shape(&["3", "4"])));
+    }
+
+    const METHOD_HEAD: &str = "import jax\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n";
+    const TRANSPOSE: &str = "        return v.T\n";
+    const RUN: &str = "    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\n";
+
+    fn methods(body: &str) -> String {
+        format!("{METHOD_HEAD}{body}")
+    }
+
+    #[test]
+    fn a_self_call_stays_in_the_class_of_the_call() {
+        let code = format!("class A:\n    def helper(self, v):\n{TRANSPOSE}{RUN}class B:\n    def helper(self, v):\n        return v\n");
+        known_in(&methods(&code), "r", &["4", "3"]);
+        let annotated = "class A:\n    def helper(self, v: Float[Array, \"a b\"]) -> Float[Array, \"b a\"]:\n        return v.T\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\nclass B:\n    def helper(self, v: Float[Array, \"a\"]) -> Float[Array, \"a\"]:\n        return v\n";
+        known_in(&methods(annotated), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_self_call_never_reaches_an_unrelated_class_or_a_function() {
+        unknown_in(&methods(&format!("class A:\n{RUN}class B:\n    def helper(self, v):\n        return v\n")), "r");
+        unknown_in(&methods(&format!("def helper(v):\n    return v\nclass A:\n{RUN}")), "r");
+        unknown_in(&methods(&format!("class A:\n    def other(self, x):\n        def helper(v):\n            return v\n{RUN}")), "r");
+    }
+
+    #[test]
+    fn a_self_call_follows_the_method_resolution_order() {
+        let base = format!("class Base:\n    def helper(self, v):\n{TRANSPOSE}class Other:\n    def helper(self, v):\n        return v\n");
+        known_in(&methods(&format!("{base}class Sub(Base):\n{RUN}")), "r", &["4", "3"]);
+        known_in(&methods(&format!("{base}class Sub(Other, Base):\n{RUN}")), "r", &["3", "4"]);
+        known_in(&methods(&format!("{base}class Sub(Base):\n    def helper(self, v):\n        return v\n{RUN}")), "r", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_self_call_stops_at_a_base_the_file_does_not_define() {
+        let base = format!("from lib import Opaque\nclass Base:\n    def helper(self, v):\n{TRANSPOSE}");
+        unknown_in(&methods(&format!("{base}class Sub(Opaque):\n{RUN}")), "r");
+        unknown_in(&methods(&format!("{base}class Sub(Opaque, Base):\n{RUN}")), "r");
+        known_in(&methods(&format!("{base}class Sub(Base, Opaque):\n{RUN}")), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_self_call_with_an_override_below_it_is_unknown() {
+        let base = format!("class Base:\n    def helper(self, v):\n{TRANSPOSE}{RUN}");
+        unknown_in(&methods(&format!("{base}class Sub(Base):\n    def helper(self, v):\n        return v\n")), "r");
+        unknown_in(&methods(&format!("{base}class Sub(Base):\n    helper = None\n")), "r");
+        unknown_in(&methods(&format!("{base}class Mixin:\n    def helper(self, v):\n        return v\nclass Both(Mixin, Base):\n    pass\n")), "r");
+        unknown_in(&methods(&format!("{base}from lib import Opaque\nclass Sub(Opaque, Base):\n    def helper(self, v):\n        return v\n")), "r");
+        known_in(&methods(&format!("{base}class Sub(Base):\n    pass\n")), "r", &["4", "3"]);
+        known_in(&methods(&format!("{base}class Mixin:\n    def helper(self, v):\n        return v\nclass Both(Base, Mixin):\n    pass\n")), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_class_attribute_or_an_instance_field_hides_a_method() {
+        let base = format!("class Base:\n    def helper(self, v):\n{TRANSPOSE}");
+        unknown_in(&methods(&format!("{base}class Sub(Base):\n    helper = None\n{RUN}")), "r");
+        unknown_in(&methods(&format!("class A:\n    def helper(self, v):\n{TRANSPOSE}    helper = make(helper)\n{RUN}")), "r");
+        unknown_in(&methods(&format!("class A:\n    def __init__(self):\n        self.helper = make()\n    def helper(self, v):\n{TRANSPOSE}{RUN}")), "r");
+        let field_below = format!("{base}    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\nclass Sub(Base):\n    def __init__(self):\n        self.helper = make()\n");
+        unknown_in(&methods(&field_below), "r");
+    }
+
+    #[test]
+    fn a_class_call_follows_the_bases() {
+        let base = "class Base:\n    @classmethod\n    def helper(cls, v):\n        return v.T\n";
+        let sub = "class Sub(Base):\n    @classmethod\n    def build(cls, x: Float[Array, \"3 4\"]):\n        r = cls.helper(x)\nclass Other:\n    @classmethod\n    def helper(cls, v):\n        return v\n";
+        known_in(&methods(&format!("{base}{sub}")), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_super_call_starts_after_the_class_of_the_call() {
+        let base = format!("class Base:\n    def helper(self, v):\n{TRANSPOSE}");
+        let sub = "    def helper(self, v):\n        r = super().helper(v)\n        return r\n    def run(self, x: Float[Array, \"3 4\"]):\n        q = super().helper(x)\n";
+        known_in(&methods(&format!("{base}class Sub(Base):\n{sub}")), "q", &["4", "3"]);
+        let two_args = "class Sub(Base):\n    def run(self, x: Float[Array, \"3 4\"]):\n        q = super(Sub, self).helper(x)\n";
+        known_in(&methods(&format!("{base}{two_args}")), "q", &["4", "3"]);
+        let other_class = "class Sub(Base):\n    def run(self, x: Float[Array, \"3 4\"]):\n        q = super(Base, self).helper(x)\n";
+        unknown_in(&methods(&format!("{base}{other_class}")), "q");
+        unknown_in(&methods(&format!("{base}class Sub:\n{sub}")), "q");
+        unknown_in(&methods(&format!("from lib import Opaque\n{base}class Sub(Opaque, Base):\n{sub}")), "q");
+        unknown_in(&methods(&format!("from lib import Opaque\n{base}class Sub(Opaque):\n{sub}")), "q");
+        let unrelated = "class Other:\n    def helper(self, v):\n        return v\n";
+        unknown_in(&methods(&format!("{unrelated}class Sub:\n{sub}")), "q");
+    }
+
+    #[test]
+    fn a_super_call_follows_the_order_of_a_subclass() {
+        let top = format!("class Top:\n    def helper(self, v):\n{TRANSPOSE}class Left(Top):\n    def run(self, x: Float[Array, \"3 4\"]):\n        q = super().helper(x)\nclass Right(Top):\n");
+        let right = "    def helper(self, v):\n        return v\n";
+        unknown_in(&methods(&format!("{top}{right}class Both(Left, Right):\n    pass\n")), "q");
+        known_in(&methods(&format!("{top}{right}")), "q", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_static_or_class_method_binds_the_right_parameters() {
+        let stat = "class A:\n    @staticmethod\n    def helper(v):\n        return v.T\n";
+        known_in(&methods(&format!("{stat}{RUN}")), "r", &["4", "3"]);
+        let by_cls = "    @classmethod\n    def build(cls, x: Float[Array, \"3 4\"]):\n        r = cls.helper(x)\n";
+        known_in(&methods(&format!("{stat}{by_cls}")), "r", &["4", "3"]);
+        let clsm = "class A:\n    @classmethod\n    def helper(cls, v):\n        return v.T\n";
+        known_in(&methods(&format!("{clsm}{RUN}")), "r", &["4", "3"]);
+        known_in(&methods(&format!("{clsm}{by_cls}")), "r", &["4", "3"]);
+        let inst = format!("class A:\n    def helper(self, v):\n{TRANSPOSE}");
+        unknown_in(&methods(&format!("{inst}{by_cls}")), "r");
+    }
+
+    #[test]
+    fn a_receiver_in_a_static_method_or_a_function_is_not_the_class() {
+        let inst = format!("class A:\n    def helper(self, v):\n{TRANSPOSE}");
+        let in_static = "    @staticmethod\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\n";
+        unknown_in(&methods(&format!("{inst}{in_static}")), "r");
+        let free = "def run(self, x: Float[Array, \"3 4\"]):\n    r = self.helper(x)\n";
+        unknown_in(&methods(&format!("{inst}{free}")), "r");
+        let closure = "    def run(self, x: Float[Array, \"3 4\"]):\n        def inner(y):\n            return self.helper(y)\n        r = inner(x)\n";
+        known_in(&methods(&format!("{inst}{closure}")), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_method_that_is_not_a_plain_call_stays_unknown() {
+        let prop = "class A:\n    @property\n    def helper(self):\n        return jnp.zeros((1, 2))\n";
+        unknown_in(&methods(&format!("{prop}{RUN}")), "r");
+        let other_receiver = "class A:\n    def helper(this, v):\n        return v.T\n";
+        unknown_in(&methods(&format!("{other_receiver}{RUN}")), "r");
+        let twice = "class A:\n    def helper(self, v):\n        return v.T\n    if c:\n        def helper(self, v):\n            return v\n";
+        unknown_in(&methods(&format!("{twice}{RUN}")), "r");
+        let recursive = "class Base:\n    def helper(self, v):\n        return v\nclass A(Base):\n    def helper(self, v):\n        r = self.helper(v)\n        return v.T\n    def run(self, x: Float[Array, \"3 4\"]):\n        q = self.helper(x)\n";
+        known_in(&methods(recursive), "q", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_user_method_wins_over_the_array_method_of_the_same_name() {
+        let code = "class A:\n    def sum(self, v):\n        return v.T\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = self.sum(x)\n";
+        known_in(&methods(code), "r", &["4", "3"]);
+    }
+
+    #[test]
+    fn a_bare_call_never_reaches_a_method() {
+        let code = "class A:\n    def helper(self, v):\n        return v\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = helper(x)\n";
+        unknown_in(&methods(code), "r");
+        let code = format!("def helper(v):\n{TRANSPOSE}class A:\n    def helper(self, v):\n        return v\n    def run(self, x: Float[Array, \"3 4\"]):\n        r = helper(x)\n");
+        known_in(&methods(&code).replace("return v.T", "    return v.T"), "r", &["4", "3"]);
+        let in_body = "def helper(v):\n    return v.T\nclass A:\n    def helper(v):\n        return v\n    x: Float[Array, \"3 4\"] = make()\n    r = helper(x)\n";
+        unknown_in(&methods(in_body), "r");
+    }
+
+    #[test]
+    fn a_vmap_of_a_name_finds_the_function_the_call_sees() {
+        let closures = "def a(xs: Float[Array, \"b 3 4\"]):\n    def f(v: Float[Array, \"p q\"]) -> Float[Array, \"q p\"]:\n        return v.T\n    r = jax.vmap(f)(xs)\ndef c(xs: Float[Array, \"b 3 4\"]):\n    def f(v: Float[Array, \"p q\"]) -> Float[Array, \"p q\"]:\n        return v\n    s = jax.vmap(f)(xs)\n";
+        let a = analyze(&methods(closures));
+        assert_eq!(find_shape(&a, "r"), Some(&shape(&["b", "4", "3"])));
+        assert_eq!(find_shape(&a, "s"), Some(&shape(&["b", "3", "4"])));
+
+        let named = closures.replace("r = jax.vmap(f)(xs)", "vf = jax.vmap(f)\n    r = vf(xs)").replace("s = jax.vmap(f)(xs)", "vf = jax.vmap(f)\n    s = vf(xs)");
+        let a = analyze(&methods(&named));
+        assert_eq!(find_shape(&a, "r"), Some(&shape(&["b", "4", "3"])));
+        assert_eq!(find_shape(&a, "s"), Some(&shape(&["b", "3", "4"])));
+
+        let map = closures.replace("jax.vmap(f)(xs)", "jax.lax.map(f, xs)");
+        let a = analyze(&methods(&map));
+        assert_eq!(find_shape(&a, "r"), Some(&shape(&["b", "4", "3"])));
+        assert_eq!(find_shape(&a, "s"), Some(&shape(&["b", "3", "4"])));
+
+        let hidden = "def a():\n    def f(v: Float[Array, \"p q\"]) -> Float[Array, \"q p\"]:\n        return v.T\ndef c(xs: Float[Array, \"b 3 4\"]):\n    r = jax.vmap(f)(xs)\n";
+        unknown_in(&methods(hidden), "r");
+    }
+
+    #[test]
+    fn a_vmap_of_a_name_never_reaches_a_method() {
+        let method = "class A:\n    def f(self, v: Float[Array, \"p q\"]) -> Float[Array, \"q p\"]:\n        return v.T\n    def run(self, xs: Float[Array, \"b 3 4\"]):\n        r = jax.vmap(f)(xs)\n";
+        unknown_in(&methods(method), "r");
+        unknown_in(&methods(&method.replace("jax.vmap(f)(xs)", "jax.lax.map(f, xs)")), "r");
+        let shadow = format!("def f(v: Float[Array, \"p q\"]) -> Float[Array, \"p q\"]:\n    return v\n{method}");
+        known_in(&methods(&shadow), "r", &["b", "3", "4"]);
+    }
+
+    #[test]
+    fn a_closure_hides_a_smaller_function_of_the_same_name() {
+        let code = "def f(v):\n    return v\ndef a(x: Float[Array, \"3 4\"]):\n    def f(v):\n        y = v\n        z = y\n        return z.T\n    r = f(x)\n";
+        known_in(&methods(code), "r", &["4", "3"]);
+        let vmapped = "def f(v: Float[Array, \"p q\"]) -> Float[Array, \"p q\"]:\n    return v\ndef a(xs: Float[Array, \"b 3 4\"]):\n    def f(v: Float[Array, \"p q\"]) -> Float[Array, \"q p\"]:\n        y = v\n        z = y\n        return z.T\n    r = jax.vmap(f)(xs)\n";
+        known_in(&methods(vmapped), "r", &["b", "4", "3"]);
+    }
+
+    #[test]
+    fn a_scan_body_never_reaches_a_method_or_a_foreign_closure() {
+        let body = "        def step(c, y):\n            return c, y.T\n";
+        let code = format!("def a():\n{}def run(c0: Float[Array, \"2\"], xs: Float[Array, \"b 3 4\"]):\n    c, ys = jax.lax.scan(step, c0, xs)\n", body.replace("        ", "    "));
+        unknown_in(&methods(&code), "ys");
+        let method = format!("class A:\n{}    def run(self, c0: Float[Array, \"2\"], xs: Float[Array, \"b 3 4\"]):\n        c, ys = jax.lax.scan(step, c0, xs)\n", body.replace("        ", "    "));
+        unknown_in(&methods(&method), "ys");
+    }
+}
+
+#[cfg(test)]
+mod layer_constant_dim_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    const HEAD: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n";
+    const USE_FC: &str = "    def forward(self, x: Float[Array, \"n 8\"], t: Float[Array, \"n 4\"]):\n        y = self.fc(x)\n        z = y + t\n        return self.fc(x) + t\n";
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|d| d.to_string()).collect()
+    }
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let code = format!("{HEAD}{code}");
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), &code, &[], |_: &PathBuf| None, 5, None).unwrap()
+    }
+
+    #[track_caller]
+    fn holds(code: &str, name: &str, dims: &[&str]) {
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), Some(&shape(dims)), "{code}");
+    }
+
+    #[track_caller]
+    fn unknown(code: &str, name: &str) {
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{code}");
+    }
+
+    fn module(before: &str, init: &str, ctor: &str, after: &str) -> String {
+        format!("{before}class M(nn.Module):\n    def __init__(self):\n        super().__init__()\n{init}        self.fc = {ctor}\n{USE_FC}{after}")
+    }
+
+    #[test]
+    fn a_module_constant_is_the_dim_of_a_layer() {
+        holds(&module("OUT = 4\n", "", "nn.Linear(8, OUT)", ""), "y", &["n", "4"]);
+        holds(&module("OUT = 4\nOUT = 4\n", "", "nn.Linear(8, OUT)", ""), "y", &["n", "4"]);
+        holds(&module("OUT = 2\n", "", "nn.Linear(8, OUT * 2)", ""), "y", &["n", "4"]);
+        holds(&module("OUT = 2\n", "", "nn.Linear(8, (OUT + 2) * 3 // 3)", ""), "y", &["n", "4"]);
+        holds(&module("IN = 8\nOUT = 4\n", "", "nn.Linear(in_features=IN, out_features=OUT)", ""), "y", &["n", "4"]);
+        holds(&module("OUT = 4\n", "", "nn.Sequential(nn.Linear(8, OUT), nn.ReLU())", ""), "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_module_level_layer_and_a_local_layer_read_the_constant() {
+        let body = "def f(x: Float[Array, \"n 8\"], t: Float[Array, \"n 4\"]):\n    y = l(x)\n    z = y + t\n";
+        holds(&format!("OUT = 4\nl = nn.Linear(8, OUT)\n{body}"), "y", &["n", "4"]);
+        let local = "def f(x: Float[Array, \"n 8\"], t: Float[Array, \"n 4\"]):\n    d = 4\n    l = nn.Linear(8, d)\n    y = l(x)\n    z = y + t\n";
+        holds(local, "y", &["n", "4"]);
+        let inline = "OUT = 4\ndef f(x: Float[Array, \"n 8\"], t: Float[Array, \"n 4\"]):\n    y = nn.Linear(8, OUT)(x)\n    z = y + t\n";
+        holds(inline, "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_constant_reaches_every_layer_kind_that_takes_dims() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("C = 16\nK = 3\nP = 1\n", "nn.Conv2d(3, C, K, padding=P)", &["1", "16", "32", "32"]),
+            ("C = 16\n", "nn.ConvTranspose2d(3, C, 2, stride=2)", &["1", "16", "64", "64"]),
+            ("K = 2\n", "nn.MaxPool2d(K)", &["1", "3", "16", "16"]),
+            ("S = 7\n", "nn.AdaptiveAvgPool2d(S)", &["1", "3", "7", "7"]),
+            ("D = 1\n", "nn.Flatten(D)", &["1", "3072"]),
+            ("S = 2\n", "nn.Upsample(scale_factor=S)", &["1", "3", "64", "64"]),
+        ];
+        for (before, ctor, want) in cases {
+            let code = format!("{before}class M(nn.Module):\n    def __init__(self):\n        self.layer = {ctor}\n    def forward(self, x: Float[Array, \"1 3 32 32\"]):\n        y = self.layer(x)\n");
+            holds(&code, "y", want);
+        }
+        let embed = "V = 100\nD = 4\nclass M(nn.Module):\n    def __init__(self):\n        self.layer = nn.Embedding(V, D)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.layer(x)\n";
+        holds(embed, "y", &["n", "8", "4"]);
+        let lstm = "H = 4\nclass M(nn.Module):\n    def __init__(self):\n        self.layer = nn.LSTM(8, H)\n    def forward(self, x: Float[Array, \"s n 8\"], t: Float[Array, \"s n 4\"]):\n        y, (h, c) = self.layer(x)\n        z = y + t\n";
+        holds(lstm, "y", &["s", "n", "4"]);
+        let list = "OUT = 4\nclass M(nn.Module):\n    def __init__(self):\n        self.layers = nn.ModuleList([nn.Linear(8, OUT)])\n    def forward(self, x: Float[Array, \"n 8\"], t: Float[Array, \"n 4\"]):\n        y = self.layers[0](x)\n        z = y + t\n";
+        holds(list, "y", &["n", "4"]);
+        let rearrange = "from einops.layers.torch import Rearrange\nP = 2\nclass M(nn.Module):\n    def __init__(self):\n        self.layer = Rearrange(\"b (h p) -> b h p\", p=P)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.layer(x)\n";
+        holds(rearrange, "y", &["n", "4", "2"]);
+    }
+
+    #[test]
+    fn a_constant_finds_a_real_mismatch() {
+        let a = analyze(&module("IN = 16\n", "", "nn.Linear(IN, 4)", ""));
+        assert_eq!(a.errors.len(), 2, "{:?}", a.errors);
+        assert!(a.errors[0].message.contains("expected input last dim 16"), "{:?}", a.errors);
+    }
+
+    #[test]
+    fn a_self_attribute_holds_a_constant() {
+        for (before, init, ctor) in [
+            ("OUT = 4\n", "        self.out = OUT\n", "nn.Linear(8, self.out)"),
+            ("", "        self.out = 4\n", "nn.Linear(8, self.out)"),
+            ("OUT = 2\n", "        self.out = OUT * 2\n", "nn.Linear(8, self.out)"),
+            ("OUT = 2\n", "        self.out = OUT\n", "nn.Linear(8, self.out * 2)"),
+            ("", "        out = 4\n        self.out = out\n", "nn.Linear(8, self.out)"),
+        ] {
+            holds(&module(before, init, ctor, ""), "y", &["n", "4"]);
+        }
+        let class_level = "class M(nn.Module):\n    OUT = 4\n    def __init__(self):\n        self.fc = nn.Linear(8, self.OUT)\n";
+        holds(&format!("{class_level}{USE_FC}"), "y", &["n", "4"]);
+        let base = "OUT = 4\nclass B(nn.Module):\n    def __init__(self):\n        self.out = OUT\nclass M(B):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(8, self.out)\n";
+        holds(&format!("{base}{USE_FC}"), "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn an_attribute_does_not_read_a_global_of_its_own_name() {
+        holds(&module("out = 4\n", "        self.out = 9\n", "nn.Linear(8, self.out)", "").replace("Array, \"n 4\"", "Array, \"n 9\""), "y", &["n", "9"]);
+        let param = "out = 4\nclass M(nn.Module):\n    def __init__(self, out):\n        self.fc = nn.Linear(8, out)\n";
+        let a = analyze(&format!("{param}    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.fc(x)\n"));
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "out"])));
+    }
+
+    #[test]
+    fn an_attribute_with_two_values_is_unknown() {
+        for (init, after) in [
+            ("        self.out = 4\n", "    def reset(self):\n        self.out = 5\n"),
+            ("        self.out = 4\n        self.out += 1\n", ""),
+            ("        self.out = 4\n", "class S(M):\n    def __init__(self):\n        self.out = 5\n"),
+            ("        self.out, self.b = 4, 5\n", ""),
+            ("        self.out = cfg.out\n", ""),
+        ] {
+            unknown(&module("", init, "nn.Linear(8, self.out)", after), "y");
+        }
+        let class_level = "class M(nn.Module):\n    OUT = 4\n    def __init__(self):\n        self.fc = nn.Linear(8, self.OUT)\n";
+        unknown(&format!("{class_level}{USE_FC}class S(M):\n    OUT = 5\n"), "y");
+        unknown(&format!("{}{USE_FC}class S(M):\n    def __init__(self):\n        self.OUT = 5\n", class_level), "y");
+    }
+
+    #[test]
+    fn a_value_the_file_cannot_prove_gives_no_false_error() {
+        for before in [
+            "OUT = 4\nOUT = 5\n",
+            "OUT = compute()\n",
+            "from config import OUT\n",
+            "from config import *\nOUT = 4\n",
+            "OUT = 4\nOUT += 1\n",
+            "OUT = 4\ndef bump():\n    global OUT\n    OUT = 5\n",
+            "class C:\n    OUT = 5\nOUT = 4\n",
+        ] {
+            unknown(&module(before, "", "nn.Linear(8, OUT)", ""), "y");
+        }
+        unknown(&module("", "", "nn.Linear(8, cfg.out)", ""), "y");
+        let lstm = "H = load()\nclass M(nn.Module):\n    def __init__(self):\n        self.layer = nn.LSTM(8, H)\n    def forward(self, x: Float[Array, \"s n 8\"], t: Float[Array, \"s n 4\"]):\n        y, (h, c) = self.layer(x)\n        z = y + t\n";
+        unknown(lstm, "y");
+        unknown(&module("", "", "nn.Linear(8, int(4.0))", ""), "y");
+        unknown(&module("", "        d = load()\n", "nn.Linear(8, d)", ""), "y");
+    }
+
+    #[test]
+    fn a_write_below_the_reader_is_unknown() {
+        unknown(&module("", "", "nn.Linear(8, OUT)", "OUT = 4\n"), "y");
+        unknown(&module("OUT = 4\n", "", "nn.Linear(8, OUT)", "OUT = 4\n"), "y");
+        unknown(&module("OUT = 4\n", "", "nn.Linear(8, OUT)", "OUT = 5\n"), "y");
+    }
+
+    #[test]
+    fn an_unproven_input_dim_keeps_the_output() {
+        holds(&module("IN = load()\n", "", "nn.Linear(IN, 4)", ""), "y", &["n", "4"]);
+        let chain = "H = load()\nclass M(nn.Module):\n    def __init__(self):\n        self.fc = nn.Sequential(nn.Linear(8, H), nn.Linear(H, 4))\n";
+        holds(&format!("{chain}{USE_FC}"), "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_local_or_a_parameter_hides_the_constant() {
+        let param = "OUT = 4\nclass M(nn.Module):\n    def __init__(self, OUT):\n        self.fc = nn.Linear(8, OUT)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.fc(x)\n";
+        assert_eq!(find_shape(&analyze(param), "y"), Some(&shape(&["n", "OUT"])));
+        unknown(&module("OUT = 4\n", "        OUT = load()\n", "nn.Linear(8, OUT)", ""), "y");
+    }
+
+    #[test]
+    fn a_constant_named_like_an_annotation_symbol_stays_a_name() {
+        let code = "D = 64\nclass M(nn.Module):\n    def __init__(self):\n        self.fc = nn.Linear(8, D)\n    def forward(self, x: Float[Array, \"n 8\"], t: Float[Array, \"n D\"]):\n        y = self.fc(x)\n        z = y + t\n";
+        holds(code, "y", &["n", "D"]);
+    }
+}
+
+#[cfg(test)]
+mod import_scope_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    const HEAD: &str = "from jaxtyping import Float, Array\n";
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|d| d.to_string()).collect()
+    }
+
+    fn analyze_in(dir: Option<&std::path::Path>, code: &str) -> LayerShapeAnalysis {
+        let code = format!("{HEAD}{code}");
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        let roots: Vec<PathBuf> = dir.iter().map(|d| d.to_path_buf()).collect();
+        analyze_layer_shapes(tree.root_node(), &code, &roots, |p: &PathBuf| fs::read_to_string(p).ok(), 8, None)
+            .unwrap()
+    }
+
+    #[track_caller]
+    fn holds(code: &str, name: &str, dims: &[&str]) {
+        let a = analyze_in(None, code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), Some(&shape(dims)), "{code}");
+    }
+
+    #[track_caller]
+    fn unknown(code: &str, name: &str) {
+        let a = analyze_in(None, code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{code}");
+    }
+
+    #[test]
+    fn a_function_import_binds_only_in_that_function() {
+        let reader = "def read(k: Float[Array, \"3 4\"]):\n    y = k.reshape(4, 3)\n";
+        for writer in [
+            "def write():\n    import os as k\n    return k.getcwd()\n",
+            "def write():\n    from os import path as k\n    return k\n",
+            "class C:\n    def write(self):\n        import os as k\n",
+            "class C:\n    import os as k\n",
+        ] {
+            holds(&format!("{writer}{reader}"), "y", &["4", "3"]);
+            holds(&format!("{reader}{writer}"), "y", &["4", "3"]);
+        }
+    }
+
+    #[test]
+    fn a_function_import_reaches_its_nested_scopes() {
+        holds("def f():\n    import numpy as q\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        holds("def f():\n    y = q.zeros((2, 3))\n    import numpy as q\n", "y", &["2", "3"]);
+        holds("def f():\n    import numpy as q\n    def g():\n        y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        holds("def f():\n    import numpy as q\n    class C:\n        def m(self):\n            y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        holds("def f():\n    if a:\n        import numpy as q\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        unknown("def f():\n    import numpy as q\ndef g():\n    y = q.zeros((2, 3))\n", "y");
+    }
+
+    #[test]
+    fn a_class_import_binds_only_in_the_class_body() {
+        holds("class C:\n    import numpy as q\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        unknown("class C:\n    import numpy as q\n    def m(self):\n        y = q.zeros((2, 3))\n", "y");
+        unknown("class C:\n    import numpy as q\n    f = lambda self: q.zeros((2, 3)) + (y := q.zeros((2, 3)))\n", "y");
+        unknown("class C:\n    import numpy as q\n    class D:\n        y = q.zeros((2, 3))\n", "y");
+        holds("import numpy as q\nclass C:\n    import os as q\n    def m(self):\n        y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        holds("import os as q\ndef f():\n    import numpy as q\n    class C:\n        import os as q\n        def m(self):\n            y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+    }
+
+    #[test]
+    fn a_nested_import_wins_over_the_module_import() {
+        holds("import os as q\ndef f():\n    import numpy as q\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+        unknown("import numpy as q\ndef f():\n    import os as q\n    y = q.zeros((2, 3))\n", "y");
+        holds("import numpy as q\ndef f():\n    import os as q\ndef g():\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+    }
+
+    #[test]
+    fn a_global_import_in_a_function_binds_for_the_file() {
+        let code = "def setup():\n    global q\n    import numpy as q\ndef f():\n    y = q.zeros((2, 3))\n";
+        holds(code, "y", &["2", "3"]);
+        holds("import numpy as q\ndef f():\n    global q\n    q = load()\n    y = q.zeros((2, 3))\n", "y", &["2", "3"]);
+    }
+
+    #[test]
+    fn a_name_that_a_scope_binds_hides_the_import() {
+        for (head, rhs) in [("import numpy as np", "np.zeros((2, 3))"), ("import torch", "torch.zeros(2, 3)")] {
+            let name = rhs.split('.').next().unwrap();
+            for body in [
+                format!("def f({name}):\n    y = {rhs}\n"),
+                format!("def f(*{name}):\n    y = {rhs}\n"),
+                format!("def f(**{name}):\n    y = {rhs}\n"),
+                format!("def f(a, {name}=None):\n    y = {rhs}\n"),
+                format!("def f({name}: int):\n    y = {rhs}\n"),
+                format!("def f({name}: int = 3):\n    y = {rhs}\n"),
+                format!("def f():\n    {name} = load()\n    y = {rhs}\n"),
+                format!("def f():\n    y = {rhs}\n    {name} = load()\n"),
+                format!("def f():\n    for {name} in xs:\n        y = {rhs}\n"),
+                format!("def f():\n    with a as {name}:\n        y = {rhs}\n"),
+                format!("def f():\n    def {name}():\n        pass\n    y = {rhs}\n"),
+                format!("def f():\n    class {name}:\n        pass\n    y = {rhs}\n"),
+                format!("def f({name}):\n    def g():\n        y = {rhs}\n"),
+                format!("def f({name}):\n    import os\n    y = {rhs}\n"),
+                format!("def f():\n    import numpy as {name}\n    {name} = load()\n    y = {rhs}\n"),
+                format!("class C:\n    {name} = load()\n    y = {rhs}\n"),
+            ] {
+                unknown(&format!("{head}\n{body}"), "y");
+                unknown(&body, "y");
+            }
+            holds(
+                &format!("{head}\ndef f({name}):\n    pass\ndef g():\n    y = {rhs}\n"),
+                "y",
+                &["2", "3"],
+            );
+            holds(
+                &format!("{head}\nclass C:\n    {name} = load()\n    def m(self):\n        y = {rhs}\n"),
+                "y",
+                &["2", "3"],
+            );
+        }
+    }
+
+    #[test]
+    fn a_lambda_or_a_comprehension_hides_the_import_inside_itself() {
+        let head = "import numpy as np\n";
+        unknown(&format!("{head}def f(xs):\n    y = [np.zeros((2, 3)) for np in xs]\n    z = sum(y)\n"), "z");
+        let code = format!("{head}def f(xs):\n    g = lambda np: (y := np.zeros((2, 3)))\n");
+        unknown(&code, "y");
+        let code = format!("{head}def f(xs):\n    a = [np for np in xs]\n    y = np.zeros((2, 3))\n");
+        holds(&code, "y", &["2", "3"]);
+        let code = format!("{head}def f(xs, g=lambda np: np):\n    y = np.zeros((2, 3))\n");
+        holds(&code, "y", &["2", "3"]);
+    }
+
+    #[test]
+    fn a_default_value_reads_the_scope_around_the_function() {
+        let code = "import numpy as np\ndef f(np=np.pi, a=[np for np in xs]):\n    return np\ng = lambda np=np.e: np\n";
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let imports = ImportScopes::new(tree.root_node(), code).unwrap();
+        let hidden = |at: &str| !is_imported(imports.at(code.find(at).unwrap()), "np");
+        assert!(!hidden("np.pi"));
+        assert!(hidden("np for np"));
+        assert!(hidden("np\ng"));
+        assert!(!hidden("np.e"));
+    }
+
+    #[test]
+    fn a_parameter_is_read_as_the_array_it_holds() {
+        let code = "import numpy as x\ndef f(x: Float[Array, \"3 4\"]):\n    y = x.reshape(4, 3)\n    z = x.T\n    w = x.sum(0).reshape(2, 2)\n";
+        holds(code, "y", &["4", "3"]);
+        let code = "from torch import nn\ndef f(x: Float[Array, \"n 8\"]):\n    fc = nn.Linear(8, 4)\n    y = fc(x)\ndef g(nn, x: Float[Array, \"n 8\"]):\n    fc = nn.Linear(8, 4)\n    z = fc(x)\n";
+        let a = analyze_in(None, code);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&a, "z"), None);
+    }
+
+    #[test]
+    fn a_layer_from_a_function_import_keeps_its_shape() {
+        let code = "def f(x: Float[Array, \"n 8\"]):\n    from torch import nn\n    fc = nn.Linear(8, 4)\n    y = fc(x)\n    z = nn.Linear(8, 5)(x)\n";
+        let a = analyze_in(None, code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&a, "z"), Some(&shape(&["n", "5"])));
+        let code = "def f():\n    from torch import nn\ndef g(x: Float[Array, \"n 8\"]):\n    fc = nn.Linear(8, 4)\n    y = fc(x)\n";
+        assert_eq!(find_shape(&analyze_in(None, code), "y"), None);
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_module_is_not_the_module() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("blocks.py"),
+            "import torch.nn as nn\nclass Block(nn.Module):\n    def __init__(self, a, b):\n        super().__init__()\n        self.fc = nn.Linear(a, b)\n    def forward(self, x):\n        return self.fc(x)\n",
+        )
+        .unwrap();
+        let root = Some(dir.path());
+        let imported = "import torch.nn as nn\nimport blocks\n";
+        let code = format!("{imported}def f(x: Float[Array, \"n 8\"]):\n    y = blocks.Block(8, 4)(x)\n");
+        assert_eq!(find_shape(&analyze_in(root, &code), "y"), Some(&shape(&["n", "4"])));
+        for body in [
+            "def f(blocks, x: Float[Array, \"n 8\"]):\n    y = blocks.Block(8, 4)(x)\n",
+            "def f(x: Float[Array, \"n 8\"]):\n    blocks = load()\n    y = blocks.Block(8, 4)(x)\n",
+            "def f(blocks, x: Float[Array, \"n 8\"]):\n    m = blocks.Block(8, 4)\n    y = m(x)\n",
+            "class M(nn.Module):\n    def __init__(self, blocks):\n        super().__init__()\n        self.m = blocks.Block(8, 4)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.m(x)\n",
+        ] {
+            let a = analyze_in(root, &format!("{imported}{body}"));
+            assert_eq!(find_shape(&a, "y"), None, "{body}");
+            assert!(a.errors.is_empty(), "{:?}\n{body}", a.errors);
+        }
+        let code = "import torch.nn as nn\ndef f(x: Float[Array, \"n 8\"]):\n    import blocks\n    y = blocks.Block(8, 4)(x)\n";
+        assert_eq!(find_shape(&analyze_in(root, code), "y"), Some(&shape(&["n", "4"])));
+    }
+
+    #[test]
+    fn a_function_import_still_names_the_backend_of_the_file() {
+        let body = "def f(x: Float[Array, \"3 4\"]):\n    y = x.max(0)\n";
+        let numpy = format!("def g():\n    import numpy\n{body}");
+        assert_eq!(find_shape(&analyze_in(None, &numpy), "y"), Some(&shape(&["4"])));
+        assert_eq!(find_shape(&analyze_in(None, &format!("import numpy\n{body}")), "y"), Some(&shape(&["4"])));
+        assert_eq!(find_shape(&analyze_in(None, &format!("def g():\n    import torch\n{body}")), "y"), None);
+    }
+}
+
+#[cfg(test)]
+mod binding_review_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    const HEAD: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n";
+
+    fn analyze_in(dir: Option<&std::path::Path>, code: &str) -> LayerShapeAnalysis {
+        let code = format!("{HEAD}{code}");
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        let roots: Vec<PathBuf> = dir.iter().map(|d| d.to_path_buf()).collect();
+        analyze_layer_shapes(tree.root_node(), &code, &roots, |p: &PathBuf| fs::read_to_string(p).ok(), 8, None)
+            .unwrap()
+    }
+
+    #[track_caller]
+    fn check(dir: Option<&std::path::Path>, code: &str, name: &str, dims: Option<&[&str]>) {
+        let a = analyze_in(dir, code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        let want: Option<Vec<String>> = dims.map(|d| d.iter().map(|d| d.to_string()).collect());
+        assert_eq!(find_shape(&a, name), want.as_ref(), "{code}");
+    }
+
+    #[track_caller]
+    fn holds(code: &str, name: &str, dims: &[&str]) {
+        check(None, code, name, Some(dims));
+    }
+
+    #[track_caller]
+    fn unknown(code: &str, name: &str) {
+        check(None, code, name, None);
+    }
+
+    #[test]
+    fn the_last_function_import_of_a_name_wins() {
+        unknown("def f():\n    import numpy as k\n    import os as k\n    a = k.zeros((2, 3))\n", "a");
+        holds("def f():\n    import os as k\n    import numpy as k\n    a = k.zeros((2, 3))\n", "a", &["2", "3"]);
+        unknown("def f():\n    from numpy import zeros as z\n    from os import path as z\n    a = z((2, 3))\n", "a");
+        holds("def f():\n    from os import path as z\n    from numpy import zeros as z\n    a = z((2, 3))\n", "a", &["2", "3"]);
+        unknown("def f(c):\n    import numpy as k\n    if c:\n        import os as k\n    a = k.zeros((2, 3))\n", "a");
+    }
+
+    #[test]
+    fn a_nested_global_reads_the_module_import() {
+        let nested = "def f():\n    import numpy as k\n    def g():\n        global k\n        a = k.zeros((2, 3))\n";
+        unknown(&format!("import os as k\n{nested}"), "a");
+        unknown(nested, "a");
+        holds("import numpy as k\ndef f():\n    import os as k\n    def g():\n        global k\n        a = k.zeros((2, 3))\n", "a", &["2", "3"]);
+        let inner = "import numpy as k\ndef f():\n    import os as k\n    def g():\n        global k\n        def h():\n            a = k.zeros((2, 3))\n";
+        holds(inner, "a", &["2", "3"]);
+    }
+
+    fn class_attr(body: &str) -> String {
+        format!("class M(nn.Module):\n{body}    def __init__(self):\n        self.l = nn.Linear(8, self.h)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.l(x)\n")
+    }
+
+    #[test]
+    fn every_write_in_a_class_body_counts() {
+        holds(&class_attr("    h = 4\n"), "y", &["n", "4"]);
+        holds(&class_attr("    h = 4\n    if FLAG:\n        h = 4\n"), "y", &["n", "4"]);
+        for body in [
+            "    h = 4\n    h += 4\n",
+            "    h = 4\n    if FLAG:\n        h = 8\n",
+            "    h = 4\n    h, w = 8, 9\n",
+            "    h = 4\n    for h in (8, 16):\n        pass\n",
+            "    h = 4\n    with a() as h:\n        pass\n",
+            "    h = 4\n    del h\n",
+        ] {
+            unknown(&class_attr(body), "y");
+        }
+    }
+
+    #[test]
+    fn a_for_or_with_target_writes_the_attribute() {
+        let attr = |write: &str| format!("class M(nn.Module):\n    def __init__(self):\n        self.h = 4\n{write}        self.l = nn.Linear(8, self.h)\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.l(x)\n");
+        holds(&attr(""), "y", &["n", "4"]);
+        for write in [
+            "        for self.h in (8, 9):\n            pass\n",
+            "        for self.h, w in pairs:\n            pass\n",
+            "        with a() as self.h:\n            pass\n",
+            "        with a() as (self.h, w):\n            pass\n",
+        ] {
+            unknown(&attr(write), "y");
+        }
+        let method = "class B:\n    def helper(self, x):\n        return x.T\n    def s(self):\n        WRITE\n    def go(self, x: Float[Array, \"3 4\"]):\n        y = self.helper(x)\n";
+        holds(&method.replace("WRITE", "pass"), "y", &["4", "3"]);
+        unknown(&method.replace("WRITE", "for self.helper in others:\n            pass"), "y");
+        unknown(&method.replace("WRITE", "with a() as self.helper:\n            pass"), "y");
+    }
+
+    #[test]
+    fn a_conditional_dim_stays_unknown() {
+        let code = |before: &str, dim: &str| format!("{before}class M(nn.Module):\n    def __init__(self, big, d):\n        self.l = nn.Linear(8, {dim})\n    def forward(self, x: Float[Array, \"n 8\"], z: Float[Array, \"n 4\"]):\n        y = self.l(x)\n        w = y + z\n");
+        unknown(&code("OUT = 4\n", "OUT if big else 8"), "y");
+        unknown(&code("", "d if big else 8"), "y");
+        unknown(&code("", "big or 4"), "y");
+        unknown(&code("", "not big"), "y");
+    }
+
+    const P: &str = "class P(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.l = nn.Linear(8, d)\n    def forward(self, x):\n        return self.l(x)\n";
+    const INPUTS: &str = "x: Float[Array, \"n 8\"], z: Float[Array, \"n 4\"]";
+
+    fn constructor_cases(head: &str) -> Vec<(String, Option<Vec<&'static str>>)> {
+        let call = |constant: &str, body: &str| format!("{head}{constant}def f({INPUTS}):\n{body}");
+        let held = |constant: &str, arg: &str| format!("{head}{constant}class H(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.p = P({arg})\n    def forward(self, {INPUTS}):\n        y = self.p(x)\n        w = y + z\n");
+        let four = || Some(vec!["n", "4"]);
+        let use_y = "    y = P(OUT)(x)\n    w = y + z\n";
+        vec![
+            (call("OUT = 4\n", use_y), four()),
+            (call("OUT = 2\n", "    y = P(OUT * 2)(x)\n    w = y + z\n"), four()),
+            (call("", "    d = 4\n    y = P(d)(x)\n    w = y + z\n"), four()),
+            (call("OUT = 4\n", "    y = P(d=OUT)(x)\n    w = y + z\n"), four()),
+            (held("OUT = 4\n", "OUT"), four()),
+            (call("OUT = load()\n", use_y), None),
+            (call("OUT = 4\nOUT = 8\n", use_y), None),
+            (call("", "    d = load()\n    y = P(d)(x)\n    w = y + z\n"), None),
+            (held("OUT = load()\n", "OUT"), None),
+        ]
+    }
+
+    #[test]
+    fn a_constructor_argument_gives_its_value() {
+        for (code, want) in constructor_cases(P) {
+            check(None, &code, "y", want.as_deref());
+        }
+        let param = format!("{P}def f(d, x: Float[Array, \"n 8\"]):\n    y = P(d)(x)\n");
+        holds(&param, "y", &["n", "d"]);
+    }
+
+    #[test]
+    fn a_constructor_argument_gives_its_value_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("blocks.py"), format!("{HEAD}{P}")).unwrap();
+        for (code, want) in constructor_cases("from blocks import P\n") {
+            check(Some(dir.path()), &code, "y", want.as_deref());
+        }
+        let param = "from blocks import P\ndef f(d, x: Float[Array, \"n 8\"]):\n    y = P(d)(x)\n";
+        check(Some(dir.path()), param, "y", Some(&["n", "d"]));
+    }
+
+    #[test]
+    fn an_unproven_argument_keeps_an_output_that_does_not_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = "class Q(nn.Module):\n    def __init__(self, act):\n        super().__init__()\n        self.act = act\n        self.l = nn.Linear(8, 4)\n    def forward(self, x):\n        return self.l(x)\n";
+        fs::write(dir.path().join("blocks.py"), format!("{HEAD}{fixed}")).unwrap();
+        let code = |head: &str| format!("{head}ACT = load()\ndef f({INPUTS}):\n    y = Q(ACT)(x)\n");
+        check(None, &code(fixed), "y", Some(&["n", "4"]));
+        check(Some(dir.path()), &code("from blocks import Q\n"), "y", Some(&["n", "4"]));
+    }
+
+    const CLASSES: &str = "class A:\n    def helper(self, x):\n        return x.T\nclass O:\n    def helper(self, x):\n        return x\n";
+
+    fn receiver(body: &str, params: &str) -> String {
+        format!("{CLASSES}class B(A):\n    def go(self, x: Float[Array, \"3 4\"]{params}):\n{body}")
+    }
+
+    #[test]
+    fn a_rebound_receiver_is_not_the_receiver() {
+        holds(&receiver("        self.other = O()\n        y = self.helper(x)\n", ""), "y", &["4", "3"]);
+        for body in [
+            "        self = O()\n        y = self.helper(x)\n",
+            "        if o:\n            self = o\n        y = self.helper(x)\n",
+            "        for self in os:\n            pass\n        y = self.helper(x)\n",
+            "        with os as self:\n            pass\n        y = self.helper(x)\n",
+            "        (self := O())\n        y = self.helper(x)\n",
+            "        self = O()\n        def inner():\n            return self.helper(x)\n        y = inner()\n",
+            "        def inner():\n            nonlocal self\n            self = O()\n        inner()\n        y = self.helper(x)\n",
+            "        y = [self.helper(x) for self in os][0]\n",
+        ] {
+            unknown(&receiver(body, ""), "y");
+        }
+    }
+
+    #[test]
+    fn a_rebound_super_is_not_the_builtin() {
+        let own = "class B(A):\n    def helper(self, x):\n        return x\n    def go(self, x: Float[Array, \"3 4\"]SUPER):\n        BODY\n";
+        let code = |params: &str, body: &str| format!("{CLASSES}{}", own.replace("SUPER", params).replace("BODY", body));
+        holds(&code("", "y = super().helper(x)"), "y", &["4", "3"]);
+        unknown(&code(", super=None", "y = super().helper(x)"), "y");
+        unknown(&code("", "super = make\n        y = super().helper(x)"), "y");
+        unknown(&format!("super = make\n{}", code("", "y = super().helper(x)")), "y");
+        unknown(&code("", "self = O()\n        y = super().helper(x)"), "y");
+    }
+
+    #[test]
+    fn a_rebound_base_name_is_not_the_class() {
+        let parent = "class P:\n    def helper(self, x):\n        return x.T\n";
+        let child = "class B(P):\n    def go(self, x: Float[Array, \"3 4\"]):\n        y = self.helper(x)\n";
+        holds(&format!("{parent}{child}"), "y", &["4", "3"]);
+        for rebinding in [
+            "P = other\n",
+            "from e import P\n",
+            "if c:\n    P = other\n",
+            "for P in others:\n    pass\n",
+            "def P():\n    pass\n",
+        ] {
+            unknown(&format!("{parent}{rebinding}{child}"), "y");
+        }
     }
 }

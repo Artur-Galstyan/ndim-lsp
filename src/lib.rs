@@ -1,4 +1,5 @@
 mod analysis;
+mod imports;
 mod incremental;
 mod known_functions;
 mod layers;
@@ -16,6 +17,7 @@ mod integration_tests;
 mod jax_compat_tests;
 
 pub use analysis::*;
+pub use imports::*;
 pub use incremental::*;
 pub use known_functions::*;
 pub use layers::*;
