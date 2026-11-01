@@ -549,6 +549,15 @@ Done since the catalog pass (analysis behavior, not catalog rows): tuple-literal
 
 Still open: tuple unpacking of user-defined helper tuple returns, and heterogeneous tuple carries. Also open from the work above:
 
+- A slice of a symbolic axis has a form (`n-1`, `min(4, n)`, `ceil(n/2)`) and an unproven bound gives an axis of size `?`, but three cases stay open: a bound that is a name (`x[:, k:]`) is `?`, not `n-k`; `[-a:b]` and a negative step with bounds are `?`; and a method on an inline subscript (`x[:, :4].sum(1)`) stays unknown, so bind the slice to a name first.
+- A chain on a `ceil` form with a lower bound (`x[::2][1:]`) is `?`, not `ceil(n/2)-1`.
+- A sum, a product, or a flatten of `_` or `*b` keeps the text (`_+_`, `_*m`). The dim conflicts with nothing. A rank with `*b` in a broadcast is not proven.
+- A rule other than `concatenate` and `stack` still counts `*b` as one axis in its output: `x.sum(axis=0)` on `*b n` drops `*b`. Only the false errors are closed. These outputs should become unknown when the axis crosses the variadic dim.
+- `ShapeCtx::report` also drops a true error of a known function on a value with a variadic dim, for example a last-axis mismatch in `jnp.matmul(x, w)` on `... n m`. A rule that aligns from the right could keep the error. The operator `x @ w`, the layers, `concatenate`, and `stack` keep it (`variadic_join_conflict`). The check of `concatenate` and `stack` reads the shape that a rule above gives, so a rule that counts `*b` as one axis can give it a wrong shape.
+- Each statement has its own limit of steps, so a file of many hostile statements stays linear in its statements with a large factor: 800 calls of a wide callee in a 21 KB file take about 8 s in a release build.
+- Sums repeat the text (`n+n+n+n`). Folding to `4*n` would make the limit of 256 bytes arrive later.
+- A file with a tree deeper than 1,000 levels has no analysis at all. Imported files go through `resolve_imported_function_shape` without this check.
+- A shape argument without spaces, such as `shp*2` or `a+b` on names of tuples, stays one dim, the same as a plain name. The text cannot show the difference from a real dim `n*2`.
 - A global or constant below its reader (source order) stays unknown, also in a layer dim. A shape assigned in a global by several writes stays unknown.
 - A comprehension or lambda stored in a name (`ys = [f(x) for x in xs]`, `f = lambda ...`) is not evaluated, nor are set and dict comprehensions, filters or several `for` clauses in `stack`, symbolic lengths, generators, and tuple results of a lambda (`vmap`, `lax.map`, `lax.scan` with a tuple carry).
 - `self.layers.append(...)` in a loop makes the field unknown. Modules in local variables, `zip`, `reversed`, slices, and `nn.ModuleDict` stay unknown.

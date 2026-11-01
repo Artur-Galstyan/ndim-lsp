@@ -15,6 +15,8 @@
 //! - itself, when an annotation uses it as a dim and the file does not bind it:
 //!   the name is a claim.
 //! - `UNPROVEN_DIM` otherwise. The output of the layer stays unknown.
+//!
+//! A slice writes its size in the same way (`ShapeCtx::slice_size`).
 
 use tree_sitter::Node;
 
@@ -26,8 +28,8 @@ use super::{
 use crate::layers::{PADDING_NAME, UNPROVEN_DIM, map_layer_dims};
 use crate::python_ast::dim_symbols;
 use crate::types::{
-    CallArgument, FREE_DIM, LITERAL_DIM, LayerKind, dims_canonically_equal, fold_integers, is_free_dim,
-    literal_dim,
+    CallArgument, FREE_DIM, LITERAL_DIM, LayerKind, MAX_DIM_TEXT, UNKNOWN_DIM, dims_canonically_equal, factor_text,
+    fold_integers, is_free_dim, is_named_size, literal_dim, min_form, offset_dim,
 };
 
 enum Value {
@@ -87,20 +89,30 @@ impl ShapeCtx<'_> {
     }
 
     /// The size of `[start:stop:step]` on an axis of size `axis`. An integer
-    /// axis with proven bounds gives the size of Python. `None` when the size
-    /// depends on a value that is not known: `[:2]` on `n` is `min(2, n)`.
+    /// axis with proven bounds gives the size of Python, and a symbolic axis
+    /// gives `symbolic_slice_len`. A bound that is not proven gives
+    /// `UNKNOWN_DIM`: the axis stays. `None` for a step of 0, which Python
+    /// refuses.
     pub(super) fn slice_size(
         &self,
         [start, stop, step]: [&str; 3],
         axis: &str,
         byte: usize,
     ) -> Option<String> {
-        let step = self.slice_bound(step, byte)?.unwrap_or(1);
-        let start = self.slice_bound(start, byte)?;
-        if step == 1 && start.unwrap_or(0) == 0 && self.stop_is_axis(stop, axis, byte) {
-            return Some(axis.to_string());
-        }
-        let stop = self.slice_bound(stop, byte)?;
+        let unknown = || Some(UNKNOWN_DIM.to_string());
+        let (Some(step), Some(start)) = (self.slice_bound(step, byte), self.slice_bound(start, byte))
+        else {
+            return unknown();
+        };
+        let step = step.unwrap_or(1);
+        let stop = if step > 0 && self.stop_is_axis(stop, axis, byte) {
+            None
+        } else {
+            match self.slice_bound(stop, byte) {
+                Some(stop) => stop,
+                None => return unknown(),
+            }
+        };
         let whole = stop.is_none()
             && match step {
                 1 => start.unwrap_or(0) == 0,
@@ -113,15 +125,18 @@ impl ShapeCtx<'_> {
         if step == 0 {
             return None;
         }
-        let axis = literal_dim(axis).unwrap_or(axis).parse().ok()?;
-        Some(python_slice_len(start, stop, step, axis).to_string())
+        match literal_dim(axis).unwrap_or(axis).parse() {
+            Ok(axis) => Some(python_slice_len(start, stop, step, axis).to_string()),
+            Err(_) => symbolic_slice_len(start, stop, step, axis).or_else(unknown),
+        }
     }
 
     /// Whether the value of `stop` is the size of `axis`: an integer, or a name
     /// that is an annotation symbol and that no scope binds. An attribute that
-    /// holds a parameter stands for the name of the parameter.
+    /// holds a parameter stands for the name of the parameter, when no other
+    /// write reaches the attribute.
     fn stop_is_axis(&self, stop: &str, axis: &str, byte: usize) -> bool {
-        if stop.is_empty() {
+        if stop.is_empty() || self.dim_at(stop, byte).contains(UNPROVEN_DIM) {
             return false;
         }
         let written = self.dim_at(&normalize_dim(stop, self.aliases, self.hierarchy, byte), byte);
@@ -170,6 +185,9 @@ impl ShapeCtx<'_> {
         let mut replaced = false;
         let mut i = 0;
         while i < dim.len() {
+            if written.len() > MAX_DIM_TEXT {
+                return UNKNOWN_DIM.to_string();
+            }
             if matches!(bytes[i], b'"' | b'\'') {
                 let literal = i == 0 && bytes.last() == Some(&bytes[0]);
                 return if literal { dim.to_string() } else { UNPROVEN_DIM.to_string() };
@@ -188,7 +206,8 @@ impl ShapeCtx<'_> {
                 written.push_str(word);
                 continue;
             }
-            if KEYWORDS.contains(&word) || dim[i..].trim_start().starts_with('(') {
+            let call = dim[i..].trim_start().starts_with('(') && !word.starts_with(FREE_DIM);
+            if KEYWORDS.contains(&word) || call {
                 return UNPROVEN_DIM.to_string();
             }
             match self.word_value(word, at) {
@@ -431,6 +450,80 @@ fn literal_value(name: &str, value: String, symbol: bool) -> Value {
     }
 }
 
+/// The size of `[start:stop:step]` on the symbolic axis `n`. `step` is not 0.
+/// A positive step `k` gives `ceil(s/k)` with the size `s` of `[start:stop]`. A
+/// negative step gives a form only without bounds. `None` when no form exists,
+/// which is also the result for an axis that `is_named_size` refuses.
+fn symbolic_slice_len(start: Option<i64>, stop: Option<i64>, step: i64, n: &str) -> Option<String> {
+    if !is_named_size(n) || (step < 0 && (start.is_some() || stop.is_some())) {
+        return None;
+    }
+    let size = form_slice_len(start, stop, n)?;
+    if step.abs() == 1 || size == "0" {
+        return Some(size);
+    }
+    Some(format!("{FREE_DIM}ceil({}/{})", factor_text(&size), step.checked_abs()?))
+}
+
+/// The size of `[start:stop]` on the axis `n`. A slice of `min(l, e)` is the
+/// same as a slice of `e` with the limit `l` in its bounds, so that `[5:]` on
+/// `min(4, n)` is 0. A form with `ceil` or another `min` is not below 0 and can
+/// have a `min` with an integer. Any other size assumes more than its text
+/// proves, so `None`.
+fn form_slice_len(start: Option<i64>, stop: Option<i64>, n: &str) -> Option<String> {
+    let first = start.unwrap_or(0);
+    if let Some((limit, size)) = min_form(n) {
+        if start.is_none() && stop.is_none() {
+            return Some(n.to_string());
+        }
+        let (start, stop) = match stop {
+            None if first >= 0 => (first, limit),
+            Some(stop) if first >= 0 && stop >= 0 => (first, stop.min(limit)),
+            Some(stop) if first >= 0 => (first.checked_sub(stop)?, limit),
+            None => (0, first.checked_neg()?.min(limit)),
+            Some(stop) if stop < 0 => (stop.checked_neg()?, first.checked_neg()?.min(limit)),
+            Some(_) => return None,
+        };
+        return unit_slice_len((start != 0).then_some(start), Some(stop), size);
+    }
+    if n.contains("min(") || n.contains("ceil(") {
+        let fits = match stop {
+            None => first <= 0,
+            Some(stop) => first == 0 && stop >= 0 || (first < 0) == (stop < 0) && stop <= first,
+        };
+        if !fits {
+            return None;
+        }
+    }
+    unit_slice_len(start, stop, n)
+}
+
+/// The size of `[start:stop]` on the symbolic axis `n`, for `a`, `b` > 0:
+///
+/// - `[a:]` is `n-a`, `[:-b]` is `n-b`, and `[a:-b]` is `n-a-b`. These forms
+///   assume that the axis has no less than that many items, as a shorter axis
+///   gives 0.
+/// - `[:b]` and `[-b:]` are `min(b, n)` for every `n`.
+/// - `[a:b]` is `min(b-a, n-a)` and `[-a:-b]` is `min(a-b, n-b)`, with the same
+///   assumption for `n-a` and `n-b`. A range with no items is 0.
+/// - `[-a:b]` depends on `n` in a way no form here gives: `None`.
+///
+/// A `min` form has the `FREE_DIM` mark, so it conflicts with nothing.
+fn unit_slice_len(start: Option<i64>, stop: Option<i64>, n: &str) -> Option<String> {
+    let min = |limit: i64, axis: &str| format!("{FREE_DIM}min({limit}, {axis})");
+    let start = start.unwrap_or(0);
+    Some(match stop {
+        None if start >= 0 => offset_dim(n, start)?,
+        None => min(start.checked_neg()?, n),
+        Some(stop) if start >= 0 && stop < 0 => offset_dim(n, start.checked_sub(stop)?)?,
+        Some(stop) if start < 0 && stop >= 0 => return None,
+        Some(stop) if stop <= start => "0".to_string(),
+        Some(stop) if start > 0 => min(stop.checked_sub(start)?, &offset_dim(n, start)?),
+        Some(stop) if stop < 0 => min(stop.checked_sub(start)?, &offset_dim(n, stop.checked_neg()?)?),
+        Some(stop) => min(stop, n),
+    })
+}
+
 /// The number of items of `range(n)[start:stop:step]`. `step` is not 0.
 fn python_slice_len(start: Option<i64>, stop: Option<i64>, step: i64, n: i64) -> i64 {
     let (n, step) = (i128::from(n), i128::from(step));
@@ -448,4 +541,108 @@ fn python_slice_len(start: Option<i64>, stop: Option<i64>, step: i64, n: i64) ->
     };
     let span = if step > 0 { last - first } else { first - last };
     if span <= 0 { 0 } else { ((span - 1) / step.abs() + 1) as i64 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value of a slice form at `n`, with `ceil` and `min` as in Python.
+    fn value(form: &str, n: i64) -> i64 {
+        let form = form.replace(FREE_DIM, "").replace(' ', "").replace("min", "M").replace('n', &n.to_string());
+        fn eval(form: &str) -> i64 {
+            if let Some(inner) = form.strip_prefix("ceil(").and_then(|f| f.strip_suffix(')')) {
+                let (size, step) = inner.rsplit_once('/').unwrap();
+                return (eval(size) as f64 / step.parse::<f64>().unwrap()).ceil() as i64;
+            }
+            if let Some(inner) = form.strip_prefix("M(").and_then(|f| f.strip_suffix(')')) {
+                let (left, right) = inner.split_once(',').unwrap();
+                return eval(left).min(eval(right));
+            }
+            fold_integers(form).unwrap()
+        }
+        eval(&form)
+    }
+
+    #[test]
+    fn every_slice_form_equals_python_on_an_axis_that_is_big_enough() {
+        let bounds = [None, Some(0), Some(1), Some(2), Some(5), Some(-1), Some(-2), Some(-5)];
+        let mut forms = 0;
+        for start in bounds {
+            for stop in bounds {
+                for step in [1, 2, 3, -1, -2] {
+                    let Some(form) = symbolic_slice_len(start, stop, step, "n") else {
+                        continue;
+                    };
+                    forms += 1;
+                    let assumed = start.unwrap_or(0).abs() + stop.unwrap_or(0).abs();
+                    for n in assumed..assumed + 12 {
+                        let label = format!("{start:?} {stop:?} {step} {form} n={n}");
+                        assert_eq!(value(&form, n), python_slice_len(start, stop, step, n), "{label}");
+                    }
+                }
+            }
+        }
+        assert!(forms > 60, "{forms}");
+    }
+
+    #[test]
+    fn a_slice_of_a_limited_axis_equals_python() {
+        let bounds = [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(7), Some(-1), Some(-2), Some(-3), Some(-4), Some(-7)];
+        for (base, take) in [("__free_min(4, n)", 4), ("__free_min(1, n)", 1)] {
+            for start in bounds {
+                for stop in bounds {
+                    for step in [1, 2, 3, -1, -2] {
+                        let Some(form) = symbolic_slice_len(start, stop, step, base) else {
+                            continue;
+                        };
+                        let assumed = start.unwrap_or(0).abs() + stop.unwrap_or(0).abs();
+                        for n in assumed..assumed + 12 {
+                            let size = python_slice_len(None, Some(take), 1, n);
+                            let label = format!("{base} {start:?} {stop:?} {step} {form} n={n}");
+                            assert_eq!(value(&form, n), python_slice_len(start, stop, step, size), "{label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_slice_of_a_ceil_axis_equals_python_at_every_size() {
+        let bounds = [None, Some(0), Some(1), Some(2), Some(5), Some(-1), Some(-2), Some(-5)];
+        for start in bounds {
+            for stop in bounds {
+                for step in [1, 2, -1] {
+                    let base = "__free_ceil(n/2)";
+                    let Some(form) = symbolic_slice_len(start, stop, step, base) else {
+                        continue;
+                    };
+                    for n in 0..24 {
+                        let size = python_slice_len(None, None, 2, n);
+                        let label = format!("{start:?} {stop:?} {step} {form} n={n}");
+                        assert_eq!(value(&form, n), python_slice_len(start, stop, step, size), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_min_form_needs_no_assumption() {
+        for n in 0..12 {
+            for (form, start, stop) in
+                [("__free_min(4, n)", None, Some(4)), ("__free_min(4, n)", Some(-4), None)]
+            {
+                assert_eq!(value(form, n), python_slice_len(start, stop, 1, n), "{form} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_form_never_overflows() {
+        for (start, stop) in [(Some(i64::MIN), None), (Some(i64::MAX), Some(i64::MIN))] {
+            assert_eq!(unit_slice_len(start, stop, "n"), None);
+        }
+    }
 }

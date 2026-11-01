@@ -1949,8 +1949,8 @@ def nested_37(x: Float[Array, "b37 n37 d37"], w: Float[Array, "d37 d37"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b37, n37, d37]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b37, min(4, n37), d37]
+    h = c.sum(axis=1)  # expected-shape: h=[b37, d37]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b37, n37, 3]; ix=[b37, n37, 3]
     z = y @ w  # expected-shape: z=[b37, n37, d37]
     return y, h, z
@@ -2637,8 +2637,8 @@ def nested_43(x: Float[Array, "b43 n43 d43"], w: Float[Array, "d43 d43"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b43, n43, d43]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b43, min(4, n43), d43]
+    h = c.sum(axis=1)  # expected-shape: h=[b43, d43]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b43, n43, 3]; ix=[b43, n43, 3]
     z = y @ w  # expected-shape: z=[b43, n43, d43]
     return y, h, z
@@ -2777,8 +2777,8 @@ def nested_51(x: Float[Array, "b51 n51 d51"], w: Float[Array, "d51 d51"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b51, n51, d51]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b51, min(4, n51), d51]
+    h = c.sum(axis=1)  # expected-shape: h=[b51, d51]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b51, n51, 3]; ix=[b51, n51, 3]
     z = y @ w  # expected-shape: z=[b51, n51, d51]
     return y, h, z
@@ -2838,8 +2838,8 @@ def nested_56(x: Float[Array, "b56 n56 d56"], w: Float[Array, "d56 d56"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b56, n56, d56]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b56, min(4, n56), d56]
+    h = c.sum(axis=1)  # expected-shape: h=[b56, d56]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b56, n56, 3]; ix=[b56, n56, 3]
     z = y @ w  # expected-shape: z=[b56, n56, d56]
     return y, h, z
@@ -2931,8 +2931,8 @@ def nested_61(x: Float[Array, "b61 n61 d61"], w: Float[Array, "d61 d61"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b61, n61, d61]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b61, min(4, n61), d61]
+    h = c.sum(axis=1)  # expected-shape: h=[b61, d61]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b61, n61, 3]; ix=[b61, n61, 3]
     z = y @ w  # expected-shape: z=[b61, n61, d61]
     return y, h, z
@@ -2967,8 +2967,8 @@ def nested_63(x: Float[Array, "b63 n63 d63"], w: Float[Array, "d63 d63"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b63, n63, d63]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b63, min(4, n63), d63]
+    h = c.sum(axis=1)  # expected-shape: h=[b63, d63]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b63, n63, 3]; ix=[b63, n63, 3]
     z = y @ w  # expected-shape: z=[b63, n63, d63]
     return y, h, z
@@ -4713,8 +4713,8 @@ def nested_91(x: Float[Array, "b91 n91 d91"], w: Float[Array, "d91 d91"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b91, n91, d91]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b91, min(4, n91), d91]
+    h = c.sum(axis=1)  # expected-shape: h=[b91, d91]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b91, n91, 3]; ix=[b91, n91, 3]
     z = y @ w  # expected-shape: z=[b91, n91, d91]
     return y, h, z
@@ -5152,8 +5152,8 @@ def nested_107(x: Float[Array, "b107 n107 d107"], w: Float[Array, "d107 d107"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b107, n107, d107]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b107, min(4, n107), d107]
+    h = c.sum(axis=1)  # expected-shape: h=[b107, d107]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b107, n107, 3]; ix=[b107, n107, 3]
     z = y @ w  # expected-shape: z=[b107, n107, d107]
     return y, h, z
@@ -5389,8 +5389,8 @@ def nested_120(x: Float[Array, "b120 n120 d120"], w: Float[Array, "d120 d120"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b120, n120, d120]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b120, min(4, n120), d120]
+    h = c.sum(axis=1)  # expected-shape: h=[b120, d120]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b120, n120, 3]; ix=[b120, n120, 3]
     z = y @ w  # expected-shape: z=[b120, n120, d120]
     return y, h, z
@@ -5730,8 +5730,8 @@ def nested_122(x: Float[Array, "b122 n122 d122"], w: Float[Array, "d122 d122"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b122, n122, d122]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b122, min(4, n122), d122]
+    h = c.sum(axis=1)  # expected-shape: h=[b122, d122]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b122, n122, 3]; ix=[b122, n122, 3]
     z = y @ w  # expected-shape: z=[b122, n122, d122]
     return y, h, z
@@ -5838,8 +5838,8 @@ def nested_129(x: Float[Array, "b129 n129 d129"], w: Float[Array, "d129 d129"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b129, n129, d129]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b129, min(4, n129), d129]
+    h = c.sum(axis=1)  # expected-shape: h=[b129, d129]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b129, n129, 3]; ix=[b129, n129, 3]
     z = y @ w  # expected-shape: z=[b129, n129, d129]
     return y, h, z
@@ -5897,8 +5897,8 @@ def nested_134(x: Float[Array, "b134 n134 d134"], w: Float[Array, "d134 d134"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b134, n134, d134]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b134, min(4, n134), d134]
+    h = c.sum(axis=1)  # expected-shape: h=[b134, d134]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b134, n134, 3]; ix=[b134, n134, 3]
     z = y @ w  # expected-shape: z=[b134, n134, d134]
     return y, h, z
@@ -6020,8 +6020,8 @@ def nested_139(x: Float[Array, "b139 n139 d139"], w: Float[Array, "d139 d139"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b139, n139, d139]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b139, min(4, n139), d139]
+    h = c.sum(axis=1)  # expected-shape: h=[b139, d139]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b139, n139, 3]; ix=[b139, n139, 3]
     z = y @ w  # expected-shape: z=[b139, n139, d139]
     return y, h, z
@@ -9810,8 +9810,8 @@ def nested_206(x: Float[Array, "b206 n206 d206"], w: Float[Array, "d206 d206"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b206, n206, d206]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b206, min(4, n206), d206]
+    h = c.sum(axis=1)  # expected-shape: h=[b206, d206]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b206, n206, 3]; ix=[b206, n206, 3]
     z = y @ w  # expected-shape: z=[b206, n206, d206]
     return y, h, z
@@ -12117,8 +12117,8 @@ def nested_254(x: Float[Array, "b254 n254 d254"], w: Float[Array, "d254 d254"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b254, n254, d254]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b254, min(4, n254), d254]
+    h = c.sum(axis=1)  # expected-shape: h=[b254, d254]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b254, n254, 3]; ix=[b254, n254, 3]
     z = y @ w  # expected-shape: z=[b254, n254, d254]
     return y, h, z
@@ -13206,8 +13206,8 @@ def nested_289(x: Float[Array, "b289 n289 d289"], w: Float[Array, "d289 d289"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b289, n289, d289]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b289, min(4, n289), d289]
+    h = c.sum(axis=1)  # expected-shape: h=[b289, d289]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b289, n289, 3]; ix=[b289, n289, 3]
     z = y @ w  # expected-shape: z=[b289, n289, d289]
     return y, h, z
@@ -13873,8 +13873,8 @@ def nested_309(x: Float[Array, "b309 n309 d309"], w: Float[Array, "d309 d309"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b309, n309, d309]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b309, min(4, n309), d309]
+    h = c.sum(axis=1)  # expected-shape: h=[b309, d309]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b309, n309, 3]; ix=[b309, n309, 3]
     z = y @ w  # expected-shape: z=[b309, n309, d309]
     return y, h, z
@@ -13972,8 +13972,8 @@ def nested_314(x: Float[Array, "b314 n314 d314"], w: Float[Array, "d314 d314"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b314, n314, d314]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b314, min(4, n314), d314]
+    h = c.sum(axis=1)  # expected-shape: h=[b314, d314]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b314, n314, 3]; ix=[b314, n314, 3]
     z = y @ w  # expected-shape: z=[b314, n314, d314]
     return y, h, z
@@ -14765,8 +14765,8 @@ def nested_340(x: Float[Array, "b340 n340 d340"], w: Float[Array, "d340 d340"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b340, n340, d340]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b340, min(4, n340), d340]
+    h = c.sum(axis=1)  # expected-shape: h=[b340, d340]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b340, n340, 3]; ix=[b340, n340, 3]
     z = y @ w  # expected-shape: z=[b340, n340, d340]
     return y, h, z
@@ -15761,8 +15761,8 @@ def nested_356(x: Float[Array, "b356 n356 d356"], w: Float[Array, "d356 d356"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b356, n356, d356]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b356, min(4, n356), d356]
+    h = c.sum(axis=1)  # expected-shape: h=[b356, d356]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b356, n356, 3]; ix=[b356, n356, 3]
     z = y @ w  # expected-shape: z=[b356, n356, d356]
     return y, h, z
@@ -15910,8 +15910,8 @@ def nested_365(x: Float[Array, "b365 n365 d365"], w: Float[Array, "d365 d365"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b365, n365, d365]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b365, min(4, n365), d365]
+    h = c.sum(axis=1)  # expected-shape: h=[b365, d365]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b365, n365, 3]; ix=[b365, n365, 3]
     z = y @ w  # expected-shape: z=[b365, n365, d365]
     return y, h, z
@@ -17744,8 +17744,8 @@ def nested_394(x: Float[Array, "b394 n394 d394"], w: Float[Array, "d394 d394"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b394, n394, d394]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b394, min(4, n394), d394]
+    h = c.sum(axis=1)  # expected-shape: h=[b394, d394]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b394, n394, 3]; ix=[b394, n394, 3]
     z = y @ w  # expected-shape: z=[b394, n394, d394]
     return y, h, z
@@ -18784,8 +18784,8 @@ def nested_428(x: Float[Array, "b428 n428 d428"], w: Float[Array, "d428 d428"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b428, n428, d428]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b428, min(4, n428), d428]
+    h = c.sum(axis=1)  # expected-shape: h=[b428, d428]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b428, n428, 3]; ix=[b428, n428, 3]
     z = y @ w  # expected-shape: z=[b428, n428, d428]
     return y, h, z
@@ -20099,8 +20099,8 @@ def nested_467(x: Float[Array, "b467 n467 d467"], w: Float[Array, "d467 d467"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b467, n467, d467]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b467, min(4, n467), d467]
+    h = c.sum(axis=1)  # expected-shape: h=[b467, d467]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b467, n467, 3]; ix=[b467, n467, 3]
     z = y @ w  # expected-shape: z=[b467, n467, d467]
     return y, h, z
@@ -20129,8 +20129,8 @@ def nested_469(x: Float[Array, "b469 n469 d469"], w: Float[Array, "d469 d469"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b469, n469, d469]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b469, min(4, n469), d469]
+    h = c.sum(axis=1)  # expected-shape: h=[b469, d469]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b469, n469, 3]; ix=[b469, n469, 3]
     z = y @ w  # expected-shape: z=[b469, n469, d469]
     return y, h, z
@@ -20562,8 +20562,8 @@ def nested_474(x: Float[Array, "b474 n474 d474"], w: Float[Array, "d474 d474"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b474, n474, d474]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b474, min(4, n474), d474]
+    h = c.sum(axis=1)  # expected-shape: h=[b474, d474]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b474, n474, 3]; ix=[b474, n474, 3]
     z = y @ w  # expected-shape: z=[b474, n474, d474]
     return y, h, z
@@ -20579,8 +20579,8 @@ def nested_475(x: Float[Array, "b475 n475 d475"], w: Float[Array, "d475 d475"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b475, n475, d475]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b475, min(4, n475), d475]
+    h = c.sum(axis=1)  # expected-shape: h=[b475, d475]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b475, n475, 3]; ix=[b475, n475, 3]
     z = y @ w  # expected-shape: z=[b475, n475, d475]
     return y, h, z
@@ -20927,8 +20927,8 @@ def nested_487(x: Float[Array, "b487 n487 d487"], w: Float[Array, "d487 d487"]):
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b487, n487, d487]
-    c = x[:, :4]  # expected-shape: c=?
-    h = c.sum(axis=1)  # expected-shape: h=?
+    c = x[:, :4]  # expected-shape: c=[b487, min(4, n487), d487]
+    h = c.sum(axis=1)  # expected-shape: h=[b487, d487]
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b487, n487, 3]; ix=[b487, n487, 3]
     z = y @ w  # expected-shape: z=[b487, n487, d487]
     return y, h, z
@@ -21046,8 +21046,8 @@ def closure_capture_491(x: Float[Array, "b491 n491 d491"], w: Float[Array, "d491
         return u
 
     y = level1(x)  # expected-shape: y=[b491, n491, e491]
-    w = w[:, :4]  # expected-shape: w=?
-    y2 = level1(x)  # expected-shape: y2=?
+    w = w[:, :4]  # expected-shape: w=[d491, min(4, e491)]
+    y2 = level1(x)  # expected-shape: y2=[b491, n491, min(4, e491)]
 
     def level2(t):
         nonlocal W
@@ -21079,8 +21079,8 @@ def closure_capture_492(x: Float[Array, "b492 n492 d492"], w: Float[Array, "d492
         return u
 
     y = level1(x)  # expected-shape: y=[b492, n492, e492]
-    w = w[:, :4]  # expected-shape: w=?
-    y2 = level1(x)  # expected-shape: y2=?
+    w = w[:, :4]  # expected-shape: w=[d492, min(4, e492)]
+    y2 = level1(x)  # expected-shape: y2=[b492, n492, min(4, e492)]
 
     def level2(t):
         nonlocal W
@@ -21112,8 +21112,8 @@ def closure_capture_493(x: Float[Array, "b493 n493 d493"], w: Float[Array, "d493
         return u
 
     y = level1(x)  # expected-shape: y=[b493, n493, e493]
-    w = w[:, :4]  # expected-shape: w=?
-    y2 = level1(x)  # expected-shape: y2=?
+    w = w[:, :4]  # expected-shape: w=[d493, min(4, e493)]
+    y2 = level1(x)  # expected-shape: y2=[b493, n493, min(4, e493)]
 
     def level2(t):
         nonlocal W

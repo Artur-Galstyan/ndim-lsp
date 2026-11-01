@@ -65,6 +65,7 @@ impl Frame {
 
     /// Bind `name` over whatever the scope around holds for it.
     pub(super) fn bind(&mut self, ctx: &mut ShapeCtx, name: String, inner: Inner) {
+        ctx.name_checks.borrow_mut().clear();
         let key = (self.scope, name.clone());
         let shape = ctx.scopes[self.scope].shapes.remove(&name);
         let carry = ctx.tuple_carries.remove(&key);
@@ -105,6 +106,7 @@ impl Frame {
 
     /// Put every name back and drop the errors that name a changing number.
     pub(super) fn restore(&mut self, ctx: &mut ShapeCtx) {
+        ctx.name_checks.borrow_mut().clear();
         while let Some(undo) = self.undo.pop() {
             let key = (self.scope, undo.name.clone());
             ctx.inner_arrays.remove(&(self.owner, undo.name.clone()));

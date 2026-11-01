@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -6,8 +6,10 @@ use tree_sitter::Node;
 
 use crate::imports::{ImportScopes, is_imported};
 use crate::known_functions::{
+    parse_shape_value,
     apply_known_function, apply_known_kthvalue_shape, apply_known_linalg_lstsq_solution,
     apply_known_reduction, apply_known_topk_shape, apply_method_call, classify_known_function,
+    joins_variadic_shape,
     classify_method_call, compute_array_split_shapes, compute_chunk_shapes,
     compute_einops_pack_shape, compute_fixed_axis_split_shapes, compute_split_shapes,
     compute_torch_split_shapes,
@@ -57,11 +59,43 @@ pub fn analyze_layer_shapes<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    if too_deep(node) {
+        return Ok(LayerShapeAnalysis::default());
+    }
     if let Some(cache) = cache {
         cache.revalidate(&[]);
     }
     analyze_tree(node, text, search_roots, &read_file, max_depth, cache)
         .map(LayerShapeAnalysis::without_free_marks)
+}
+
+/// The deepest syntax tree that the analysis reads. Each pass over a tree is
+/// recursive. CPython refuses a file far below this depth, so that a deeper
+/// tree is not a real file, and such a file has no analysis at all.
+const MAX_SYNTAX_DEPTH: u32 = 1000;
+
+/// Whether the tree of `node` goes below `MAX_SYNTAX_DEPTH`. This walk uses no
+/// stack. One byte of text gives no more than `DEPTH_OF_A_BYTE` levels, so a
+/// short node cannot reach the limit and the walk does not enter it. The walk
+/// then costs about one step for each statement of the file.
+pub(crate) fn too_deep(node: Node) -> bool {
+    const DEPTH_OF_A_BYTE: usize = 4;
+    let mut cursor = node.walk();
+    loop {
+        let here = cursor.node();
+        let reach = cursor.depth() as usize + 8 + here.byte_range().len() * DEPTH_OF_A_BYTE;
+        if reach > MAX_SYNTAX_DEPTH as usize && cursor.goto_first_child() {
+            if cursor.depth() > MAX_SYNTAX_DEPTH {
+                return true;
+            }
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return false;
+            }
+        }
+    }
 }
 
 /// `analyze_layer_shapes` without the check of the cache against the disk,
@@ -104,6 +138,10 @@ where
     cache.revalidate(&[]);
     let (pre, mut next) = match memo.prepass(node, text, search_roots, &read_file, max_depth, cache) {
         Ok((pre, next)) => (pre, Some(next)),
+        Err(_) if too_deep(node) => {
+            *memo = UnitMemo::default();
+            return Ok(LayerShapeAnalysis::default());
+        }
         Err(_) => (
             PrePass::whole_tree(node, text, search_roots, &read_file, max_depth, Some(cache))?,
             None,
@@ -417,6 +455,15 @@ struct ShapeCtx<'a> {
     /// specialization with `None` rather than looping forever; depth is
     /// additionally capped at `MAX_SPECIALIZATION_DEPTH`.
     active_specializations: Vec<usize>,
+    /// How many `shape_of_expression` calls are open.
+    expression_depth: usize,
+    /// What `MAX_STATEMENT_STEPS` leaves for the statement that runs.
+    steps_left: usize,
+    /// Results of the checks that follow a name to its bindings (see
+    /// `checked_name`).
+    name_checks: RefCell<HashMap<(NameCheck, usize, String), bool>>,
+    /// Whether a check that runs met a name that it already follows.
+    name_cycle: Cell<bool>,
     /// Scope indices that have already had a "first-call-wins" successful
     /// specialization (see `specialize_callee_call`). Only the first
     /// specialization of a given scope writes its computed local shapes,
@@ -643,7 +690,7 @@ fn normalize_shape(
 ) -> Vec<String> {
     shape
         .into_iter()
-        .map(|d| fold_literal_marks(normalize_dim(&d, aliases, hierarchy, byte)))
+        .map(|d| fold_literal_marks(bounded_dim(normalize_dim(&d, aliases, hierarchy, byte))))
         .collect()
 }
 
@@ -697,6 +744,52 @@ fn normalize_dim(
 }
 
 impl<'a> ShapeCtx<'a> {
+    /// Add `error`, unless a value that it reads has a variadic dim. The rules
+    /// count and index the dims of a shape, and such a shape has a rank that
+    /// the file does not give, so the error is not proven.
+    fn report(&mut self, error: ShapeError) {
+        if !self.reads_variadic_dim(error.range) {
+            self.errors.push(error);
+        }
+    }
+
+    /// Add an error of a layer. A layer reads the input from its last axis, so
+    /// only an error about the rank depends on a variadic dim.
+    fn report_layer(&mut self, error: ShapeError) {
+        if error.message.contains("rank") || error.message.contains("at least") {
+            self.report(error);
+        } else {
+            self.errors.push(error);
+        }
+    }
+
+    fn reads_variadic_dim(&self, range: tree_sitter::Range) -> bool {
+        let Some(node) = self.root.descendant_for_byte_range(range.start_byte, range.end_byte) else {
+            return false;
+        };
+        // The range of a method call holds its arguments, not its receiver.
+        let node = match node.parent() {
+            Some(call) if node.kind() == "argument_list" => call,
+            _ => node,
+        };
+        let mut names = HashSet::new();
+        insert_identifiers(node, self.text, &mut names);
+        let Some(scope) = self.links.scope_index.lookup(node.start_byte()) else {
+            return false;
+        };
+        names.iter().any(|name| {
+            self.resolve_shape(name, scope).is_some_and(|shape| shape.iter().any(|dim| is_variadic_dim(dim)))
+        })
+    }
+
+    /// Give the next statement of the file its steps. A statement in the body
+    /// of a call runs on the steps of the statement with the call.
+    fn start_statement(&mut self) {
+        if self.active_specializations.is_empty() {
+            self.steps_left = MAX_STATEMENT_STEPS;
+        }
+    }
+
     /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`,
     /// else in its bases (MRO order). Unrelated classes never match, and a
     /// base the file does not define ends the search with None.
@@ -981,7 +1074,9 @@ impl<'a> ShapeCtx<'a> {
             self.tuple_carries.remove(&(scope_idx, name.to_string()));
         }
         let shape = normalize_shape(shape, self.aliases, self.hierarchy, byte);
-        if shape.iter().any(|dim| has_internal_name(dim) || dim.contains(UNPROVEN_DIM)) {
+        if shape.len() > MAX_RANK
+            || shape.iter().any(|dim| has_internal_name(dim) || dim.contains(UNPROVEN_DIM))
+        {
             self.evict_binding(scope_idx, name);
             return;
         }
@@ -1196,6 +1291,17 @@ impl<'a> ShapeCtx<'a> {
 /// (silently skipped — unrecognised function, missing variable shape, etc.).
 /// On error (dimension mismatch etc.) records a `ShapeError` and returns `None`.
 fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    if ctx.expression_depth >= MAX_EXPRESSION_DEPTH || ctx.steps_left == 0 {
+        return None;
+    }
+    ctx.steps_left -= 1;
+    ctx.expression_depth += 1;
+    let shape = shape_of_expression_kind(node, ctx);
+    ctx.expression_depth -= 1;
+    shape
+}
+
+fn shape_of_expression_kind(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let shape = match node.kind() {
         "call" => shape_of_call(node, ctx),
         "identifier" => shape_of_identifier(node, ctx),
@@ -1213,6 +1319,7 @@ fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     };
     let no_size = |dim: &String| dim.contains(UNPROVEN_DIM) || dim.parse::<i64>().is_ok_and(|size| size < 0);
     shape
+        .and_then(bounded_shape)
         .map(|shape| shape.into_iter().map(fold_literal_marks).collect::<Vec<_>>())
         .filter(|shape| !shape.iter().any(no_size))
 }
@@ -1405,8 +1512,8 @@ fn shape_of_unary(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 /// - proven integer → drops that axis (rank −1);
 /// - one list of integers, with no other integer or list → that axis has the
 ///   length of the list;
-/// - slice → keeps the axis with the size of `ShapeCtx::slice_size`, and an
-///   unknown size makes the whole shape unknown;
+/// - slice → keeps the axis with the size of `ShapeCtx::slice_size`. A size that
+///   is not known is a free dim, so the rank and the other axes stay;
 /// - `None` / newaxis → inserts a size-1 axis;
 /// - `...` (ellipsis) → expands to the un-indexed middle axes, unchanged;
 /// - axes past the last index are kept unchanged (implicit full slices).
@@ -1438,10 +1545,20 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut axis = 0usize;
     let (mut integers, mut lists) = (0usize, 0usize);
+    let variadic = input_shape.iter().position(|dim| is_variadic_dim(dim));
+    let mut past_ellipsis = false;
 
     for idx in &indices {
+        // Before the variadic dim, the axis counts from the start, and after an
+        // ellipsis from the end. Elsewhere only a slice of all items is proven.
+        let unplaced = variadic.is_some_and(|at| if past_ellipsis { axis <= at } else { axis >= at });
+        let before = idx.kind() == "none" && !past_ellipsis && variadic == Some(axis);
+        if unplaced && !before && !matches!(idx.kind(), "slice" | "ellipsis") {
+            return None;
+        }
         match idx.kind() {
             "ellipsis" => {
+                past_ellipsis = true;
                 for _ in 0..ellipsis_axes {
                     out.push(input_shape.get(axis)?.clone());
                     axis += 1;
@@ -1456,7 +1573,11 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 {
                     return None;
                 }
-                out.push(ctx.slice_size(parts, orig, idx.start_byte())?);
+                let size = ctx.slice_size(parts, orig, idx.start_byte())?;
+                if unplaced && size != *orig {
+                    return None;
+                }
+                out.push(size);
                 axis += 1;
             }
             "list" => {
@@ -1788,15 +1909,50 @@ fn name_is_scalar(
         (owner, NameBinding::Opaque) => ctx.inner_scalars.contains(&(owner.id(), name.to_string())),
         (owner, NameBinding::Values(values)) => {
             let key = (owner.id(), name.to_string());
-            if visiting.contains(&key) {
-                return true;
-            }
-            visiting.push(key);
-            let scalar = values.iter().all(|v| is_scalar_expr(*v, ctx, visiting));
-            visiting.pop();
-            scalar
+            checked_name(NameCheck::Scalar, key, true, ctx, visiting, |visiting| {
+                values.iter().all(|v| is_scalar_expr(*v, ctx, visiting))
+            })
         }
     }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum NameCheck {
+    Scalar,
+    Integer,
+    Torch,
+    Array,
+}
+
+/// The result of `check` for a name, with the memo that keeps a chain such as
+/// `b = a + a; c = b + b` linear: each name runs its check one time. A name on
+/// `visiting` gives `on_cycle`. A result that used `on_cycle` depends on the
+/// path to it, so it stays out of the memo.
+fn checked_name(
+    kind: NameCheck,
+    key: (usize, String),
+    on_cycle: bool,
+    ctx: &ShapeCtx,
+    visiting: &mut Vec<(usize, String)>,
+    check: impl FnOnce(&mut Vec<(usize, String)>) -> bool,
+) -> bool {
+    if visiting.contains(&key) {
+        ctx.name_cycle.set(true);
+        return on_cycle;
+    }
+    let memo_key = (kind, key.0, key.1.clone());
+    if let Some(known) = ctx.name_checks.borrow().get(&memo_key) {
+        return *known;
+    }
+    let outer_cycle = ctx.name_cycle.replace(false);
+    visiting.push(key);
+    let result = check(visiting);
+    visiting.pop();
+    if !ctx.name_cycle.get() {
+        ctx.name_checks.borrow_mut().insert(memo_key, result);
+    }
+    ctx.name_cycle.set(ctx.name_cycle.get() || outer_cycle);
+    result
 }
 
 /// The innermost scope around `at` that binds `name`, with its binding.
@@ -1986,13 +2142,9 @@ fn name_is_integer(
         return false;
     }
     let key = (owner.id(), name.to_string());
-    if visiting.contains(&key) {
-        return true;
-    }
-    visiting.push(key);
-    let integer = owner_binds_integer(owner, name, ctx, visiting);
-    visiting.pop();
-    integer
+    checked_name(NameCheck::Integer, key, true, ctx, visiting, |visiting| {
+        owner_binds_integer(owner, name, ctx, visiting)
+    })
 }
 
 fn owner_binds_integer(
@@ -2180,14 +2332,13 @@ fn name_is_torch(
     let NameBinding::Values(values) = binding else {
         return false;
     };
-    let key = (owner.id(), name.to_string());
-    if values.is_empty() || visiting.contains(&key) {
+    if values.is_empty() {
         return false;
     }
-    visiting.push(key);
-    let torch = values.iter().all(|value| is_torch_value(*value, ctx, visiting));
-    visiting.pop();
-    torch
+    let key = (owner.id(), name.to_string());
+    checked_name(NameCheck::Torch, key, false, ctx, visiting, |visiting| {
+        values.iter().all(|value| is_torch_value(*value, ctx, visiting))
+    })
 }
 
 fn binary_mismatch_axes(
@@ -2378,7 +2529,7 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
             {
                 error = error.with_fix(fix);
             }
-            ctx.errors.push(error);
+            ctx.report(error);
             None
         }
     }
@@ -2582,7 +2733,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 Ok(Some(output)) => Some(output),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             };
@@ -2674,7 +2825,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         }
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError::mismatch(method_name, message, args_node.range()));
+                            ctx.report(ShapeError::mismatch(method_name, message, args_node.range()));
                             None
                         }
                     };
@@ -2722,7 +2873,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         }
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError::mismatch(receiver_name, message, args_node.range()));
+                            ctx.report(ShapeError::mismatch(receiver_name, message, args_node.range()));
                             None
                         }
                     };
@@ -2796,7 +2947,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Err(message) => {
                 // We'll record the error with a variable name from the caller.
                 // For now use the target as placeholder — caller replaces it.
-                ctx.errors.push(ShapeError::mismatch(target.clone(), message, application.range));
+                ctx.report_layer(ShapeError::mismatch(target.clone(), message, application.range));
                 return None;
             }
         }
@@ -2815,7 +2966,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError::mismatch(target, message, args_node.range()));
+                ctx.report(ShapeError::mismatch(target, message, args_node.range()));
                 None
             }
         };
@@ -2874,7 +3025,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes) {
                     Ok(shape) => shape,
                     Err(message) => {
-                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -2945,7 +3096,11 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 } else {
                     ShapeError::mismatch(target, message, args_node.range())
                 };
-                ctx.errors.push(error);
+                if joins_variadic_shape(&known, &args, &ctx.scope_shapes(scope_idx)) {
+                    ctx.errors.push(error);
+                } else {
+                    ctx.report(error);
+                }
                 None
             }
         };
@@ -2990,8 +3145,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Ok(Some(shape)) => Some(shape),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors
-                    .push(ShapeError::mismatch(target, message, args_node.range()));
+                ctx.report(ShapeError::mismatch(target, message, args_node.range()));
                 None
             }
         };
@@ -3236,6 +3390,9 @@ fn dim_list_text(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String>
     }
     let mut cursor = node.walk();
     let elements: Vec<Node> = node.named_children(&mut cursor).collect();
+    if elements.len() > MAX_RANK {
+        return None;
+    }
     let resolved: Vec<Option<String>> = elements
         .iter()
         .map(|element| scalar_dim_expr(*element, scope_idx, ctx))
@@ -3258,6 +3415,36 @@ fn dim_list_text(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String>
     (squeeze(&text) != squeeze(source)).then_some(text)
 }
 
+/// The dims of a tuple or a list, or of `x.shape`, or of a sum of them, and
+/// whether the value is a list. A dim of a variable rank gives `None`, as does
+/// a sum of a tuple and a list, which Python refuses.
+fn sequence_sum(node: Node, scope_idx: usize, ctx: &mut ShapeCtx) -> Option<(bool, Vec<String>)> {
+    match node.kind() {
+        "parenthesized_expression" => sequence_sum(node.named_child(0)?, scope_idx, ctx),
+        "tuple" | "list" => {
+            let source = ctx.text.get(node.byte_range())?;
+            let text = dim_list_text(node, scope_idx, ctx).unwrap_or_else(|| source.to_string());
+            let dims = if text == "()" || text == "[]" { Vec::new() } else { parse_shape_value(&text)? };
+            Some((node.kind() == "list", dims))
+        }
+        "attribute" if ctx.text.get(node.child_by_field_name("attribute")?.byte_range())? == "shape" => {
+            let dims = shape_of_expression(node.child_by_field_name("object")?, ctx)?;
+            (!dims.iter().any(|dim| is_variadic_dim(dim))).then_some((false, dims))
+        }
+        "binary_operator" => {
+            let (left, right) = (node.child_by_field_name("left")?, node.child_by_field_name("right")?);
+            if find_binary_op_text(node, &left, &right, ctx.text)? != "+" {
+                return None;
+            }
+            let (list, mut dims) = sequence_sum(left, scope_idx, ctx)?;
+            let (right_list, right_dims) = sequence_sum(right, scope_idx, ctx)?;
+            dims.extend(right_dims);
+            (list == right_list && dims.len() <= MAX_RANK).then_some((list, dims))
+        }
+        _ => None,
+    }
+}
+
 /// Resolve one argument from its matching AST node. Expressions without a
 /// known shape pass through unchanged.
 fn resolve_call_arg(
@@ -3273,7 +3460,12 @@ fn resolve_call_arg(
         CallArgument::Positional { .. } => arg_node,
         CallArgument::Keyword { .. } => arg_node.child_by_field_name("value")?,
     };
-    if let Some(dims) = dim_list_text(value_node, scope_idx, ctx) {
+    let sum = (value_node.kind() == "binary_operator")
+        .then(|| sequence_sum(value_node, scope_idx, ctx))
+        .flatten()
+        .filter(|(_, dims)| !dims.is_empty())
+        .map(|(_, dims)| format!("({},)", dims.join(", ")));
+    if let Some(dims) = sum.or_else(|| dim_list_text(value_node, scope_idx, ctx)) {
         return Some(match arg {
             CallArgument::Positional { .. } => CallArgument::Positional { value: dims },
             CallArgument::Keyword { name, .. } => CallArgument::Keyword { name, value: dims },
@@ -4386,6 +4578,10 @@ fn with_propagation<T>(
         tuple_carries: HashSet::new(),
         scope_function_nodes: &scope_function_nodes,
         active_specializations: Vec::new(),
+        expression_depth: 0,
+        steps_left: MAX_STATEMENT_STEPS,
+        name_checks: Default::default(),
+        name_cycle: Cell::new(false),
         specialized_scopes: std::collections::HashSet::new(),
         original_shapes: &original_shapes,
         links: &links,
@@ -4413,6 +4609,7 @@ fn with_propagation<T>(
 
 fn process_value_statements(statements: Vec<Node>, ctx: &mut ShapeCtx) {
     for stmt in statements {
+        ctx.start_statement();
         let errors_before = ctx.errors.len();
         let _ = shape_of_expression(stmt, ctx);
         // Fix up error variable names: for return/yield/assert contexts,
@@ -4468,6 +4665,7 @@ fn replay_items(
 /// (`specialize_callee_call`, which re-collects and replays just a single
 /// callee's own assignments on demand).
 fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx: &mut ShapeCtx) {
+    ctx.start_statement();
     let name = match &lhs {
         Lhs::Single(name) | Lhs::Augmented(name) => Some(name.clone()),
         Lhs::Tuple(_) => None,
@@ -4599,7 +4797,7 @@ fn process_assignment_item_inner(
                                 }
                                 Err(message) => {
                                     ctx.evict_binding(scope_idx, &lhs_name);
-                                    ctx.errors.push(ShapeError::mismatch(lhs_name.clone(), message, application.range));
+                                    ctx.report_layer(ShapeError::mismatch(lhs_name.clone(), message, application.range));
                                 }
                             }
                             ctx.applications.push(application);
@@ -4838,7 +5036,7 @@ fn handle_augmented_assignment(
             ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
         }
         Ok(None) => {}
-        Err(message) => ctx.errors.push(ShapeError::mismatch(name.to_string(), message, assignment_node.range())),
+        Err(message) => ctx.report(ShapeError::mismatch(name.to_string(), message, assignment_node.range())),
     }
 }
 
@@ -4975,13 +5173,9 @@ fn name_is_array(
         (owner, NameBinding::Opaque) => ctx.inner_arrays.contains(&(owner.id(), name.to_string())),
         (owner, NameBinding::Values(values)) => {
             let key = (owner.id(), name.to_string());
-            if visiting.contains(&key) {
-                return true;
-            }
-            visiting.push(key);
-            let array = values.iter().all(|v| is_array_expr(*v, ctx, visiting));
-            visiting.pop();
-            array
+            checked_name(NameCheck::Array, key, true, ctx, visiting, |visiting| {
+                values.iter().all(|v| is_array_expr(*v, ctx, visiting))
+            })
         }
     }
 }
@@ -5430,7 +5624,7 @@ fn tuple_rhs_shapes(
                     }
                     Ok(_) => None,
                     Err(message) => {
-                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -5472,7 +5666,7 @@ fn tuple_rhs_shapes(
                     Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                     Ok(None) => None,
                     Err(message) => {
-                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -5511,7 +5705,7 @@ fn tuple_rhs_shapes(
                 return match compute_einops_pack_shape(&args, &ctx.scope_shapes(scope_idx)) {
                     Ok(shape) => Some(vec![shape, None]),
                     Err(message) => {
-                        ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                         None
                     }
                 };
@@ -5572,7 +5766,7 @@ fn tuple_rhs_shapes(
                         Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
                         Ok(None) => None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError::mismatch(
+                            ctx.report(ShapeError::mismatch(
                                 String::new(),
                                 message,
                                 args_node.range(),
@@ -5594,7 +5788,7 @@ fn tuple_rhs_shapes(
                         Ok(Some(shape)) => shapes.push(Some(shape)),
                         Ok(None) => return None,
                         Err(message) => {
-                            ctx.errors.push(ShapeError::mismatch(
+                            ctx.report(ShapeError::mismatch(
                                 String::new(),
                                 message,
                                 args_node.range(),
@@ -5675,7 +5869,7 @@ fn tuple_rhs_shapes(
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5705,7 +5899,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5718,7 +5912,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5743,7 +5937,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5756,7 +5950,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5765,7 +5959,7 @@ fn tuple_multi_output_shapes(
             Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
             Ok(None) => None,
             Err(message) => {
-                ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                 None
             }
         },
@@ -5778,7 +5972,7 @@ fn tuple_multi_output_shapes(
                 Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
                 Ok(None) => None,
                 Err(message) => {
-                    ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
                     None
                 }
             }
@@ -5796,7 +5990,7 @@ fn min_dim(a: &str, b: &str) -> String {
     if a == b {
         return a.to_string();
     }
-    format!("min({},{})", a, b)
+    format!("{FREE_DIM}min({},{})", a, b)
 }
 
 /// Per-target shapes for multi-output linalg calls and meshgrid, default
@@ -6182,7 +6376,7 @@ fn shape_of_inline_vmap(
         ) {
             Ok(shape) => shape,
             Err(message) => {
-                ctx.errors.push(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
+                ctx.report(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
                 None
             }
         };
@@ -6249,7 +6443,7 @@ fn batched_lambda(
         Ok(Some((examples, batch_dims))) => (examples, batch_dims),
         Ok(None) => return None,
         Err(message) => {
-            ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+            ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
             return None;
         }
     };
@@ -6441,7 +6635,7 @@ fn shape_of_inline_layer(
         Ok(Some(output)) => Some(output),
         Ok(None) => None,
         Err(message) => {
-            ctx.errors.push(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
+            ctx.report(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
             None
         }
     }
@@ -6509,7 +6703,7 @@ fn apply_inline_vmap_layer_chain(
         Ok(Some(output)) => output,
         Ok(None) => return None,
         Err(message) => {
-            ctx.errors.push(ShapeError::mismatch(String::new(), message, range));
+            ctx.report(ShapeError::mismatch(String::new(), message, range));
             return None;
         }
     };
@@ -6671,7 +6865,7 @@ fn apply_user_function(
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(message) => {
-                ctx.errors.push(ShapeError::mismatch(display, message, args_node.range()));
+                ctx.report(ShapeError::mismatch(display, message, args_node.range()));
                 return Some(None);
             }
         }
@@ -6731,7 +6925,7 @@ fn build_dim_binding(
             continue;
         };
 
-        if param_shape.len() != arg_shape.len() {
+        let Some(axes) = aligned_axes(param_shape, arg_shape) else {
             return Err(format!(
                 "call to {}: argument '{}' expected rank {}, got rank {}",
                 target_name,
@@ -6739,10 +6933,18 @@ fn build_dim_binding(
                 param_shape.len(),
                 arg_shape.len()
             ));
-        }
+        };
 
-        for (dim_idx, (param_dim, arg_dim)) in param_shape.iter().zip(arg_shape.iter()).enumerate()
-        {
+        for (dim_idx, param_dim) in param_shape.iter().enumerate() {
+            let Some(arg_at) = axes[dim_idx] else {
+                let unbound = if is_variadic_dim(param_dim) { UNPROVEN_DIM } else { UNKNOWN_DIM };
+                binding.insert(param_dim.clone(), unbound.to_string());
+                continue;
+            };
+            let arg_dim = &arg_shape[arg_at];
+            if param_dim == UNKNOWN_DIM {
+                continue;
+            }
             let is_param_concrete = param_dim.parse::<usize>().is_ok();
 
             if is_param_concrete {
@@ -6767,11 +6969,76 @@ fn build_dim_binding(
     Ok(binding)
 }
 
+/// For each dim of `param`, the axis of `arg` that it stands for. A variadic dim
+/// stands for any number of axes, so only the dims before and after it have one
+/// axis. A dim with `None` has no axis that the file proves. `None` for a count
+/// of dims that no variadic dim explains.
+fn aligned_axes(param: &[String], arg: &[String]) -> Option<Vec<Option<usize>>> {
+    let param_at = param.iter().position(|dim| is_variadic_dim(dim));
+    let arg_at = arg.iter().position(|dim| is_variadic_dim(dim));
+    let (head, tail) = match (param_at, arg_at) {
+        (None, None) if param.len() != arg.len() => return None,
+        (None, None) => (param.len(), 0),
+        (Some(_), None) if arg.len() + 1 < param.len() => return None,
+        (None, Some(_)) if param.len() + 1 < arg.len() => return None,
+        (Some(p), Some(a)) => (p.min(a), (param.len() - p - 1).min(arg.len() - a - 1)),
+        (Some(p), None) => (p, param.len() - p - 1),
+        (None, Some(a)) => (a, arg.len() - a - 1),
+    };
+    let mut axes = vec![None; param.len()];
+    for (at, axis) in axes.iter_mut().enumerate().take(head) {
+        *axis = Some(at);
+    }
+    for back in 1..=tail {
+        axes[param.len() - back] = Some(arg.len() - back);
+    }
+    // One variadic dim that meets one axis, or another variadic dim, is that axis.
+    if param.len() == arg.len()
+        && let Some(at) = param_at.filter(|at| arg_at.is_none_or(|arg_at| arg_at == *at))
+    {
+        axes[at] = Some(at);
+    }
+    Some(axes)
+}
+
 fn substitute_dims(shape: &[String], binding: &HashMap<String, String>) -> Vec<String> {
-    shape
-        .iter()
-        .map(|dim| binding.get(dim).cloned().unwrap_or_else(|| dim.clone()))
-        .collect()
+    shape.iter().map(|dim| substitute_dim(dim, binding)).collect()
+}
+
+/// `dim` with each name that `binding` holds replaced by its value, so that a
+/// form such as `q-1` follows `q`.
+fn substitute_dim(dim: &str, binding: &HashMap<String, String>) -> String {
+    let bound = |word: &str| binding.get(word.strip_prefix(FREE_DIM).unwrap_or(word));
+    if let Some(value) = bound(dim) {
+        return value.clone();
+    }
+    if let Some(at) = dim.rfind(['+', '-'])
+        && let Ok(amount) = dim[at..].parse::<i64>()
+        && let Some(value) = bound(&dim[..at])
+        && let Some(moved) = offset_dim(value, -amount)
+    {
+        return if is_named_size(value) { moved } else { UNKNOWN_DIM.to_string() };
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+    let mut out = String::with_capacity(dim.len());
+    let mut rest = dim;
+    while !rest.is_empty() {
+        let end = rest.find(|c| !is_word(c)).unwrap_or(rest.len());
+        match bound(&rest[..end]) {
+            Some(value) if !is_named_size(value) => return UNKNOWN_DIM.to_string(),
+            Some(value) if out.len() + value.len() > MAX_DIM_TEXT => return UNKNOWN_DIM.to_string(),
+            Some(value) => {
+                let product = out.ends_with(['*', '/', '%']) || rest[end..].starts_with(['*', '/', '%']);
+                out.push_str(&if product { operand_text(value) } else { factor_text(value) });
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+        let other = rest.find(is_word).unwrap_or(rest.len());
+        out.push_str(&rest[..other]);
+        rest = &rest[other..];
+    }
+    bounded_dim(offset_dim(&out, 0).unwrap_or(out))
 }
 
 /// Fallback for a same-file `self.<method>(...)` call whose callee has no
@@ -6858,6 +7125,18 @@ fn collect_bare_return_identifiers(
 /// Recursion/cycle guard depth cap for `specialize_callee_call` — deep but
 /// non-cyclic call chains bail rather than recursing unboundedly.
 const MAX_SPECIALIZATION_DEPTH: usize = 8;
+
+/// The deepest nesting of one expression that the analysis reads. A deeper form
+/// has no shape, so that a hostile file cannot use up the stack.
+const MAX_EXPRESSION_DEPTH: usize = 200;
+
+/// The expressions that one statement of the file can evaluate, with the bodies
+/// of its calls. Each call also costs one step for each node of the callee. The
+/// statement that costs the most in `bench/stress` and `corpus` uses 133 steps. A statement
+/// that reaches it has no shape, so that the work on a file stays linear in its
+/// statements. The limit is per statement, so that a unit gives the same result
+/// in an incremental run.
+const MAX_STATEMENT_STEPS: usize = 20_000;
 
 /// Outcome of lazily evaluating a same-file callee's body with seeded
 /// parameter shapes.
@@ -6991,6 +7270,8 @@ fn specialize_callee_call(
         return None;
     }
     let func_node = (*ctx.scope_function_nodes.get(callee_idx)?)?;
+    // A call reads the whole body, also the parts that use no expression step.
+    ctx.steps_left = ctx.steps_left.checked_sub(func_node.descendant_count())?;
 
     // Always start from the call-site-independent baseline (`original_
     // shapes`), NEVER from the live `scopes[callee_idx].shapes` — the live
@@ -7231,7 +7512,7 @@ fn apply_submodule_call(
     let binding = match bind_module_dims(declared, display, &bound) {
         Ok(binding) => binding,
         Err(message) => {
-            ctx.errors.push(ShapeError::mismatch(display.to_string(), message, range));
+            ctx.report(ShapeError::mismatch(display.to_string(), message, range));
             return None;
         }
     };
@@ -7291,6 +7572,10 @@ fn bind_module_dims(
             exact = false;
             continue;
         }
+        if arg.iter().any(|dim| is_variadic_dim(dim)) {
+            exact = false;
+            continue;
+        }
         if declared.len() != arg.len() {
             return Err(format!(
                 "call to {target_name}: argument '{param}' expected rank {}, got rank {}",
@@ -7327,6 +7612,9 @@ fn rebind_callee_dim(
     let mut out = String::with_capacity(dim.len());
     let mut rest = dim;
     while let Some(c) = rest.chars().next() {
+        if out.len() > MAX_DIM_TEXT {
+            return Some(UNKNOWN_DIM.to_string());
+        }
         if !is_word(c) {
             out.push(c);
             rest = &rest[c.len_utf8()..];
@@ -7356,7 +7644,7 @@ fn rebind_callee_dim(
             out.push_str(word);
         }
     }
-    Some(out)
+    Some(bounded_dim(out))
 }
 
 /// `jax.lax.scan` body seeding (the flagship consumer of lazy call-site
@@ -7559,6 +7847,11 @@ fn apply_matmul_shape(
             (Some(l), Some(r)) if l == "1" => batch.push(r.clone()),
             (Some(l), Some(r)) if r == "1" => batch.push(l.clone()),
             (Some(l), Some(r)) if !dims_conflict(l, r) => batch.push(unified_dim(l, r)),
+            (Some(_), Some(_))
+                if left_batch.iter().chain(right_batch).any(|dim| is_variadic_dim(dim)) =>
+            {
+                return Ok(None);
+            }
             (Some(l), Some(r)) => {
                 return Err(format!(
                     "matmul batch dimension mismatch: {} has {}, {} has {} (align from the right)",
@@ -7638,6 +7931,13 @@ fn apply_elementwise_shape(
                     b.clone()
                 } else if !dims_conflict(a, b) {
                     unified_dim(a, b)
+                } else if left[left.len() + i - rank..]
+                    .iter()
+                    .chain(&right[right.len() + i - rank..])
+                    .any(|dim| is_variadic_dim(dim))
+                {
+                    // A variadic dim on the right of this pair moves the axes.
+                    return Ok(None);
                 } else {
                     // ponytail: unequal non-"1" dims are incompatible, including
                     // distinct annotation symbols ("batch" vs "seq"). Strict in v1;
@@ -7833,6 +8133,10 @@ mod shape_of_expression_tests {
             tuple_carries: HashSet::new(),
             scope_function_nodes: &scope_function_nodes,
             active_specializations: Vec::new(),
+            expression_depth: 0,
+            steps_left: MAX_STATEMENT_STEPS,
+            name_checks: Default::default(),
+            name_cycle: Cell::new(false),
             specialized_scopes: std::collections::HashSet::new(),
             original_shapes: &original_shapes,
             links: &links,
@@ -7880,6 +8184,17 @@ mod shape_of_expression_tests {
 
     fn find_shape<'a>(analysis: &'a LayerShapeAnalysis, var: &str) -> Option<&'a Vec<String>> {
         analysis.scopes.iter().find_map(|s| s.shapes.get(var))
+    }
+
+    #[test]
+    fn test_a_substitution_stops_at_the_dim_limit() {
+        let long = "m".repeat(200);
+        let binding = HashMap::from([("n".to_string(), long.clone())]);
+        assert_eq!(substitute_dim("n+1", &binding), format!("{long}+1"));
+        assert_eq!(substitute_dim("n*n*n*n", &binding), UNKNOWN_DIM);
+        let names = |word: &str| (word == "n").then(|| Some(long.clone()));
+        assert_eq!(rebind_callee_dim("n", &names, &HashSet::new()).as_deref(), Some(long.as_str()));
+        assert_eq!(rebind_callee_dim("n*n*n", &names, &HashSet::new()).as_deref(), Some(UNKNOWN_DIM));
     }
 
     #[test]

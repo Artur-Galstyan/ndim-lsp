@@ -400,8 +400,8 @@ fn parse_simple_sequence_names(value: &str) -> Option<Vec<String>> {
         trimmed
     };
 
-    let names = inner
-        .split(',')
+    let names = split_top_level(inner)
+        .into_iter()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
@@ -550,28 +550,95 @@ fn nth_two_positional_or_keywords<'a>(
     (a, b)
 }
 
-fn parse_shape_value(value: &str) -> Option<Vec<String>> {
+/// The text inside the brackets of a sequence. `(a)*(b)` has no outer pair.
+fn sequence_inner(text: &str) -> Option<&str> {
+    if !(text.starts_with('(') && text.ends_with(')') || text.starts_with('[') && text.ends_with(']')) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && at + 1 < text.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(&text[1..text.len() - 1])
+}
+
+/// Whether `text` calls something: `get(1)`, but not `(n-1)*2`.
+fn has_call(text: &str) -> bool {
+    text.char_indices().any(|(at, c)| {
+        c == '(' && text[..at].ends_with(|before: char| before.is_alphanumeric() || "_.)]".contains(before))
+    })
+}
+
+/// Whether `text`, which is not a sequence, is proven to be one integer. A plain
+/// name or an arithmetic on names stays, and a call, a subscript, or `x.shape`
+/// can be a sequence. A free dim is a value of the analysis.
+fn is_one_size(text: &str) -> bool {
+    if text.contains(FREE_DIM) {
+        return true;
+    }
+    let shape_index = text.split_once(".shape[").is_some_and(|(_, index)| {
+        index.strip_suffix(']').is_some_and(|index| index.parse::<i64>().is_ok())
+    });
+    shape_index
+        || !(text.contains([',', '[', '{'])
+            || text.ends_with(".shape")
+            || has_call(text))
+}
+
+/// Whether `dim`, which has a comma, is one call or one subscript: `min(k, 2)`.
+/// The comma of `d for d in (2, 3)` or of `(2, 3)` is not in one size.
+fn is_call_with_comma(dim: &str) -> bool {
+    let mut depth = 0usize;
+    dim.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && dim.char_indices().all(|(_, c)| {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            depth > 0 || !c.is_whitespace()
+        })
+}
+
+/// The dims of a size argument: a tuple, a list, or one size. A dim with a
+/// comma, such as `min(k, 2)`, has a value the analysis does not compute, so it
+/// is free. Any other expression has no proven rank, so `None`.
+pub(crate) fn parse_shape_value(value: &str) -> Option<Vec<String>> {
     let trimmed = value.trim();
-    let inner = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
+    let inner = match sequence_inner(trimmed) {
+        Some(inner) if trimmed.starts_with('(') && split_top_level(inner).len() == 1 => {
+            return parse_shape_value(inner);
+        }
+        Some(inner) => inner,
+        None if is_one_size(trimmed) => trimmed,
+        None => return None,
     };
 
-    let dims = inner
-        .split(',')
+    let dims = split_top_level(inner)
+        .into_iter()
         .map(str::trim)
         .filter(|dim| !dim.is_empty())
-        .map(|dim| dim.to_string())
-        .collect::<Vec<_>>();
+        .map(|dim| {
+            if !dim.contains(',') || dim.contains(FREE_DIM) {
+                Some(dim.to_string())
+            } else {
+                is_call_with_comma(dim).then(|| format!("{FREE_DIM}{dim}"))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
 
-    if dims.is_empty()
-        || dims
-            .iter()
-            .any(|dim| dim.starts_with("__synth_") || dim.contains(char::is_whitespace))
-    {
+    let spaced = |dim: &String| !dim.contains(FREE_DIM) && dim.contains(char::is_whitespace);
+    let invalid = |dim: &String| dim.starts_with("__synth_") || dim.starts_with('*') || spaced(dim);
+    if dims.is_empty() || dims.iter().any(invalid) {
         None
     } else {
         Some(dims)
@@ -581,14 +648,17 @@ fn parse_shape_value(value: &str) -> Option<Vec<String>> {
 fn dim_product(dims: &[String]) -> Option<usize> {
     dims.iter()
         .map(|dim| dim.parse::<usize>())
-        .try_fold(1usize, |acc, dim| dim.map(|dim| acc * dim).ok())
+        .try_fold(1usize, |acc, dim| acc.checked_mul(dim.ok()?))
 }
 
 fn flattened_dim(dims: &[String]) -> String {
     if let Some(product) = dim_product(dims) {
         return product.to_string();
     }
-    dims.join("*")
+    match dims {
+        [dim] => dim.clone(),
+        _ => joined_dim(&dims.iter().map(|dim| factor_text(dim)).collect::<Vec<_>>(), "*"),
+    }
 }
 
 pub(crate) fn multiply_dim(dim: &str, factor: &str) -> String {
@@ -599,9 +669,9 @@ pub(crate) fn multiply_dim(dim: &str, factor: &str) -> String {
         return factor.to_string();
     }
     if let (Ok(dim), Ok(factor)) = (dim.parse::<usize>(), factor.parse::<usize>()) {
-        return (dim * factor).to_string();
+        return dim.checked_mul(factor).map_or(UNKNOWN_DIM.to_string(), |dim| dim.to_string());
     }
-    format!("{}*{}", dim, factor)
+    joined_dim(&[factor_text(dim), factor_text(factor)], "*")
 }
 
 fn add_to_dim(dim: &str, amount: isize) -> String {
@@ -609,17 +679,18 @@ fn add_to_dim(dim: &str, amount: isize) -> String {
         return dim.to_string();
     }
     if let Ok(dim) = dim.parse::<isize>() {
-        return (dim + amount).to_string();
+        return dim.checked_add(amount).map_or(UNKNOWN_DIM.to_string(), |dim| dim.to_string());
     }
-    if amount > 0 {
-        format!("{}+{}", dim, amount)
-    } else {
-        format!("{}{}", dim, amount)
-    }
+    offset_dim(dim, -(amount as i64)).unwrap_or_else(|| format!("{dim}{amount:+}"))
 }
 
+/// The integers of a literal. A value with a name has none: `min(1, 2)` is
+/// one item, not two.
 fn parse_ints(value: &str) -> Vec<isize> {
     let mut ints = Vec::new();
+    if value.chars().any(char::is_alphabetic) {
+        return ints;
+    }
     let mut current = String::new();
 
     for ch in value.chars() {
@@ -648,6 +719,7 @@ fn parse_ints(value: &str) -> Vec<isize> {
 fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>, String> {
     let rank = left.len().max(right.len());
     let mut result = Vec::new();
+    let mut aligned = true;
 
     for i in 0..rank {
         let left_dim = left
@@ -659,11 +731,14 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
             .map(String::as_str)
             .unwrap_or("1");
 
+        // Past a variadic dim, the two shapes have no common axis numbers.
+        aligned &= !is_variadic_dim(left_dim) && !is_variadic_dim(right_dim);
+
         let dim = if right_dim == "1" {
             left_dim.to_string()
         } else if left_dim == "1" {
             right_dim.to_string()
-        } else if !dims_conflict(left_dim, right_dim) {
+        } else if !aligned || !dims_conflict(left_dim, right_dim) {
             unified_dim(left_dim, right_dim)
         } else {
             return Err(format!(
@@ -688,6 +763,107 @@ fn broadcast_changes(target: &[String], other: &[String]) -> Result<bool, String
         || broadcast.iter().zip(target).any(|(a, b)| dims_conflict(a, b)))
 }
 
+fn has_variadic_dim(shape: &[String]) -> bool {
+    shape.iter().any(|dim| is_variadic_dim(dim))
+}
+
+/// The index in `shape` of the axis `axis`, when no variadic dim is between it
+/// and the end that `axis` counts from.
+fn fixed_axis(shape: &[String], axis: isize) -> Option<usize> {
+    let at = if axis < 0 { shape.len().checked_add_signed(axis)? } else { axis as usize };
+    match shape.iter().position(|dim| is_variadic_dim(dim)) {
+        Some(variadic) if axis < 0 => (at > variadic).then_some(at),
+        Some(variadic) => (at < variadic).then_some(at),
+        None => (at < shape.len()).then_some(at),
+    }
+}
+
+/// The index in `shape` of the new axis of a stack at `axis`, on the same terms
+/// as `fixed_axis`.
+fn stack_axis(shape: &[String], axis: isize) -> Option<usize> {
+    let variadic = shape.iter().position(|dim| is_variadic_dim(dim))?;
+    if axis < 0 {
+        (shape.len() + 1).checked_add_signed(axis).filter(|at| *at > variadic)
+    } else {
+        Some(axis as usize).filter(|at| *at <= variadic)
+    }
+}
+
+/// Whether the dim at index `at` of `shape` can be the axis `axis` for some
+/// count of axes of the variadic dim.
+fn can_be_axis(shape: &[String], at: usize, axis: isize) -> bool {
+    let from_end = |index: usize| shape.len() - 1 - index;
+    let variadic = shape.iter().position(|dim| is_variadic_dim(dim));
+    let (at, axis, variadic) = if axis < 0 {
+        (from_end(at), axis.unsigned_abs() - 1, variadic.map(from_end))
+    } else {
+        (at, axis as usize, variadic)
+    };
+    match variadic {
+        Some(variadic) if at > variadic => axis >= at - 1,
+        _ => at == axis,
+    }
+}
+
+/// Compare `dim` with the dim that the shapes before it have at index `at`
+/// from one end. Gives the earlier dim when the two conflict.
+fn merge_aligned_dim(seen: &mut Vec<String>, at: usize, dim: &str) -> Option<String> {
+    if seen.len() <= at {
+        seen.resize(at + 1, UNKNOWN_DIM.to_string());
+    }
+    if dims_conflict(&seen[at], dim) {
+        return Some(seen[at].clone());
+    }
+    seen[at] = unified_dim(&seen[at], dim);
+    None
+}
+
+/// The error that `shapes`, of which at least one has a variadic dim, prove for
+/// `rule`. A variadic dim gives a lower bound of the rank. The dims between it
+/// and an end align from that end. `join_axis` is the axis of a concatenate,
+/// which may differ in size.
+fn variadic_join_conflict(rule: &str, shapes: &[Vec<String>], join_axis: Option<isize>) -> Result<(), String> {
+    let lowest = |shape: &Vec<String>| shape.len() - usize::from(has_variadic_dim(shape));
+    let lower_bound = shapes.iter().map(lowest).max().unwrap_or(0);
+    if let Some(short) = shapes.iter().find(|shape| !has_variadic_dim(shape) && shape.len() < lower_bound) {
+        return Err(format!(
+            "{rule} expected all inputs to have rank {lower_bound} or more, got rank {}",
+            short.len()
+        ));
+    }
+
+    let first_rank = shapes.first().map_or(0, Vec::len);
+    let (mut from_start, mut from_end) = (Vec::new(), Vec::new());
+    for shape in shapes {
+        let variadic = shape.iter().position(|dim| is_variadic_dim(dim));
+        let mismatch = |axis: usize, expected: &str, got: &str| {
+            format!("{rule} dimension mismatch at axis {axis}: expected {expected}, got {got}")
+        };
+        let joined = |at: usize| join_axis.is_some_and(|axis| can_be_axis(shape, at, axis));
+        for at in (0..variadic.unwrap_or(shape.len())).filter(|at| !joined(*at)) {
+            if let Some(expected) = merge_aligned_dim(&mut from_start, at, &shape[at]) {
+                return Err(mismatch(at, &expected, &shape[at]));
+            }
+        }
+        for at in (variadic.map_or(0, |at| at + 1)..shape.len()).rev().filter(|at| !joined(*at)) {
+            let back = shape.len() - 1 - at;
+            if let Some(expected) = merge_aligned_dim(&mut from_end, back, &shape[at]) {
+                return Err(mismatch(first_rank.saturating_sub(back + 1), &expected, &shape[at]));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a `Concatenate` or a `Stack` call reads a shape with a variadic dim.
+/// The error of such a call is proven, see `variadic_join_conflict`.
+pub(crate) fn joins_variadic_shape(known: &KnownFunction, args: &[CallArgument], shapes: &dyn ShapeLookup) -> bool {
+    matches!(known, KnownFunction::Concatenate | KnownFunction::Stack)
+        && sequence_arg_value(args).and_then(parse_simple_sequence_names).is_some_and(|names| {
+            names.iter().any(|name| shapes.shape(name).is_some_and(|shape| has_variadic_dim(shape)))
+        })
+}
+
 fn concat_dim(dims: &[String]) -> String {
     let parsed = dims
         .iter()
@@ -695,10 +871,11 @@ fn concat_dim(dims: &[String]) -> String {
         .collect::<Result<Vec<_>, _>>();
 
     if let Ok(values) = parsed {
-        return values.iter().sum::<usize>().to_string();
+        let sum = values.iter().try_fold(0usize, |sum, value| sum.checked_add(*value));
+        return sum.map_or(UNKNOWN_DIM.to_string(), |sum| sum.to_string());
     }
 
-    dims.join("+")
+    joined_dim(dims, "+")
 }
 
 pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
@@ -1522,6 +1699,20 @@ fn apply_known_concatenate(
         return Err("concatenate requires rank >= 1 inputs".to_string());
     }
 
+    if let Some(variadic) = input_shapes.iter().find(|shape| has_variadic_dim(shape)) {
+        variadic_join_conflict("concatenate", &input_shapes, Some(axis))?;
+        let Some(at) = fixed_axis(variadic, axis) else {
+            return Ok(None);
+        };
+        let dims = input_shapes.iter().map(|shape| Some(shape[fixed_axis(shape, axis)?].clone()));
+        let Some(dims) = dims.collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        let mut output = variadic.clone();
+        output[at] = concat_dim(&dims);
+        return Ok(Some(output));
+    }
+
     let rank = first_shape.len();
     let axis = if axis < 0 { rank as isize + axis } else { axis };
     if axis < 0 || axis as usize >= rank {
@@ -1586,6 +1777,17 @@ fn apply_known_stack(
     let Some(first_shape) = input_shapes.first() else {
         return Ok(None);
     };
+
+    if let Some(variadic) = input_shapes.iter().find(|shape| has_variadic_dim(shape)) {
+        variadic_join_conflict("stack", &input_shapes, None)?;
+        let axis = nth_positional_or_keyword(args, 1, &["axis", "dim"]).map_or(Some(0), parse_axis);
+        let Some(axis) = axis.and_then(|axis| stack_axis(variadic, axis)) else {
+            return Ok(None);
+        };
+        let mut output = variadic.clone();
+        output.insert(axis, input_shapes.len().to_string());
+        return Ok(Some(output));
+    }
 
     let mut stacked = first_shape.clone();
     for shape in &input_shapes {
@@ -2051,7 +2253,7 @@ fn numeric_min_dim(left: &str, right: &str) -> String {
     if let (Ok(left), Ok(right)) = (left.parse::<usize>(), right.parse::<usize>()) {
         return left.min(right).to_string();
     }
-    format!("min({},{})", left, right)
+    format!("{FREE_DIM}min({},{})", left, right)
 }
 
 fn first_two_positional_values(args: &[CallArgument]) -> Option<(String, String)> {
@@ -5548,13 +5750,10 @@ fn apply_known_cartesian_prod(
         };
         lens.push(len.clone());
     }
-    let total = match lens
-        .iter()
-        .map(|s| s.parse::<usize>().ok())
-        .collect::<Option<Vec<_>>>()
-    {
-        Some(values) => values.iter().product::<usize>().to_string(),
-        None => lens.join("*"),
+    let total = if lens.iter().all(|len| len.parse::<usize>().is_ok()) {
+        dim_product(&lens).map_or(UNKNOWN_DIM.to_string(), |total| total.to_string())
+    } else {
+        joined_dim(&lens, "*")
     };
     Ok(Some(vec![total, names.len().to_string()]))
 }

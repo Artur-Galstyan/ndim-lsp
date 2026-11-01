@@ -994,6 +994,26 @@ fn an_edit_of_another_unit_reaches_a_subscript() {
 }
 
 #[test]
+fn an_edit_of_a_write_reaches_a_slice_stop() {
+    let head = "from jaxtyping import Float, Array\n\n";
+    let reader = "class C:\n    def __init__(self, n):\n        self.n = n\n\n    def f(self, w: Float[Array, \"n m\"]):\n        y = w[:self.n]\n";
+    for sub in [
+        "class D(C):\n    def __init__(self, n):\n        super().__init__(n)\n        self.n = 1\n",
+        "class D(C):\n    def g(self):\n        self.n = load()\n",
+    ] {
+        let plain = format!("{head}{reader}\n\nclass D(C):\n    pass\n");
+        let written = format!("{head}{reader}\n\n{sub}");
+        let (with_write, _) = memo_y_shape(&plain, &written);
+        let (without_write, _) = memo_y_shape(&written, &plain);
+        assert_ne!(with_write, without_write);
+        for (old, new) in [(&plain, &written), (&written, &plain)] {
+            let (memoized, fresh) = memo_y_shape(old, new);
+            assert_eq!(memoized, fresh, "{old}\n->\n{new}");
+        }
+    }
+}
+
+#[test]
 fn an_edit_of_a_class_body_reaches_the_function_around_it() {
     let body = |line: &str| {
         format!("import torch\n\ndef h():\n    f = torch.zeros(3, 4)\n    class C:\n        nonlocal f\n{line}    y = f\n")

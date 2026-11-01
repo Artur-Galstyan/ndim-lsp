@@ -4823,10 +4823,10 @@ mod torch_varargs_size_tests {
     fn size_expressions_and_single_names_stay_unknown() {
         assert_eq!(torch("zeros(size=shp)"), None);
         assert_eq!(torch("zeros(shp)"), None);
-        assert_eq!(torch("zeros((B, S) + (3,))"), None);
+        assert_eq!(torch("zeros((B, S) + (3,))"), dims(&["B", "S", "3"]));
         assert_eq!(torch("zeros((B, S) * 2)"), None);
-        assert_eq!(torch("zeros((f(a, b), 3))"), None);
-        assert_eq!(torch("zeros(size=(B, S) + (3,))"), None);
+        assert_eq!(torch("zeros((f(a, b), 3))"), dims(&["f(a, b)", "3"]));
+        assert_eq!(torch("zeros(size=(B, S) + (3,))"), dims(&["B", "S", "3"]));
         assert_eq!(torch("zeros(4)"), dims(&["4"]));
         let method = |call: &str| {
             y_shape(&format!("def f(x, shp):\n    y = x.{call}"))
@@ -6555,7 +6555,7 @@ class B(eqx.Module):
         let roots = vec![tmp.path().to_path_buf()];
         let analysis =
             analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
-        assert_eq!(find_shape_in_scope(&analysis, "f", "y"), None);
+        assert_eq!(find_shape_in_scope(&analysis, "f", "y"), Some(&shape(&["seq", "min(3, hidden)"])));
     }
 
     #[test]
@@ -11931,7 +11931,6 @@ mod comprehension_lambda_tests {
 
     #[test]
     fn a_dim_that_names_the_loop_variable_is_unknown() {
-        unknown(&["out = jnp.stack([y[:i] for i in range(3)])"], "out");
         unknown(&["out = jnp.stack([jnp.zeros((i, 2)) for i in range(3)])"], "out");
         unknown(&["out = jnp.stack([jnp.zeros((2, k)) for k in range(3)])"], "out");
     }
@@ -14616,10 +14615,17 @@ mod free_dim_tests {
     }
 
     #[test]
-    fn a_slice_bound_of_unknown_value_gives_an_unknown_shape() {
-        for expression in ["v[:d] + v", "v[:, :d] + v", "v[:d]", "v[:, :d + 1]", "v[:len(d)]", "v[:cfg[\"d\"]]"] {
+    fn a_slice_bound_of_unknown_value_gives_an_unknown_size() {
+        for (expression, want) in [
+            ("v[:d] + v", ["3", "4"]),
+            ("v[:, :d] + v", ["3", "4"]),
+            ("v[:d]", ["?", "4"]),
+            ("v[:, :d + 1]", ["3", "?"]),
+            ("v[:len(d)]", ["?", "4"]),
+            ("v[:cfg[\"d\"]]", ["?", "4"]),
+        ] {
             let code = format!("{HEAD}def f(d, cfg):\n    v = torch.zeros(3, 4)\n    a = {expression}\n");
-            assert_eq!(find_shape(&no_errors(&code), "a"), None, "{expression}");
+            assert_eq!(find_shape(&no_errors(&code), "a"), Some(&shape(&want)), "{expression}");
         }
     }
 
@@ -14812,34 +14818,45 @@ mod free_dim_tests {
     }
 
     #[test]
-    fn a_symbolic_slice_bound_is_unknown() {
-        for (index, other) in [
-            ("0:d", "torch.zeros(2, 4)"),
-            ("d:", "torch.zeros(2, 4)"),
-            ("1:d", "torch.zeros(2, 4)"),
-            ("::d", "torch.zeros(2, 4)"),
-            (":d", "torch.zeros(2, 4)"),
-            ("f(a[\"x:y\"]):", "torch.zeros(2, 4)"),
-            (":, 0:d", "torch.zeros(3, 2)"),
-            (":, 1:d", "torch.zeros(3, 2)"),
+    fn a_symbolic_slice_bound_is_an_unknown_size() {
+        for (index, other, want) in [
+            ("0:d", "torch.zeros(2, 4)", ["?", "4"]),
+            ("d:", "torch.zeros(2, 4)", ["?", "4"]),
+            ("1:d", "torch.zeros(2, 4)", ["?", "4"]),
+            ("::d", "torch.zeros(2, 4)", ["?", "4"]),
+            (":d", "torch.zeros(2, 4)", ["?", "4"]),
+            ("f(a[\"x:y\"]):", "torch.zeros(2, 4)", ["?", "4"]),
+            (":, 0:d", "torch.zeros(3, 2)", ["3", "?"]),
+            (":, 1:d", "torch.zeros(3, 2)", ["3", "?"]),
         ] {
             let code = format!(
                 "{HEAD}def f(d, a):\n    v = torch.zeros(3, 4)\n    r = v[{index}]\n    s = r + {other}\n"
             );
-            assert_eq!(find_shape(&no_errors(&code), "r"), None, "{index}");
+            assert_eq!(find_shape(&no_errors(&code), "r"), Some(&shape(&want)), "{index}");
         }
     }
 
     #[test]
-    fn a_slice_of_a_symbolic_axis_is_unknown_unless_it_is_sound() {
+    fn a_slice_of_a_symbolic_axis_has_a_form_or_an_unknown_size() {
         let run = |index: &str| {
             let code = format!(
                 "{HEAD}def f(w: Float[Array, \"n m\"], k):\n    r = w[{index}]\n"
             );
             find_shape(&no_errors(&code), "r").cloned()
         };
-        for index in [":2", "1:", "-1:", ":-1", "::2", "1:3", ":k", ":m", ":, :2", ":, ::2"] {
-            assert_eq!(run(index), None, "{index}");
+        for (index, want) in [
+            (":2", ["min(2, n)", "m"]),
+            ("1:", ["n-1", "m"]),
+            ("-1:", ["min(1, n)", "m"]),
+            (":-1", ["n-1", "m"]),
+            ("::2", ["ceil(n/2)", "m"]),
+            ("1:3", ["min(2, n-1)", "m"]),
+            (":k", ["?", "m"]),
+            (":m", ["?", "m"]),
+            (":, :2", ["n", "min(2, m)"]),
+            (":, ::2", ["n", "ceil(m/2)"]),
+        ] {
+            assert_eq!(run(index), Some(shape(&want)), "{index}");
         }
         for index in [":", "::", "::1", "0:", "0::1", "::-1", ":n", ":, :m", "...", "None:None"] {
             assert_eq!(run(index), Some(shape(&["n", "m"])), "{index}");
@@ -14911,7 +14928,7 @@ mod free_dim_tests {
             let analysis = no_errors(&code);
             assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "self.d"])), "{outside}");
             assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3", "7"])), "{outside}");
-            assert_eq!(find_shape(&analysis, "s"), None, "{outside}");
+            assert_eq!(find_shape(&analysis, "s"), Some(&shape(&["?", "4"])), "{outside}");
         }
     }
 }
@@ -15391,7 +15408,8 @@ mod size_soundness_tests {
         let annotated = |lines: &str| {
             format!("def g(w: Float[Array, \"n m\"], c):\n{lines}    y = w[:n]\n")
         };
-        assert_eq!(y_of(&annotated("    n = 2\n")), None);
+        let unknown = Some(shape(&["?", "m"]));
+        assert_eq!(y_of(&annotated("    n = 2\n")), Some(shape(&["min(2, n)", "m"])));
         for lines in [
             "    for n in range(3):\n        pass\n",
             "    n = c()\n",
@@ -15400,18 +15418,18 @@ mod size_soundness_tests {
             "    with c as n:\n        pass\n",
             "    import n\n",
         ] {
-            assert_eq!(y_of(&annotated(lines)), None, "{lines}");
+            assert_eq!(y_of(&annotated(lines)), unknown, "{lines}");
         }
-        assert_eq!(y_of("def g(w: Float[Array, \"n m\"], n):\n    y = w[:n]\n"), None);
-        assert_eq!(y_of("n = 2\ndef g(w: Float[Array, \"n m\"]):\n    y = w[:n]\n"), None);
-        assert_eq!(y_of("n = load()\ndef g(w: Float[Array, \"n m\"]):\n    y = w[:n]\n"), None);
+        assert_eq!(y_of("def g(w: Float[Array, \"n m\"], n):\n    y = w[:n]\n"), unknown);
+        assert_eq!(y_of("n = 2\ndef g(w: Float[Array, \"n m\"]):\n    y = w[:n]\n"), Some(shape(&["min(2, n)", "m"])));
+        assert_eq!(y_of("n = load()\ndef g(w: Float[Array, \"n m\"]):\n    y = w[:n]\n"), unknown);
         let global = "def s():\n    global n\n    n = 2\n\ndef g(w: Float[Array, \"n m\"]):\n    y = w[:n]\n";
-        assert_eq!(y_of(global), None);
+        assert_eq!(y_of(global), unknown);
         let inner = "def o(n):\n    def g(w: Float[Array, \"n m\"]):\n        y = w[:n]\n";
-        assert_eq!(y_of(inner), None);
+        assert_eq!(y_of(inner), unknown);
         let attribute = "class C:\n    def __init__(self, c):\n        self.n = c()\n\n    def g(self, w: Float[Array, \"n m\"]):\n        y = w[:self.n]\n";
-        assert_eq!(y_of(attribute), None);
-        assert_eq!(y_of(&format!("def g(n):\n{W}    y = w[:n]\n")), None);
+        assert_eq!(y_of(attribute), unknown);
+        assert_eq!(y_of(&format!("def g(n):\n{W}    y = w[:n]\n")), Some(shape(&["?", "4"])));
     }
 
     #[test]
@@ -15533,10 +15551,10 @@ mod size_soundness_tests {
             "def g(v: torch.Tensor):\n    w = v.view(3, 4)\n    y = w[::-1]\n",
             "from torch import Tensor\ndef g(v: Float[Tensor, \"3 4\"]):\n    y = v[::-1]\n",
             "def g(v: Float[torch.Tensor, \"3 4\"]):\n    y = (v + 1)[:, ::-1]\n",
-            "s = -1\nv = torch.zeros(3, 4)\ny = v[::s]\n",
         ] {
             assert_eq!(y_of(body), None, "{body}");
         }
+        assert_eq!(y_of("s = -1\nv = torch.zeros(3, 4)\ny = v[::s]\n"), Some(shape(&["?", "4"])));
         assert_eq!(y_of("v = jnp.zeros((3, 4))\ny = v[::-1]\n"), Some(shape(&["3", "4"])));
         let array = "def g(v: Float[Array, \"3 4\"]):\n    y = v[::-1]\n";
         assert_eq!(y_of(array), Some(shape(&["3", "4"])));
@@ -15676,6 +15694,507 @@ mod size_soundness_tests {
                 let call = format!("fnn.{function}(x, {arguments})");
                 assert_eq!(pool(&call), want.map(|dims| shape(&dims)), "{call}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod symbolic_slice_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    const HEAD: &str = "import torch\nimport torch.nn as nn\nimport jax.numpy as jnp\nimport einops\nfrom jaxtyping import Float, Array\n\n";
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn no_errors(body: &str) -> LayerShapeAnalysis {
+        let code = format!("{HEAD}{body}");
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{code}\n{:?}", analysis.errors);
+        let text = format!("{analysis:?}");
+        assert!(!text.contains("__free") && !text.contains("__unproven"), "{text}");
+        analysis
+    }
+
+    /// The shape of `y = <expression>` in a function with `x` of `[n, m]`, `b`
+    /// of `[n, 4]`, and the integer `k` as a parameter.
+    fn y(expression: &str) -> Option<Vec<String>> {
+        let body = format!(
+            "def f(x: Float[Array, \"n m\"], b: Float[Array, \"n 4\"], k):\n    y = {expression}\n"
+        );
+        find_shape(&no_errors(&body), "y").cloned()
+    }
+
+    fn y_is(expression: &str, want: &[&str]) {
+        assert_eq!(y(expression), Some(shape(want)), "{expression}");
+    }
+
+    fn has_error(expression: &str) -> bool {
+        let code = format!(
+            "{HEAD}def f(x: Float[Array, \"n m\"]):\n    y = {expression}\n"
+        );
+        !analyze(&code).errors.is_empty()
+    }
+
+    /// The shape of `y` after `s = <slice>` and `y = <use of s>`.
+    fn y_of_s(slice: &str, expression: &str) -> Option<Vec<String>> {
+        y(&format!("0\n    s = {slice}\n    y = {expression}"))
+    }
+
+    #[test]
+    fn a_slice_of_a_symbolic_axis_has_an_exact_size() {
+        for (index, size) in [
+            ("1:", "n-1"),
+            (":-1", "n-1"),
+            ("3:", "n-3"),
+            (":-3", "n-3"),
+            ("1:-2", "n-3"),
+            (":", "n"),
+            ("0:", "n"),
+            (":n", "n"),
+            ("2:n", "n-2"),
+            (":4", "min(4, n)"),
+            ("-4:", "min(4, n)"),
+            ("0:4", "min(4, n)"),
+            ("2:4", "min(2, n-2)"),
+            ("-4:-1", "min(3, n-1)"),
+            ("2:2", "0"),
+            ("3:2", "0"),
+            (":0", "0"),
+            ("-1:-4", "0"),
+            ("::2", "ceil(n/2)"),
+            ("1::2", "ceil((n-1)/2)"),
+            (":4:2", "ceil(min(4, n)/2)"),
+            ("::-2", "ceil(n/2)"),
+            ("::-1", "n"),
+        ] {
+            y_is(&format!("x[{index}]"), &[size, "m"]);
+        }
+    }
+
+    #[test]
+    fn a_slice_of_a_free_axis_has_the_same_form() {
+        let code = "def f(a, b):\n    x = jnp.zeros((a, b))\n    y = x[:, 1:]\n    z = x[:, :4]\n    w = x[:2]\n";
+        let analysis = no_errors(code);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["a", "b-1"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["a", "min(4, b)"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["min(2, a)", "b"])));
+    }
+
+    #[test]
+    fn slices_add_up() {
+        y_is("x[1:][1:]", &["n-2", "m"]);
+        y_is("x[1:][:-1]", &["n-2", "m"]);
+        y_is("x[:, 1:][:, :-2]", &["n", "m-3"]);
+        y_is("x[1:][:4]", &["min(4, n-1)", "m"]);
+    }
+
+    #[test]
+    fn an_unproven_bound_keeps_the_rank_and_the_other_axes() {
+        for expression in ["x[:, k:]", "x[:, :k]", "x[:, ::k]", "x[:, k:k + 1]", "x[:, -4:4]", "x[:, 1::-1]", "x[:, :len(k)]"] {
+            y_is(expression, &["n", "?"]);
+        }
+        y_is("x[k:]", &["?", "m"]);
+        y_is("x[k:, k:]", &["?", "?"]);
+        y_is("b[:, k:]", &["n", "?"]);
+        y_is("x[:, k:][:, 1:]", &["n", "?"]);
+        y_is("x[:, k:] + x[:, k:]", &["n", "?"]);
+    }
+
+    #[test]
+    fn a_step_of_zero_stays_unknown() {
+        assert_eq!(y("x[::0]"), None);
+    }
+
+    #[test]
+    fn a_min_form_conflicts_with_nothing() {
+        y_is("x[:, :4] + b", &["n", "4"]);
+        y_is("b + x[:, :4]", &["n", "4"]);
+        y_is("x[:, :4] + x", &["n", "m"]);
+        y_is("x[:, :4] + x[:, :4]", &["n", "min(4, m)"]);
+        y_is("x[:, :4] * jnp.zeros((1, 3))", &["n", "3"]);
+        y_is("x[:, :4] @ jnp.zeros((3, 9))", &["n", "9"]);
+        y_is("x[:, :4] @ x.T", &["n", "n"]);
+        y_is("jnp.concatenate([x[:, :4], b], axis=0)", &["n+n", "4"]);
+        y_is("jnp.stack([x[:, :4], b])", &["2", "n", "4"]);
+        assert_eq!(y("x[:, :4] + x[:, :3]"), None);
+        y_is("x[:, :4] + x[:, k:]", &["n", "min(4, m)"]);
+        y_is("x[:, k:] + x[:, :4]", &["n", "min(4, m)"]);
+    }
+
+    #[test]
+    fn a_difference_compares_by_its_name_and_its_integer() {
+        y_is("x[1:] + x[:-1]", &["n-1", "m"]);
+        y_is("x[1:-1] + x[2:]", &["n-2", "m"]);
+        y_is("x[1:] @ x.T[:, 1:]", &["n-1", "n-1"]);
+        y_is("x[:, 1:-1] + x[:, 2:]", &["n", "m-2"]);
+        y_is("x[:, 1:] + jnp.zeros((1, 5))", &["n", "5"]);
+        y_is("jnp.zeros((1, 5)) + x[:, 1:]", &["n", "5"]);
+        y_is("x[:, 1:] @ jnp.zeros((5, 2))", &["n", "2"]);
+        y_is("x[:, 1:] + b[:, :1]", &["n", "m-1"]);
+        assert!(has_error("x[:, 1:] + x"));
+        assert!(has_error("x + x[:, :-1]"));
+        assert!(has_error("x[:, 1:] @ x.T"));
+        assert!(has_error("x[:, 2:] + x[:, 1:]"));
+        assert!(has_error("jnp.stack([x[1:], x])"));
+    }
+
+    #[test]
+    fn a_difference_may_equal_another_name() {
+        let free = "def f(a, x: Float[Array, \"n m\"]):\n    y = x[:, 1:] + jnp.zeros((1, a))\n    z = x[:, 1:] + x[:, :4]\n";
+        let analysis = no_errors(free);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "m-1"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n", "m-1"])));
+        let body = "def f(x: Float[Array, \"n m\"], w: Float[Array, \"s m\"]):\n    y = x[1:] + w\n    z = x[1:] @ w.T\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["s", "m"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n-1", "s"])));
+    }
+
+    #[test]
+    fn a_difference_cancels_in_a_sum() {
+        let body = "def f(x: Float[Array, \"n m\"], c: Float[Array, \"1 m\"], d: Float[Array, \"n 1\"]):\n    y = jnp.concatenate([x[1:], c]) + x\n    z = jnp.concatenate([x[:, 1:], d], axis=1) + x\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "m"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n", "m"])));
+        y_is("jnp.concatenate([x[1:], x[-1:]]) + x", &["n", "m"]);
+        y_is("jnp.concatenate([x[1:], x[:1]], axis=0)", &["n-1+min(1, n)", "m"]);
+        y_is("jnp.stack([x[1:], x[:-1]])", &["2", "n-1", "m"]);
+    }
+
+    #[test]
+    fn a_product_keeps_the_difference_together() {
+        for (slice, expression, want) in [
+            ("x[:, 1:]", "s.reshape(-1)", vec!["n*(m-1)"]),
+            ("x[1:]", "s.reshape(-1)", vec!["(n-1)*m"]),
+            ("x[:, 1:]", "s.reshape(s.shape[0], -1)", vec!["n", "m-1"]),
+            ("x[:, :4]", "s.reshape(-1)", vec!["n*min(4, m)"]),
+            ("x[:, :4]", "s.reshape(s.shape[0], -1)", vec!["n", "min(4, m)"]),
+            ("x[:, k:]", "s.reshape(s.shape[0], -1)", vec!["n", "?"]),
+            ("x[:, 1:]", "einops.rearrange(s, \"a b -> (a b)\")", vec!["n*(m-1)"]),
+            ("x[:, 1:]", "s.reshape(-1) + jnp.zeros((6,))", vec!["6"]),
+            ("x[:, ::2]", "s.reshape(-1)", vec!["n*ceil(m/2)"]),
+        ] {
+            assert_eq!(y_of_s(slice, expression), Some(shape(&want)), "{expression}");
+        }
+    }
+
+    #[test]
+    fn the_downstream_of_a_slice_has_shapes() {
+        let body = "def f(x: Float[Array, \"b n d\"], w: Float[Array, \"d e\"]):\n    c = x[:, :4]\n    h = c.sum(axis=1)\n    w = w[:, :4]\n    v = x @ w\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["b", "min(4, n)", "d"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["b", "d"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["d", "min(4, e)"])));
+        assert_eq!(find_shape(&analysis, "v"), Some(&shape(&["b", "n", "min(4, e)"])));
+    }
+
+    #[test]
+    fn a_layer_takes_a_slice_dim_as_a_size() {
+        let body = "def f(x: Float[Array, \"n m\"], k):\n    c = x[:, :4]\n    l = nn.Linear(c.shape[1], 8)\n    y = l(c)\n    u = x[:, k:]\n    p = nn.Linear(u.shape[1], 8)\n    z = p(u)\n    d = x[:, 1:]\n    q = nn.Linear(d.shape[1], 8)\n    r = q(d)\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "8"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n", "8"])));
+        assert_eq!(find_shape(&analysis, "r"), Some(&shape(&["n", "8"])));
+        let wide = "def f(x: Float[Array, \"n m\"]):\n    y = nn.Linear(4, 8)(x[:, :4])\n    z = nn.Linear(9, 8)(x[:, 1:])\n";
+        no_errors(wide);
+    }
+
+    #[test]
+    fn a_call_returns_a_slice_dim() {
+        let body = "def g(a: Float[Array, \"p q\"]):\n    c = a[:, 1:]\n    return c\n\n\ndef h(a: Float[Array, \"p q\"]):\n    c = a[:, :4]\n    return c\n\n\ndef t(a: Float[Array, \"p q\"], k: int):\n    c = a[:, k:]\n    return c\n\n\ndef f(x: Float[Array, \"n m\"]):\n    y = g(x)\n    z = h(x)\n    w = t(x, 2)\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "m-1"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n", "min(4, m)"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["n", "?"])));
+    }
+
+    #[test]
+    fn a_comma_in_a_size_stays_in_one_dim() {
+        for (call, want) in [
+            ("jnp.zeros((min(k, 2), 2))", vec!["min(k, 2)", "2"]),
+            ("jnp.zeros((min(k,2), 2))", vec!["min(k,2)", "2"]),
+            ("jnp.zeros((2, max(k, 2), 3))", vec!["2", "max(k, 2)", "3"]),
+            ("jnp.zeros([min(k, 2), 2])", vec!["min(k, 2)", "2"]),
+            ("jnp.ones((min(k, 2),))", vec!["min(k, 2)"]),
+            ("torch.zeros(min(k, 2), 2)", vec!["min(k, 2)", "2"]),
+            ("torch.zeros((min(k, 2), 2))", vec!["min(k, 2)", "2"]),
+            ("torch.zeros(size=(min(k, 2), 2))", vec!["min(k, 2)", "2"]),
+            ("x.reshape((min(k, 2), 6))", vec!["min(k, 2)", "6"]),
+            ("x.reshape(min(k, 2), 6)", vec!["min(k, 2)", "6"]),
+            ("jnp.broadcast_to(x, (min(k, 2), 3, 4))", vec!["min(k, 2)", "3", "4"]),
+            ("jnp.full((min(k, 2), 2), 0.0)", vec!["min(k, 2)", "2"]),
+            ("jnp.zeros((min(k, 2), 2)) + jnp.zeros((3, 2))", vec!["3", "2"]),
+        ] {
+            let body = format!("def f(k, x: Float[Array, \"3 4\"]):\n    y = {call}\n");
+            assert_eq!(find_shape(&no_errors(&body), "y"), Some(&shape(&want)), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_comma_in_a_literal_is_no_list_of_integers() {
+        for call in ["jnp.pad(x, (min(1, 2), 3))", "jnp.pad(x, min(1, 2))"] {
+            let body = format!("def f(x: Float[Array, \"3 4\"]):\n    y = {call}\n");
+            assert_eq!(find_shape(&no_errors(&body), "y"), None, "{call}");
+        }
+    }
+
+    #[test]
+    fn a_comma_in_a_layer_size_stays_in_one_dim() {
+        let body = "def f(k, x: Float[Array, \"2 3 8 8\"]):\n    l = nn.AdaptiveAvgPool2d((min(k, 2), 4))\n    y = l(x)\n    m = nn.Unflatten(1, (min(k, 2), 3))\n    z = m(jnp.zeros((2, 6)))\n    p = nn.Conv(4, (min(k, 2), 3))\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), None);
+        assert_eq!(find_shape(&analysis, "z"), None);
+    }
+
+    #[test]
+    fn min_of_a_shape_function_conflicts_with_nothing() {
+        let body = "def f(x: Float[Array, \"n m\"]):\n    y = jnp.diag(x) + jnp.zeros((5,))\n    z = jnp.diag(x) + x[:, 0]\n";
+        let analysis = no_errors(body);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["n"])));
+    }
+
+    #[test]
+    fn a_second_write_stops_the_attribute_as_the_axis() {
+        let program = |init: &str, stop: &str| {
+            format!(
+                "class C:\n    def __init__(self, n):\n{init}\n\n    def f(self, w: Float[Array, \"n m\"]):\n        y = w[:{stop}]\n"
+            )
+        };
+        for init in [
+            "        self.n = n\n        self.n = 1",
+            "        self.n = 1\n        self.n = n",
+            "        self.n = n\n        self.n += 1",
+            "        self.n = n\n        self.n = load()",
+        ] {
+            let analysis = no_errors(&program(init, "self.n"));
+            assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["?", "m"])), "{init}");
+        }
+        let one = no_errors(&program("        self.n = n", "self.n"));
+        assert_eq!(find_shape(&one, "y"), Some(&shape(&["n", "m"])));
+        let later = "class C:\n    def __init__(self, n):\n        self.n = n\n\n    def g(self):\n        self.n = 1\n\n    def f(self, w: Float[Array, \"n m\"]):\n        y = w[:self.n]\n";
+        assert_eq!(find_shape(&no_errors(later), "y"), Some(&shape(&["?", "m"])));
+        let sub = "class C:\n    def __init__(self, n):\n        self.n = n\n\n    def f(self, w: Float[Array, \"n m\"]):\n        y = w[:self.n]\n\n\nclass D(C):\n    def __init__(self, n):\n        super().__init__(n)\n        self.n = 1\n";
+        assert_eq!(find_shape(&no_errors(sub), "y"), Some(&shape(&["?", "m"])));
+    }
+
+    /// `y = <expression>` with `x` of `[n, m]`, and with `a` and `b` of the
+    /// annotation `dims`.
+    fn annotated(dims: &str, expression: &str) -> Option<Vec<String>> {
+        let body = format!(
+            "def f(a: Float[Array, \"{dims}\"], b: Float[Array, \"{dims}\"]):\n    y = {expression}\n"
+        );
+        find_shape(&no_errors(&body), "y").cloned()
+    }
+
+    #[test]
+    fn a_shape_argument_that_is_an_expression_has_no_rank() {
+        for expression in [
+            "jnp.zeros((2,) * 3)",
+            "jnp.zeros([2, 3] * 2)",
+            "jnp.zeros((2, 3) if k else (3, 2))",
+            "jnp.zeros(tuple(max(1, d) for d in x.shape))",
+            "jnp.zeros(tuple(d for d in (2, 3)))",
+            "jnp.zeros((d for d in (2, 3)))",
+            "jnp.zeros([d for d in (2, 3)])",
+            "jnp.zeros(tuple((2, 3)))",
+            "jnp.zeros(get(1))",
+            "jnp.zeros(get(k, 2))",
+            "jnp.zeros((get(1)))",
+            "jnp.zeros(x.shape[1:])",
+            "jnp.zeros((*x.shape, 3))",
+            "jnp.zeros((2, 3)[0:1])",
+            "jnp.zeros(shape=(2, 3) + (k,) * 2)",
+            "jnp.zeros(())",
+            "x.reshape(x.shape[::-1])",
+            "x.reshape(get(1))",
+            "jnp.broadcast_to(x, (2,) * 2)",
+            "jnp.broadcast_to(x, get(k, 2))",
+            "jnp.zeros((2, 3) + [4])",
+            "jnp.zeros((k) + (4,))",
+            "jnp.zeros(unknown.shape + (4,))",
+        ] {
+            assert_eq!(y(expression), None, "{expression}");
+        }
+    }
+
+    #[test]
+    fn a_sum_of_tuples_is_a_shape() {
+        for (expression, want) in [
+            ("jnp.zeros((2, 3) + (4,))", vec!["2", "3", "4"]),
+            ("jnp.zeros([2, 3] + [4])", vec!["2", "3", "4"]),
+            ("jnp.zeros(x.shape + (3,))", vec!["n", "m", "3"]),
+            ("jnp.zeros((1,) + x.shape + (k,))", vec!["1", "n", "m", "k"]),
+            ("x.reshape(x.shape + (1,))", vec!["n", "m", "1"]),
+            ("x.reshape((1,) + x.shape)", vec!["1", "n", "m"]),
+            ("jnp.broadcast_to(x, (2,) + x.shape)", vec!["2", "n", "m"]),
+        ] {
+            y_is(expression, &want);
+        }
+        let t = "def f(x: Float[Array, \"n m\"]):\n    t = jnp.zeros((2, 3) + (4,))\n    y = t.sum(axis=2)\n";
+        assert_eq!(find_shape(&no_errors(t), "y"), Some(&shape(&["2", "3"])));
+    }
+
+    #[test]
+    fn a_plain_size_argument_keeps_its_rank() {
+        y_is("jnp.zeros(k)", &["k"]);
+        y_is("jnp.zeros(5)", &["5"]);
+        y_is("jnp.zeros((min(k, 2), 2))", &["min(k, 2)", "2"]);
+        y_is("jnp.zeros((k, 2))", &["k", "2"]);
+        y_is("jnp.zeros(x.shape[0])", &["x.shape[0]"]);
+        y_is("x.reshape(-1)", &["n*m"]);
+    }
+
+    #[test]
+    fn a_slice_of_an_axis_without_a_name_has_no_form() {
+        for (dims, index, want) in [
+            ("_ m", "1:", vec!["?", "m"]),
+            ("_ m", "::2", vec!["?", "m"]),
+            ("_ m", ":4", vec!["?", "m"]),
+            ("_ m", ":", vec!["_", "m"]),
+            ("_ m", ":, 1:", vec!["_", "m-1"]),
+            ("_n m", "1:", vec!["?", "m"]),
+            ("#n m", "1:", vec!["?", "m"]),
+            ("#n m", ":2", vec!["?", "m"]),
+            ("batch=4 m", "1:", vec!["?", "m"]),
+            ("batch=4 m", ":4", vec!["?", "m"]),
+            ("m _", ":, 1:", vec!["m", "?"]),
+            ("m *b", "1:", vec!["m-1", "*b"]),
+            ("m ...", "1:", vec!["m-1", "..."]),
+            ("*b m", "..., 1:", vec!["*b", "m-1"]),
+            ("... m", "..., :2", vec!["...", "min(2, m)"]),
+            ("*b m", ":", vec!["*b", "m"]),
+            ("*b m", "::-1", vec!["*b", "m"]),
+            ("*b m", ":, :", vec!["*b", "m"]),
+            ("*b m", "..., None", vec!["*b", "m", "1"]),
+            ("*b m", "None", vec!["1", "*b", "m"]),
+        ] {
+            let got = annotated(dims, &format!("a[{index}]"));
+            assert_eq!(got, Some(shape(&want)), "{dims} {index}");
+        }
+    }
+
+    #[test]
+    fn an_index_after_a_variadic_axis_has_no_position() {
+        for dims in ["*b m", "... m", "*#b m", "#*b m", "*_ m", "k *b m"] {
+            let skip = usize::from(dims.starts_with('k'));
+            let prefix = ":, ".repeat(skip);
+            for index in ["1:", ":, 1:", "0", ":, 0", "::2", ":, None", "1:, ..., 1:", "..., 1:, 1:", "[0, 1]"] {
+                let got = annotated(dims, &format!("a[{prefix}{index}]"));
+                assert_eq!(got, None, "{dims} {prefix}{index}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sum_with_an_axis_without_a_name_is_no_error() {
+        for (dims, expression) in [
+            ("_ m", "a[1:] + b"),
+            ("_ m", "a[2:] + b[1:]"),
+            ("#n m", "a[1:] + b"),
+            ("_n m", "a[1:] + b"),
+            ("batch=4 m", "a[1:] + b"),
+        ] {
+            annotated(dims, expression);
+        }
+    }
+
+    #[test]
+    fn a_call_form_on_an_axis_without_a_name_is_unknown() {
+        for dims in ["_ m", "#n m", "batch=4 m"] {
+            let body = format!(
+                "def g(p: Float[Array, \"q m\"]) -> Float[Array, \"q-1 m\"]:\n    return p[1:]\n\ndef f(a: Float[Array, \"{dims}\"]):\n    y = g(a)\n"
+            );
+            assert_eq!(find_shape(&no_errors(&body), "y"), Some(&shape(&["?", "m"])), "{dims}");
+        }
+    }
+
+    #[test]
+    fn a_slice_of_a_min_axis_folds_its_limit() {
+        for (expression, want) in [
+            ("x[:4][5:]", "0"),
+            ("x[:4][4:]", "0"),
+            ("x[:4][:-5]", "0"),
+            ("x[:4][:-4]", "0"),
+            ("x[:2][3:]", "0"),
+            ("x[:4][2:-3]", "0"),
+            ("x[:4][:7]", "min(4, n)"),
+            ("x[:4][:2]", "min(2, n)"),
+            ("x[:4][-7:]", "min(4, n)"),
+            ("x[:4][-2:]", "min(2, n)"),
+            ("x[:4][1:]", "min(3, n-1)"),
+            ("x[:4][:-1]", "min(3, n-1)"),
+            ("x[:4][1:2]", "min(1, n-1)"),
+            ("x[:4][1:9]", "min(3, n-1)"),
+            ("x[:4][-3:-1]", "min(2, n-1)"),
+            ("x[:4][::2]", "ceil(min(4, n)/2)"),
+            ("x[-4:][5:]", "0"),
+            ("x[1:3][1:]", "min(1, n-2)"),
+            ("x[:4][-1:1]", "?"),
+            ("x[:4][::-2]", "ceil(min(4, n)/2)"),
+            ("x[:4][1::-1]", "?"),
+        ] {
+            y_is(expression, &[want, "m"]);
+        }
+        y_is("x[:4][5:] + jnp.zeros((1, 1))", &["0", "m"]);
+    }
+
+    #[test]
+    fn a_slice_of_a_ceil_axis_folds_or_is_unknown() {
+        for (expression, want) in [
+            ("x[::2][:3]", "min(3, ceil(n/2))"),
+            ("x[::2][-3:]", "min(3, ceil(n/2))"),
+            ("x[::2][::3]", "ceil(ceil(n/2)/3)"),
+            ("x[::2][2:2]", "0"),
+            ("x[::2][1:]", "?"),
+            ("x[::2][:-1]", "?"),
+            ("x[::2][1:3]", "?"),
+            ("x[::2][-3:-1]", "?"),
+        ] {
+            y_is(expression, &[want, "m"]);
+        }
+    }
+
+    #[test]
+    fn a_form_on_a_min_axis_is_not_below_zero() {
+        let body = "def g(p: Float[Array, \"q m\"]) -> Float[Array, \"q-5 m\"]:\n    return p\n\ndef f(x: Float[Array, \"n m\"]):\n    y = g(x[:4])\n";
+        assert_eq!(find_shape(&no_errors(body), "y"), Some(&shape(&["?", "m"])));
+    }
+
+    #[test]
+    fn a_substitution_next_to_a_product_keeps_its_value_together() {
+        let run = |result: &str, sizes: &str| {
+            let body = format!(
+                "def g(a: Float[Array, \"q r\"]) -> Float[Array, \"{result}\"]:\n    return a\n\ndef f(b: Float[Array, \"{sizes}\"]):\n    y = g(b)\n"
+            );
+            find_shape(&no_errors(&body), "y").cloned()
+        };
+        for (result, sizes, want) in [
+            ("q/r", "s t*u", "s/(t*u)"),
+            ("q/r", "s t/u", "s/(t/u)"),
+            ("q/r", "s t-u", "s/(t-u)"),
+            ("q/r", "s*t u", "(s*t)/u"),
+            ("q*r", "s t/u", "s*(t/u)"),
+            ("q*r", "s t*u", "s*(t*u)"),
+            ("q*r", "s t+u", "s*(t+u)"),
+            ("q/r", "s 2", "s/2"),
+            ("q/r", "s t", "s/t"),
+            ("q+r", "s t*u", "s+t*u"),
+            ("q-r", "s t+u", "s-(t+u)"),
+        ] {
+            assert_eq!(run(result, sizes), Some(shape(&[want])), "{result} {sizes}");
         }
     }
 }

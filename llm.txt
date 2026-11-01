@@ -12,8 +12,8 @@ across files, scoped bare names and `vmap` names (item 18a), and module-level
 rebinding of imports (item 22). Commit `c6f2860` is the last commit without
 these four items. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,406 tests pass and six are ignored.
-  - 2,309 library tests (49 of them in `src/incremental_tests.rs`). Two
+- `cargo test --quiet` passes: 2,474 tests pass and seven are ignored.
+  - 2,354 library tests (50 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
   - 34 in `tests/incremental_edits.rs`. One ignored:
@@ -21,6 +21,8 @@ these four items. `ndim-lsp` is 0.1.1.
   - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 3 in
     `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
     `golden_dump`, `golden_has_no_internal_names`.
+  - 13 in `tests/dim_growth.rs` (one more ignored: `growth_probe`) and 10 in
+    `tests/variadic_rank.rs`.
   The known-function tests live in `src/known_functions/*_tests.rs`. The dev
   profile compiles `tree-sitter` at opt-level 3, so the randomized edit tests
   stay fast (a debug `cargo test` takes about a minute).
@@ -312,7 +314,7 @@ server logs `incremental mismatch, used the fresh result: ...`, uses the fresh
 result, and drops the memo. In `cfg!(test)` builds the same difference panics.
 The cost is one extra fresh parse and analysis per edit, so never time with it.
 
-Tests: `src/incremental_tests.rs` (49 library tests) and
+Tests: `src/incremental_tests.rs` (50 library tests) and
 `tests/incremental_edits.rs` (seeded random edit sequences over `corpus/` and
 `bench/stress/`; after every edit the reparsed tree and the memo analysis must
 equal the fresh ones; seeded edits also change each added dependency, such as
@@ -963,8 +965,9 @@ What works now
      prefix `__free_`, the same method as `UNPROVEN_DIM`. `dims_conflict` is the
      test of every mismatch check, and a free dim conflicts with nothing.
      `dims_canonically_equal` ignores the mark. `unified_dim` gives the result:
-     a free dim takes the value of the other side, and two different free dims
-     give `UNPROVEN_DIM`. `shape_of_expression` and `apply_known_function` drop
+     a free dim takes the value of the other side, a difference such as `n-1`
+     takes an exact dim, `UNKNOWN_DIM` takes any other side, and two other
+     different free dims give `UNPROVEN_DIM`. `shape_of_expression` and `apply_known_function` drop
      a shape with `UNPROVEN_DIM`, so `[n, d] + [n, e]` is unknown and a hover
      shows nothing. `record_binding` also refuses such a shape.
      `without_free_marks` writes `?` for it in the layer of an application. A free dim against an annotation symbol gives the symbol,
@@ -979,15 +982,89 @@ What works now
      gets the mark also when the class writes one integer to it, because code
      outside the class can write another. `slice_size` gives the size of
      a slice. An integer axis with proven start, stop, and step gives the size
-     of Python, with negative values and steps. Any other form is unknown,
-     because `[:2]` on `n` is `min(2, n)`. The exceptions are the forms that
-     keep the whole axis: `[:]`, `[::1]`, `[0:]`, `[::-1]`, and `[:n]` on `n`.
+     of Python, with negative values and steps. A symbolic axis `n` with
+     integer bounds gets a form (`symbolic_slice_len`), for `a`, `b` > 0:
+     `[a:]` is `n-a`, `[:-b]` is `n-b`, `[a:-b]` is `n-a-b`, `[:b]` and `[-b:]`
+     are `min(b, n)`, `[a:b]` is `min(b-a, n-a)`, `[-a:-b]` is `min(a-b, n-b)`,
+     and an empty range is 0. A step `k` > 1 gives `ceil(s/k)` with the size
+     `s` of the range, and `[::-k]` gives `ceil(n/k)`. The `n-a` forms assume
+     an axis of at least that many items: a shorter axis has size 0. The `min`
+     and `ceil` forms have the `FREE_DIM` mark. A form is written on the text of
+     the axis, so that `x[1:][1:]` is `n-2` and a free axis stays free.
+     Forms use only names (`is_named_size`). A slice of `_`, `_n`, `#n`, `*b`,
+     `...`, or `n=4` gives `?`, and such a dim conflicts with nothing. A slice
+     of `min(l, e)` is a slice of `e` with the limit in the bounds
+     (`form_slice_len`): `x[:4][5:]` is 0, `x[:4][:2]` is `min(2, n)`, and
+     `x[:4][1:]` is `min(3, n-1)`. On a `ceil` form or a compound `min` form,
+     only `[:b]`, `[-b:]`, `[::k]`, and an empty range have a form. The other
+     slices give `?`. `offset_dim` gives `?` for a `min` form below 0 at every
+     size. After a variadic dim (`*b`, `...`) the axis of an index has no
+     proven position, so `shape_of_subscript` gives no shape unless the slice
+     keeps all items or an ellipsis covers the variadic dim: `x[..., 1:]` on
+     `*b m` is `[*b, m-1]`, and `x[:, 1:]` is unknown.
+   - Bounds of one analysis. `bounded_dim` (`types.rs`) makes a dim over
+     `MAX_DIM_TEXT` (256 bytes), or a form that holds `UNKNOWN_DIM`, into
+     `UNKNOWN_DIM`. `shape_of_expression`, `normalize_shape`, the layer rules,
+     and the annotation parser apply it. `joined_dim` checks the length before
+     it builds a sum or a product, and `substitute_dim`, `rebind_callee_dim`,
+     and `dim_with_values` stop when the text passes the limit. A value over
+     `MAX_RANK` (64) has no shape. Integer dims use checked arithmetic and an
+     overflow gives `UNKNOWN_DIM`, also in each size rule of `src/layers.rs`.
+     `MAX_STATEMENT_STEPS` (20,000) limits the `shape_of_expression` calls of
+     one statement with the bodies it calls, per statement so that a unit gives
+     the same result in an incremental run. `specialize_callee_call` also takes
+     one step for each node of the callee (`descendant_count`), and a call with
+     too few steps has no shape. The most that a statement of `bench/stress` or
+     `corpus` uses is 133 steps.
+     `MAX_EXPRESSION_DEPTH` (200) limits open calls. `too_deep` gives an empty
+     analysis for a tree deeper than `MAX_SYNTAX_DEPTH` (1,000), and the memo
+     path checks only the units that changed. `checked_name` keeps a memo of
+     the name checks (scalar, integer, torch, array), so that a chain such as
+     `b = a + a` is linear. `inner.rs` clears it, because a lambda changes what
+     a name holds. `tests/dim_growth.rs` measures bytes with a counting
+     allocator.
+   - Variadic dims. A shape with `*b` or `...` has a rank that is only a lower
+     bound. `ShapeCtx::report` drops an error whose source reads a value with a
+     variadic dim, so that every rule is covered at one place. Three errors
+     stay.
+     A binary operator error on two annotations has the range of the
+     annotations: broadcast and matmul align from the right and stop at a
+     variadic dim. A layer error stays unless it is about the rank
+     (`report_layer`), because a layer reads the input from its last axis. `aligned_axes` binds the dims of a call before and after
+     the variadic dim. A variadic parameter over no axis or over many axes gives
+     no return shape, and a named dim with no proven axis is `?`.
+     `apply_known_concatenate` and `apply_known_stack` use `fixed_axis` and
+     `stack_axis`: an axis that crosses the variadic dim gives no shape. Before
+     that, `variadic_join_conflict` gives the errors that the dims prove: a rank
+     under the lower bound of another input, or a conflict on an axis with no
+     variadic dim between it and an end. `can_be_axis` skips a dim that can be
+     the axis of a concatenate. `joins_variadic_shape` adds such an error past
+     `ShapeCtx::report`.
      `[:n]` keeps the axis only when `n` is an annotation symbol that no scope
-     binds, or an attribute that holds a parameter of that name
-     (`stop_is_axis`). A local, a global, a parameter, a loop target, or a
-     `global` write of `n` in any function gives unknown. A negative step on a
-     proven torch tensor (`is_torch_value`) is unknown, because torch refuses
-     it. Unknown drops the whole shape, also the rank.
+     binds, or an attribute that holds a parameter of that name and has no
+     other write (`stop_is_axis`). An unproven bound or step, `[-a:b]`, and any
+     other negative step give `UNKNOWN_DIM` (`__free_?`). The axis stays, the
+     reader sees `?`, and the rank and the other axes stay known. A step of 0
+     and a negative step on a proven torch tensor (`is_torch_value`) drop the
+     whole shape, because Python and torch refuse them.
+   - A difference is a dim with a name and a `-`. It conflicts only with a flat
+     sum of the same names and another integer: `n-1` conflicts with `n` and
+     `n-2`, but not with `5`, `m`, or `(n-1)*2`. `canonicalize_dim` reads a
+     subtraction as a term with a sign, so `n-1+1` equals `n`. A product or a
+     division writes a sum in parentheses (`factor_text`): `n*(m-1)`.
+     `substitute_dims` replaces a name inside a form, so a call gives `m-1`
+     for `q-1`. Next to a `*`, a `/`, or a `%`, any compound value gets
+     parentheses (`operand_text`): `q/r` with `r` = `t*u` gives `s/(t*u)`. A
+     value that is not a name gives `?` inside a form.
+   - A dim can hold a comma: `min(4, n)`. `split_top_level` splits a size
+     argument only outside brackets, and `parse_shape_value` gives such a dim
+     the `FREE_DIM` mark. `parse_ints` gives nothing for a literal with a name.
+   - `parse_shape_value` reads a tuple, a list, or one size (`is_one_size`). A
+     plain name stays one dim. Any other expression gives no shape: a call, a
+     slice of `x.shape`, a starred item, a conditional, a generator, a
+     comprehension, or a product of a tuple. `sequence_sum` reads a sum of
+     tuples, lists, and `x.shape` to a real shape, so `jnp.zeros(x.shape + (3,))`
+     is `[n, m, 3]`.
    - A name with a literal value, when an annotation also uses the word as a
      dim, gets `LITERAL_DIM`: `__free_D__is_64`. An annotation dim `D` is a
      size that the value of the name does not bind, so the dim equals both 64
@@ -1156,7 +1233,7 @@ Known limitations / important caveats
   `x.flatten(start_dim, end_dim)` honor the dims (a positional argument that is
   not a string counts as torch); out-of-range dims are unknown.
 - Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
-- Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (Python size on an integer axis with proven bounds, a form that keeps the whole axis, otherwise the whole shape is unknown), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. A list of integers gives its length to the axis, alone or next to slices. Every other index that is not a proven integer (`is_integer_expr`) makes the whole shape unknown: an array, a mask, a tuple, a `bool`, a list next to an integer, or two lists. A proven integer is a literal, `len`, `int`, `x.shape[i]`, a parameter annotated `int`, a target of `range` or the index of `enumerate`, or a name with only such bindings.
+- Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (Python size on an integer axis with proven bounds, a symbolic form on a symbolic axis, otherwise an axis of size `?` that keeps the rank), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. A list of integers gives its length to the axis, alone or next to slices. Every other index that is not a proven integer (`is_integer_expr`) makes the whole shape unknown: an array, a mask, a tuple, a `bool`, a list next to an integer, or two lists. A proven integer is a literal, `len`, `int`, `x.shape[i]`, a parameter annotated `int`, a target of `range` or the index of `enumerate`, or a name with only such bindings.
 - Multi-output tuple assignment covers `split`, default `meshgrid`, default
   linalg `svd`/`qr`/`eig`, top-k-style functions, supported RNN/LSTM/GRU
   layers, and other explicitly modeled calls in `tuple_rhs_shapes`. Its

@@ -128,16 +128,16 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             let kernel_size = call.bindings.get("kernel_size")?;
             // Spatial rank from the kernel tuple: (3, 3) → 2, scalar → 1.
             let spatial_rank = if is_sequence(kernel_size) {
-                kernel_size.matches(',').count() + usize::from(!kernel_size.ends_with(",)"))
+                parse_dim_sequence(kernel_size)?.len()
             } else {
                 1
             };
             // v1 models only the default stride-1 / SAME-padding case.
             if let Some(strides) = call.bindings.get("strides")
-                && strides.trim_matches(['(', ')', ' ']).split(',').any(|s| {
-                    let s = s.trim();
-                    !s.is_empty() && s != "1"
-                })
+                && parse_dim_sequence(strides)
+                    .unwrap_or_else(|| vec![strides.clone()])
+                    .iter()
+                    .any(|s| !s.is_empty() && s != "1")
             {
                 return None;
             }
@@ -1287,19 +1287,19 @@ pub fn extract_layer_applications(
 }
 
 /// Apply a signed integer offset to a symbolic expression, constant-folding
-/// when the expression itself is an integer.
+/// when the expression itself is an integer. An overflow gives `UNKNOWN_DIM`.
 fn apply_offset(expr: &str, offset: isize) -> String {
     if offset == 0 {
         return expr.to_string();
     }
     // If expr is itself an integer, fold the whole thing
     if let Ok(val) = expr.parse::<isize>() {
-        return (val + offset).to_string();
+        return val.checked_add(offset).map_or(UNKNOWN_DIM.to_string(), |sum| sum.to_string());
     }
     if offset > 0 {
         format!("{}+{}", expr, offset)
     } else {
-        format!("{}-{}", expr, -offset)
+        format!("{}-{}", expr, offset.unsigned_abs())
     }
 }
 
@@ -1368,8 +1368,10 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
         padding.parse::<i64>(),
     ) && s > 0
     {
-        let span = l + 2 * p - k;
-        return literal_mark(&inputs.concat(), if span < 0 { -1 } else { span / s + 1 });
+        let size = p.checked_mul(2).and_then(|pad| l.checked_add(pad)?.checked_sub(k)).and_then(|span| {
+            if span < 0 { Some(-1) } else { (span / s).checked_add(1) }
+        });
+        return size.map_or(UNKNOWN_DIM.to_string(), |size| literal_mark(&inputs.concat(), size));
     }
 
     // Symbolic: (L + 2*p - k) / s + 1
@@ -1380,12 +1382,18 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
 
     if let (Ok(p), Ok(k)) = (padding.parse::<isize>(), kernel_size.parse::<isize>()) {
         // Fully concrete offset(s)
+        let Some(offset) = p.checked_mul(2).and_then(|pad| pad.checked_sub(k)) else {
+            return UNKNOWN_DIM.to_string();
+        };
         if is_stride_one {
             // Total offset: 2*p - k + 1, folded into one operation
-            apply_offset(spatial_dim, 2 * p - k + 1)
+            let Some(offset) = offset.checked_add(1) else {
+                return UNKNOWN_DIM.to_string();
+            };
+            apply_offset(spatial_dim, offset)
         } else {
             // Inner offset: 2*p - k, then divide by stride and add 1
-            let inner = apply_offset(spatial_dim, 2 * p - k);
+            let inner = apply_offset(spatial_dim, offset);
             if let Some(s) = stride_val {
                 format!("({})/{}+1", inner, s)
             } else {
@@ -1398,14 +1406,20 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
 
         // Add 2*padding
         if let Ok(p) = padding.parse::<isize>() {
-            inner = apply_offset(&inner, 2 * p);
+            let Some(pad) = p.checked_mul(2) else {
+                return UNKNOWN_DIM.to_string();
+            };
+            inner = apply_offset(&inner, pad);
         } else {
             inner = format!("{}+2*{}", inner, padding);
         }
 
         // Subtract kernel_size
         if let Ok(k) = kernel_size.parse::<isize>() {
-            inner = apply_offset(&inner, -k);
+            let Some(kernel) = k.checked_neg() else {
+                return UNKNOWN_DIM.to_string();
+            };
+            inner = apply_offset(&inner, kernel);
         } else {
             inner = format!("{}-{}", inner, kernel_size);
         }
@@ -1455,7 +1469,10 @@ fn conv_transpose_spatial_dim(
         stride.parse::<i64>(),
         padding.parse::<i64>(),
     ) {
-        return literal_mark(&inputs.concat(), (l - 1) * s - 2 * p + k);
+        let size = l.checked_sub(1).and_then(|l| l.checked_mul(s)).and_then(|scaled| {
+            scaled.checked_sub(p.checked_mul(2)?)?.checked_add(k)
+        });
+        return size.map_or(UNKNOWN_DIM.to_string(), |size| literal_mark(&inputs.concat(), size));
     }
 
     // Symbolic: (L-1)*stride - 2*padding + kernel
@@ -1468,7 +1485,10 @@ fn conv_transpose_spatial_dim(
 
     let mut result = scaled;
     if let Ok(p) = padding.parse::<isize>() {
-        result = apply_offset(&result, -2 * p);
+        let Some(pad) = p.checked_mul(-2) else {
+            return UNKNOWN_DIM.to_string();
+        };
+        result = apply_offset(&result, pad);
     } else {
         result = format!("{}-2*{}", result, padding);
     }
@@ -1485,12 +1505,14 @@ fn without_literal_mark(dim: &str) -> &str {
 }
 
 /// Multiply a dim by a literal factor: exact when the dim is a literal int,
-/// otherwise a symbolic `dim*factor` string.
+/// otherwise a symbolic `dim*factor` string. An overflow gives `UNKNOWN_DIM`.
 fn mul_dim(dim: &str, factor: u64) -> String {
-    if let Ok(v) = dim.parse::<u64>() {
-        (v * factor).to_string()
+    if dim == UNKNOWN_DIM {
+        dim.to_string()
+    } else if let Ok(v) = dim.parse::<u64>() {
+        v.checked_mul(factor).map_or(UNKNOWN_DIM.to_string(), |product| product.to_string())
     } else {
-        format!("{}*{}", dim, factor)
+        format!("{}*{}", factor_text(dim), factor)
     }
 }
 
@@ -1498,14 +1520,16 @@ fn mul_dim(dim: &str, factor: u64) -> String {
 /// isn't evenly divisible (a provable contradiction); otherwise a symbolic
 /// `dim/factor` string (unprovable, trusted as-is).
 fn div_dim(dim: &str, factor: u64) -> Result<String, String> {
-    if let Ok(v) = dim.parse::<u64>() {
+    if factor == 0 {
+        Ok(UNKNOWN_DIM.to_string())
+    } else if let Ok(v) = dim.parse::<u64>() {
         if v % factor == 0 {
             Ok((v / factor).to_string())
         } else {
             Err(format!("{} is not evenly divisible by {}", v, factor))
         }
     } else {
-        Ok(format!("{}/{}", dim, factor))
+        Ok(format!("{}/{}", factor_text(dim), factor))
     }
 }
 
@@ -1520,9 +1544,10 @@ fn product_dims(dims: &[String]) -> String {
         .map(|d| d.parse::<u64>().ok())
         .collect::<Option<Vec<_>>>()
     {
-        values.iter().product::<u64>().to_string()
+        let product = values.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
+        product.map_or(UNKNOWN_DIM.to_string(), |product| product.to_string())
     } else {
-        dims.join("*")
+        joined_dim(&dims.iter().map(|dim| factor_text(dim)).collect::<Vec<_>>(), "*")
     }
 }
 
@@ -1554,9 +1579,8 @@ fn parse_dim_sequence(text: &str) -> Option<Vec<String>> {
         return Some(Vec::new());
     }
     Some(
-        inner
-            .trim_end_matches(',')
-            .split(',')
+        split_top_level(inner.trim_end_matches(','))
+            .into_iter()
             .map(|s| s.trim().to_string())
             .collect(),
     )
@@ -1590,10 +1614,11 @@ fn parse_pair_arg(text: &str) -> Option<(String, String)> {
 /// effective size is `kernel` unchanged regardless of whether `kernel`
 /// itself is literal (covering the overwhelmingly common default even for
 /// symbolic kernel sizes). Any other non-literal combination isn't
-/// foldable and returns `None`.
+/// foldable and returns `None`. An overflow gives `UNKNOWN_DIM`.
 fn effective_kernel_size(kernel: &str, dilation: &str) -> Option<String> {
     if let (Ok(k), Ok(d)) = (kernel.trim().parse::<i64>(), dilation.trim().parse::<i64>()) {
-        return Some((d * (k - 1) + 1).to_string());
+        let size = k.checked_sub(1).and_then(|span| d.checked_mul(span)?.checked_add(1));
+        return Some(size.map_or(UNKNOWN_DIM.to_string(), |size| size.to_string()));
     }
     if dilation.trim() == "1" {
         return Some(kernel.to_string());
@@ -1614,14 +1639,16 @@ fn div_dim_by_dims(dim: &str, factors: &[String]) -> Result<String, String> {
             .map(|f| f.parse::<u64>().ok())
             .collect::<Option<Vec<_>>>()
     {
-        let divisor: u64 = factor_vals.iter().product();
+        let Some(divisor) = factor_vals.iter().try_fold(1u64, |product, value| product.checked_mul(*value)) else {
+            return Ok(UNKNOWN_DIM.to_string());
+        };
         if divisor != 0 && dim_val % divisor == 0 {
             return Ok((dim_val / divisor).to_string());
         } else if divisor != 0 {
             return Err(format!("{} is not evenly divisible by {}", dim_val, divisor));
         }
     }
-    Ok(format!("{}/({})", dim, product_dims(factors)))
+    Ok(format!("{}/({})", factor_text(dim), product_dims(factors)))
 }
 
 /// Shared minimum-rank guard used by every layer whose validity depends on
@@ -1785,6 +1812,7 @@ pub(crate) fn apply_layer_kind(
 ) -> Result<Option<Vec<String>>, String> {
     match apply_layer_rule(kind, input_shape, layer, input) {
         Ok(Some(output)) if output.iter().any(|dim| dim.contains(UNPROVEN_DIM)) => Ok(None),
+        Ok(Some(output)) => Ok(bounded_shape(output)),
         Err(message) if message.contains(UNPROVEN_DIM) => Ok(None),
         result => result,
     }
@@ -2133,7 +2161,7 @@ fn apply_layer_rule(
             let mut output_shape = input_shape.to_vec();
             let len = output_shape.len();
             let channels_idx = len - 3;
-            output_shape[channels_idx] = div_dim(&input_shape[channels_idx], r * r)
+            output_shape[channels_idx] = div_dim(&input_shape[channels_idx], r.checked_mul(r).unwrap_or(0))
                 .map_err(|e| format!("PixelShuffle layer '{}': {}", layer, e))?;
             output_shape[len - 2] = mul_dim(&input_shape[len - 2], r);
             output_shape[len - 1] = mul_dim(&input_shape[len - 1], r);
@@ -2148,7 +2176,9 @@ fn apply_layer_rule(
             let mut output_shape = input_shape.to_vec();
             let len = output_shape.len();
             let channels_idx = len - 3;
-            output_shape[channels_idx] = mul_dim(&input_shape[channels_idx], r * r);
+            output_shape[channels_idx] = r.checked_mul(r).map_or(UNKNOWN_DIM.to_string(), |square| {
+                mul_dim(&input_shape[channels_idx], square)
+            });
             output_shape[len - 2] = div_dim(&input_shape[len - 2], r)
                 .map_err(|e| format!("PixelUnshuffle layer '{}': {}", layer, e))?;
             output_shape[len - 1] = div_dim(&input_shape[len - 1], r)
@@ -2168,7 +2198,7 @@ fn apply_layer_rule(
             let start = input_shape.len() - spatial_rank;
             if let Ok(p) = padding.trim().parse::<isize>() {
                 for dim in &mut output_shape[start..] {
-                    *dim = apply_offset(dim, 2 * p);
+                    *dim = p.checked_mul(2).map_or(UNKNOWN_DIM.to_string(), |pad| apply_offset(dim, pad));
                 }
                 Ok(Some(output_shape))
             } else if let Some(pairs) = parse_dim_sequence(padding)
@@ -2182,7 +2212,7 @@ fn apply_layer_rule(
                 // *last* spatial dim.
                 for (i, dim) in output_shape[start..].iter_mut().rev().enumerate() {
                     let (left, right) = (values[2 * i], values[2 * i + 1]);
-                    *dim = apply_offset(dim, left + right);
+                    *dim = left.checked_add(right).map_or(UNKNOWN_DIM.to_string(), |pad| apply_offset(dim, pad));
                 }
                 Ok(Some(output_shape))
             } else {
@@ -2319,7 +2349,7 @@ fn apply_layer_rule(
             let mut current = input_shape.to_vec();
             for (i, child) in children.iter().enumerate() {
                 let child_layer = format!("{layer}[{i}]");
-                match apply_layer_rule(child, &current, &child_layer, input)? {
+                match apply_layer_rule(child, &current, &child_layer, input)?.and_then(bounded_shape) {
                     Some(shape) => current = shape,
                     None => return Ok(None),
                 }
@@ -5617,7 +5647,7 @@ mod new_layer_kind_apply_tests {
 
         let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
 
-        assert_eq!(out, Some(shape(&["c*3*3", "H-2*W-2"])));
+        assert_eq!(out, Some(shape(&["c*3*3", "(H-2)*(W-2)"])));
     }
 
     #[test]
@@ -5731,5 +5761,54 @@ mod new_layer_kind_apply_tests {
         let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
 
         assert_eq!(out, None);
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    const MAX: i64 = i64::MAX;
+
+    #[test]
+    fn test_integer_rules_give_unknown_on_overflow() {
+        let max = MAX.to_string();
+        let unknown = UNKNOWN_DIM.to_string();
+        assert_eq!(apply_offset(&max, 1), unknown);
+        assert_eq!(mul_dim(&u64::MAX.to_string(), 2), unknown);
+        assert_eq!(conv_spatial_dim(&max, "0", "1", "0"), unknown);
+        assert_eq!(conv_spatial_dim("5", "3", "1", &max), unknown);
+        assert_eq!(conv_spatial_dim("n", "3", "1", &max), unknown);
+        assert_eq!(conv_spatial_dim("n", "3", "2", &max), unknown);
+        assert_eq!(conv_spatial_dim("n", "k", "2", &max), unknown);
+        assert_eq!(conv_transpose_spatial_dim("5", "3", &max, "0"), unknown);
+        assert_eq!(conv_transpose_spatial_dim("5", "3", "1", &max), unknown);
+        assert_eq!(conv_transpose_spatial_dim("n", "3", "1", &max), unknown);
+        assert_eq!(effective_kernel_size("3", &max), Some(unknown.clone()));
+        assert_eq!(div_dim_by_dims("6", &[u64::MAX.to_string(), "2".to_string()]), Ok(unknown));
+    }
+
+    #[test]
+    fn test_integer_rules_keep_an_exact_size() {
+        assert_eq!(apply_offset("5", -2), "3");
+        assert_eq!(apply_offset("n", -2), "n-2");
+        assert_eq!(mul_dim("4", 2), "8");
+        assert_eq!(conv_spatial_dim("10", "3", "2", "1"), "5");
+        assert_eq!(conv_transpose_spatial_dim("5", "3", "2", "1"), "9");
+        assert_eq!(effective_kernel_size("3", "2"), Some("5".to_string()));
+    }
+
+    #[test]
+    fn test_pixel_rules_stay_defined_for_a_large_or_zero_factor() {
+        let shape: Vec<String> = ["4", "8", "8"].map(String::from).to_vec();
+        let shuffle = |factor: &str| LayerKind::PixelShuffle { upscale_factor: factor.to_string() };
+        let unshuffle = |factor: &str| LayerKind::PixelUnshuffle { downscale_factor: factor.to_string() };
+        let apply = |kind: LayerKind| apply_layer_kind(&kind, &shape, "l", "x").unwrap().unwrap();
+        let large = (1u64 << 40).to_string();
+        assert_eq!(apply(shuffle(&large))[0], UNKNOWN_DIM);
+        assert_eq!(apply(shuffle("0"))[0], UNKNOWN_DIM);
+        assert_eq!(apply(unshuffle("0"))[1], UNKNOWN_DIM);
+        let pad = LayerKind::Pad { name: "ZeroPad1d".to_string(), spatial_rank: 1, padding: MAX.to_string() };
+        assert_eq!(apply(pad)[2], UNKNOWN_DIM);
     }
 }

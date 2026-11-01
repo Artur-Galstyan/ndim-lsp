@@ -934,8 +934,7 @@ fn apply_held(
             match apply_layer_application(&application, &ctx.scope_shapes(scope)) {
                 Ok(shape) => shape,
                 Err(message) => {
-                    ctx.errors
-                        .push(ShapeError::mismatch(String::new(), message, range));
+                    ctx.report(ShapeError::mismatch(String::new(), message, range));
                     None
                 }
             }
@@ -1299,7 +1298,7 @@ fn apply_imported_module(
         text
     };
     for message in &result.errors {
-        ctx.errors.push(ShapeError::mismatch(
+        ctx.report(ShapeError::mismatch(
             display.to_string(),
             restore(message),
             range,

@@ -155,7 +155,9 @@ See `llm.txt` for the design.
 - [x] Provable scalar operands broadcast in binary operations
 - [x] A name whose shape changes across a loop (`x, y = y, x`) is unknown after the loop, and the hints of the first iteration are taken back
 - [ ] Tuple unpacking for user-defined helper tuple returns
-- [x] Basic array slicing and indexing (`x[:, 1:5, ...]`, integer indices, `None`). A slice of an integer axis with integer bounds has the size of Python. Other slices that do not keep the whole axis are unknown: `x[:2]` on `n` is `min(2, n)`. A negative step on a torch tensor is unknown
+- [x] Basic array slicing and indexing (`x[:, 1:5, ...]`, integer indices, `None`). A slice of an integer axis with integer bounds has the size of Python. A slice of a symbolic axis keeps the rank and has an exact form: `x[1:]` and `x[:-1]` are `n-1`, `x[a:-b]` is `n-a-b`, `x[:4]` and `x[-4:]` are `min(4, n)`, `x[a:b]` is `min(b-a, n-a)`, and `x[::2]` is `ceil(n/2)`. The `n-a` forms assume that the axis has at least that many items. A `min` or `ceil` form conflicts with nothing. `n-1` equals `n-1`, does not conflict with an integer or another name, and conflicts with `n`. An unproven bound or step (`x[:, k:]`) gives an axis of size `?` that conflicts with nothing, and the other axes stay known. A slice of `x[:4]` folds the limit: `x[:4][5:]` is 0. A slice of an axis that is not a name (`_`, `#n`, `*b`, `...`, `n=4`) is `?`, and an index after `*b` or `...` is unknown unless an ellipsis places it. A negative step on a torch tensor is unknown
+- [x] A variadic dim (`*b`, `...`) makes a rank a lower bound. No rule reports an error for a value with a variadic dim, except a broadcast or a matmul that aligns from the right. `concatenate` and `stack` keep a shape only when the axis does not cross the variadic dim
+- [x] A shape argument is a tuple, a list, one size, or a sum of tuples and `x.shape`: `jnp.zeros(x.shape + (3,))` is `[n, m, 3]`. Any other expression (`(2,) * 3`, a call, a conditional, a comprehension) is unknown
 - [x] A list of integers as an index gives its length to the axis. Any other index that is not a proven integer or a slice (an array, a mask, a tuple) is unknown
 - [ ] Precise array and boolean indexing
 - [x] Control flow tracing: `if`/`elif`/`else`, `match`, `try`, loops and `with` start each arm from the entry state and join the live paths (a name with different shapes is unknown)
@@ -183,3 +185,4 @@ See `llm.txt` for the design.
 - [x] Cache import resolution and function signatures across edits (a saved change to an imported file, or a watched-file event, drops the affected entries and republishes the open documents)
 - [x] Reuse parsed trees and local shape analysis across document edits (per top-level statement memo and propagation replay; see "Incremental analysis")
 - [x] Incremental document sync and a cost-based debounce (20 to 150 ms)
+- [x] One analysis stays bounded on a hostile file: a dim over 256 bytes is `?` and the rank stays, a value over rank 64 has no shape, one statement has a limit of steps, and a syntax tree deeper than 1,000 levels gives no analysis

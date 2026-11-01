@@ -411,7 +411,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
                     let Some(name) = first_identifier(parameter, text)? else {
                         continue;
                     };
-                    let dims = parsed_dims.iter().map(|(value, _)| value.clone()).collect();
+                    let dims = parsed_dims.iter().map(|(value, _)| bounded_dim(value.clone())).collect();
                     for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
                         dimension_sites.push(ShapeDimensionSite {
                             binding: Some(name.clone()),
@@ -431,7 +431,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             {
                 let parsed_dims = shape_dims(shape_node, text)?;
                 if !parsed_dims.is_empty() {
-                    return_shape = Some(parsed_dims.iter().map(|(value, _)| value.clone()).collect());
+                    return_shape = Some(parsed_dims.iter().map(|(value, _)| bounded_dim(value.clone())).collect());
                     for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
                         dimension_sites.push(ShapeDimensionSite {
                             binding: None,
@@ -480,7 +480,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             let parsed_dims = shape_dims(shape_node, text)?;
             if !parsed_dims.is_empty() {
                 let name = node_text(left_node, text)?;
-                let dims = parsed_dims.iter().map(|(value, _)| value.clone()).collect();
+                let dims = parsed_dims.iter().map(|(value, _)| bounded_dim(value.clone())).collect();
                 for (axis, (value, range)) in parsed_dims.into_iter().enumerate() {
                     scopes[child_scope_idx].dimension_sites.push(ShapeDimensionSite {
                         binding: Some(name.clone()),

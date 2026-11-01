@@ -25,8 +25,154 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
 /// end, so that only the analysis sees it.
 pub(crate) const FREE_DIM: &str = "__free_";
 
+/// The free dim of an axis that keeps its place in the shape but has a size
+/// the file does not give. The reader sees `?`.
+pub(crate) const UNKNOWN_DIM: &str = "__free_?";
+
+/// The longest dim text that the analysis keeps. No dim of a real file comes
+/// near it. A longer dim is `UNKNOWN_DIM`, so that a chain of lines that doubles
+/// a dim stays small and the axis stays in the shape.
+pub(crate) const MAX_DIM_TEXT: usize = 256;
+
+/// The highest rank that the analysis keeps. A value with a higher rank has no
+/// shape: the axes of a shape cannot stay when the rank itself is the problem.
+pub(crate) const MAX_RANK: usize = 64;
+
+/// `dim`, or `UNKNOWN_DIM` when `dim` is too long or holds an unknown size. A
+/// form of an unknown size says nothing about the axis, so it does not grow.
+pub(crate) fn bounded_dim(dim: String) -> String {
+    if dim.len() > MAX_DIM_TEXT || (dim.contains('?') && dim.contains(UNKNOWN_DIM) && dim != UNKNOWN_DIM) {
+        UNKNOWN_DIM.to_string()
+    } else {
+        dim
+    }
+}
+
+/// `shape` with each dim in its limit. `None` when the rank is over its limit.
+pub(crate) fn bounded_shape(shape: Vec<String>) -> Option<Vec<String>> {
+    (shape.len() <= MAX_RANK).then(|| shape.into_iter().map(bounded_dim).collect())
+}
+
+/// `parts` with `separator` between them. The length comes first, so that many
+/// long parts allocate nothing.
+pub(crate) fn joined_dim<S: AsRef<str>>(parts: &[S], separator: &str) -> String {
+    let separators = separator.len().saturating_mul(parts.len().saturating_sub(1));
+    let text: usize = parts.iter().map(|part| part.as_ref().len()).sum();
+    if text.saturating_add(separators) > MAX_DIM_TEXT {
+        return UNKNOWN_DIM.to_string();
+    }
+    let parts: Vec<&str> = parts.iter().map(AsRef::as_ref).collect();
+    bounded_dim(parts.join(separator))
+}
+
 pub(crate) fn is_free_dim(dim: &str) -> bool {
     dim.contains(FREE_DIM) || dim.contains(crate::layers::UNPROVEN_DIM)
+}
+
+/// Whether `dim` subtracts from a name: `n-1`. The value of the name is not
+/// known, so only the same name proves that such a dim differs.
+fn is_difference(dim: &str) -> bool {
+    dim.contains('-') && dim.chars().any(|c| c.is_alphabetic() || c == '_')
+}
+
+/// Whether `dim` is one size with names that a form can use. `_` and `_n` are
+/// separate sizes, `#n` can broadcast, `*b` and `...` have a variable rank, and
+/// `n=4` and `?` are not names.
+pub(crate) fn is_named_size(dim: &str) -> bool {
+    let text = dim.replace(FREE_DIM, "");
+    !text.contains(['#', '=', '?'])
+        && !text.contains("...")
+        && !text.starts_with('*')
+        && !text.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word.starts_with('_'))
+}
+
+/// Whether the annotation dim `dim` stands for any number of axes.
+pub(crate) fn is_variadic_dim(dim: &str) -> bool {
+    dim == "..." || dim.trim_start_matches(['#', '_']).starts_with('*')
+}
+
+/// The limit `l` and the size `e` of the whole form `min(l, e)`, when `l` is an
+/// integer.
+pub(crate) fn min_form(dim: &str) -> Option<(i64, &str)> {
+    let inner = dim.strip_prefix(FREE_DIM).unwrap_or(dim).strip_prefix("min(")?.strip_suffix(')')?;
+    let (limit, size) = inner.split_once(", ")?;
+    let mut depth = 0i32;
+    for c in size.chars() {
+        depth += match c {
+            '(' => 1,
+            ')' => -1,
+            _ => 0,
+        };
+        if depth < 0 {
+            return None;
+        }
+    }
+    Some((limit.parse().ok()?, size))
+}
+
+/// The parts of `text` between the commas outside all brackets.
+pub(crate) fn split_top_level(text: &str) -> Vec<&str> {
+    let (mut parts, mut depth, mut start) = (Vec::new(), 0usize, 0);
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// `dim` in brackets when an operator of `operators` is outside all its
+/// brackets. A sign at the start is no operator.
+fn bracket_on(dim: &str, operators: &[char]) -> String {
+    let mut depth = 0usize;
+    for (at, c) in dim.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && at > 0 && operators.contains(&c) => return format!("({dim})"),
+            _ => {}
+        }
+    }
+    dim.to_string()
+}
+
+/// `dim` as a factor of a product or a dividend: `n-1` becomes `(n-1)`.
+pub(crate) fn factor_text(dim: &str) -> String {
+    bracket_on(dim, &['+', '-'])
+}
+
+/// `dim` next to a `*` or a `/`: `t*u` becomes `(t*u)`, so that `s/(t*u)` keeps
+/// its value.
+pub(crate) fn operand_text(dim: &str) -> String {
+    bracket_on(dim, &['+', '-', '*', '/', '%'])
+}
+
+/// `dim` less `amount`, with the integer at the end of `dim` folded: `n-1`
+/// less 1 is `n-2`, and `n+1` less 1 is `n`. `None` when the integer overflows.
+/// A `min` form less more than its limit is below 0 at every size, so the size
+/// is `UNKNOWN_DIM`.
+pub(crate) fn offset_dim(dim: &str, amount: i64) -> Option<String> {
+    let (base, held) = match dim.rfind(['+', '-']) {
+        Some(at) if at > 0 && dim[at + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+            (&dim[..at], dim[at..].parse::<i64>().ok()?)
+        }
+        _ => (dim, 0),
+    };
+    let total = held.checked_sub(amount)?;
+    if min_form(base).is_some_and(|(limit, _)| limit.checked_add(total).is_none_or(|low| low < 0)) {
+        return Some(UNKNOWN_DIM.to_string());
+    }
+    Some(match total {
+        0 => base.to_string(),
+        total => format!("{base}{total:+}"),
+    })
 }
 
 /// Joins a free name to its integer: `__free_D__is_64`. The file binds `D` to
@@ -144,24 +290,56 @@ fn fold_atom(tokens: &[u8], at: &mut usize) -> Option<i64> {
 }
 
 /// Whether the two dims are different at run time, as far as the file proves.
-/// A free dim conflicts with nothing.
+/// A free dim conflicts with nothing. A difference conflicts only with a dim of
+/// the same name and another integer: `n-1` with `n`, but not with `m` or `4`.
 pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
     let other_integer = |value: &str, dim: &str| dim.parse::<i64>().is_ok() && dim != value;
     match (literal_dim(a), literal_dim(b)) {
         (Some(left), Some(right)) => left != right,
         (Some(value), None) => other_integer(value, b),
         (None, Some(value)) => other_integer(value, a),
-        (None, None) => a != b && !is_free_dim(a) && !is_free_dim(b) && !dims_canonically_equal(a, b),
+        (None, None) => {
+            a != b
+                && !is_free_dim(a)
+                && !is_free_dim(b)
+                && is_named_size(a)
+                && is_named_size(b)
+                && !dims_canonically_equal(a, b)
+                && (!(is_difference(a) || is_difference(b)) || same_names(a, b))
+        }
     }
 }
 
+/// Whether two flat sums have the same terms apart from their integers.
+fn same_names(a: &str, b: &str) -> bool {
+    let names = |dim: &str| {
+        let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+        flat_sum(&stripped).map(|(terms, _)| terms)
+    };
+    names(a).is_some_and(|terms| !terms.is_empty() && names(b).as_ref() == Some(&terms))
+}
+
 /// The dim that two dims without a conflict give together. A free dim takes
-/// the value of the other side. Two different free dims give `UNPROVEN_DIM`.
+/// the value of the other side, and a difference takes an exact dim. Two
+/// different free dims give `UNPROVEN_DIM`, except that `UNKNOWN_DIM` says
+/// nothing and so takes any other side.
 pub(crate) fn unified_dim(a: &str, b: &str) -> String {
-    match (is_free_dim(a), is_free_dim(b)) {
-        (true, false) => b.to_string(),
-        (true, true) if !dims_canonically_equal(a, b) => crate::layers::UNPROVEN_DIM.to_string(),
-        _ => a.to_string(),
+    if b == UNKNOWN_DIM {
+        return a.to_string();
+    }
+    let rank = |dim: &str| match (is_free_dim(dim), is_difference(dim)) {
+        (true, _) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    };
+    match rank(a).cmp(&rank(b)) {
+        std::cmp::Ordering::Greater => b.to_string(),
+        std::cmp::Ordering::Less => a.to_string(),
+        std::cmp::Ordering::Equal if a == UNKNOWN_DIM => b.to_string(),
+        std::cmp::Ordering::Equal if rank(a) > 0 && !dims_canonically_equal(a, b) => {
+            crate::layers::UNPROVEN_DIM.to_string()
+        }
+        std::cmp::Ordering::Equal => a.to_string(),
     }
 }
 
@@ -188,12 +366,12 @@ pub(crate) fn shapes_canonically_equal(a: &[String], b: &[String]) -> bool {
 ///   `2*b+a`);
 /// * drops additive-identity `0` terms (`d+0` → `d`), unless every term is
 ///   zero;
-/// * adds the integer terms into one (`4+d+4` → `8+d`).
+/// * adds the integer terms into one (`4+d+4` → `8+d`, `n-1+1` → `n`).
 ///
-/// Anything containing parens, subtraction, or division is returned
-/// unchanged (whitespace-stripped only) — those aren't provably commutative
-/// under this simple a token shuffle, so we don't risk a false "equal" —
-/// except for the one unambiguous case `fold_paren_cancellation` recognizes
+/// A subtraction is a term with a sign. Anything containing parens or
+/// division is returned unchanged (whitespace-stripped only) — those aren't
+/// provably commutative under this simple a token shuffle, so we don't risk a
+/// false "equal" — except for the one unambiguous case `fold_paren_cancellation` recognizes
 /// (a leading paren group whose contents are cancelled by the very next
 /// operation, e.g. `(d-1)+1` → `d`): additive-inverse cancellation is sound
 /// regardless of what the parenthesized expression is, so it's folded
@@ -208,26 +386,55 @@ pub fn canonicalize_dim(dim: &str) -> String {
     if stripped.is_empty() {
         return stripped;
     }
-    if stripped.contains(['(', ')', '-', '/']) {
+    if stripped.contains(['(', ')', '/']) {
         if let Some(folded) = fold_paren_cancellation(&stripped) {
             return canonicalize_dim(&folded);
         }
         return stripped;
     }
+    let Some((terms, integers)) = flat_sum(&stripped) else {
+        return stripped;
+    };
+    let (subtracted, mut added): (Vec<String>, Vec<String>) =
+        terms.into_iter().partition(|term| term.starts_with('-'));
+    if integers > 0 || (integers == 0 && added.is_empty() && subtracted.is_empty()) {
+        added.push(integers.to_string());
+    }
+    added.sort_unstable();
+    let mut canonical = added.join("+");
+    canonical.extend(subtracted);
+    if integers < 0 {
+        canonical.push_str(&integers.to_string());
+    }
+    canonical
+}
 
+/// The sorted terms of a flat sum without its integers, with a `-` on a
+/// subtracted term, and the sum of the integers. `None` for a sign that does
+/// not start a term: `n*-1`.
+fn flat_sum(stripped: &str) -> Option<(Vec<String>, i64)> {
     let mut integers = 0i64;
     let mut terms: Vec<String> = Vec::new();
-    for term in stripped.split('+').map(canonicalize_product_term) {
+    let mut rest = stripped;
+    while !rest.is_empty() {
+        let negative = rest.starts_with('-');
+        rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+        let end = rest.find(['+', '-']).unwrap_or(rest.len());
+        if end == 0 || rest[..end].ends_with('*') {
+            return None;
+        }
+        let term = canonicalize_product_term(&rest[..end]);
+        rest = &rest[end..];
         match term.parse::<i64>() {
-            Ok(value) => integers = integers.saturating_add(value),
+            Ok(value) => {
+                integers = integers.saturating_add(if negative { -value } else { value });
+            }
+            Err(_) if negative => terms.push(format!("-{term}")),
             Err(_) => terms.push(term),
         }
     }
-    if integers != 0 || terms.is_empty() {
-        terms.push(integers.to_string());
-    }
     terms.sort_unstable();
-    terms.join("+")
+    Some((terms, integers))
 }
 
 /// Fold the narrow, unambiguous shape `(expr<op1><lit1>)<op2><lit2>` → `expr`
@@ -359,11 +566,80 @@ mod canonicalize_dim_tests {
 
     #[test]
     fn test_non_commutative_forms_returned_unchanged() {
-        // Parens, subtraction, division: not a CAS, returned as-is
+        // Parens, division: not a CAS, returned as-is
         // (whitespace-stripped) rather than risking a false "equal".
         assert_eq!(canonicalize_dim("(d)"), "(d)");
         assert_eq!(canonicalize_dim("d-1"), "d-1");
         assert_eq!(canonicalize_dim("d/2"), "d/2");
+    }
+
+    #[test]
+    fn test_subtraction_is_a_term_with_a_sign() {
+        assert_eq!(canonicalize_dim("n-1+1"), "n");
+        assert_eq!(canonicalize_dim("n-1-1"), canonicalize_dim("n-2"));
+        assert_eq!(canonicalize_dim("1-n+2"), canonicalize_dim("3-n"));
+        assert_eq!(canonicalize_dim("a-b-c"), canonicalize_dim("a-c-b"));
+        assert_ne!(canonicalize_dim("a-b"), canonicalize_dim("b-a"));
+        assert_eq!(canonicalize_dim("n*-1"), "n*-1");
+    }
+
+    #[test]
+    fn test_a_difference_conflicts_only_with_its_own_name() {
+        assert!(dims_conflict("n-1", "n"));
+        assert!(dims_conflict("n", "n-1"));
+        assert!(dims_conflict("n-1", "n-2"));
+        assert!(dims_conflict("n-1", "n+1"));
+        assert!(!dims_conflict("n-1", "n-1"));
+        assert!(!dims_conflict("n-1", "1-1+n-1"));
+        assert!(!dims_conflict("n-1", "4"));
+        assert!(!dims_conflict("4", "n-1"));
+        assert!(!dims_conflict("n-1", "m"));
+        assert!(!dims_conflict("n-1", "m-1"));
+        assert!(!dims_conflict("__free_n-1", "n"));
+        assert!(!dims_conflict("(n-1)*2", "6"));
+        for other in ["4", "n", "m", "n-1", "2*n", "__free_k"] {
+            assert!(!dims_conflict("__free_min(4, n)", other), "{other}");
+            assert!(!dims_conflict(other, "__free_min(4, n)"), "{other}");
+            assert!(!dims_conflict(UNKNOWN_DIM, other), "{other}");
+        }
+    }
+
+    #[test]
+    fn test_a_long_dim_is_unknown() {
+        let at_limit = "n".repeat(MAX_DIM_TEXT);
+        assert_eq!(bounded_dim(at_limit.clone()), at_limit);
+        assert_eq!(bounded_dim("n".repeat(MAX_DIM_TEXT + 1)), UNKNOWN_DIM);
+        assert_eq!(bounded_dim(format!("{UNKNOWN_DIM}+n")), UNKNOWN_DIM);
+        assert_eq!(joined_dim(&["n", "m"], "+"), "n+m");
+        assert_eq!(joined_dim(&vec![at_limit.as_str(); 1 << 20], "+"), UNKNOWN_DIM);
+        assert_eq!(bounded_shape(vec!["n".to_string(); MAX_RANK]).map(|s| s.len()), Some(MAX_RANK));
+        assert_eq!(bounded_shape(vec!["n".to_string(); MAX_RANK + 1]), None);
+    }
+
+    #[test]
+    fn test_a_top_level_split_keeps_a_call() {
+        assert_eq!(split_top_level("min(k, 2), [1, 2], 3"), vec!["min(k, 2)", " [1, 2]", " 3"]);
+        assert_eq!(split_top_level("n"), vec!["n"]);
+    }
+
+    #[test]
+    fn test_an_offset_folds_the_last_integer() {
+        assert_eq!(offset_dim("n", 1).as_deref(), Some("n-1"));
+        assert_eq!(offset_dim("n-1", 2).as_deref(), Some("n-3"));
+        assert_eq!(offset_dim("n+1", 1).as_deref(), Some("n"));
+        assert_eq!(offset_dim("n+3", 1).as_deref(), Some("n+2"));
+        assert_eq!(offset_dim("2*n", 1).as_deref(), Some("2*n-1"));
+        assert_eq!(offset_dim("(n-1)//2", 1).as_deref(), Some("(n-1)//2-1"));
+        assert_eq!(offset_dim("min(4, n-1)", 1).as_deref(), Some("min(4, n-1)-1"));
+    }
+
+    #[test]
+    fn test_a_factor_keeps_a_sum_together() {
+        assert_eq!(factor_text("n-1"), "(n-1)");
+        assert_eq!(factor_text("n+1"), "(n+1)");
+        assert_eq!(factor_text("n*2"), "n*2");
+        assert_eq!(factor_text("min(4, n-1)"), "min(4, n-1)");
+        assert_eq!(factor_text("-1"), "-1");
     }
 
     #[test]
@@ -1128,7 +1404,7 @@ pub struct AssignmentShape {
     pub shape: Vec<String>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct LayerShapeAnalysis {
     pub scopes: Vec<FunctionShapeScope>,
     pub layers: HashMap<String, LayerKind>,
@@ -1138,7 +1414,8 @@ pub struct LayerShapeAnalysis {
 }
 
 impl LayerShapeAnalysis {
-    /// The analysis without the `FREE_DIM` marks, for the reader of the result.
+    /// The analysis without the `FREE_DIM` marks, for the reader of the result:
+    /// `UNKNOWN_DIM` becomes `?`.
     /// A shape or a message has no `UNPROVEN_DIM`: the analysis drops those. A
     /// layer of an application keeps it, so it becomes `?` here.
     pub(crate) fn without_free_marks(mut self) -> Self {

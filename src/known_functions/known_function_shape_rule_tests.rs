@@ -1014,7 +1014,7 @@ fn test_diag_matrix_to_vector() {
 
     let output = apply_known_function(&KnownFunction::Diag, &args, &shapes).unwrap();
 
-    assert_eq!(output, Some(shape(&["min(m,n)"])));
+    assert_eq!(output, Some(shape(&["__free_min(m,n)"])));
 }
 
 #[test]
@@ -1024,7 +1024,7 @@ fn test_diagonal_batch_matrix() {
 
     let output = apply_known_function(&KnownFunction::Diagonal, &args, &shapes).unwrap();
 
-    assert_eq!(output, Some(shape(&["batch", "min(m,n)"])));
+    assert_eq!(output, Some(shape(&["batch", "__free_min(m,n)"])));
 }
 
 #[test]

@@ -15,7 +15,8 @@ Marker syntax (checked by tests/lsp_stress.rs):
 Expected shapes are derived from the semantics of each operation (numpy/torch/
 jax/einops rules, conv arithmetic, jaxtyping binding), never from analyzer
 output. Dimensions print as the analyzer's documented convention: symbolic
-names as written, integers as integers, products as `a*b`, sums as `a+b`.
+names as written, integers as integers, products as `a*b`, sums as `a+b`,
+`x[:, :4]` on axis `n` as `min(4, n)`.
 """
 
 import random
@@ -538,8 +539,8 @@ def t_nested(i):
         "        return level2(u)",
         "",
         f"    y = level1(x){es(y=[b, n, d])}",
-        "    c = x[:, :4]  # expected-shape: c=?",
-        "    h = c.sum(axis=1)  # expected-shape: h=?",
+        f"    c = x[:, :4]{es(c=[b, f'min(4, {n})', d])}",
+        f"    h = c.sum(axis=1){es(h=[b, d])}",
         f"    top, ix = jax.lax.top_k(y, 3){es(top=[b, n, 3], ix=[b, n, 3])}",
         f"    z = y @ w{es(z=[b, n, d])}",
         "    return y, h, z",
@@ -1165,8 +1166,8 @@ def t_closure_capture(i):
         "        return u",
         "",
         f"    y = level1(x){es(y=[b, n, e])}",
-        "    w = w[:, :4]  # expected-shape: w=?",
-        "    y2 = level1(x)  # expected-shape: y2=?",
+        f"    w = w[:, :4]{es(w=[d, f'min(4, {e})'])}",
+        f"    y2 = level1(x){es(y2=[b, n, f'min(4, {e})'])}",
         "",
         "    def level2(t):",
         "        nonlocal W",

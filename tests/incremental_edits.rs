@@ -2081,7 +2081,7 @@ fn a_slice_follows_the_constant_of_its_bound() {
         dims(&["3", "2"]),
         dims(&["2", "2"]),
         dims(&["2", "2"]),
-        None,
+        dims(&["?", "2"]),
     ];
     let replayed = walk_edits(&base, &steps, |step, a, text| {
         assert_eq!(shape_named(a, "z"), want[step], "step {step}\n{text}");
@@ -2399,7 +2399,8 @@ fn a_size_follows_the_statements_of_other_units() {
     let two = dims(&["2", "4"]);
     let none = &None;
     let r_want = [&four, &four, &four, none, &four, &four, &four, &four, &four];
-    let s_want = [none, &two, &two, &two, &two, none, none, none, none];
+    let free = dims(&["?", "4"]);
+    let s_want = [&free, &two, &two, &two, &two, &free, &free, &free, &free];
     let nine = dims(&["n", "9"]);
     let t_want = [none, none, none, none, none, none, &nine, none, &nine];
     let error_count = [0, 0, 0, 1, 0, 0, 0, 0, 0];

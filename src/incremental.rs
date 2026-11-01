@@ -977,6 +977,9 @@ impl UnitMemo {
                         comp: 0,
                     }
                 }
+                None if crate::analysis::too_deep(nodes[i]) => {
+                    return Err("a unit is too deep".to_string());
+                }
                 None => Unit {
                     span: *span,
                     hash: *hashes[i]
