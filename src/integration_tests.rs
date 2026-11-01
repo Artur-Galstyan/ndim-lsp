@@ -1274,6 +1274,7 @@ mod additional_edge_case_tests {
             input: input.to_string(),
             kind,
             range: dummy_range(),
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -3148,6 +3149,7 @@ mod conv_layer_tests {
             input: input.to_string(),
             kind,
             range: dummy_range(),
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -3738,6 +3740,7 @@ mod shape_preserving_layer_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         };
         let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
 
@@ -3763,6 +3766,7 @@ mod shape_preserving_layer_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         };
         let shapes = HashMap::new();
 
@@ -4004,6 +4008,7 @@ mod shape_preserving_layer_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -11222,5 +11227,2024 @@ mod lone_quote_tests {
             let roots: Vec<PathBuf> = Vec::new();
             let _ = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod branch_merge_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn hint(analysis: &LayerShapeAnalysis, line: u32, name: &str) -> Option<Vec<String>> {
+        analysis
+            .assignment_shapes
+            .iter()
+            .find(|r| r.line == line && r.name == name)
+            .map(|r| r.shape.clone())
+    }
+
+    const HEAD: &str = "import jax.numpy as jnp\ndef f(x: Float[Array, \"3 4\"], y: Float[Array, \"5\"], c, d):\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEAD}{body}"))
+    }
+
+    fn known(body: &str, name: &str, dims: &[&str]) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, name), Some(&shape(dims)), "{body}");
+    }
+
+    fn unknown(body: &str, name: &str) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{body}");
+    }
+
+    #[test]
+    fn a_shape_assigned_in_a_branch_without_else_is_unknown_after_it() {
+        let a = run("    if c:\n        x = jnp.zeros(5)\n    q = x\n");
+        assert_eq!(find_shape(&a, "x"), None);
+        assert_eq!(find_shape(&a, "q"), None);
+        assert_eq!(hint(&a, 3, "x"), Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn a_branch_that_keeps_the_shape_keeps_it_known() {
+        known("    if c:\n        x = jnp.ones((3, 4))\n", "x", &["3", "4"]);
+    }
+
+    #[test]
+    fn exhaustive_if_else_with_equal_shapes_is_known() {
+        known("    if c:\n        a = jnp.zeros(5)\n    else:\n        a = jnp.ones(5)\n", "a", &["5"]);
+        unknown("    if c:\n        a = jnp.zeros(5)\n    else:\n        a = jnp.ones(6)\n", "a");
+    }
+
+    #[test]
+    fn elif_chain_needs_every_arm_to_agree() {
+        let same = "    if c:\n        a = jnp.zeros(5)\n    elif d:\n        a = jnp.zeros(5)\n    else:\n        a = jnp.zeros(5)\n";
+        known(same, "a", &["5"]);
+        let last_differs = "    if c:\n        a = jnp.zeros(5)\n    elif d:\n        a = jnp.zeros(5)\n    else:\n        a = jnp.zeros(6)\n";
+        unknown(last_differs, "a");
+        let middle_differs = "    if c:\n        a = jnp.zeros(5)\n    elif d:\n        a = jnp.zeros(6)\n    else:\n        a = jnp.zeros(5)\n";
+        unknown(middle_differs, "a");
+    }
+
+    #[test]
+    fn a_name_new_in_some_branches_keeps_the_shape_the_branches_give_it() {
+        known("    if c:\n        a = jnp.zeros(5)\n", "a", &["5"]);
+        known("    if c:\n        a = jnp.zeros(5)\n    elif d:\n        a = jnp.zeros(5)\n", "a", &["5"]);
+        unknown("    if c:\n        a = jnp.zeros(5)\n    elif d:\n        a = jnp.zeros(6)\n", "a");
+    }
+
+    #[test]
+    fn a_name_bound_by_unknown_means_before_the_branch_is_not_new() {
+        unknown("    a = mystery()\n    if c:\n        a = jnp.zeros(5)\n", "a");
+        let param = "import jax.numpy as jnp\ndef g(p, c):\n    if c:\n        p = jnp.zeros(5)\n";
+        assert_eq!(find_shape(&analyze(param), "p"), None);
+    }
+
+    #[test]
+    fn a_path_that_returns_or_raises_does_not_reach_the_join() {
+        for end in ["return x", "raise ValueError()"] {
+            let body = format!("    if c:\n        x = jnp.zeros(5)\n        {end}\n    q = x\n");
+            let a = run(&body);
+            assert_eq!(find_shape(&a, "q"), Some(&shape(&["3", "4"])), "{end}");
+            assert_eq!(hint(&a, 5, "q"), Some(shape(&["3", "4"])), "{end}");
+            assert_eq!(hint(&a, 3, "x"), Some(shape(&["5"])), "{end}");
+        }
+    }
+
+    #[test]
+    fn only_the_arms_that_fall_through_are_joined() {
+        known("    if c:\n        r = jnp.zeros(5)\n    else:\n        return x\n", "r", &["5"]);
+        let both = "    if c:\n        a = jnp.zeros(5)\n        return a\n    else:\n        a = jnp.zeros(6)\n        return a\n";
+        unknown(both, "a");
+        let agree = "    if c:\n        a = jnp.zeros(5)\n        return a\n    else:\n        a = jnp.zeros(5)\n        return a\n";
+        known(agree, "a", &["5"]);
+        known("    if c:\n        t = jnp.zeros(5)\n        return t\n", "t", &["5"]);
+    }
+
+    #[test]
+    fn a_loop_body_may_run_zero_times() {
+        unknown("    for i in range(3):\n        x = jnp.zeros(5)\n", "x");
+        unknown("    while c:\n        x = jnp.zeros(5)\n", "x");
+        known("    for i in range(3):\n        x = jnp.ones((3, 4))\n", "x", &["3", "4"]);
+        known("    for i in range(3):\n        a = jnp.zeros(5)\n", "a", &["5"]);
+    }
+
+    #[test]
+    fn loop_exits_by_break_join_with_the_end_of_the_body() {
+        let body = "    while True:\n        a = jnp.zeros(5)\n        if c:\n            break\n";
+        known(body, "a", &["5"]);
+        let differ = "    while True:\n        if c:\n            a = jnp.zeros(6)\n            break\n        a = jnp.zeros(5)\n";
+        unknown(differ, "a");
+    }
+
+    #[test]
+    fn a_name_that_changes_in_an_iteration_is_unknown_after_the_loop() {
+        let nested = "    h = x\n    for i in range(3):\n        for j in range(2):\n            h = jnp.exp(h)\n";
+        known(nested, "h", &["3", "4"]);
+        unknown("    for i in range(2):\n        x = x.T\n", "x");
+        let through_continue = "    for i in range(3):\n        if i:\n            continue\n        x = x.T\n";
+        unknown(through_continue, "x");
+        let inner = "    for i in range(3):\n        for j in range(2):\n            x = x.T\n        x = x.T\n";
+        unknown(inner, "x");
+    }
+
+    #[test]
+    fn a_loop_target_hides_an_earlier_shape() {
+        unknown("    for x in y:\n        pass\n", "x");
+    }
+
+    #[test]
+    fn break_and_continue_end_the_path_where_they_stand() {
+        let brk = "    for i in range(3):\n        a = jnp.zeros(5)\n        if i:\n            a = jnp.zeros(6)\n            break\n";
+        unknown(brk, "a");
+        let cont = "    for i in range(3):\n        if i:\n            continue\n        t = jnp.zeros(5)\n";
+        known(cont, "t", &["5"]);
+        let cont_keeps = "    for i in range(3):\n        if i:\n            x = jnp.zeros(5)\n            continue\n        x = jnp.ones((3, 4))\n";
+        unknown(cont_keeps, "x");
+        let brk_guard = "    for i in range(3):\n        if i:\n            break\n        t = jnp.zeros(5)\n";
+        known(brk_guard, "t", &["5"]);
+    }
+
+    #[test]
+    fn a_loop_else_runs_when_no_break_leaves_the_loop() {
+        let body = "    for i in range(3):\n        pass\n    else:\n        a = jnp.zeros(5)\n";
+        known(body, "a", &["5"]);
+        let with_break = "    for i in range(3):\n        a = jnp.zeros(6)\n        break\n    else:\n        a = jnp.zeros(5)\n";
+        unknown(with_break, "a");
+    }
+
+    #[test]
+    fn try_except_joins_the_body_and_the_handlers() {
+        known("    try:\n        a = jnp.zeros(5)\n    except E:\n        a = jnp.zeros(5)\n", "a", &["5"]);
+        unknown("    try:\n        a = jnp.zeros(5)\n    except E:\n        a = jnp.zeros(6)\n", "a");
+        unknown("    try:\n        a = jnp.zeros(5)\n    except E:\n        pass\n", "a");
+        known("    try:\n        a = jnp.zeros(5)\n    except E:\n        raise\n", "a", &["5"]);
+        unknown("    try:\n        x = jnp.zeros(5)\n    except E:\n        pass\n", "x");
+    }
+
+    #[test]
+    fn a_handler_cannot_trust_what_the_body_wrote() {
+        let body = "    try:\n        x = jnp.zeros(5)\n        z = f()\n    except E:\n        q = x\n";
+        let a = run(body);
+        assert_eq!(hint(&a, 6, "q"), None);
+    }
+
+    #[test]
+    fn try_else_and_finally() {
+        let with_else = "    try:\n        a = jnp.zeros(5)\n    except E:\n        return x\n    else:\n        a = jnp.zeros(6)\n";
+        known(with_else, "a", &["6"]);
+        let fin = "    try:\n        a = jnp.zeros(5)\n    finally:\n        b = jnp.zeros(6)\n";
+        known(fin, "a", &["5"]);
+        known(fin, "b", &["6"]);
+        known("    try:\n        x = jnp.zeros(5)\n    finally:\n        x = jnp.ones((3, 4))\n", "x", &["3", "4"]);
+        known("    try:\n        x = jnp.zeros(5)\n    finally:\n        pass\n", "x", &["5"]);
+    }
+
+    #[test]
+    fn match_joins_its_cases() {
+        let both = "    match c:\n        case 1:\n            a = jnp.zeros(5)\n        case _:\n            a = jnp.zeros(5)\n";
+        known(both, "a", &["5"]);
+        let differ = "    match c:\n        case 1:\n            a = jnp.zeros(5)\n        case _:\n            a = jnp.zeros(6)\n";
+        unknown(differ, "a");
+        let open = "    match c:\n        case 1:\n            x = jnp.zeros(5)\n";
+        unknown(open, "x");
+        let guarded = "    match c:\n        case 1:\n            x = jnp.zeros(5)\n        case n if n:\n            x = jnp.zeros(5)\n";
+        unknown(guarded, "x");
+        let capture = "    match c:\n        case 1:\n            x = jnp.zeros(5)\n        case n:\n            x = jnp.zeros(5)\n";
+        known(capture, "x", &["5"]);
+    }
+
+    #[test]
+    fn with_blocks_run_once_unless_they_swallow_errors() {
+        known("    with ctx():\n        a = jnp.zeros(5)\n", "a", &["5"]);
+                unknown("    with suppress(E):\n        a = jnp.zeros(5)\n", "a");
+        unknown("    with pytest.raises(E):\n        x = jnp.zeros(5)\n", "x");
+    }
+
+    #[test]
+    fn nested_branches_join_from_the_inside_out() {
+        unknown("    if c:\n        if d:\n            x = jnp.zeros(5)\n", "x");
+        known("    if c:\n        if d:\n            x = jnp.ones((3, 4))\n", "x", &["3", "4"]);
+        let inner_returns = "    if c:\n        if d:\n            x = jnp.zeros(5)\n            return x\n        q = x\n";
+        let a = run(inner_returns);
+        assert_eq!(hint(&a, 6, "q"), Some(shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "x"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn each_arm_starts_from_the_state_before_the_branch() {
+        let body = "    if c:\n        x = jnp.zeros(5)\n    else:\n        q = x\n";
+        let a = run(body);
+        assert_eq!(hint(&a, 5, "q"), Some(shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn code_after_a_branch_reads_the_joined_state() {
+        let body = "    if c:\n        a = jnp.zeros(5)\n    else:\n        a = jnp.zeros(5)\n    b = a + jnp.ones(5)\n";
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 6, "b"), Some(shape(&["5"])));
+    }
+
+    #[test]
+    fn a_mismatch_inside_a_branch_still_reports() {
+        let body = "    b = jnp.zeros((6, 2))\n    if c:\n        x = jnp.zeros((3, 5))\n        z = x @ b\n";
+        let a = run(body);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn no_error_comes_from_a_state_the_join_made_unknown() {
+        let body = "    b = jnp.zeros((4, 2))\n    if c:\n        x = jnp.zeros((3, 7))\n    z = x @ b\n";
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        let straight = "    b = jnp.zeros((4, 2))\n    x = jnp.zeros((3, 7))\n    z = x @ b\n";
+        assert_eq!(run(straight).errors.len(), 1);
+    }
+
+    #[test]
+    fn a_called_helper_with_a_branch_is_joined_too() {
+        let same = "import jax.numpy as jnp\ndef helper(a: Float[Array, \"3 4\"], c):\n    if c:\n        b = a\n    else:\n        b = jnp.ones((3, 4))\n    return b\ndef outer(x: Float[Array, \"3 4\"]):\n    r = helper(x, True)\n";
+        assert_eq!(find_shape(&analyze(same), "r"), Some(&shape(&["3", "4"])));
+        let differ = "import jax.numpy as jnp\ndef helper(a: Float[Array, \"3 4\"], c):\n    if c:\n        b = a\n    else:\n        b = jnp.ones(5)\n    return b\ndef outer(x: Float[Array, \"3 4\"]):\n    r = helper(x, True)\n";
+        assert_eq!(find_shape(&analyze(differ), "r"), None);
+        let seeded = "import jax.numpy as jnp\ndef helper(a, c):\n    if c:\n        b = a\n    else:\n        b = jnp.ones(5)\n    return b\ndef outer(x: Float[Array, \"3 4\"]):\n    r = helper(x, True)\n";
+        assert_eq!(find_shape(&analyze(seeded), "r"), None);
+    }
+
+    #[test]
+    fn a_branch_in_one_function_does_not_touch_another() {
+        let code = "def f(x: Float[Array, \"3 4\"], c):\n    if c:\n        x = jnp.zeros(5)\ndef g(x: Float[Array, \"3 4\"]):\n    y = x\n";
+        let a = analyze(code);
+        assert_eq!(hint(&a, 4, "y"), Some(shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn loops_nested_in_branches_still_close_by_themselves() {
+        let body = "    if c:\n        for i in range(2):\n            x, y2 = y, x\n";
+        let a = run(body);
+        assert_eq!(find_shape(&a, "x"), None);
+    }
+
+    #[test]
+    fn module_level_branches_join_too() {
+        let code = "import jax.numpy as jnp\nx = jnp.zeros(5)\nif c:\n    x = jnp.zeros(6)\nz = x\nw = jnp.zeros(3)\nif c:\n    w = jnp.zeros(3)\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "x"), None);
+        assert_eq!(find_shape(&a, "z"), None);
+        assert_eq!(find_shape(&a, "w"), Some(&shape(&["3"])));
+        let fresh = "import jax.numpy as jnp\nif c:\n    n = jnp.zeros(6)\n";
+        assert_eq!(find_shape(&analyze(fresh), "n"), Some(&shape(&["6"])));
+        let read_before = "import jax.numpy as jnp\nprint(n)\nif c:\n    n = jnp.zeros(6)\n";
+        assert_eq!(find_shape(&analyze(read_before), "n"), None);
+        let in_function_only = "import jax.numpy as jnp\ndef g(n):\n    return n\nif c:\n    n = jnp.zeros(6)\n";
+        assert_eq!(find_shape(&analyze(in_function_only), "n"), Some(&shape(&["6"])));
+        let global_elsewhere = "import jax.numpy as jnp\ndef g():\n    global n\n    n = 1\nif c:\n    n = jnp.zeros(6)\n";
+        assert_eq!(find_shape(&analyze(global_elsewhere), "n"), None);
+        let wildcard = "import jax.numpy as jnp\nfrom lib import *\nif c:\n    n = jnp.zeros(6)\n";
+        assert_eq!(find_shape(&analyze(wildcard), "n"), None);
+        let main_block = "import jax.numpy as jnp\nif __name__ == \"__main__\":\n    a = jnp.zeros(4)\n    b = a + a\n";
+        assert_eq!(find_shape(&analyze(main_block), "b"), Some(&shape(&["4"])));
+    }
+}
+
+#[cfg(test)]
+mod module_global_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    const HEAD: &str = "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEAD}{body}"))
+    }
+
+    fn known(body: &str, name: &str, dims: &[&str]) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}\n{body}", a.errors);
+        let want: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+        assert_eq!(find_shape(&a, name), Some(&want), "{body}");
+    }
+
+    fn unknown(body: &str, name: &str) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}\n{body}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{body}");
+    }
+
+    #[test]
+    fn a_function_reads_a_module_global() {
+        known("W = jnp.zeros((3, 4))\ndef f():\n    out = W\n    return out\n", "out", &["3", "4"]);
+        known(
+            "W = jnp.zeros((3, 4))\ndef f(x: Float[Array, \"3 4\"]):\n    out = x + W\n",
+            "out",
+            &["3", "4"],
+        );
+        known(
+            "W = jnp.zeros((3, 4))\nclass C:\n    def m(self):\n        out = W\n",
+            "out",
+            &["3", "4"],
+        );
+        known(
+            "W = jnp.zeros((3, 4))\ndef f():\n    def g():\n        return W\n    out = W\n",
+            "out",
+            &["3", "4"],
+        );
+    }
+
+    #[test]
+    fn a_true_mismatch_with_a_module_global_is_an_error() {
+        let a = run("W = jnp.zeros((3, 4))\ndef f(x: Float[Array, \"5 6\"]):\n    out = x @ W\n");
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn a_name_the_function_binds_shadows_the_global() {
+        let g = "W = jnp.zeros((3, 4))\n";
+        unknown(&format!("{g}def f(W):\n    out = W\n"), "out");
+        unknown(&format!("{g}def f():\n    W = mystery()\n    out = W\n"), "out");
+        unknown(&format!("{g}def f():\n    for W in ws:\n        pass\n    out = W\n"), "out");
+        known(&format!("{g}def f():\n    W = jnp.zeros(7)\n    out = W\n"), "out", &["7"]);
+        unknown(
+            &format!("{g}def f():\n    W = mystery()\n    def h():\n        return W\n    out = W\n"),
+            "out",
+        );
+        unknown(
+            &format!("{g}def f():\n    def h():\n        W = mystery()\n    W = mystery()\n    out = W\n"),
+            "out",
+        );
+        unknown(&format!("{g}def f():\n    out = W\n    W = mystery()\n"), "out");
+        known(&format!("{g}def f(W: Float[Array, \"9\"]):\n    out = W\n"), "out", &["9"]);
+    }
+
+    #[test]
+    fn a_global_statement_makes_the_name_unknown() {
+        let code = "W = jnp.zeros((3, 4))\ndef set_it():\n    global W\n    W = jnp.zeros(5)\ndef f():\n    out = W\n";
+        unknown(code, "out");
+        let reads = "W = jnp.zeros((3, 4))\ndef f():\n    global W\n    out = W\n";
+        unknown(reads, "out");
+    }
+
+    #[test]
+    fn the_global_needs_one_shape_over_all_assignments() {
+        known("W = jnp.zeros(3)\nW = jnp.ones(3)\ndef f():\n    out = W\n", "out", &["3"]);
+        unknown("W = jnp.zeros(3)\nW = jnp.ones(4)\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\nW = mystery()\ndef f():\n    out = W\n", "out");
+        unknown(
+            "if c:\n    W = jnp.zeros(3)\nelse:\n    W = jnp.zeros(4)\ndef f():\n    out = W\n",
+            "out",
+        );
+        known(
+            "if c:\n    W = jnp.zeros(3)\nelse:\n    W = jnp.ones(3)\ndef f():\n    out = W\n",
+            "out",
+            &["3"],
+        );
+        unknown("W = jnp.zeros(3)\nfor i in r:\n    W = W[None]\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\nW += jnp.ones((2, 3))\ndef f():\n    out = W\n", "out");
+        known("W = jnp.zeros(3)\nW += 1\ndef f():\n    out = W\n", "out", &["3"]);
+    }
+
+    #[test]
+    fn an_assignment_after_the_function_makes_the_global_unknown() {
+        unknown("def f():\n    out = W\nW = jnp.zeros(3)\n", "out");
+        unknown("W = jnp.zeros(3)\ndef f():\n    out = W\nW = jnp.zeros(3)\n", "out");
+        unknown(
+            "def g(x):\n    return f(x)\nW = jnp.zeros(3)\nW = jnp.zeros(4)\ndef f(x):\n    out = x + W\n    return out\ndef h():\n    return g(jnp.zeros(4))\n",
+            "out",
+        );
+    }
+
+    #[test]
+    fn other_bindings_of_the_global_name_make_it_unknown() {
+        unknown("W, V = mystery()\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\nfor W in ws:\n    pass\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\nwith ctx() as W:\n    pass\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\nimport W\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\ndef W():\n    pass\ndef f():\n    out = W\n", "out");
+        unknown("W = jnp.zeros(3)\ndel W\ndef f():\n    out = W\n", "out");
+        unknown("from lib import *\nW = jnp.zeros(3)\ndef f():\n    out = W\n", "out");
+        unknown("W = V = jnp.zeros(3)\ndef f():\n    out = W\n", "out");
+        unknown("import W\ndef f():\n    out = W\n", "out");
+    }
+
+    #[test]
+    fn a_class_body_name_is_not_a_module_global() {
+        unknown("class C:\n    W = jnp.zeros(9)\n    def m(self):\n        out = W\n", "out");
+        unknown(
+            "W = jnp.zeros((3, 4))\nclass C:\n    W = jnp.zeros(9)\ndef f():\n    out = W\n",
+            "out",
+        );
+        unknown(
+            "W = jnp.zeros((3, 4))\nclass C:\n    W: Float[Array, \"9\"]\ndef f():\n    out = W\n",
+            "out",
+        );
+        unknown(
+            "W = jnp.zeros((3, 4))\nclass C:\n    def W(self):\n        pass\ndef f():\n    out = W\n",
+            "out",
+        );
+        known(
+            "W = jnp.zeros((3, 4))\nclass C:\n    V = jnp.zeros(9)\ndef f():\n    out = W\n",
+            "out",
+            &["3", "4"],
+        );
+    }
+
+    #[test]
+    fn a_class_body_read_does_not_see_a_global_through_a_function() {
+        known(
+            "W = jnp.zeros((3, 4))\ndef f():\n    class C:\n        W = jnp.zeros(9)\n        def m(self):\n            return W\n    out = W\n",
+            "out",
+            &["3", "4"],
+        );
+        unknown(
+            "W = jnp.zeros((3, 4))\ndef f():\n    class C:\n        W = jnp.zeros(9)\n        out = W\n",
+            "out",
+        );
+    }
+
+    #[test]
+    fn self_attribute_does_not_read_a_module_global() {
+        unknown(
+            "W = jnp.zeros((3, 4))\nclass C:\n    def m(self):\n        out = self.W\n",
+            "out",
+        );
+        known(
+            "class C:\n    W: Float[Array, \"3 4\"]\n    def m(self):\n        out = self.W\n",
+            "out",
+            &["3", "4"],
+        );
+        unknown(
+            "W = jnp.zeros((3, 4))\nclass C:\n    W: Float[Array, \"3 4\"]\n    def m(self):\n        out = self.W\n",
+            "out",
+        );
+    }
+
+    #[test]
+    fn a_lambda_or_comprehension_target_shadows_the_global() {
+        let g = "W = jnp.zeros((3, 4))\n";
+        unknown(&format!("{g}def f(xs):\n    out = jnp.stack([W for W in xs])\n"), "out");
+        unknown(&format!("{g}def f():\n    out = (lambda W: W)(1)\n"), "out");
+    }
+
+    #[test]
+    fn module_constants_work_as_dims() {
+        known("D = 64\ndef f():\n    out = jnp.zeros((D, D))\n", "out", &["64", "64"]);
+        known(
+            "D = 64\ndef f(x: Float[Array, \"64 64\"]):\n    out = x + jnp.zeros((D, D))\n",
+            "out",
+            &["64", "64"],
+        );
+        known("D = 64\nD = 32\ndef f():\n    out = jnp.zeros((D, D))\n", "out", &["D", "D"]);
+        known("D = 64\ndef f(D):\n    out = jnp.zeros((D, D))\n", "out", &["D", "D"]);
+    }
+
+    #[test]
+    fn two_names_for_one_constant_are_not_a_mismatch() {
+        let two = "D = 64\nE = 64\ndef f():\n    x = jnp.zeros((D,))\n    y = jnp.zeros((E,))\n    z = x + y\n";
+        known(two, "z", &["64"]);
+        let right = "D = 64\ndef f(a: Float[Array, \"64 3\"]):\n    z = a + jnp.zeros((D, 3))\n";
+        known(right, "z", &["64", "3"]);
+        let wrong = "D = 64\ndef f(a: Float[Array, \"65 3\"]):\n    z = a + jnp.zeros((D, 3))\n";
+        assert_eq!(run(wrong).errors.len(), 1);
+        known("D = 64\ndef f(x):\n    out = jnp.zeros((D, x.shape[0]))\n", "out", &["64", "x.shape[0]"]);
+    }
+
+    #[test]
+    fn a_constant_needs_one_literal_and_no_other_binding() {
+        let sym = &["D", "3"];
+        known("D = 64\ndef f():\n    D += 1\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 1\nD += 1\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 64\ndef f():\n    global D\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 64\nD = len(xs)\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 0x40\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 64\nclass C:\n    D = 32\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D = 64\ndef f(D: int):\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D: Float[Array, \"2\"] = 64\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", sym);
+        known("D: int = 64\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", &["64", "3"]);
+        known("D = 64\ndef f():\n    D = 65\n    out = jnp.zeros((D, 3))\n", "out", &["65", "3"]);
+        known("D = 64\nclass C:\n    D = 32\n    def m(self):\n        out = jnp.zeros((D, 3))\n", "out", &["64", "3"]);
+    }
+
+    #[test]
+    fn a_class_inside_a_function_does_not_bind_in_the_function() {
+        unknown("def f():\n    class C:\n        W = jnp.zeros(9)\n    out = W\n", "out");
+        unknown(
+            "def f():\n    class C:\n        W: Float[Array, \"9\"]\n    out = W\n",
+            "out",
+        );
+    }
+
+    #[test]
+    fn a_module_level_read_is_unchanged() {
+        known("W = jnp.zeros((3, 4))\nout = W\n", "out", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_constant_named_like_an_annotation_symbol_stays_a_name() {
+        let symbol = "D = 64\ndef f(x: Float[Array, \"D 3\"]):\n    y = x + jnp.zeros((D, 3))\n";
+        known(symbol, "y", &["D", "3"]);
+        let local = "def f(x: Float[Array, \"D 3\"]):\n    D = 64\n    y = x + jnp.zeros((D, 3))\n";
+        known(local, "y", &["D", "3"]);
+        // Another function's annotation uses the symbol: the name is shared.
+        let apart = "D = 64\ndef g(x: Float[Array, \"D 3\"]):\n    return x\ndef f():\n    out = jnp.zeros((D, 3))\n";
+        known(apart, "out", &["D", "3"]);
+        let inside = "D = 64\ndef g(x: Float[Array, \"2*D 3\"]):\n    return x\ndef f():\n    out = jnp.zeros((D, 3))\n";
+        known(inside, "out", &["D", "3"]);
+        known("D = 64\ndef g(x: Float[Array, \"E 3\"]):\n    return x\ndef f():\n    out = jnp.zeros((D, 3))\n", "out", &["64", "3"]);
+    }
+
+    #[test]
+    fn many_distinct_globals_cost_a_linear_scan() {
+        let time = |n: usize| {
+            let mut code = String::from(HEAD);
+            for i in 0..n {
+                code.push_str(&format!("W{i} = jnp.zeros((3, 4))\nD{i} = {i}\n"));
+            }
+            for i in 0..n {
+                code.push_str(&format!(
+                    "def g{i}(a):\n    out = W{i}\n    z = jnp.zeros((D{i}, 2))\n    return out\n"
+                ));
+            }
+            let started = std::time::Instant::now();
+            let a = analyze(&code);
+            let elapsed = started.elapsed();
+            assert_eq!(find_shape(&a, "out"), Some(&vec!["3".to_string(), "4".to_string()]));
+            elapsed.as_secs_f64()
+        };
+        let best = |n| (0..3).map(|_| time(n)).fold(f64::MAX, f64::min);
+        let (small, large) = (best(300), best(1200));
+        // Four times the globals: a linear scan takes about four times as
+        // long, a scan per global about sixteen times.
+        assert!(large < small * 10.0, "{small:.3}s for 300, {large:.3}s for 1200");
+    }
+}
+
+#[cfg(test)]
+mod comprehension_lambda_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    const HEAD: &str = "import jax\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\ndef f(xs: Float[Array, \"5 3 4\"], w: Float[Array, \"4 2\"], v: Float[Array, \"5 4\"], sym: Float[Array, \"n 3 4\"], y: Float[Array, \"3 4\"], s: Float[Array, \"\"], lst):\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        let code = format!("{HEAD}{body}");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), &code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn body(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("    {l}\n")).collect()
+    }
+
+    #[track_caller]
+    fn known(lines: &[&str], name: &str, dims: &[&str]) {
+        let a = run(&body(lines));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        let want: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+        assert_eq!(find_shape(&a, name), Some(&want), "{lines:?}");
+    }
+
+    #[track_caller]
+    fn unknown(lines: &[&str], name: &str) {
+        let a = run(&body(lines));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{lines:?}");
+    }
+
+    #[test]
+    fn stack_of_a_comprehension_over_an_array() {
+        known(&["out = jnp.stack([x @ w for x in xs])"], "out", &["5", "3", "2"]);
+        unknown(&["out = jnp.stack([r * 2.0 for x in xs for r in x])"], "out");
+    }
+
+    #[test]
+    fn concatenate_of_a_comprehension() {
+        known(&["out = jnp.concatenate([x @ w for x in xs])"], "out", &["15", "2"]);
+        known(&["out = jnp.concatenate([x @ w for x in xs], axis=1)"], "out", &["3", "10"]);
+    }
+
+    #[test]
+    fn comprehension_over_enumerate_zip_and_range() {
+        known(&["out = jnp.stack([x * i for i, x in enumerate(xs)])"], "out", &["5", "3", "4"]);
+        known(&["out = jnp.stack([a + b for a, b in zip(xs, xs)])"], "out", &["5", "3", "4"]);
+        known(&["out = jnp.stack([a[0] + b for a, b in zip(xs, v)])"], "out", &["5", "4"]);
+        known(&["out = jnp.stack([w * k for k in range(3)])"], "out", &["3", "4", "2"]);
+        known(&["out = jnp.stack([xs[i] for i in range(5)])"], "out", &["5", "3", "4"]);
+        known(&["out = jnp.stack([xs[i] for i in range(len(xs))])"], "out", &["5", "3", "4"]);
+        known(&["out = jnp.stack([xs[i] for i in range(xs.shape[0])])"], "out", &["5", "3", "4"]);
+        known(&["out = jnp.stack([w for _ in range(2, 5)])"], "out", &["3", "4", "2"]);
+        known(&["out = jnp.stack([w for _ in range(5, 0, -2)])"], "out", &["3", "4", "2"]);
+    }
+
+    #[test]
+    fn zip_stops_at_the_shortest_array() {
+        known(&["out = jnp.stack([a[0] for a, b in zip(xs, xs[:3])])"], "out", &["3", "4"]);
+        let short = "Float[Array, \"2 3 4\"]";
+        let code = format!(
+            "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\ndef g(xs: Float[Array, \"5 3 4\"], zs: {short}):\n    out = jnp.stack([a + b for a, b in zip(xs, zs)])\n"
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&code, None).unwrap();
+        let a = analyze_layer_shapes(tree.root_node(), &code, &[], |_| None, 5, None).unwrap();
+        assert_eq!(find_shape(&a, "out"), Some(&vec!["2".to_string(), "3".into(), "4".into()]));
+    }
+
+    #[test]
+    fn sum_of_a_comprehension() {
+        known(&["out = sum(x @ w for x in xs)"], "out", &["3", "2"]);
+        known(&["out = sum([x @ w for x in xs])"], "out", &["3", "2"]);
+        unknown(&["out = sum(x @ w for x in sym)"], "out");
+        unknown(&["out = sum(x @ w for x in xs if lst)"], "out");
+        unknown(&["sum = lst", "out = sum(x @ w for x in xs)"], "out");
+    }
+
+    #[test]
+    fn the_loop_variable_does_not_leak() {
+        known(
+            &["x = jnp.ones((7,))", "out = jnp.stack([x @ w for x in xs])", "after = x"],
+            "after",
+            &["7"],
+        );
+        known(
+            &["x = jnp.ones((7,))", "out = jnp.stack([x @ w for x in xs])"],
+            "out",
+            &["5", "3", "2"],
+        );
+    }
+
+    #[test]
+    fn a_loop_variable_of_unknown_shape_hides_the_outer_name() {
+        unknown(&["x = jnp.ones((7, 7))", "out = jnp.stack([x * 1.0 for x in lst])"], "out");
+        unknown(&["x = jnp.ones((7, 7))", "out = jnp.stack([x * 1.0 for x, _ in lst])"], "out");
+        unknown(&["x = jnp.ones((7, 7))", "out = jnp.stack([x * 1.0 for x in (y, y)])"], "out");
+    }
+
+    #[test]
+    fn an_integer_loop_variable_hides_an_outer_integer() {
+        known(&["i = 3", "out = jnp.stack([y * i for i in range(2)])"], "out", &["2", "3", "4"]);
+        unknown(&["i = jnp.ones(3)", "out = jnp.stack([y * i for i in lst])"], "out");
+    }
+
+    #[test]
+    fn only_arrays_are_iterated_by_their_first_axis() {
+        unknown(&["out = jnp.stack([x @ w for x in sym])"], "out");
+        unknown(&["out = jnp.stack([x for x in s])"], "out");
+        unknown(&["out = jnp.stack([x for x in lst])"], "out");
+        unknown(&["pair = (y, y)", "out = jnp.stack([x * 2.0 for x in pair])"], "out");
+        unknown(&["out = jnp.stack([x * 2.0 for x in (y, y)])"], "out");
+        unknown(&["out = jnp.stack([x for x in xs if lst])"], "out");
+        unknown(&["out = jnp.stack(x @ w for x in xs)"], "out");
+    }
+
+    #[test]
+    fn a_dim_that_names_the_loop_variable_is_unknown() {
+        unknown(&["out = jnp.stack([y[:i] for i in range(3)])"], "out");
+        unknown(&["out = jnp.stack([jnp.zeros((i, 2)) for i in range(3)])"], "out");
+        unknown(&["out = jnp.stack([jnp.zeros((2, k)) for k in range(3)])"], "out");
+    }
+
+    #[test]
+    fn nested_comprehensions() {
+        known(
+            &["out = jnp.stack([jnp.stack([r * 2.0 for r in x]) for x in xs])"],
+            "out",
+            &["5", "3", "4"],
+        );
+    }
+
+    #[test]
+    fn a_comprehension_body_error_is_reported_once() {
+        let a = run(&body(&["bad = jnp.ones((9, 2))", "out = jnp.stack([x @ bad for x in xs])"]));
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn an_error_that_depends_on_the_loop_integer_is_not_reported() {
+        let a = run(&body(&["out = jnp.stack([y @ jnp.ones((i, 2)) for i in range(5, 7)])"]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        let a = run(&body(&["out = y @ jnp.ones((7, 2))"]));
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn a_direct_lambda_call() {
+        known(&["out = (lambda x: x * 2)(y)"], "out", &["3", "4"]);
+        known(&["out = (lambda x: x @ w)(xs)"], "out", &["5", "3", "2"]);
+        known(&["out = (lambda a, b: a @ b)(y, w)"], "out", &["3", "2"]);
+        known(&["out = (lambda a, b: a @ b)(b=w, a=y)"], "out", &["3", "2"]);
+        known(&["out = (lambda x, k=2: x * k)(y)"], "out", &["3", "4"]);
+        known(&["out = (lambda x: x @ w)(y)"], "out", &["3", "2"]);
+    }
+
+    #[test]
+    fn a_lambda_parameter_hides_the_outer_name() {
+        known(&["x = jnp.ones((9, 9))", "out = (lambda x: x * 2)(y)"], "out", &["3", "4"]);
+        unknown(&["x = jnp.ones((9, 9))", "out = (lambda x: x * 2)(lst)"], "out");
+        unknown(&["x = jnp.ones((9, 9))", "out = (lambda x, z: x * 2)(z=y)"], "out");
+        known(&["n = 3", "out = (lambda n: n * 2)(y)"], "out", &["3", "4"]);
+        unknown(&["n = 3", "out = (lambda n: y * n)(lst)"], "out");
+        known(&["out = (lambda: y * 2)()"], "out", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_lambda_that_is_not_modelled_is_unknown() {
+        unknown(&["out = (lambda x: x * 2)(y, y)"], "out");
+        unknown(&["out = (lambda x: x * 2)()"], "out");
+        unknown(&["out = (lambda x: (x, x))(y)"], "out");
+        unknown(&["out = (lambda *a: a[0])(y)"], "out");
+        unknown(&["out = (lambda x, **k: x)(y)"], "out");
+        unknown(&["out = (lambda x: x)(*lst)"], "out");
+        unknown(&["out = (lambda x: x)(y, z=1)"], "out");
+    }
+
+    #[test]
+    fn vmap_of_a_lambda() {
+        known(&["out = jax.vmap(lambda x: x @ w)(xs)"], "out", &["5", "3", "2"]);
+        known(&["out = jax.vmap(lambda a, b: a + b)(xs, xs)"], "out", &["5", "3", "4"]);
+        known(&["out = jax.vmap(lambda x: x.sum(), in_axes=1)(xs)"], "out", &["3"]);
+        known(&["out = jax.vmap(lambda x: x * 2.0, out_axes=1)(xs)"], "out", &["3", "5", "4"]);
+        known(&["out = jax.vmap(jax.vmap(lambda x: x * 2.0))(xs)"], "out", &["5", "3", "4"]);
+        known(&["out = jax.vmap(lambda x: jax.vmap(lambda r: r * 2.0)(x))(xs)"], "out", &["5", "3", "4"]);
+    }
+
+    #[test]
+    fn vmap_of_a_lambda_that_is_not_modelled_is_unknown() {
+        unknown(&["out = jax.vmap(lambda x: x * 2.0, in_axes=(0,))(xs)"], "out");
+        unknown(&["out = jax.vmap(lambda x: (x, x))(xs)"], "out");
+        unknown(&["out = jax.vmap(lambda x: x * 2.0)(lst)"], "out");
+        unknown(&["out = jax.vmap(lambda x: x * 2.0)((xs, xs))"], "out");
+        unknown(&["out = jax.vmap(lambda x: x * 2.0)(x=xs)"], "out");
+        unknown(&["x = jnp.ones((9, 9))", "out = jax.vmap(lambda x: x * 2.0)(lst)"], "out");
+    }
+
+    #[test]
+    fn vmap_of_a_lambda_reports_a_body_error_once() {
+        let a = run(&body(&["bad = jnp.ones((9, 2))", "out = jax.vmap(lambda x: x @ bad)(xs)"]));
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        let a = run(&body(&["out = jax.vmap(lambda a, b: a + b)(xs, w)"]));
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+    }
+
+    #[test]
+    fn lax_map_with_a_lambda() {
+        known(&["out = jax.lax.map(lambda x: x @ w, xs)"], "out", &["5", "3", "2"]);
+        unknown(&["out = jax.lax.map(lambda x: x @ w, (xs, xs))"], "out");
+        unknown(&["out = jax.lax.map(lambda x: x @ w, lst)"], "out");
+    }
+
+    #[test]
+    fn scan_with_a_lambda() {
+        known(
+            &["c, ys = jax.lax.scan(lambda c, x: (c + x, c * x), v[0], v)"],
+            "ys",
+            &["5", "4"],
+        );
+        known(
+            &["c, ys = jax.lax.scan(lambda c, x: (c + x, c * x), v[0], v)"],
+            "c",
+            &["4"],
+        );
+        known(
+            &["c, ys = jax.lax.scan(lambda c, x: (c, x.sum()), v[0], v)"],
+            "ys",
+            &["5"],
+        );
+        unknown(&["c, ys = jax.lax.scan(lambda c, x: (c, None), v[0], v)"], "ys");
+        unknown(&["c, ys = jax.lax.scan(lambda c, x: (c, (x, x)), v[0], v)"], "ys");
+        unknown(&["c, ys = jax.lax.scan(lambda c, x: c, v[0], v)"], "ys");
+        unknown(&["c, ys = jax.lax.scan(lambda c, x: (c, x), v[0], lst)"], "ys");
+        unknown(&["c, ys = jax.lax.scan(lambda c, x, z: (c, x), v[0], v)"], "ys");
+    }
+
+    #[test]
+    fn a_lambda_reads_the_variables_around_it() {
+        known(&["k = jnp.ones((4,))", "out = jax.vmap(lambda x: x * k)(xs)"], "out", &["5", "3", "4"]);
+        known(&["out = jax.vmap(lambda x: x @ w)(xs)", "w = jnp.ones((9, 9))"], "out", &["5", "3", "2"]);
+    }
+
+    #[test]
+    fn module_level_comprehensions_and_lambdas() {
+        let code = "import jax\nimport jax.numpy as jnp\n\nxs = jnp.ones((5, 3, 4))\nw = jnp.ones((4, 2))\nstacked = jnp.stack([x @ w for x in xs])\nmapped = jax.vmap(lambda x: x @ w)(xs)\ntotal = sum(x @ w for x in xs)\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let a = analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        let want = |dims: &[&str]| Some(dims.iter().map(|d| d.to_string()).collect::<Vec<_>>());
+        assert_eq!(find_shape(&a, "stacked").cloned(), want(&["5", "3", "2"]));
+        assert_eq!(find_shape(&a, "mapped").cloned(), want(&["5", "3", "2"]));
+        assert_eq!(find_shape(&a, "total").cloned(), want(&["3", "2"]));
+        assert_eq!(find_shape(&a, "x"), None);
+    }
+}
+
+#[cfg(test)]
+mod loss_layer_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEADER: &str = "import torch\nimport torch.nn as nn\nfrom torch.nn import MSELoss as Mse\nfrom jaxtyping import Float, Array\n";
+
+    fn run(params: &str, body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEADER}def f({params}):\n{body}"))
+    }
+
+    const CLASS_PARAMS: &str = "logits: Float[Array, \"n c\"], y: Float[Array, \"n\"]";
+
+    #[test]
+    fn classification_losses_follow_the_functional_rule_and_the_constructor_reduction() {
+        let body = "    ce = nn.CrossEntropyLoss()\n    a = ce(logits, y)\n    ce_none = nn.CrossEntropyLoss(reduction='none')\n    b = ce_none(logits, y)\n    nll = nn.NLLLoss(reduction=\"sum\")\n    c = nll(logits, y)\n    nll_none = nn.NLLLoss(None, None, -100, None, 'none')\n    d = nll_none(logits, y)\n    e = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1, reduction='none')(logits, y)\n    g = nn.CrossEntropyLoss(ignore_index=3)(logits, y)\n";
+        let analysis = run(CLASS_PARAMS, body);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for (name, dims) in [("a", &[][..]), ("b", &["n"]), ("c", &[]), ("d", &["n"]), ("e", &["n"]), ("g", &[])] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(dims)), "{name}");
+        }
+    }
+
+    #[test]
+    fn cross_entropy_takes_probability_targets_and_spatial_inputs_but_nll_does_not() {
+        let params = "x: Float[Array, \"n c h w\"], idx: Float[Array, \"n h w\"], p: Float[Array, \"n c h w\"]";
+        let body = "    ce = nn.CrossEntropyLoss(reduction='none')\n    a = ce(x, idx)\n    b = ce(x, p)\n    nll = nn.NLLLoss(reduction='none')\n    c = nll(x, idx)\n    d = nll(x, p)\n";
+        let analysis = run(params, body);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "h", "w"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "h", "w"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["n", "h", "w"])));
+        assert_eq!(find_shape(&analysis, "d"), None);
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+    }
+
+    #[test]
+    fn classification_loss_target_mismatch_is_an_error() {
+        let params = "logits: Float[Array, \"n c\"], y: Float[Array, \"m\"]";
+        let analysis = run(params, "    loss = nn.CrossEntropyLoss()(logits, y)\n");
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "loss"), None);
+    }
+
+    #[test]
+    fn regression_losses_reduce_to_a_scalar_or_keep_the_broadcast_shape() {
+        let params = "p: Float[Array, \"n c\"], t: Float[Array, \"n c\"], row: Float[Array, \"c\"], col: Float[Array, \"n 1\"]";
+        let mut body = String::new();
+        for (i, layer) in ["MSELoss", "L1Loss", "SmoothL1Loss", "HuberLoss"].iter().enumerate() {
+            body += &format!(
+                "    m{i} = nn.{layer}()\n    mean{i} = m{i}(p, t)\n    s{i} = nn.{layer}(reduction='sum')(p, t)\n    none{i} = nn.{layer}(reduction='none')(p, t)\n    row{i} = nn.{layer}(reduction='none')(p, row)\n    col{i} = nn.{layer}(reduction='none')(p, col)\n"
+            );
+        }
+        let analysis = run(params, &body);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for i in 0..4 {
+            assert_eq!(find_shape(&analysis, &format!("mean{i}")), Some(&shape(&[])));
+            assert_eq!(find_shape(&analysis, &format!("s{i}")), Some(&shape(&[])));
+            for name in ["none", "row", "col"] {
+                assert_eq!(
+                    find_shape(&analysis, &format!("{name}{i}")),
+                    Some(&shape(&["n", "c"])),
+                    "{name}{i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regression_loss_broadcasts_a_column_against_a_row_as_torch_does() {
+        let params = "p: Float[Array, \"4 1\"], t: Float[Array, \"4\"]";
+        let analysis = run(params, "    a = nn.MSELoss(reduction='none')(p, t)\n    b = nn.MSELoss()(p, t)\n");
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["4", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&[])));
+    }
+
+    #[test]
+    fn huber_loss_reads_its_reduction_from_the_first_position() {
+        let params = "p: Float[Array, \"n c\"], t: Float[Array, \"n c\"]";
+        let body = "    a = nn.HuberLoss('none')(p, t)\n    b = nn.HuberLoss(delta=2.0, reduction='none')(p, t)\n    c = nn.HuberLoss(2.0)(p, t)\n    d = nn.SmoothL1Loss(None, None, 'none', beta=0.5)(p, t)\n";
+        let analysis = run(params, body);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "c"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "c"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["n", "c"])));
+        assert_eq!(find_shape(&analysis, "c"), None);
+    }
+
+    #[test]
+    fn regression_loss_with_provably_different_dims_is_an_error() {
+        for (target, error) in [("5 3", true), ("3 4", true), ("n 3", false), ("2 4 3", false), ("3", false), ("4", true)] {
+            let params = format!("p: Float[Array, \"4 3\"], t: Float[Array, \"{target}\"]");
+            let analysis = run(&params, "    loss = nn.MSELoss(reduction='none')(p, t)\n");
+            assert_eq!(analysis.errors.len(), usize::from(error), "{target}: {:?}", analysis.errors);
+        }
+        let analysis = run(
+            "p: Float[Array, \"n c\"], t: Float[Array, \"m c\"]",
+            "    mean = nn.MSELoss()(p, t)\n    none = nn.MSELoss(reduction='none')(p, t)\n",
+        );
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "mean"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "none"), None);
+    }
+
+    #[test]
+    fn binary_cross_entropy_needs_the_same_shape_without_broadcasting() {
+        let ok = run(
+            "p: Float[Array, \"n 1\"], t: Float[Array, \"n 1\"]",
+            "    a = nn.BCELoss()(p, t)\n    b = nn.BCEWithLogitsLoss(reduction='none')(p, t)\n    c = nn.BCEWithLogitsLoss(pos_weight=w, reduction='sum')(p, t)\n    d = nn.BCELoss(weight=w, reduction='none')(p, t)\n",
+        );
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        assert_eq!(find_shape(&ok, "a"), Some(&shape(&[])));
+        assert_eq!(find_shape(&ok, "b"), Some(&shape(&["n", "1"])));
+        assert_eq!(find_shape(&ok, "c"), Some(&shape(&[])));
+        assert_eq!(find_shape(&ok, "d"), Some(&shape(&["n", "1"])));
+        for (p, t) in [("n 1", "n"), ("4 3", "5 3"), ("1 3", "4 3"), ("n", "n 1")] {
+            for layer in ["BCELoss", "BCEWithLogitsLoss"] {
+                let params = format!("p: Float[Array, \"{p}\"], t: Float[Array, \"{t}\"]");
+                let analysis = run(&params, &format!("    loss = nn.{layer}()(p, t)\n"));
+                assert_eq!(analysis.errors.len(), 1, "{layer} {p} / {t}: {:?}", analysis.errors);
+                assert_eq!(find_shape(&analysis, "loss"), None);
+            }
+        }
+        let symbolic = run(
+            "p: Float[Array, \"n c\"], t: Float[Array, \"m c\"]",
+            "    loss = nn.BCELoss()(p, t)\n",
+        );
+        assert!(symbolic.errors.is_empty(), "{:?}", symbolic.errors);
+        assert_eq!(find_shape(&symbolic, "loss"), Some(&shape(&[])));
+    }
+
+    #[test]
+    fn a_loss_with_a_value_dependent_reduction_keeps_its_checks_but_not_its_shape() {
+        let body = "    a = nn.MSELoss(reduction=mode)(p, t)\n    b = nn.MSELoss(size_average=False)(p, t)\n    c = nn.CrossEntropyLoss(reduce=False)(p, t)\n    d = nn.BCELoss(reduction=self_mode)(p, t)\n";
+        let analysis = run("p: Float[Array, \"n c\"], t: Float[Array, \"n c\"]", body);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["a", "b", "c", "d"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        let bad = run(
+            "p: Float[Array, \"4 3\"], t: Float[Array, \"5 3\"]",
+            "    a = nn.MSELoss(reduction=mode)(p, t)\n",
+        );
+        assert_eq!(bad.errors.len(), 1, "{:?}", bad.errors);
+    }
+
+    #[test]
+    fn an_unknown_target_leaves_the_loss_unknown_without_an_error() {
+        let analysis = run(
+            "p: Float[Array, \"n c\"]",
+            "    a = nn.MSELoss()(p, mystery)\n    b = nn.CrossEntropyLoss()(p, mystery())\n    c = nn.BCELoss()(p)\n",
+        );
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), None);
+        assert_eq!(find_shape(&analysis, "b"), None);
+        assert_eq!(find_shape(&analysis, "c"), None);
+    }
+
+    #[test]
+    fn keyword_arguments_and_aliased_imports_reach_the_loss_rule() {
+        let params = "p: Float[Array, \"n c\"], t: Float[Array, \"n c\"], y: Float[Array, \"n\"]";
+        let body = "    a = Mse(reduction='none')(p, t)\n    b = nn.MSELoss(reduction='none')(p, target=t)\n    c = nn.CrossEntropyLoss(reduction='none')(p, target=y)\n    d = nn.MSELoss(reduction='none')(input=p, target=t)\n";
+        let analysis = run(params, body);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "c"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "c"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["n"])));
+        assert_eq!(find_shape(&analysis, "d"), None);
+    }
+
+    #[test]
+    fn a_loss_held_in_a_field_is_applied_in_the_method_and_in_an_expression() {
+        let code = format!(
+            "{HEADER}class Net(nn.Module):\n    def __init__(self, reduction='mean'):\n        super().__init__()\n        self.head = nn.Linear(8, 3)\n        self.crit = nn.CrossEntropyLoss(reduction='none')\n        self.mse = nn.MSELoss()\n\n    def forward(self, x: Float[Array, \"n 8\"], y: Float[Array, \"n\"], t: Float[Array, \"n 3\"]):\n        logits = self.head(x)\n        per = self.crit(logits, y)\n        total = self.mse(logits, t)\n        both = self.crit(logits, y).sum() + self.mse(logits, t)\n        return per, total, both\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "per"), Some(&shape(&["n"])));
+        assert_eq!(find_shape(&analysis, "total"), Some(&shape(&[])));
+        assert_eq!(find_shape(&analysis, "both"), Some(&shape(&[])));
+    }
+
+    #[test]
+    fn an_application_names_an_inline_input_by_its_source() {
+        let params = "logits: Float[Array, \"n c\"], y: Float[Array, \"n\"]";
+        let body = "    nll = nn.NLLLoss()\n    loss = nll(torch.log_softmax(logits, dim=1), torch.abs(y).long())\n";
+        let analysis = run(params, body);
+        let application = &analysis.applications[0];
+        assert_eq!(application.input, "torch.log_softmax(logits, dim=1)");
+        assert_eq!(application.extra_inputs, ["torch.abs(y).long()"]);
+    }
+
+    #[test]
+    fn a_loss_fed_by_a_layer_output_checks_the_layer_output() {
+        let code = format!(
+            "{HEADER}def f(x: Float[Array, \"n 8\"], y: Float[Array, \"n\"]):\n    head = nn.Linear(8, 3)\n    crit = nn.CrossEntropyLoss(reduction='none')\n    logits = head(x)\n    per = crit(logits, y)\n    bad = crit(logits, x)\n"
+        );
+        let analysis = analyze(&code);
+        assert_eq!(find_shape(&analysis, "per"), Some(&shape(&["n"])));
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "bad"), None);
+    }
+}
+
+#[cfg(test)]
+mod module_container_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const HEADER: &str = "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport equinox as eqx\nfrom jaxtyping import Float, Array\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, d_out)\n\n    def forward(self, x):\n        return self.fc(x)\n\nclass Ann(nn.Module):\n    def __init__(self, d_out):\n        super().__init__()\n        self.fc = nn.Linear(8, d_out)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        return self.fc(x)\n\nclass Pair(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.up = nn.Linear(d, 2 * d)\n        self.down = nn.Linear(2 * d, d)\n\n    def forward(self, x):\n        return self.down(self.up(x))\n\n";
+
+    /// A module `Net` whose `__init__` runs `init` and whose `forward` takes
+    /// `x: Float[Array, "n 8"]` and runs `body`.
+    fn net(init: &str, body: &str) -> LayerShapeAnalysis {
+        let indent = |text: &str| {
+            text.lines()
+                .map(|line| format!("        {line}\n"))
+                .collect::<String>()
+        };
+        analyze(&format!(
+            "{HEADER}class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n{}\n    def forward(self, x: Float[Array, \"n 8\"], i: int):\n{}",
+            indent(init),
+            indent(body)
+        ))
+    }
+
+    fn known(analysis: &LayerShapeAnalysis, name: &str, dims: &[&str]) {
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(analysis, name), Some(&shape(dims)), "{name}");
+    }
+
+    fn unknown(analysis: &LayerShapeAnalysis, name: &str) {
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(analysis, name), None, "{name}");
+    }
+
+    const LOOP: &str = "for layer in self.layers:\n    x = layer(x)\ny = x";
+
+    #[test]
+    fn a_loop_chains_the_modules_of_a_list_in_order() {
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])", LOOP);
+        known(&a, "y", &["n", "4"]);
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Pair(16), Block(16, 2)])", LOOP);
+        known(&a, "y", &["n", "2"]);
+        let a = net("self.layers = [Block(8, 16), Block(16, 4)]", LOOP);
+        known(&a, "y", &["n", "4"]);
+        let a = net("self.layers = (Block(8, 16), Block(16, 4))", LOOP);
+        known(&a, "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_loop_chains_framework_layers_and_modules_together() {
+        let a = net(
+            "self.layers = nn.ModuleList([nn.Linear(8, 16), nn.ReLU(), Block(16, 4)])",
+            LOOP,
+        );
+        known(&a, "y", &["n", "4"]);
+        let a = net("self.layers = nn.ModuleList([nn.Linear(8, 16), nn.Linear(16, 3)])", LOOP);
+        known(&a, "y", &["n", "3"]);
+    }
+
+    #[test]
+    fn a_loop_with_enumerate_chains_the_same_way() {
+        let body = "for k, layer in enumerate(self.layers):\n    x = layer(x)\ny = x";
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])", body);
+        known(&a, "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_chain_with_a_mismatch_reports_the_failing_element() {
+        let a = net("self.layers = nn.ModuleList([Ann(16), Ann(4)])", LOOP);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert!(a.errors[0].message.contains("expected 8, got 16"), "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+    }
+
+    #[test]
+    fn comments_in_the_loop_do_not_change_the_chain() {
+        let body = "for layer in self.layers:  # each block\n    # apply it\n    x = layer(x)  # in order\ny = x";
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])", body);
+        known(&a, "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_loop_over_an_empty_list_leaves_the_input_alone() {
+        let a = net("self.layers = nn.ModuleList([])", LOOP);
+        known(&a, "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn a_comprehension_repeats_one_module() {
+        let a = net("self.layers = nn.ModuleList([Block(8, 8) for _ in range(4)])", LOOP);
+        known(&a, "y", &["n", "8"]);
+        let a = net("self.layers = nn.ModuleList(Block(8, 8) for _ in range(n_layers))", LOOP);
+        known(&a, "y", &["n", "8"]);
+        let a = net("self.layers = nn.ModuleList([Pair(8) for _ in range(n_layers)])", LOOP);
+        known(&a, "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn a_repeated_module_that_changes_the_shape_needs_a_known_count() {
+        // Applied once: [n, 8] -> [n, 16]. A second application is a mismatch.
+        let a = net("self.layers = nn.ModuleList([Block(8, 16) for _ in range(n_layers)])", LOOP);
+        unknown(&a, "y");
+        let a = net("self.layers = nn.ModuleList([Block(8, 16) for _ in range(1)])", LOOP);
+        known(&a, "y", &["n", "16"]);
+        let a = net("self.layers = nn.ModuleList([Ann(16) for _ in range(3)])", LOOP);
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+        let a = net("self.layers = nn.ModuleList([Block(8, 16) for _ in range(0)])", LOOP);
+        known(&a, "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn elements_that_depend_on_the_loop_variable_are_not_one_module() {
+        let a = net("self.layers = nn.ModuleList([Block(8, 8 + k) for k in range(3)])", LOOP);
+        unknown(&a, "y");
+        let a = net("self.layers = nn.ModuleList([Block(8, 8) for _ in range(3) if flag])", LOOP);
+        known(&a, "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn sequential_of_modules_applies_in_order() {
+        let a = net(
+            "self.net = nn.Sequential(Block(8, 16), nn.ReLU(), Block(16, 4))",
+            "y = self.net(x)",
+        );
+        known(&a, "y", &["n", "4"]);
+        let a = net(
+            "self.net = nn.Sequential(*[Block(8, 8) for _ in range(3)])",
+            "y = self.net(x)",
+        );
+        known(&a, "y", &["n", "8"]);
+        let a = net("self.net = nn.Sequential(Ann(16), Ann(4))", "y = self.net(x)");
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        assert_eq!(find_shape(&a, "y"), None);
+        // A list is not callable.
+        let a = net("self.net = nn.ModuleList([Block(8, 8)])", "y = self.net(x)");
+        unknown(&a, "y");
+    }
+
+    #[test]
+    fn indexing_picks_one_element() {
+        let init = "self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])";
+        let a = net(init, "a = self.layers[0](x)\nb = self.layers[1](a)\nc = self.layers[-1](a)\nd = self.layers[i](x)\ne = self.layers[5](x)");
+        known(&a, "a", &["n", "16"]);
+        known(&a, "b", &["n", "4"]);
+        known(&a, "c", &["n", "4"]);
+        unknown(&a, "d");
+        unknown(&a, "e");
+        let wrong = net(
+            "self.layers = nn.ModuleList([Ann(16), Ann(4)])",
+            "a = self.layers[0](x)\nb = self.layers[0](a)",
+        );
+        assert_eq!(wrong.errors.len(), 1, "{:?}", wrong.errors);
+    }
+
+    #[test]
+    fn an_unknown_index_is_known_when_every_element_agrees() {
+        let a = net(
+            "self.layers = nn.ModuleList([Block(8, 4), Block(8, 4)])\nself.other = nn.ModuleList([Block(8, 4), Block(8, 5)])",
+            "a = self.layers[i](x)\nb = self.other[i](x)\nc = self.layers[1:](x)",
+        );
+        known(&a, "a", &["n", "4"]);
+        unknown(&a, "b");
+        unknown(&a, "c");
+    }
+
+    #[test]
+    fn a_comprehension_indexed_by_an_unknown_index_is_the_module() {
+        let a = net(
+            "self.layers = nn.ModuleList([Block(8, 4) for _ in range(n_layers)])",
+            "a = self.layers[i](x)\nb = self.layers[0](x)",
+        );
+        known(&a, "a", &["n", "4"]);
+        known(&a, "b", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_loop_body_with_more_than_the_chain_statement_sees_one_element() {
+        let body = "for layer in self.layers:\n    h = layer(x)\n    x = F.relu(h)\ny = x\nz = h";
+        let a = net("self.layers = nn.ModuleList([Block(8, 8) for _ in range(n_layers)])", body);
+        known(&a, "y", &["n", "8"]);
+        known(&a, "z", &["n", "8"]);
+        // Different elements: the call stands for a different module per
+        // iteration, so no shape holds for every iteration.
+        let a = net("self.layers = nn.ModuleList([Block(8, 8), Block(8, 4)])", body);
+        unknown(&a, "z");
+        unknown(&a, "y");
+    }
+
+    #[test]
+    fn a_loop_that_changes_a_shape_across_iterations_is_unknown_after_it() {
+        let body = "for layer in self.layers:\n    h = layer(x)\n    x = F.relu(h)\ny = x";
+        let a = net("self.layers = nn.ModuleList([Block(8, 16) for _ in range(n_layers)])", body);
+        unknown(&a, "y");
+    }
+
+    #[test]
+    fn a_loop_with_an_early_exit_or_a_rebound_variable_is_not_a_chain() {
+        let a = net(
+            "self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])",
+            "for layer in self.layers:\n    x = layer(x)\n    break\ny = x",
+        );
+        unknown(&a, "y");
+        let a = net(
+            "self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])",
+            "for layer in self.layers:\n    layer = Block(8, 8)\n    x = layer(x)\ny = x",
+        );
+        unknown(&a, "y");
+        let a = net(
+            "self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])",
+            "for layer in self.layers:\n    x = layer(x)\nelse:\n    x = x\ny = x",
+        );
+        unknown(&a, "y");
+    }
+
+    #[test]
+    fn a_list_changed_after_the_constructor_is_unknown() {
+        for change in [
+            "self.layers.append(Block(4, 4))",
+            "self.layers.extend([Block(4, 4)])",
+            "self.layers.insert(0, Block(4, 4))",
+            "self.layers[0] = Block(8, 8)",
+            "del self.layers[0]",
+            "self.layers += [Block(4, 4)]",
+            "self.layers = nn.ModuleList([Block(8, 8)])",
+        ] {
+            let init = format!("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])\n{change}");
+            let a = net(&init, LOOP);
+            unknown(&a, "y");
+        }
+        let code = format!(
+            "{HEADER}class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n\nmodel = Net()\nmodel.layers.append(Block(4, 4))\n"
+        );
+        let a = analyze(&code);
+        unknown(&a, "y");
+    }
+
+    #[test]
+    fn a_list_changed_through_another_name_is_unknown() {
+        for change in [
+            "ls = self.layers\nls.append(Block(8, 5))",
+            "ls = self.layers\nls[0] = Block(8, 5)",
+            "ls = self.layers\ndel ls[0]",
+            "getattr(self, \"layers\").append(Block(8, 5))",
+            "getattr(self, 'layers')[0] = Block(8, 5)",
+            "setattr(self, \"layers\", nn.ModuleList([Block(8, 5)]))",
+            "register(self.layers)",
+            "self.alias = self.layers",
+            "self.net = nn.Sequential(*self.layers)",
+        ] {
+            let init = format!("self.layers = nn.ModuleList([Block(8, 8)])\n{change}");
+            unknown(&net(&init, LOOP), "y");
+        }
+        let method = |body: &str| {
+            format!(
+                "{HEADER}class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 8)])\n\n    def grow(self):\n{body}\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n"
+            )
+        };
+        unknown(&analyze(&method("        ls = self.layers\n        ls.append(Block(8, 5))\n")), "y");
+        unknown(&analyze(&method("        return self.layers\n")), "y");
+        let outside = format!(
+            "{HEADER}class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 8)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n\nmodel = Net()\nm = model.layers\nm.append(Block(8, 5))\n"
+        );
+        unknown(&analyze(&outside), "y");
+    }
+
+    #[test]
+    fn a_list_kept_by_one_class_reaches_only_the_classes_of_its_instances() {
+        let grab = "    def grab(self):\n        ls = self.layers\n        ls.append(None)\n\n";
+        let net = "class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n";
+        let other = format!(
+            "class Other(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 2)])\n\n{grab}"
+        );
+        known(&analyze(&format!("{HEADER}{other}{net}")), "y", &["n", "4"]);
+        // An instance of the subclass runs the forward of its base.
+        let child = format!("\n\nclass Child(Net):\n{grab}");
+        unknown(&analyze(&format!("{HEADER}{net}{child}")), "y");
+        // A base that the subclass does not inherit from is not reached.
+        let sibling = format!("\n\nclass Sibling(Net):\n    pass\n\n\nclass Child(Sibling):\n{grab}");
+        unknown(&analyze(&format!("{HEADER}{net}{sibling}")), "y");
+        let apart = format!("{net}\n\nclass Left(Net):\n    pass\n\n\nclass Right(nn.Module):\n{grab}");
+        known(&analyze(&format!("{HEADER}{apart}")), "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn reading_a_list_without_keeping_it_leaves_it_known() {
+        let read = "self.layers = nn.ModuleList([Block(8, 8)])\nk = len(self.layers)\nls = list(self.layers)\nls.append(Block(8, 5))\nparams = self.layers.parameters()\nfirst = self.layers[0]\nrest = self.layers[1:]\nif self.layers:\n    k = 1\nmore = [l for l in self.layers]\nfor i, l in enumerate(self.layers):\n    pass\nok = (self.layers) is not None\nflag = not self.layers";
+        known(&net(read, LOOP), "y", &["n", "8"]);
+        let indexed = "self.layers = nn.ModuleList([Block(8, 8), Block(8, 8)])\nz = self.layers[0](x)\nk = len(self.layers)";
+        known(&net(indexed, LOOP), "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn the_list_of_another_class_does_not_leak() {
+        let code = format!(
+            "{HEADER}class Other(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 2)])\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n"
+        );
+        known(&analyze(&code), "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn a_list_of_equinox_layers_chains_in_a_call() {
+        let code = "import equinox as eqx\nimport jax\nfrom jaxtyping import Float, Array\n\nclass Mlp(eqx.Module):\n    layers: list\n\n    def __init__(self, key):\n        k1, k2 = jax.random.split(key)\n        self.layers = [eqx.nn.Linear(8, 16, key=k1), eqx.nn.Linear(16, 4, key=k2)]\n\n    def __call__(self, x: Float[Array, \"8\"]):\n        for layer in self.layers:\n            x = layer(x)\n        y = x\n        return y\n";
+        known(&analyze(code), "y", &["4"]);
+    }
+
+    #[test]
+    fn an_equinox_sequential_of_user_modules_chains() {
+        let code = "import equinox as eqx\nfrom jaxtyping import Float, Array\n\nclass Up(eqx.Module):\n    w: eqx.nn.Linear\n\n    def __init__(self, key):\n        self.w = eqx.nn.Linear(8, 16, key=key)\n\n    def __call__(self, x):\n        return self.w(x)\n\nclass Net(eqx.Module):\n    net: eqx.nn.Sequential\n\n    def __init__(self, key):\n        self.net = eqx.nn.Sequential([Up(key), eqx.nn.Linear(16, 3, key=key)])\n\n    def __call__(self, x: Float[Array, \"8\"]):\n        y = self.net(x, key=key)\n        return y\n";
+        known(&analyze(code), "y", &["3"]);
+    }
+
+    #[test]
+    fn nested_containers_use_the_sequence_of_their_own_class() {
+        let code = format!(
+            "{HEADER}class Stage(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.layers = nn.ModuleList([Block(d, d), Block(d, d)])\n\n    def forward(self, x):\n        for layer in self.layers:\n            x = layer(x)\n        return x\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.stages = nn.ModuleList([Stage(8), Stage(8)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        for stage in self.stages:\n            x = stage(x)\n        y = x\n        return y\n"
+        );
+        known(&analyze(&code), "y", &["n", "8"]);
+    }
+
+    #[test]
+    fn a_loop_variable_hides_a_layer_of_the_same_name() {
+        let body = "layer = nn.Linear(8, 3)\nfor layer in self.layers:\n    x = layer(x)\ny = x";
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])", body);
+        known(&a, "y", &["n", "4"]);
+    }
+
+    #[test]
+    fn the_inlay_hint_of_a_chain_statement_shows_the_result() {
+        let a = net("self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])", LOOP);
+        let hint = a
+            .assignment_shapes
+            .iter()
+            .find(|r| r.name == "x")
+            .map(|r| r.shape.clone());
+        assert_eq!(hint, Some(shape(&["n", "4"])));
+    }
+}
+
+#[cfg(test)]
+mod imported_module_tests {
+    use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
+
+    fn analyze_in(
+        dir: &std::path::Path,
+        code: &str,
+        cache: Option<&ResolutionCache>,
+    ) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let roots = vec![dir.to_path_buf()];
+        analyze_layer_shapes(
+            tree.root_node(),
+            code,
+            &roots,
+            |p: &PathBuf| fs::read_to_string(p).ok(),
+            8,
+            cache,
+        )
+        .unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    const BLOCKS: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, d_out)\n\n    def forward(self, x):\n        return self.fc(x)\n\nclass Strict(nn.Module):\n    def __init__(self, d_out):\n        super().__init__()\n        self.fc = nn.Linear(8, d_out)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        return self.fc(x)\n\ndef helper(d):\n    return d\n\nclass Pair(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.up = Block(d, d)\n        self.down = Block(d, d)\n\n    def forward(self, x):\n        return self.down(self.up(x))\n";
+
+    const HEAD: &str = "import torch.nn as nn\nimport blocks\nfrom blocks import Block, Strict, Pair, helper\nfrom jaxtyping import Float, Array\n\n";
+
+    fn write(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn net(init: &str, body: &str) -> String {
+        let indent = |text: &str| text.lines().map(|l| format!("        {l}\n")).collect::<String>();
+        format!(
+            "{HEAD}class Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n{}\n    def forward(self, x: Float[Array, \"n 8\"], d):\n{}",
+            indent(init),
+            indent(body)
+        )
+    }
+
+    #[test]
+    fn a_module_of_another_file_is_applied_like_one_of_this_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "blocks.py", BLOCKS);
+        let code = net(
+            "self.blk = Block(8, 16)\nself.via = blocks.Block(8, 3)",
+            "a = self.blk(x)\nb = Block(8, 5)(x)\nc = self.via(x)\nd2 = blocks.Block(8, 7)(x)\ne = Pair(8)(x)\nf = Block(8, d)(x)",
+        );
+        let analysis = analyze_in(dir.path(), &code, None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for (name, dims) in [
+            ("a", ["n", "16"]),
+            ("b", ["n", "5"]),
+            ("c", ["n", "3"]),
+            ("d2", ["n", "7"]),
+            ("e", ["n", "8"]),
+            ("f", ["n", "d"]),
+        ] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&dims)), "{name}");
+        }
+    }
+
+    #[test]
+    fn constructor_values_come_through_keywords_aliases_and_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "blocks.py",
+            &format!("{BLOCKS}\nclass Mix(nn.Module):\n    def __init__(self, scale=1):\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n"),
+        );
+        let code = "import torch.nn as nn\nfrom blocks import Block, Mix\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.dim = dim\n        self.a = Block(self.dim, 16)\n        self.b = Block(d_in=dim, d_out=3)\n        self.c = Mix(scale=0.5)\n\n    def forward(self, x: Float[Array, \"n dim\"], y: Float[Array, \"n dim\"], z: Float[Array, \"n 9\"]):\n        a = self.a(x)\n        b = self.b(x)\n        c = self.c(x, y)\n        d = self.c(b=y, a=x)\n        e = self.c(x, z)\n";
+        let analysis = analyze_in(dir.path(), code, None);
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert!(analysis.errors[0].message.contains("incompatible"), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "16"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "3"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["n", "dim"])));
+        assert_eq!(find_shape(&analysis, "d"), Some(&shape(&["n", "dim"])));
+        assert_eq!(find_shape(&analysis, "e"), None);
+    }
+
+    #[test]
+    fn a_name_of_the_class_file_does_not_reach_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "fixed.py",
+            "import torch.nn as nn\n\nOUT = 4\n\nclass Fixed(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(8, OUT)\n\n    def forward(self, x):\n        return self.fc(x)\n\nclass Literal(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(8, 4)\n\n    def forward(self, x):\n        return self.fc(x)\n",
+        );
+        let code = "import torch.nn as nn\nfrom fixed import Fixed, Literal\nfrom jaxtyping import Float, Array\n\n\ndef g(x: Float[Array, \"n 8\"], y: Float[Array, \"n 4\"]):\n    f1 = Fixed()(x)\n    z = f1 + y\n    f2 = Literal()(x)\n    w = f2 + y\n";
+        let analysis = analyze_in(dir.path(), code, None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "f1"), None);
+        assert_eq!(find_shape(&analysis, "f2"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["n", "4"])));
+    }
+
+    #[test]
+    fn a_parameter_named_like_an_imported_module_is_not_the_module() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "blocks.py", BLOCKS);
+        let head = "import blocks\nfrom blocks import Block\nfrom jaxtyping import Float, Array\n\n";
+        let analyze = |body: &str| analyze_in(dir.path(), &format!("{head}{body}"), None);
+        let param = analyze("def f(x: Float[Array, \"n 8\"], blocks):\n    y = blocks.Block(8, 4)(x)\n");
+        assert_eq!(find_shape(&param, "y"), None);
+        let local = analyze("def f(x: Float[Array, \"n 8\"]):\n    blocks = other()\n    y = blocks.Block(8, 4)(x)\n");
+        assert_eq!(find_shape(&local, "y"), None);
+        let class = analyze("def f(x: Float[Array, \"n 8\"], Block):\n    y = Block(8, 4)(x)\n");
+        assert_eq!(find_shape(&class, "y"), None);
+        let outer = analyze("def f(x: Float[Array, \"n 8\"], blocks):\n    def g():\n        return blocks.Block(8, 4)(x)\n    y = g()\n");
+        assert_eq!(find_shape(&outer, "y"), None);
+        let plain = analyze("def f(x: Float[Array, \"n 8\"], other):\n    y = blocks.Block(8, 4)(x)\n    z = Block(8, 3)(x)\n");
+        assert_eq!(find_shape(&plain, "y"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&plain, "z"), Some(&shape(&["n", "3"])));
+    }
+
+    #[test]
+    fn a_module_of_another_file_checks_its_annotations_at_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "blocks.py", BLOCKS);
+        let code = net(
+            "self.blk = Strict(16)",
+            "ok = self.blk(x)\nbad = self.blk(ok)",
+        );
+        let analysis = analyze_in(dir.path(), &code, None);
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(
+            analysis.errors[0].message,
+            "call to self.blk: argument 'x' dim 1 expected 8, got 16"
+        );
+        assert_eq!(find_shape(&analysis, "ok"), Some(&shape(&["n", "16"])));
+        assert_eq!(find_shape(&analysis, "bad"), None);
+    }
+
+    #[test]
+    fn a_problem_inside_the_other_file_is_not_an_error_of_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = format!(
+            "{BLOCKS}\ndef broken(a: Float[Array, \"n 3\"], b: Float[Array, \"n 4\"]):\n    return a + b\n"
+        );
+        write(&dir, "blocks.py", &broken);
+        let analysis = analyze_in(dir.path(), &net("self.blk = Block(8, 16)", "a = self.blk(x)"), None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["n", "16"])));
+    }
+
+    #[test]
+    fn the_probe_keeps_what_the_class_names_and_leaves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated: String = (0..300)
+            .map(|i| format!("\n\nclass Unrelated{i}(nn.Module):\n    def forward(self, x: Float[Array, \"n 3\"], y: Float[Array, \"n 4\"]):\n        return x + y\n"))
+            .collect();
+        write(
+            &dir,
+            "inherit.py",
+            &format!("import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nclass Base(nn.Module):\n    def __init__(self, d_in):\n        super().__init__()\n        self.fc = nn.Linear(d_in, 5)\n\n    def forward(self, x):\n        return self.fc(x)\n\nclass Child(Base):\n    pass\n{unrelated}"),
+        );
+        let code = "import torch.nn as nn\nfrom inherit import Child\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.c = Child(8)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.c(x)\n";
+        let analysis = analyze_in(dir.path(), code, None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "5"])));
+    }
+
+    #[test]
+    fn modules_of_another_file_take_part_in_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "blocks.py", BLOCKS);
+        let code = net(
+            "self.layers = nn.ModuleList([Block(8, 16), blocks.Block(16, 4)])\nself.seq = nn.Sequential(Block(8, 8), Pair(8))",
+            "for layer in self.layers:\n    x = layer(x)\ny = x\nz = self.seq(y)",
+        );
+        let analysis = analyze_in(dir.path(), &code, None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n", "4"])));
+    }
+
+    #[test]
+    fn what_is_not_a_user_class_stays_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "blocks.py", BLOCKS);
+        let code = net(
+            "self.f = helper(8)\nself.g = Missing(8)\nself.h = Block(cfg.dim, 8)\nself.k = Block(*sizes)\nself.m = Block(8, d * 2 if flag else 3)",
+            "a = self.f(x)\nb = self.g(x)\nc = self.h(x)\ne = self.k(x)\nf = self.m(x)",
+        );
+        let analysis = analyze_in(dir.path(), &code, None);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["a", "b", "c", "e", "f"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_library_class_is_not_analyzed() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("site-packages");
+        fs::create_dir_all(&library).unwrap();
+        fs::write(library.join("lib.py"), BLOCKS).unwrap();
+        let code = "import torch.nn as nn\nfrom lib import Block\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Block(8, 16)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        a = self.blk(x)\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let roots = vec![library.clone()];
+        let analysis = analyze_layer_shapes(
+            tree.root_node(),
+            code,
+            &roots,
+            |p: &PathBuf| fs::read_to_string(p).ok(),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_eq!(find_shape(&analysis, "a"), None);
+    }
+
+    #[test]
+    fn a_file_over_the_probe_limit_gives_an_unknown_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let filler = "v = 1\n".repeat(90_000);
+        write(&dir, "blocks.py", &format!("{BLOCKS}{filler}"));
+        let analysis = analyze_in(dir.path(), &net("self.blk = Block(8, 16)", "a = self.blk(x)"), None);
+        assert_eq!(find_shape(&analysis, "a"), None);
+    }
+
+    #[test]
+    fn imports_in_a_cycle_end() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "cyc_a.py",
+            "import torch.nn as nn\nfrom cyc_b import B\n\nclass A(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.b = B()\n\n    def forward(self, x):\n        return self.b(x)\n",
+        );
+        write(
+            &dir,
+            "cyc_b.py",
+            "import torch.nn as nn\nfrom cyc_a import A\n\nclass B(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.a = A()\n\n    def forward(self, x):\n        return self.a(x)\n",
+        );
+        let code = "import torch.nn as nn\nfrom cyc_a import A\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.a = A()\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.a(x)\n";
+        let analysis = analyze_in(dir.path(), code, None);
+        assert_eq!(find_shape(&analysis, "y"), None);
+    }
+
+    #[test]
+    fn nested_imports_stop_at_the_probe_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "lvl_c.py",
+            "import torch.nn as nn\n\nclass C(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(8, 4)\n\n    def forward(self, x):\n        return self.fc(x)\n",
+        );
+        for (name, inner, class, import) in [
+            ("lvl_b.py", "C", "B", "from lvl_c import C"),
+            ("lvl_a.py", "B", "A", "from lvl_b import B"),
+        ] {
+            write(
+                &dir,
+                name,
+                &format!(
+                    "import torch.nn as nn\n{import}\n\nclass {class}(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.inner = {inner}()\n\n    def forward(self, x):\n        return self.inner(x)\n"
+                ),
+            );
+        }
+        let head = "import torch.nn as nn\nfrom lvl_a import A\nfrom lvl_b import B\nfrom lvl_c import C\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.a = A()\n        self.b = B()\n        self.c = C()\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n";
+        let analysis = analyze_in(
+            dir.path(),
+            &format!("{head}        a = self.a(x)\n        b = self.b(x)\n        c = self.c(x)\n"),
+            None,
+        );
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["n", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["n", "4"])));
+        // Three files deep is past the limit: unknown, not a wrong shape.
+        assert_eq!(find_shape(&analysis, "a"), None);
+    }
+
+    #[test]
+    fn a_probe_result_follows_the_file_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "blocks.py", BLOCKS);
+        let cache = new_resolution_cache();
+        let code = net("self.blk = Block(8, 16)", "a = self.blk(x)");
+        let first = analyze_in(dir.path(), &code, Some(&cache));
+        assert_eq!(find_shape(&first, "a"), Some(&shape(&["n", "16"])));
+        let again = analyze_in(dir.path(), &code, Some(&cache));
+        assert_eq!(find_shape(&again, "a"), Some(&shape(&["n", "16"])));
+
+        // The class now outputs `d_out + 1` features. Keep the old time and
+        // size, so that only the editor event shows the change.
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, BLOCKS.replace("nn.Linear(d_in, d_out)", "nn.Linear(d_in, 9)")).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        cache.revalidate(std::slice::from_ref(&path));
+        let changed = analyze_in(dir.path(), &code, Some(&cache));
+        assert_eq!(find_shape(&changed, "a"), Some(&shape(&["n", "9"])));
+
+        fs::remove_file(&path).unwrap();
+        cache.revalidate(std::slice::from_ref(&path));
+        let gone = analyze_in(dir.path(), &code, Some(&cache));
+        assert_eq!(find_shape(&gone, "a"), None);
+    }
+
+    #[test]
+    fn a_change_in_a_file_the_class_imports_reaches_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "outer.py",
+            "import torch.nn as nn\nfrom inner import Inner\n\nclass Outer(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.inner = Inner()\n\n    def forward(self, x):\n        return self.inner(x)\n",
+        );
+        let inner = write(
+            &dir,
+            "inner.py",
+            "import torch.nn as nn\n\nclass Inner(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(8, 4)\n\n    def forward(self, x):\n        return self.fc(x)\n",
+        );
+        let code = "import torch.nn as nn\nfrom outer import Outer\nfrom jaxtyping import Float, Array\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.o = Outer()\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.o(x)\n";
+        let cache = new_resolution_cache();
+        assert_eq!(
+            find_shape(&analyze_in(dir.path(), code, Some(&cache)), "y"),
+            Some(&shape(&["n", "4"]))
+        );
+        fs::write(&inner, fs::read_to_string(&inner).unwrap().replace("(8, 4)", "(8, 5)")).unwrap();
+        cache.revalidate(std::slice::from_ref(&inner));
+        assert_eq!(
+            find_shape(&analyze_in(dir.path(), code, Some(&cache)), "y"),
+            Some(&shape(&["n", "5"]))
+        );
+    }
+}
+
+#[cfg(test)]
+mod rebinding_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn analyze(code: &str) -> LayerShapeAnalysis {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap()
+    }
+
+    fn shape(dims: &[&str]) -> Vec<String> {
+        dims.iter().map(|dim| dim.to_string()).collect()
+    }
+
+    fn hint(analysis: &LayerShapeAnalysis, line: u32, name: &str) -> Option<Vec<String>> {
+        analysis
+            .assignment_shapes
+            .iter()
+            .find(|r| r.line == line && r.name == name)
+            .map(|r| r.shape.clone())
+    }
+
+    const HEAD: &str = "import jax.numpy as jnp\ndef f(x: Float[Array, \"3 4\"], c, d):\n";
+
+    fn run(body: &str) -> LayerShapeAnalysis {
+        analyze(&format!("{HEAD}{body}"))
+    }
+
+    #[track_caller]
+    fn known(body: &str, name: &str, dims: &[&str]) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}\n{body}", a.errors);
+        assert_eq!(find_shape(&a, name), Some(&shape(dims)), "{body}");
+    }
+
+    #[track_caller]
+    fn unknown(body: &str, name: &str) {
+        let a = run(body);
+        assert!(a.errors.is_empty(), "{:?}\n{body}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{body}");
+    }
+
+    #[track_caller]
+    fn unknown_in(code: &str, name: &str) {
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), None, "{code}");
+    }
+
+    #[track_caller]
+    fn known_in(code: &str, name: &str, dims: &[&str]) {
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}\n{code}", a.errors);
+        assert_eq!(find_shape(&a, name), Some(&shape(dims)), "{code}");
+    }
+
+    #[test]
+    fn a_name_a_case_pattern_captures_is_rebound() {
+        for pattern in [
+            "[w]",
+            "_ as w",
+            "(1 | 2) as w",
+            "Point(x=w)",
+            "Point(w)",
+            "{\"k\": w}",
+            "{\"k\": 1, **w}",
+            "[1, *w]",
+            "w",
+            "[w] | (w,)",
+        ] {
+            let body = format!("    w = x\n    match c:\n        case {pattern}:\n            pass\n    z = w\n");
+            unknown(&body, "z");
+        }
+    }
+
+    #[test]
+    fn a_name_a_case_does_not_capture_keeps_its_shape() {
+        for pattern in ["Point()", "Color.RED", "[v]", "Point(x=v)", "1 | 2", "{\"w\": v}"] {
+            let body = format!("    w = x\n    match c:\n        case {pattern}:\n            pass\n    z = w\n");
+            known(&body, "z", &["3", "4"]);
+        }
+    }
+
+    #[test]
+    fn a_captured_name_is_unknown_inside_the_case_and_its_guard() {
+        let a = run("    w = x\n    match c:\n        case [w] if w:\n            z = w\n");
+        assert_eq!(hint(&a, 5, "z"), None);
+        // A failed pattern may have bound the name before it failed.
+        unknown("    w = x\n    match c:\n        case [w, 1]:\n            pass\n        case _:\n            z = w\n", "z");
+    }
+
+    #[test]
+    fn a_read_before_the_loop_rewrites_the_name_is_unknown() {
+        let a = run("    y = x\n    while c:\n        t = y\n        y = y.T\n");
+        assert_eq!(hint(&a, 4, "t"), None);
+        assert_eq!(hint(&a, 5, "y"), None);
+        assert_eq!(find_shape(&a, "t"), None);
+        let a = run("    y = x\n    for i in range(3):\n        t = y\n        y = y.T\n");
+        assert_eq!(hint(&a, 4, "t"), None);
+        let a = run("    y = x\n    for i in range(3):\n        if c:\n            y = y.T\n            continue\n        t = y\n        y = y.T\n");
+        assert_eq!(hint(&a, 7, "t"), None);
+    }
+
+    #[test]
+    fn a_read_of_a_name_that_keeps_its_shape_stays_known_in_the_loop() {
+        let a = run("    y = x\n    for i in range(3):\n        t = y\n        y = y + 0\n");
+        assert_eq!(hint(&a, 4, "t"), Some(shape(&["3", "4"])));
+        assert_eq!(hint(&a, 5, "y"), Some(shape(&["3", "4"])));
+        assert_eq!(find_shape(&a, "t"), Some(&shape(&["3", "4"])));
+    }
+
+    #[test]
+    fn only_the_hints_that_read_the_old_shape_are_taken_back() {
+        // The body writes `y` before it reads it: every iteration agrees.
+        let a = run("    y = x\n    for i in range(3):\n        y = jnp.zeros(5)\n        t = y\n");
+        assert_eq!(hint(&a, 4, "y"), Some(shape(&["5"])));
+        assert_eq!(hint(&a, 5, "t"), Some(shape(&["5"])));
+        // A write in a branch does not write it on every path.
+        let a = run("    y = x\n    for i in range(3):\n        if c:\n            y = jnp.zeros(5)\n        t = y\n");
+        assert_eq!(hint(&a, 5, "y"), Some(shape(&["5"])));
+        assert_eq!(hint(&a, 6, "t"), None);
+        // What is written from a name that is not right is not right.
+        let a = run("    y = x\n    for i in range(3):\n        t = y\n        u = t\n        z = jnp.zeros(2)\n        y = y.T\n");
+        assert_eq!(hint(&a, 4, "t"), None);
+        assert_eq!(hint(&a, 5, "u"), None);
+        assert_eq!(hint(&a, 6, "z"), Some(shape(&["2"])));
+        // The same in an inner loop.
+        let a = run("    y = x\n    for i in range(3):\n        for j in range(2):\n            t = y\n            y = y.T\n");
+        assert_eq!(hint(&a, 5, "t"), None);
+    }
+
+    #[test]
+    fn a_name_that_changes_in_the_body_is_unknown_in_the_else_clause() {
+        let a = run("    y = x\n    for i in range(3):\n        y = y.T\n    else:\n        t = y\n");
+        assert_eq!(hint(&a, 6, "t"), None);
+    }
+
+    #[test]
+    fn a_name_set_in_the_first_iteration_only_is_not_trusted() {
+        let for_loop = "    for i in d:\n        if i == 0:\n            y = x\n        y2 = y\n        y = x.T\n";
+        unknown(for_loop, "y2");
+        let a = run(for_loop);
+        assert_eq!(hint(&a, 5, "y2"), None);
+    }
+
+    #[test]
+    fn a_name_the_loop_feeds_back_is_not_new_at_the_branch() {
+        let body = "    for i in d:\n        if i == 0:\n            h = jnp.zeros(3)\n        r = h + 0\n        h = jnp.concatenate([h, h])\n";
+        unknown(body, "r");
+        let counted = "    i = 0\n    while i < 3:\n        if i == 0:\n            h = jnp.zeros(3)\n        r = h + 0\n        h = jnp.concatenate([h, h])\n        i += 1\n";
+        unknown(counted, "r");
+        let shape_changes = "    for i in d:\n        if i == 0:\n            h = jnp.zeros(3)\n        for j in d:\n            h = h[None]\n        r = h\n";
+        unknown(shape_changes, "r");
+    }
+
+    #[test]
+    fn a_name_only_the_branch_writes_stays_new_in_a_loop() {
+        known("    for i in d:\n        if i == 0:\n            h = jnp.zeros(3)\n        r = h + 0\n", "r", &["3"]);
+        known("    for i in d:\n        if i == 0:\n            h = jnp.zeros(3)\n        r = h + 0\n        q = r\n", "q", &["3"]);
+    }
+
+    #[test]
+    fn a_list_target_of_with_hides_an_earlier_shape() {
+        for target in ["[x]", "(x, y)", "[y, *x]", "x", "(y, (x, z))"] {
+            unknown(&format!("    with c as {target}:\n        pass\n    r = x + 0\n"), "r");
+        }
+        known("    with c as x.y:\n        pass\n    r = x + 0\n", "r", &["3", "4"]);
+        known("    with c as [y.x]:\n        pass\n    r = x + 0\n", "r", &["3", "4"]);
+    }
+
+    #[test]
+    fn an_imported_alias_of_a_swallowing_manager_is_found() {
+        let body = "    with sp(ValueError):\n        x = jnp.zeros(4)\n    r = x + 0\n";
+        for import in ["from contextlib import suppress as sp", "from pytest import raises as sp"] {
+            unknown_in(&format!("{import}\n{HEAD}{body}"), "r");
+        }
+        known_in(&format!("from m import other as sp\n{HEAD}{body}"), "r", &["4"]);
+        let plain = "    with suppress(E):\n        x = jnp.zeros(4)\n    r = x + 0\n";
+        unknown_in(&format!("from contextlib import suppress\n{HEAD}{plain}"), "r");
+    }
+
+    #[test]
+    fn a_walrus_rebinds_its_name_wherever_it_stands() {
+        for body in [
+            "    if (x := jnp.zeros(4)).sum() > 0:\n        pass\n    r = x + 0\n",
+            "    y = 1 if c else (x := jnp.zeros(4))\n    r = x + 0\n",
+            "    ok = c and (x := jnp.zeros(4))\n    r = x + 0\n",
+            "    z = [(x := jnp.zeros(4)) for _ in d]\n    r = x + 0\n",
+            "    [(x := jnp.zeros(4)) for _ in d]\n    r = x + 0\n",
+            "    while (x := d):\n        pass\n    r = x + 0\n",
+            "    g(a=(x := 1))\n    r = x + 0\n",
+            "    q = (x := jnp.zeros(4)) + x\n    r = x + 0\n",
+        ] {
+            unknown(body, "r");
+        }
+        let a = run("    if (w := x.T).shape[0] > 3:\n        pass\n    v = w\n");
+        assert_eq!(find_shape(&a, "v"), None);
+    }
+
+    #[test]
+    fn a_walrus_of_another_name_leaves_the_shape() {
+        known("    if (q := d).shape[0] > 3:\n        pass\n    r = x + 0\n", "r", &["3", "4"]);
+        known("    z = [(q := v) for v in d]\n    r = x + 0\n", "r", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_definition_an_import_or_a_delete_rebinds_the_name() {
+        unknown("    k = x\n    import os as k\n    s = k\n", "s");
+        unknown("    k = x\n    from os import path as k\n    s = k\n", "s");
+        unknown("    k = x\n    import k.sub\n    s = k\n", "s");
+        unknown("    q = x\n    class q:\n        pass\n    r = q\n", "r");
+        unknown("    d2 = x\n    def d2():\n        pass\n    t = d2\n", "t");
+        unknown("    d2 = x\n    @dec\n    def d2():\n        pass\n    t = d2\n", "t");
+        unknown("    d2 = x\n    async def d2():\n        pass\n    t = d2\n", "t");
+        known("    d2 = x\n    def other():\n        pass\n    t = d2\n", "t", &["3", "4"]);
+        known("    d2 = x\n    import os\n    t = d2\n", "t", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_definition_an_import_or_a_delete_in_a_branch_makes_the_name_unknown() {
+        unknown("    if c:\n        def x():\n            pass\n    r = x + 0\n", "r");
+        unknown("    if c:\n        class x:\n            pass\n    r = x + 0\n", "r");
+        unknown("    if c:\n        import os as x\n    r = x + 0\n", "r");
+        unknown("    if c:\n        from os import path as x\n    r = x + 0\n", "r");
+        unknown("    if c:\n        del x\n    r = x + 0\n", "r");
+        known("    if c:\n        def other():\n            pass\n    r = x + 0\n", "r", &["3", "4"]);
+        known("    if c:\n        del x.attr\n    r = x + 0\n", "r", &["3", "4"]);
+    }
+
+    #[test]
+    fn a_method_does_not_rebind_the_name_of_the_module() {
+        let code = "import jax.numpy as jnp\nstep = jnp.zeros(3)\nclass C:\n    def step(self):\n        pass\nz = step\n";
+        known_in(code, "z", &["3"]);
+    }
+
+    #[test]
+    fn a_module_level_definition_counts_as_an_earlier_binding() {
+        let code = "import jax.numpy as jnp\ndef n2():\n    pass\nif cond:\n    n2 = jnp.zeros((3,))\nz2 = n2\nclass n3:\n    pass\nif cond:\n    n3 = jnp.zeros((3,))\nz3 = n3\n";
+        let a = analyze(code);
+        assert_eq!(find_shape(&a, "z2"), None);
+        assert_eq!(find_shape(&a, "z3"), None);
+        known_in("import jax.numpy as jnp\nif cond:\n    n4 = jnp.zeros((3,))\nz4 = n4\n", "z4", &["3"]);
+        known_in("import jax.numpy as jnp\nif cond:\n    n5 = jnp.zeros((3,))\nz5 = n5\ndef other():\n    pass\n", "z5", &["3"]);
+    }
+
+    #[test]
+    fn a_name_defined_twice_in_one_scope_resolves_to_neither() {
+        let nested = "from jaxtyping import Float, Array\ndef k(x: Float[Array, \"3 4\"], c):\n    def inner(v):\n        return v.T\n    if c:\n        def inner(v):\n            return v\n    r = inner(x)\n";
+        unknown_in(nested, "r");
+        let top = "from jaxtyping import Float, Array\ndef inner(v):\n    return v.T\nif c:\n    def inner(v):\n        return v\ndef k(x: Float[Array, \"3 4\"]):\n    r = inner(x)\n";
+        unknown_in(top, "r");
+        let once = "from jaxtyping import Float, Array\ndef k(x: Float[Array, \"3 4\"], c):\n    def inner(v):\n        return v.T\n    r = inner(x)\n";
+        known_in(once, "r", &["4", "3"]);
+        let apart = "from jaxtyping import Float, Array\ndef k(x: Float[Array, \"3 4\"]):\n    def inner(v):\n        return v.T\n    r = inner(x)\ndef j(x: Float[Array, \"3 4\"]):\n    def inner(v):\n        return v\n    s = inner(x)\n";
+        let a = analyze(apart);
+        assert_eq!(find_shape(&a, "r"), Some(&shape(&["4", "3"])));
+        assert_eq!(find_shape(&a, "s"), Some(&shape(&["3", "4"])));
     }
 }

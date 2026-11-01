@@ -671,3 +671,1213 @@ fn reparse_after_a_syntax_error_equals_a_fresh_parse() {
         }
     }
 }
+
+const BRANCHES: &str = r#"import jax.numpy as jnp
+from jaxtyping import Float, Array
+
+
+def pick(x: Float[Array, "3 4"], c):
+    if c:
+        r = x
+    else:
+        r = jnp.ones((3, 4))
+    return r
+
+
+def early(x: Float[Array, "3 4"], c):
+    if c:
+        x = jnp.zeros(5)
+        return x
+    q = x
+    return q
+
+
+def loops(x: Float[Array, "3 4"], n):
+    for i in range(n):
+        t = jnp.zeros(5)
+        if i:
+            continue
+        x = jnp.ones((3, 4))
+    return x
+
+
+def guarded(x: Float[Array, "3 4"], c):
+    try:
+        a = jnp.zeros(5)
+    except ValueError:
+        a = jnp.zeros(5)
+    finally:
+        b = a
+    return a
+
+
+def caller(x: Float[Array, "3 4"]):
+    p = pick(x, True)
+    e = early(x, False)
+    l = loops(x, 3)
+    g = guarded(x, 1)
+    return p, e, l, g
+
+
+n = jnp.zeros(3)
+if flag:
+    m = jnp.zeros(6)
+else:
+    n = jnp.zeros(3)
+k = m
+"#;
+
+/// Each pair swaps one fragment of `BRANCHES` for another that changes what a
+/// branch, a loop, or a join depends on: the shape of an arm, whether an arm
+/// leaves, whether the `else` clause exists, a mention of a name before the
+/// branch (in the function, or in an earlier statement of the module), a
+/// `global` statement, a wildcard import. A step applies an edit or undoes one.
+const BRANCH_EDITS: [(&str, &str); 22] = [
+    ("        r = jnp.ones((3, 4))", "        r = jnp.ones((3, 5))"),
+    ("        x = jnp.zeros(5)\n        return x", "        x = jnp.zeros(5)\n        x = x[None]"),
+    ("    else:\n        r = jnp.ones((3, 4))", "    elif c > 1:\n        r = jnp.ones((3, 4))"),
+    ("    for i in range(n):\n        t = jnp.zeros(5)", "    while n:\n        t = jnp.zeros(5)"),
+    ("            continue\n", "            break\n"),
+    ("    except ValueError:\n        a = jnp.zeros(5)", "    except ValueError:\n        a = jnp.zeros(6)"),
+    ("    finally:\n        b = a", "    finally:\n        a = jnp.ones(7)"),
+    (
+        "def pick(x: Float[Array, \"3 4\"], c):\n    if c:",
+        "def pick(x: Float[Array, \"3 4\"], c):\n    r = mystery()\n    if c:",
+    ),
+    (
+        "def early(x: Float[Array, \"3 4\"], c):\n    if c:",
+        "def early(x: Float[Array, \"3 4\"], c):\n    q = mystery()\n    if c:",
+    ),
+    ("n = jnp.zeros(3)\nif flag:", "print(m)\nn = jnp.zeros(3)\nif flag:"),
+    ("n = jnp.zeros(3)\nif flag:", "dict(m=1)\nn = jnp.zeros(3)\nif flag:"),
+    ("n = jnp.zeros(3)\nif flag:", "obj.m\nn = jnp.zeros(3)\nif flag:"),
+    ("import jax.numpy as jnp\n", "import jax.numpy as jnp\nfrom lib import *\n"),
+    (
+        "def caller(x: Float[Array, \"3 4\"]):",
+        "def setter():\n    global m\n    m = 1\n\n\ndef caller(x: Float[Array, \"3 4\"]):",
+    ),
+    ("    p = pick(x, True)", "    p = pick(x, False)"),
+    ("else:\n    n = jnp.zeros(3)\nk = m", "else:\n    n = jnp.zeros(4)\nk = m"),
+    (
+        "    try:\n        a = jnp.zeros(5)",
+        "    with suppress(E):\n        a = jnp.zeros(5)\n    try:\n        a = jnp.zeros(5)",
+    ),
+    ("        t = jnp.zeros(5)\n        if i:", "        t = x\n        if i:"),
+    ("    q = x\n    return q", "    match c:\n        case [x]:\n            pass\n    q = x\n    return q"),
+    (
+        "def pick(x: Float[Array, \"3 4\"], c):\n    if c:",
+        "def pick(x: Float[Array, \"3 4\"], c):\n    if (x := mystery()):\n        pass\n    if c:",
+    ),
+    (
+        "def caller(x: Float[Array, \"3 4\"]):",
+        "def helper(v):\n    return v\n\n\ndef helper(v):\n    return v.T\n\n\ndef caller(x: Float[Array, \"3 4\"]):",
+    ),
+    ("    e = early(x, False)", "    e = early(x, False)\n    h = helper(x)"),
+];
+
+#[test]
+fn replayed_analysis_equals_fresh_analysis_after_branch_edits() {
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut rng = Rng(SEED ^ 0xb4a9c8);
+    // Independent statements, so that an edit dirties a small share of the file
+    // and the plan replays the rest instead of running everything.
+    let filler: String = (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect();
+    let mut text = format!("{BRANCHES}{filler}");
+    let mut tree = parser.parse(&text, None).unwrap();
+    let mut replayed = 0;
+    for step in 0..400 {
+        let (from, to) = BRANCH_EDITS[rng.below(BRANCH_EDITS.len())];
+        let edited = if text.contains(to) && rng.below(2) == 0 {
+            text.replacen(to, from, 1)
+        } else if text.contains(from) {
+            text.replacen(from, to, 1)
+        } else {
+            text.clone()
+        };
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = analyze_layer_shapes_with_memo(
+            tree.root_node(),
+            &text,
+            &roots,
+            read,
+            8,
+            Some(&cache),
+            &mut memo,
+        )
+        .unwrap();
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("branch edits step {step}: {part} differ\n{text}");
+        }
+        replayed += memo.stats().replayed_units;
+    }
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A module-level branch assigns `m` in one arm. Whether `m` keeps its shape
+/// after the branch depends on the statements before it: a keyword or an
+/// attribute named `m` does not bind a module name (the top-level name model
+/// does not link them), a read, a `global m` in a function, or a wildcard
+/// import does. Each edit must give the same analysis from the memo as from a
+/// fresh run, and `k = m` must show the answer.
+#[test]
+fn module_level_join_follows_the_mentions_before_it() {
+    let filler: String = (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect();
+    let base = format!(
+        "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\nn = jnp.zeros(3)\nif flag:\n    m = jnp.zeros(6)\nelse:\n    n = jnp.zeros(3)\nk = m\n{filler}"
+    );
+    let at = "n = jnp.zeros(3)\nif flag:";
+    let steps: [(&str, &str, bool); 20] = [
+        (at, "dict(m=1)\nn = jnp.zeros(3)\nif flag:", true),
+        (at, "obj.m\nn = jnp.zeros(3)\nif flag:", true),
+        (at, "print(m)\nn = jnp.zeros(3)\nif flag:", false),
+        ("print(m)\n", "", true),
+        ("dict(m=1)\nobj.m\n", "", true),
+        ("\n\n\nn = jnp.zeros(3)", "\n\n\ndef setter():\n    global m\n    m = 1\n\n\nn = jnp.zeros(3)", false),
+        ("\n\n\ndef setter():\n    global m\n    m = 1\n", "\n", true),
+        ("import jax.numpy as jnp\n", "import jax.numpy as jnp\nfrom lib import *\n", false),
+        ("from lib import *\n", "", true),
+        ("    m = jnp.zeros(6)\nelse:", "    m = jnp.zeros(6)\n    n = jnp.zeros(3)\nelse:", true),
+        ("else:\n    n = jnp.zeros(3)\nk = m", "else:\n    m = jnp.zeros(6)\nk = m", true),
+        ("else:\n    m = jnp.zeros(6)\nk = m", "else:\n    m = jnp.zeros(7)\nk = m", false),
+        ("    m = jnp.zeros(7)\nk = m", "    m = jnp.zeros(6)\nk = m", true),
+        // A `def`, a `class`, or an import of the name is an earlier binding.
+        ("else:\n    m = jnp.zeros(6)\nk = m", "else:\n    n = jnp.zeros(3)\nk = m", true),
+        (at, "def m():\n    pass\nn = jnp.zeros(3)\nif flag:", false),
+        ("def m():\n    pass\n", "class m:\n    pass\n", false),
+        ("class m:\n    pass\n", "import os as m\n", false),
+        ("import os as m\n", "", true),
+        (at, "def other():\n    pass\nn = jnp.zeros(3)\nif flag:", true),
+        ("def other():\n    pass\n", "def m():\n    pass\n", false),
+    ];
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = base.clone();
+    let mut tree = parser.parse(&text, None).unwrap();
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    let known = |a: &LayerShapeAnalysis| a.scopes[0].shapes.contains_key("k");
+    assert!(known(&run(&tree, &text, &mut memo)));
+    let mut replayed = 0;
+    for (step, (from, to, keeps)) in steps.iter().enumerate() {
+        assert!(text.contains(from), "step {step}");
+        let edited = text.replacen(from, to, 1);
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("step {step}: {part} differ");
+        }
+        assert_eq!(known(&want), *keeps, "step {step}");
+    }
+    assert!(replayed > 0);
+}
+
+/// A function reads a module global `W` and a module constant `D`. Whether
+/// the reader sees a shape depends on statements elsewhere in the file: a
+/// second write of `W`, a write after the reader, a `global W`, a class body
+/// that binds `W`, a branch that gives `W` two shapes; and for `D`, another
+/// literal, a parameter named `D`. Each edit must give the same analysis from
+/// the memo as from a fresh run, and `out` and `z` must show the answer.
+#[test]
+fn module_global_follows_the_statements_around_it() {
+    let filler: String = (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect();
+    let base = format!(
+        "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\nW = jnp.zeros((3, 4))\nD = 64\n\n\ndef use(x: Float[Array, \"3 4\"]):\n    out = x + W\n    return out\n\n\ndef dims():\n    z = jnp.zeros((D, 2))\n    return z\n{filler}"
+    );
+    let dims = |d: &[&str]| Some(d.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let w = dims(&["3", "4"]);
+    let none: Option<Vec<String>> = None;
+    let at_end = "\n\nW = jnp.zeros((3, 4))\n";
+    type Dims = Option<Vec<String>>;
+    let steps: Vec<(&str, String, Dims, Dims)> = vec![
+        ("D = 64\n", "D = 32\n".into(), w.clone(), dims(&["32", "2"])),
+        ("D = 32\n", "D = 64\n".into(), w.clone(), dims(&["64", "2"])),
+        ("\n\ndef dims():", "\n\nW = jnp.zeros((3, 4))\n\n\ndef dims():".into(), none.clone(), dims(&["64", "2"])),
+        ("\n\nW = jnp.zeros((3, 4))\n\n\ndef dims():", "\n\ndef dims():".into(), w.clone(), dims(&["64", "2"])),
+        (
+            "\n\ndef dims():",
+            "\n\ndef setter():\n    global W\n    W = 1\n\n\ndef dims():".into(),
+            none.clone(),
+            dims(&["64", "2"]),
+        ),
+        ("\n\ndef setter():\n    global W\n    W = 1\n\n\ndef dims():", "\n\ndef dims():".into(), w.clone(), dims(&["64", "2"])),
+        ("\n\ndef use(", "\n\nclass K:\n    W = jnp.zeros(9)\n\n\ndef use(".into(), none.clone(), dims(&["64", "2"])),
+        ("\n\nclass K:\n    W = jnp.zeros(9)\n\n\ndef use(", "\n\ndef use(".into(), w.clone(), dims(&["64", "2"])),
+        ("D = 64\n", "D = 64\nD = 32\n".into(), w.clone(), dims(&["D", "2"])),
+        ("D = 64\nD = 32\n", "D = 64\n".into(), w.clone(), dims(&["64", "2"])),
+        ("def dims():", "def dims(D):".into(), w.clone(), dims(&["D", "2"])),
+        ("def dims(D):", "def dims():".into(), w.clone(), dims(&["64", "2"])),
+        (
+            "W = jnp.zeros((3, 4))\nD",
+            "if flag:\n    W = jnp.zeros((3, 4))\nelse:\n    W = jnp.zeros((3, 6))\nD".into(),
+            none.clone(),
+            dims(&["64", "2"]),
+        ),
+        (
+            "if flag:\n    W = jnp.zeros((3, 4))\nelse:\n    W = jnp.zeros((3, 6))\nD",
+            "W = jnp.zeros((3, 4))\nD".into(),
+            w.clone(),
+            dims(&["64", "2"]),
+        ),
+        ("W = jnp.zeros((3, 4))\nD", "D".into(), none.clone(), dims(&["64", "2"])),
+        ("\n\ndef dims():", format!("{at_end}\n\ndef dims():"), none.clone(), dims(&["64", "2"])),
+        (at_end, "\n\n".into(), none.clone(), dims(&["64", "2"])),
+        ("D = 64\n", "W = jnp.zeros((3, 4))\nD = 64\n".into(), w.clone(), dims(&["64", "2"])),
+    ];
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = base;
+    let mut tree = parser.parse(&text, None).unwrap();
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    let find = |a: &LayerShapeAnalysis, name: &str| {
+        a.scopes.iter().find_map(|s| s.shapes.get(name).cloned())
+    };
+    let first = run(&tree, &text, &mut memo);
+    assert_eq!(find(&first, "out"), w);
+    assert_eq!(find(&first, "z"), dims(&["64", "2"]));
+    let mut replayed = 0;
+    for (step, (from, to, out, z)) in steps.iter().enumerate() {
+        assert!(text.contains(from), "step {step}");
+        let edited = text.replacen(from, to, 1);
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("step {step}: {part} differ\n{text}");
+        }
+        assert_eq!(&find(&want, "out"), out, "step {step} out\n{text}");
+        assert_eq!(&find(&want, "z"), z, "step {step} z\n{text}");
+    }
+    assert!(replayed > 0);
+}
+
+/// Lambdas and comprehensions read module globals (`XS`, `V`), a module
+/// constant (`K`), and the builtins `sum` and `range`, all defined in other
+/// statements. Their bodies bind names of their own that hide those.
+const COMPREHENSIONS: &str = r#"import jax
+import jax.numpy as jnp
+from jaxtyping import Float, Array
+
+XS = jnp.zeros((5, 3, 4))
+V = jnp.zeros((4, 2))
+K = 3
+
+
+def stacked(w: Float[Array, "4 2"]):
+    out = jnp.stack([x @ w for x in XS])
+    return out
+
+
+def mapped(w: Float[Array, "4 2"]):
+    m = jax.vmap(lambda x: x @ w)(XS)
+    return m
+
+
+def counted():
+    c = jnp.stack([jnp.zeros((2,)) for _ in range(K)])
+    return c
+
+
+def total(xs: Float[Array, "5 3"]):
+    s = sum(x * 2.0 for x in xs)
+    return s
+
+
+def named(y: Float[Array, "3 4"]):
+    r = (lambda x: V)(y)
+    return r
+
+
+def hidden():
+    q = jnp.stack([V for V in range(2)])
+    return q
+"#;
+
+/// Each pair swaps one fragment of `COMPREHENSIONS` for another that changes
+/// what a body reads: the shape of a global, a second write of it, the count of
+/// a `range`, a name that hides a global (a parameter, a loop target), a
+/// definition of `sum` or `range`, a `global` statement, a wildcard import.
+const COMPREHENSION_EDITS: [(&str, &str); 17] = [
+    ("XS = jnp.zeros((5, 3, 4))", "XS = jnp.zeros((6, 3, 4))"),
+    ("XS = jnp.zeros((5, 3, 4))\n", "XS = jnp.zeros((5, 3, 4))\nXS = jnp.zeros((7, 3, 4))\n"),
+    ("V = jnp.zeros((4, 2))", "V = jnp.zeros((4, 3))"),
+    ("K = 3\n", "K = 4\n"),
+    ("K = 3\n", "K = 3\nK = 5\n"),
+    ("lambda x: V", "lambda V: V"),
+    ("(lambda x: V)(y)", "(lambda x, V=1: V)(y)"),
+    ("for V in range(2)", "for _ in range(2)"),
+    ("for _ in range(K)", "for _ in range(2, K)"),
+    ("lambda x: x @ w", "lambda w: x @ w"),
+    ("\n\ndef total(", "\n\nsum = max\n\n\ndef total("),
+    ("\n\ndef counted(", "\n\nrange = list\n\n\ndef counted("),
+    ("\n\ndef counted(", "\n\ndef setter():\n    global XS\n    XS = 1\n\n\ndef counted("),
+    ("import jax\n", "import jax\nfrom lib import *\n"),
+    ("import jax\n", "import jax\nfrom numpy import sum\n"),
+    ("def total(xs: Float[Array, \"5 3\"]):", "def total(xs: Float[Array, \"5 3\"], sum=0):"),
+    ("for x in xs)", "for x in xs if x)"),
+];
+
+fn comprehension_filler() -> String {
+    (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect()
+}
+
+#[test]
+fn replayed_analysis_equals_fresh_analysis_after_comprehension_edits() {
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut rng = Rng(SEED ^ 0xc0a7e1);
+    let mut text = format!("{COMPREHENSIONS}{}", comprehension_filler());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let mut replayed = 0;
+    for step in 0..400 {
+        let (from, to) = COMPREHENSION_EDITS[rng.below(COMPREHENSION_EDITS.len())];
+        let edited = if text.contains(to) && rng.below(2) == 0 {
+            text.replacen(to, from, 1)
+        } else if text.contains(from) {
+            text.replacen(from, to, 1)
+        } else {
+            text.clone()
+        };
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = analyze_layer_shapes_with_memo(
+            tree.root_node(),
+            &text,
+            &roots,
+            read,
+            8,
+            Some(&cache),
+            &mut memo,
+        )
+        .unwrap();
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("comprehension edits step {step}: {part} differ\n{text}");
+        }
+        replayed += memo.stats().replayed_units;
+    }
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// Walk `COMPREHENSIONS` through edits that change what each body reads. Each
+/// step must give the same analysis from the memo as from a fresh run, and the
+/// names `out`, `m`, `c`, `s`, `r`, `q` must show the answer that Python gives
+/// (unknown where the file does not settle it).
+#[test]
+fn comprehension_and_lambda_follow_the_statements_around_them() {
+    let d = |dims: &[&str]| Some(dims.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    type Dims = Option<Vec<String>>;
+    // out, m, c, s, r, q
+    type Answer = [Dims; 6];
+    let start: Answer = [
+        d(&["5", "3", "2"]),
+        d(&["5", "3", "2"]),
+        d(&["3", "2"]),
+        d(&["3"]),
+        d(&["4", "2"]),
+        None,
+    ];
+    let none: Dims = None;
+    let steps: Vec<(&str, &str, Answer)> = vec![
+        (
+            "XS = jnp.zeros((5, 3, 4))",
+            "XS = jnp.zeros((6, 3, 4))",
+            [d(&["6", "3", "2"]), d(&["6", "3", "2"]), d(&["3", "2"]), d(&["3"]), d(&["4", "2"]), None],
+        ),
+        (
+            "XS = jnp.zeros((6, 3, 4))\n",
+            "XS = jnp.zeros((6, 3, 4))\nXS = jnp.zeros((7, 3, 4))\n",
+            [none.clone(), none.clone(), d(&["3", "2"]), d(&["3"]), d(&["4", "2"]), None],
+        ),
+        (
+            "XS = jnp.zeros((6, 3, 4))\nXS = jnp.zeros((7, 3, 4))\n",
+            "XS = jnp.zeros((5, 3, 4))\n",
+            start.clone(),
+        ),
+        (
+            "lambda x: V",
+            "lambda V: V",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["3", "2"]), d(&["3"]), d(&["3", "4"]), None],
+        ),
+        (
+            "(lambda V: V)(y)",
+            "(lambda V: V)(mystery())",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["3", "2"]), d(&["3"]), None, None],
+        ),
+        ("(lambda V: V)(mystery())", "(lambda x: V)(y)", start.clone()),
+        (
+            "for V in range(2)",
+            "for _ in range(2)",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["3", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "V = jnp.zeros((4, 2))",
+            "V = jnp.zeros((4, 3))",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["3", "2"]), d(&["3"]), d(&["4", "3"]), d(&["2", "4", "3"])],
+        ),
+        (
+            "V = jnp.zeros((4, 3))",
+            "V = jnp.zeros((4, 2))",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["3", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "for _ in range(K)",
+            "for _ in range(2, K)",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["1", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "K = 3\n",
+            "K = 3\nK = 5\n",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), none.clone(), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "K = 3\nK = 5\n",
+            "K = 4\n",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "\n\ndef total(",
+            "\n\nsum = max\n\n\ndef total(",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), none.clone(), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "\n\nsum = max\n\n\ndef total(",
+            "\n\ndef total(",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "\n\ndef counted(",
+            "\n\nrange = list\n\n\ndef counted(",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), none.clone(), d(&["3"]), d(&["4", "2"]), none.clone()],
+        ),
+        (
+            "\n\nrange = list\n\n\ndef counted(",
+            "\n\ndef setter():\n    global XS\n    XS = 1\n\n\ndef counted(",
+            [none.clone(), none.clone(), d(&["2", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "\n\ndef setter():\n    global XS\n    XS = 1\n\n\ndef counted(",
+            "\n\ndef counted(",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "import jax\n",
+            "import jax\nfrom lib import *\n",
+            [none.clone(), none.clone(), none.clone(), none.clone(), none.clone(), none.clone()],
+        ),
+        (
+            "import jax\nfrom lib import *\n",
+            "import jax\n",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), d(&["3"]), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+        (
+            "for x in xs)",
+            "for x in xs if x)",
+            [d(&["5", "3", "2"]), d(&["5", "3", "2"]), d(&["2", "2"]), none.clone(), d(&["4", "2"]), d(&["2", "4", "2"])],
+        ),
+    ];
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = format!("{COMPREHENSIONS}{}", comprehension_filler());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    let find = |a: &LayerShapeAnalysis, name: &str| {
+        a.scopes.iter().find_map(|s| s.shapes.get(name).cloned())
+    };
+    let names = ["out", "m", "c", "s", "r", "q"];
+    let first = run(&tree, &text, &mut memo);
+    for (name, want) in names.iter().zip(&start) {
+        assert_eq!(&find(&first, name), want, "start {name}");
+    }
+    let mut replayed = 0;
+    for (step, (from, to, answer)) in steps.iter().enumerate() {
+        assert!(text.contains(from), "step {step}");
+        let edited = text.replacen(from, to, 1);
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("step {step}: {part} differ\n{text}");
+        }
+        for (name, expected) in names.iter().zip(answer) {
+            assert_eq!(&find(&want, name), expected, "step {step} {name}\n{text}");
+        }
+    }
+    assert!(replayed > 0);
+}
+
+/// Modules held in lists, a `Sequential`, and a comprehension. `forward` reads
+/// them with a call of the container, an index, and a loop. Each result
+/// depends on what the constructor of the other unit (`Block`) and the other
+/// lines of `Stack` give the fields.
+const MODULES: &str = r#"import torch.nn as nn
+import torch.nn.functional as F
+from jaxtyping import Float, Array
+
+
+class Block(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.fc = nn.Linear(d_in, d_out)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class Stack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])
+        self.net = nn.Sequential(Block(8, 8), nn.ReLU(), Block(8, 8))
+        self.same = nn.ModuleList([Block(8, 8) for _ in range(3)])
+
+    def forward(self, x: Float[Array, "n 8"], i: int):
+        a = self.net(x)
+        b = self.layers[0](x)
+        h = x
+        for layer in self.layers:
+            h = layer(h)
+        s = x
+        for layer in self.same:
+            s = layer(s)
+        return a, b, h, s
+
+
+def standalone(x: Float[Array, "n 8"]):
+    y = x
+    return y
+"#;
+
+/// Each pair changes one fragment of `MODULES` for another that changes what
+/// a field holds: a ctor argument, the count of a comprehension, a change of
+/// the list in place (in the class, and from another unit), a different
+/// container, an index, a break in the loop, the module a loop runs over.
+const MODULE_EDITS: [(&str, &str); 24] = [
+    ("Block(16, 4)])", "Block(16, 5)])"),
+    ("Block(8, 8), nn.ReLU(), Block(8, 8))", "Block(8, 8), nn.ReLU(), Block(8, 9))"),
+    ("nn.Sequential(Block(8, 8), nn.ReLU(), Block(8, 8))", "nn.Sequential(Block(8, 8), Block(8, 16))"),
+    ("range(3)", "range(n_layers)"),
+    ("range(3)", "range(0)"),
+    ("Block(8, 8) for _ in range(3)", "Block(8, 9) for _ in range(1)"),
+    ("Block(8, 8) for _ in range(3)", "Block(8, 9) for _ in range(2)"),
+    ("self.same = nn.ModuleList([Block(8, 8) for _ in range(3)])", "self.same = [Block(8, 8), Block(8, 8), Block(8, 8)]"),
+    ("for layer in self.same:", "for layer in self.layers:"),
+    ("h = layer(h)", "h = layer(h)\n            break"),
+    ("self.layers[0](x)", "self.layers[i](x)"),
+    ("self.layers[0](x)", "self.layers[-2](x)"),
+    ("nn.ModuleList([Block(8, 16), Block(16, 4)])\n", "nn.ModuleList([Block(8, 16), Block(16, 4)])\n        self.layers.append(Block(4, 4))\n"),
+    ("\n\ndef standalone", "\n\nstack = Stack()\nstack.layers.append(Block(1, 1))\n\n\ndef standalone"),
+    ("self.layers = nn.ModuleList(", "self.layers = list("),
+    ("return self.fc(x)", "return F.relu(self.fc(x))"),
+    ("def forward(self, x):\n        return self.fc(x)", "def __call__(self, x):\n        return self.fc(x)"),
+    ("nn.Linear(d_in, d_out)", "nn.Linear(d_in, d_out + 1)"),
+    ("def forward(self, x):\n        return self.fc(x)", "def run(self, x):\n        return self.fc(x)"),
+    ("x: Float[Array, \"n 8\"], i: int", "x: Float[Array, \"n 8\"], i"),
+    (
+        "nn.ModuleList([Block(8, 16), Block(16, 4)])\n",
+        "nn.ModuleList([Block(8, 16), Block(16, 4)])\n        ls = self.layers\n        ls.append(Block(4, 4))\n",
+    ),
+    (
+        "\n\ndef standalone",
+        "\n\nstack = Stack()\nm = stack.layers\nm.append(Block(1, 1))\n\n\ndef standalone",
+    ),
+    (
+        "\n\ndef standalone",
+        "\n\nstack = Stack()\ngetattr(stack, \"layers\").append(Block(1, 1))\n\n\ndef standalone",
+    ),
+    ("for layer in self.layers:\n            h = layer(h)", "k = len(self.layers)\n        for layer in self.layers:\n            h = layer(h)"),
+];
+
+fn module_filler() -> String {
+    (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect()
+}
+
+#[test]
+fn replayed_analysis_equals_fresh_analysis_after_module_container_edits() {
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut rng = Rng(SEED ^ 0x30d1);
+    let mut text = format!("{MODULES}{}", module_filler());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let mut replayed = 0;
+    for step in 0..400 {
+        let (from, to) = MODULE_EDITS[rng.below(MODULE_EDITS.len())];
+        let edited = if text.contains(to) && rng.below(2) == 0 {
+            text.replacen(to, from, 1)
+        } else if text.contains(from) {
+            text.replacen(from, to, 1)
+        } else {
+            text.clone()
+        };
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = analyze_layer_shapes_with_memo(
+            tree.root_node(),
+            &text,
+            &roots,
+            read,
+            8,
+            Some(&cache),
+            &mut memo,
+        )
+        .unwrap();
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("module edits step {step}: {part} differ\n{text}");
+        }
+        replayed += memo.stats().replayed_units;
+    }
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// Walk `MODULES` through edits that change what a field holds. Each step
+/// must give the same analysis from the memo as from a fresh run, and the
+/// names `a`, `b`, `h`, `s` must show the answer that Python gives (unknown
+/// where the analyzer does not follow the code, for example a list that other
+/// code changes in place).
+#[test]
+fn module_containers_follow_the_statements_around_them() {
+    let d = |dims: &[&str]| Some(dims.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    type Dims = Option<Vec<String>>;
+    // a, b, h, s
+    type Answer = [Dims; 4];
+    let start: Answer = [d(&["n", "8"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "8"])];
+    let none: Dims = None;
+    let with = |a: Dims, b: Dims, h: Dims, s: Dims| -> Answer { [a, b, h, s] };
+    let steps: Vec<(&str, &str, Answer)> = vec![
+        ("Block(16, 4)])", "Block(16, 5)])", with(d(&["n", "8"]), d(&["n", "16"]), d(&["n", "5"]), d(&["n", "8"]))),
+        ("Block(16, 5)])", "Block(16, 4)])", start.clone()),
+        (
+            "Block(8, 8), nn.ReLU(), Block(8, 8))",
+            "Block(8, 8), nn.ReLU(), Block(8, 9))",
+            with(d(&["n", "9"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "8"])),
+        ),
+        ("Block(8, 8), nn.ReLU(), Block(8, 9))", "Block(8, 8), nn.ReLU(), Block(8, 8))", start.clone()),
+        ("range(3)", "range(n_layers)", start.clone()),
+        ("range(n_layers)", "range(3)", start.clone()),
+        (
+            "Block(8, 8) for _ in range(3)",
+            "Block(8, 9) for _ in range(1)",
+            with(d(&["n", "8"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "9"])),
+        ),
+        (
+            "Block(8, 9) for _ in range(1)",
+            "Block(8, 9) for _ in range(0)",
+            with(d(&["n", "8"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "8"])),
+        ),
+        ("Block(8, 9) for _ in range(0)", "Block(8, 8) for _ in range(3)", start.clone()),
+        (
+            "for layer in self.same:",
+            "for layer in self.layers:",
+            with(d(&["n", "8"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "4"])),
+        ),
+        ("for layer in self.layers:\n            s", "for layer in self.same:\n            s", start.clone()),
+        (
+            "h = layer(h)",
+            "h = layer(h)\n            break",
+            with(d(&["n", "8"]), d(&["n", "16"]), none.clone(), d(&["n", "8"])),
+        ),
+        ("h = layer(h)\n            break", "h = layer(h)", start.clone()),
+        (
+            "self.layers[0](x)",
+            "self.layers[i](x)",
+            with(d(&["n", "8"]), none.clone(), d(&["n", "4"]), d(&["n", "8"])),
+        ),
+        ("self.layers[i](x)", "self.layers[0](x)", start.clone()),
+        (
+            "nn.ModuleList([Block(8, 16), Block(16, 4)])\n",
+            "nn.ModuleList([Block(8, 16), Block(16, 4)])\n        self.layers.append(Block(4, 4))\n",
+            with(d(&["n", "8"]), none.clone(), none.clone(), d(&["n", "8"])),
+        ),
+        (
+            "nn.ModuleList([Block(8, 16), Block(16, 4)])\n        self.layers.append(Block(4, 4))\n",
+            "nn.ModuleList([Block(8, 16), Block(16, 4)])\n",
+            start.clone(),
+        ),
+        (
+            "\n\ndef standalone",
+            "\n\nstack = Stack()\nstack.layers.append(Block(1, 1))\n\n\ndef standalone",
+            with(d(&["n", "8"]), none.clone(), none.clone(), d(&["n", "8"])),
+        ),
+        (
+            "\n\nstack = Stack()\nstack.layers.append(Block(1, 1))\n\n\ndef standalone",
+            "\n\ndef standalone",
+            start.clone(),
+        ),
+        (
+            "self.layers = nn.ModuleList(",
+            "self.layers = list(",
+            with(d(&["n", "8"]), none.clone(), none.clone(), d(&["n", "8"])),
+        ),
+        ("self.layers = list(", "self.layers = nn.ModuleList(", start.clone()),
+        ("return self.fc(x)", "return F.relu(self.fc(x))", start.clone()),
+        (
+            "def forward(self, x):\n        return F.relu(self.fc(x))",
+            "def __call__(self, x):\n        return F.relu(self.fc(x))",
+            start.clone(),
+        ),
+        (
+            "self.same = nn.ModuleList([Block(8, 8) for _ in range(3)])",
+            "self.same = [Block(8, 8), Block(8, 8), Block(8, 8)]",
+            start.clone(),
+        ),
+        (
+            "nn.Sequential(Block(8, 8), nn.ReLU(), Block(8, 8))",
+            "nn.Sequential(Block(8, 8), Block(8, 16))",
+            with(d(&["n", "16"]), d(&["n", "16"]), d(&["n", "4"]), d(&["n", "8"])),
+        ),
+        (
+            "def __call__(self, x):\n        return F.relu(self.fc(x))",
+            "def run(self, x):\n        return F.relu(self.fc(x))",
+            with(none.clone(), none.clone(), none.clone(), none.clone()),
+        ),
+    ];
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = format!("{MODULES}{}", module_filler());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    let find = |a: &LayerShapeAnalysis, name: &str| {
+        a.scopes.iter().find_map(|s| s.shapes.get(name).cloned())
+    };
+    let names = ["a", "b", "h", "s"];
+    let first = run(&tree, &text, &mut memo);
+    for (name, want) in names.iter().zip(&start) {
+        assert_eq!(&find(&first, name), want, "start {name}");
+    }
+    let mut replayed = 0;
+    for (step, (from, to, answer)) in steps.iter().enumerate() {
+        assert!(text.contains(from), "step {step}: {from}");
+        let edited = text.replacen(from, to, 1);
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("step {step}: {part} differ\n{text}");
+        }
+        for (name, expected) in names.iter().zip(answer) {
+            assert_eq!(&find(&want, name), expected, "step {step} {name}\n{text}");
+        }
+    }
+    assert!(replayed > 0);
+}
+
+const MODULE_HELPER_A: &str = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, d_out)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_HELPER_B: &str = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, 9)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_HELPER_GONE: &str = "import torch.nn as nn\n\ndef Block(d_in, d_out):\n    return nn.Linear(d_in, d_out)\n";
+const MODULE_HELPER_DEEP: &str = "import torch.nn as nn\nfrom module_leaf import Leaf\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.leaf = Leaf(d_out)\n\n    def forward(self, x):\n        return self.leaf(x)\n";
+const MODULE_HELPER_CONST_A: &str = "import torch.nn as nn\n\nOUT = 4\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, OUT)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_HELPER_CONST_B: &str = "import torch.nn as nn\n\nOUT = 5\n\nclass Block(nn.Module):\n    def __init__(self, d_in, d_out):\n        super().__init__()\n        self.fc = nn.Linear(d_in, OUT)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_LEAF_A: &str = "import torch.nn as nn\n\nclass Leaf(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.fc = nn.Linear(8, d)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_LEAF_B: &str = "import torch.nn as nn\n\nclass Leaf(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.fc = nn.Linear(8, 6)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const MODULE_MAIN: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\nfrom module_helper import Block\n\n\nclass M(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.blk = Block(8, 16)\n        self.layers = nn.ModuleList([Block(8, 16), Block(16, 4)])\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        a = self.blk(x)\n        for layer in self.layers:\n            x = layer(x)\n        return a, x\n\n\ndef g(x: Float[Array, \"n 8\"]):\n    b = Block(8, 3)(x)\n    return b\n";
+
+/// A module class saved in the file that defines it, between edits of the file
+/// that calls it. The class imports a second file, so a save of either reaches
+/// the call.
+#[test]
+fn incremental_analysis_survives_imported_module_saves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let helper = tmp.path().join("module_helper.py");
+    let leaf = tmp.path().join("module_leaf.py");
+    let main = tmp.path().join("main.py");
+    std::fs::write(&helper, MODULE_HELPER_A).unwrap();
+    std::fs::write(&leaf, MODULE_LEAF_A).unwrap();
+    let roots = vec![tmp.path().to_path_buf()];
+    let cache: Arc<ResolutionCache> = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let mut parser = new_parser();
+    let paste = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/stress/paste_block.txt"),
+    )
+    .unwrap();
+    let mut rng = Rng(SEED ^ 0x1a0d);
+    let (mut text, mut prev) = (MODULE_MAIN.to_string(), MODULE_MAIN.to_string());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let mut kept = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let toggles = [
+        ("Block(8, 3)", "Block(8, 4)"),
+        ("Block(16, 4)", "Block(16, 5)"),
+        ("self.blk = Block(8, 16)", "self.blk = Block(8, d)"),
+        ("for layer in self.layers:", "for layer in reversed(self.layers):"),
+        ("from module_helper import Block", "from module_helper import Block as Block, helper"),
+    ];
+    for step in 0..200 {
+        match rng.below(8) {
+            0..=3 => {
+                let (file, content) = match rng.below(7) {
+                    0 => (&helper, MODULE_HELPER_A),
+                    1 => (&helper, MODULE_HELPER_B),
+                    2 => (&helper, MODULE_HELPER_GONE),
+                    3 => (&helper, MODULE_HELPER_DEEP),
+                    4 => (&helper, MODULE_HELPER_CONST_A),
+                    5 => (&helper, MODULE_HELPER_CONST_B),
+                    _ => (&leaf, [MODULE_LEAF_A, MODULE_LEAF_B][rng.below(2)]),
+                };
+                let before = std::fs::metadata(file).unwrap().modified().unwrap();
+                std::fs::write(file, content).unwrap();
+                // Keep the old time, so only the editor event shows the save.
+                if rng.below(2) == 0 && !kept.contains(&(file.clone(), before, content.len())) {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(file)
+                        .unwrap()
+                        .set_modified(before)
+                        .unwrap();
+                }
+                let after = std::fs::metadata(file).unwrap();
+                kept.insert((file.clone(), after.modified().unwrap(), content.len()));
+                cache.revalidate(std::slice::from_ref(file));
+            }
+            4..=6 => {
+                let (from, to) = toggles[rng.below(toggles.len())];
+                let edited = if text.contains(to) {
+                    text.replacen(to, from, 1)
+                } else {
+                    text.replacen(from, to, 1)
+                };
+                tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+                prev = std::mem::replace(&mut text, edited);
+            }
+            _ => {
+                let edited = mutate(&mut rng, &text, &prev, &paste);
+                tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+                prev = std::mem::replace(&mut text, edited);
+            }
+        }
+        std::fs::write(&main, &text).unwrap();
+        let got = analyze_layer_shapes_with_memo(
+            tree.root_node(),
+            &text,
+            &roots,
+            read,
+            8,
+            Some(&cache),
+            &mut memo,
+        )
+        .unwrap();
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        assert_same_analysis("module helper", step, &got, &want);
+        if let Some(shape) = got.scopes.iter().find_map(|s| s.shapes.get("a")) {
+            seen.insert(shape.clone());
+        }
+    }
+    // The saves reached the call: the output has taken more than one shape.
+    assert!(seen.len() > 1, "{seen:?}");
+}
+
+/// A save of the class changes the answer of a call that the memo replays.
+#[test]
+fn a_saved_module_class_reaches_a_replayed_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let helper = tmp.path().join("module_helper.py");
+    let leaf = tmp.path().join("module_leaf.py");
+    std::fs::write(&helper, MODULE_HELPER_DEEP).unwrap();
+    std::fs::write(&leaf, MODULE_LEAF_A).unwrap();
+    let roots = vec![tmp.path().to_path_buf()];
+    let cache: Arc<ResolutionCache> = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let mut parser = new_parser();
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = format!("{MODULE_MAIN}{}", module_filler());
+    let mut tree = parser.parse(&text, None).unwrap();
+    let find = |a: &LayerShapeAnalysis, name: &str| {
+        a.scopes.iter().find_map(|s| s.shapes.get(name).cloned())
+    };
+    let strings = |dims: &[&str]| Some(dims.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    // Block(8, 16) goes to Leaf(16): a is [n, 16]. Leaf(3) gives [n, 3].
+    let first = run(&tree, &text, &mut memo);
+    assert_eq!(find(&first, "a"), strings(&["n", "16"]));
+    assert_eq!(find(&first, "b"), strings(&["n", "3"]));
+    let mut replayed = 0;
+    for (file, content, a, b) in [
+        (&leaf, MODULE_LEAF_B, strings(&["n", "6"]), strings(&["n", "6"])),
+        (&leaf, MODULE_LEAF_A, strings(&["n", "16"]), strings(&["n", "3"])),
+        (&helper, MODULE_HELPER_B, strings(&["n", "9"]), strings(&["n", "9"])),
+        (&helper, MODULE_HELPER_GONE, None, None),
+        (&helper, MODULE_HELPER_DEEP, strings(&["n", "16"]), strings(&["n", "3"])),
+    ] {
+        // An edit of the calling class, which runs it again on a stored probe.
+        let toggled = if text.contains("return x, a") {
+            text.replacen("return x, a", "return a, x", 1)
+        } else {
+            text.replacen("return a, x", "return x, a", 1)
+        };
+        tree = reparse(&mut parser, &text, &tree, &toggled).unwrap();
+        text = toggled;
+        run(&tree, &text, &mut memo);
+        std::fs::write(file, content).unwrap();
+        cache.revalidate(std::slice::from_ref(file));
+        // An edit of a statement that shares no name with the class, so that
+        // the class is replayed.
+        let edited = format!("{text}\nunrelated_{} = 0\n", text.len());
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        assert_same_analysis("saved class", 0, &got, &want);
+        assert_eq!(find(&got, "a"), a, "{content}");
+        assert_eq!(find(&got, "b"), b, "{content}");
+    }
+    assert!(replayed > 0);
+}
+
+type Dims = Option<Vec<String>>;
+
+fn dims(d: &[&str]) -> Dims {
+    Some(d.iter().map(|s| s.to_string()).collect())
+}
+
+fn shape_named(a: &LayerShapeAnalysis, name: &str) -> Dims {
+    a.scopes.iter().find_map(|s| s.shapes.get(name).cloned())
+}
+
+/// Apply the edits of `steps` to `base` in turn. After each, the analysis from
+/// the memo must equal the fresh one, and `check` sees the fresh one with the
+/// number of the step. Returns how many units the memo replayed.
+fn walk_edits(
+    base: &str,
+    steps: &[(&str, &str)],
+    mut check: impl FnMut(usize, &LayerShapeAnalysis, &str),
+) -> usize {
+    let mut parser = new_parser();
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let roots = vec![std::env::temp_dir()];
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let mut text = base.to_string();
+    let mut tree = parser.parse(&text, None).unwrap();
+    let run = |tree: &Tree, text: &str, memo: &mut UnitMemo| {
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &roots, read, 8, Some(&cache), memo)
+            .unwrap()
+    };
+    let first = run(&tree, &text, &mut memo);
+    let fresh = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+    assert_same_analysis("walk start", 0, &first, &fresh);
+    check(0, &fresh, &text);
+    let mut replayed = 0;
+    for (step, (from, to)) in steps.iter().enumerate() {
+        assert!(text.contains(from), "step {}: {from:?} is not in\n{text}", step + 1);
+        let edited = text.replacen(from, to, 1);
+        tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+        text = edited;
+        let got = run(&tree, &text, &mut memo);
+        replayed += memo.stats().replayed_units;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        if let Some(part) = first_analysis_difference(&got, &want) {
+            panic!("step {}: {part} differ\n{text}", step + 1);
+        }
+        check(step + 1, &want, &text);
+    }
+    replayed
+}
+
+fn independent_functions() -> String {
+    (0..60)
+        .map(|i| format!("\n\ndef fill_{i}(x: Float[Array, \"2 2\"]):\n    y = x @ x\n    return y\n"))
+        .collect()
+}
+
+/// A function builds a shape from the module constant `D`. An annotation
+/// anywhere in the file that uses `D` as a dim makes `D` a name, not 64: the
+/// memo must follow an edit of such an annotation in another statement.
+#[test]
+fn a_constant_follows_the_annotations_of_the_file() {
+    let base = format!(
+        "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\nD = 64\n\n\ndef dims():\n    z = jnp.zeros((D, 2))\n    return z\n\n\ndef other(x: Float[Array, \"n 3\"]):\n    return x\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("\"n 3\"", "\"D 3\""),
+        ("\"D 3\"", "\"2*D 3\""),
+        ("\"2*D 3\"", "\"n 3\""),
+        ("    return x\n", "    return x\n\n\ndef third(x) -> Float[Array, \"D\"]:\n    return x\n"),
+        ("def third(x) -> Float[Array, \"D\"]:", "def third(x) -> Float[Array, \"E\"]:"),
+        ("D = 64\n", "D = 64\nE = 7\n"),
+        ("\"E\"", "\"n\""),
+    ];
+    let want = [
+        dims(&["64", "2"]),
+        dims(&["D", "2"]),
+        dims(&["D", "2"]),
+        dims(&["64", "2"]),
+        dims(&["D", "2"]),
+        dims(&["64", "2"]),
+        dims(&["64", "2"]),
+        dims(&["64", "2"]),
+    ];
+    let replayed = walk_edits(&base, &steps, |step, a, text| {
+        assert_eq!(shape_named(a, "z"), want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0);
+}
+
+const STACK_MAIN: &str = r#"import torch.nn as nn
+from jaxtyping import Float, Array
+
+
+class Block(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.fc = nn.Linear(d_in, d_out)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class Stack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([Block(8, 8), Block(8, 4)])
+
+    def forward(self, x: Float[Array, "n 8"]):
+        h = x
+        for layer in self.layers:
+            h = layer(h)
+        return h
+"#;
+
+/// Another statement keeps the list of a field under another name, or reaches
+/// it by a string: the list is then not the one the constructor built. The
+/// memo must follow the edit, in either direction.
+#[test]
+fn a_list_follows_the_statements_that_keep_it() {
+    let base = format!("{STACK_MAIN}{}", independent_functions());
+    let steps = [
+        ("\n\ndef fill_0(", "\n\ndef grow(stack):\n    ls = stack.layers\n    ls.append(None)\n\n\ndef fill_0("),
+        ("ls = stack.layers\n    ls.append(None)", "ls = list(stack.layers)\n    ls.append(None)"),
+        ("ls = list(stack.layers)", "ls = getattr(stack, \"layers\")"),
+        ("getattr(stack, \"layers\")", "getattr(stack, \"other\")"),
+        ("ls = getattr(stack, \"other\")", "k = len(stack.layers)"),
+        ("k = len(stack.layers)\n    ls.append(None)", "stack.layers[0] = None"),
+        ("stack.layers[0] = None", "m = stack.layers"),
+        ("\n\ndef grow(stack):\n    m = stack.layers\n", "\n"),
+    ];
+    let want = [
+        dims(&["n", "4"]),
+        None,
+        dims(&["n", "4"]),
+        None,
+        dims(&["n", "4"]),
+        dims(&["n", "4"]),
+        None,
+        None,
+        dims(&["n", "4"]),
+    ];
+    let replayed = walk_edits(&base, &steps, |step, a, text| {
+        assert_eq!(shape_named(a, "h"), want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0);
+}
+
+/// A name defined twice in one namespace has no one definition to call: the
+/// second definition can stand in another statement, or inside the function.
+#[test]
+fn a_call_follows_the_definitions_of_its_name() {
+    let base = format!(
+        "from jaxtyping import Float, Array\n\n\ndef inner(v):\n    return v.T\n\n\ndef use(x: Float[Array, \"3 4\"], c):\n    r = inner(x)\n    def local(v):\n        return v.T\n    s = local(x)\n    return r, s\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("\n\ndef use(", "\n\nif flag:\n    def inner(v):\n        return v\n\n\ndef use("),
+        ("if flag:\n    def inner(v):\n        return v\n", "if flag:\n    def other(v):\n        return v\n"),
+        ("    s = local(x)", "    if c:\n        def local(v):\n            return v\n    s = local(x)"),
+        ("        def local(v):\n            return v\n    s = local(x)", "        def alike(v):\n            return v\n    s = local(x)"),
+        ("if flag:\n    def other(v):\n        return v\n", "if flag:\n    def inner(v):\n        return v\n"),
+    ];
+    let t = dims(&["4", "3"]);
+    let want = [
+        (t.clone(), t.clone()),
+        (None, t.clone()),
+        (t.clone(), t.clone()),
+        (t.clone(), None),
+        (t.clone(), t.clone()),
+        (None, t.clone()),
+    ];
+    let replayed = walk_edits(&base, &steps, |step, a, text| {
+        let got = (shape_named(a, "r"), shape_named(a, "s"));
+        assert_eq!(got, want[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0);
+}
+
+/// Whether a `with` body can stop part way depends on what the callee is
+/// imported as, which is a statement of its own. An import edit changes what
+/// every replayed record depends on, so each step runs everything.
+#[test]
+fn a_context_manager_follows_the_import_it_is_called_by() {
+    let base = format!(
+        "from contextlib import suppress as sp\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\ndef use(x: Float[Array, \"3\"]):\n    with sp(ValueError):\n        x = jnp.zeros(4)\n    r = x + 0\n    return r\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("from contextlib import suppress as sp", "from numpy import ones as sp"),
+        ("from numpy import ones as sp", "from pytest import raises as sp"),
+        ("from pytest import raises as sp", "sp = other"),
+        ("sp = other", "from contextlib import suppress as sp"),
+    ];
+    let want = [None, dims(&["4"]), None, dims(&["4"]), None];
+    walk_edits(&base, &steps, |step, a, text| {
+        assert_eq!(shape_named(a, "r"), want[step], "step {step}\n{text}");
+    });
+}

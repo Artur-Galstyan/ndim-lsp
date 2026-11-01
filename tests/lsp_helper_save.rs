@@ -348,3 +348,74 @@ fn added_workspace_folder_republishes_open_documents() {
         .expect("no republish after the folder change");
     assert!(!got.is_empty(), "stale result after the folder change");
 }
+
+const MODULE_OK: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nclass Strict(nn.Module):\n    def __init__(self, d_out):\n        super().__init__()\n        self.fc = nn.Linear(8, d_out)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        return self.fc(x)\n";
+const MODULE_BAD: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\nclass Strict(nn.Module):\n    def __init__(self, d_out):\n        super().__init__()\n        self.fc = nn.Linear(9, d_out)\n\n    def forward(self, x: Float[Array, \"n 9\"]):\n        return self.fc(x)\n";
+const MODULE_MAIN: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\nfrom helper import Strict\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.s = Strict(4)\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        y = self.s(x)\n        return y\n";
+
+#[test]
+fn save_of_a_module_class_file_republishes_like_a_fresh_server() {
+    let (_dir, root) = project(Some(MODULE_OK));
+    let helper = root.join("helper.py");
+    let mut c = Client::start(&root);
+    assert!(c.open(MODULE_MAIN).is_empty());
+
+    fs::write(&helper, MODULE_BAD).unwrap();
+    let from = c.pubs.len();
+    c.notify(
+        "textDocument/didSave",
+        json!({"textDocument": {"uri": file_uri(&helper)}}),
+    );
+    let got = c.wait_publish(from).expect("no republish after save");
+    assert_eq!(got.len(), 1, "stale result after save: {got:?}");
+    assert_eq!(got, fresh(&root, MODULE_MAIN));
+
+    fs::write(&helper, MODULE_OK).unwrap();
+    let from = c.pubs.len();
+    c.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": file_uri(&helper), "type": 2}]}),
+    );
+    let got = c.wait_publish(from).expect("no republish after restore");
+    assert!(got.is_empty(), "stale error after restore: {got:?}");
+}
+
+#[test]
+fn module_class_change_without_notification_is_seen_at_the_next_analysis() {
+    let (_dir, root) = project(Some(MODULE_OK));
+    let mut c = Client::start(&root);
+    assert!(c.open(MODULE_MAIN).is_empty());
+
+    fs::write(root.join("helper.py"), MODULE_BAD).unwrap();
+    let text = format!("{MODULE_MAIN}\n");
+    let got = c.change(&text);
+    assert_eq!(got.len(), 1, "stale result without any notification: {got:?}");
+    assert_eq!(got, fresh(&root, &text));
+}
+
+#[test]
+fn deleted_and_created_module_class_file_give_the_fresh_result() {
+    let (_dir, root) = project(Some(MODULE_BAD));
+    let helper = root.join("helper.py");
+    let mut c = Client::start(&root);
+    assert_eq!(c.open(MODULE_MAIN).len(), 1);
+
+    fs::remove_file(&helper).unwrap();
+    let from = c.pubs.len();
+    c.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": file_uri(&helper), "type": 3}]}),
+    );
+    let got = c.wait_publish(from).expect("no republish after delete");
+    assert!(got.is_empty(), "stale result after delete: {got:?}");
+
+    fs::write(&helper, MODULE_BAD).unwrap();
+    let from = c.pubs.len();
+    c.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": file_uri(&helper), "type": 1}]}),
+    );
+    let got = c.wait_publish(from).expect("no republish after create");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got, fresh(&root, MODULE_MAIN));
+}

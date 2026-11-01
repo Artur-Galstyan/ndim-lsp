@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -8,12 +8,12 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree};
 
 mod names;
 
-use names::{Dsu, NameSet, link_units, vmap_names};
+use names::{Dsu, NameSet, link_units, name_hash, vmap_names};
 
 use crate::layers::{extract_layer_assignments_scoped, extract_self_attr_layers_by_class};
 use crate::python_ast::{
-    ClassHierarchy, ClassSummary, SelfAttrWrite, build_import_map, extract_jaxtyping_shapes,
-    extract_self_attr_writes,
+    ClassHierarchy, ClassSummary, SelfAttrWrite, build_import_map, dim_symbols,
+    extract_jaxtyping_shapes, extract_self_attr_writes,
 };
 use crate::resolution::{Deps, ResolutionCache, search_roots_fingerprint};
 use crate::types::*;
@@ -427,6 +427,7 @@ impl Shift for LayerApplication {
             variable: _,
             layer: _,
             input: _,
+            extra_inputs: _,
             kind: _,
             range,
         } = self;
@@ -444,7 +445,7 @@ pub(crate) struct NodeRef {
 }
 
 impl NodeRef {
-    fn of(node: Node) -> Self {
+    pub(crate) fn of(node: Node) -> Self {
         Self {
             kind: node.kind(),
             start_byte: node.start_byte(),
@@ -453,7 +454,7 @@ impl NodeRef {
     }
 
     /// The node under `within` that this names, if the tree still has it.
-    fn find<'t>(&self, within: Node<'t>) -> Option<Node<'t>> {
+    pub(crate) fn find<'t>(&self, within: Node<'t>) -> Option<Node<'t>> {
         let mut node = within.descendant_for_byte_range(self.start_byte, self.end_byte)?;
         while node.kind() != self.kind || node.byte_range() != (self.start_byte..self.end_byte) {
             node = node
@@ -667,12 +668,23 @@ struct SyntaxRecord {
     writes: Vec<WriteRecord>,
     classes: Vec<ClassSummary>,
     names: NameSet,
+    /// Hashes of the names the annotations of the unit use as dims.
+    symbols: Vec<u64>,
 }
 
 impl SyntaxRecord {
     fn extract(unit: Node, text: &str, span: Span) -> Result<Self, String> {
+        let scopes = extract_jaxtyping_shapes(unit, text)?;
+        let mut symbols: Vec<u64> = scopes
+            .iter()
+            .flat_map(|s| s.shapes.values().flatten().chain(s.return_shape.iter().flatten()))
+            .flat_map(|dim| dim_symbols(dim))
+            .map(|symbol| name_hash(symbol.as_bytes()))
+            .collect();
+        symbols.sort_unstable();
+        symbols.dedup();
         let mut record = Self {
-            scopes: extract_jaxtyping_shapes(unit, text)?,
+            scopes,
             imports: build_import_map(unit, text)?,
             writes: extract_self_attr_writes(unit, text)
                 .iter()
@@ -680,6 +692,7 @@ impl SyntaxRecord {
                 .collect(),
             classes: ClassSummary::collect(unit, text),
             names: NameSet::of(unit, text),
+            symbols,
         };
         record.shift(span.to_new_file().inverse());
         Ok(record)
@@ -694,6 +707,7 @@ impl Shift for SyntaxRecord {
             writes,
             classes,
             names: _,
+            symbols: _,
         } = self;
         scopes.shift(by);
         writes.shift(by);
@@ -1184,12 +1198,23 @@ impl PropPlan {
         let mut globals: Vec<u64> = sets.iter().flat_map(|s| s.globals.iter().copied()).collect();
         globals.sort_unstable();
         globals.dedup();
+        // A name that a plain assignment gives an integer and an annotation
+        // uses as a dim is not read as the integer (`integer_constant`).
+        let ints: HashSet<u64> = sets.iter().flat_map(|s| s.ints.iter().copied()).collect();
+        let mut clashes: Vec<u64> = units
+            .iter()
+            .flat_map(|u| u.syntax.symbols.iter().copied())
+            .filter(|symbol| ints.contains(symbol))
+            .collect();
+        clashes.sort_unstable();
+        clashes.dedup();
         let env = {
             let mut hasher = DefaultHasher::new();
             (
                 import_digest(import_map),
                 &globals,
                 sets.iter().any(|s| s.wildcard),
+                &clashes,
             )
                 .hash(&mut hasher);
             hasher.finish()

@@ -10,7 +10,7 @@ def scan_ema_9000(xs: Float[Array, "t9000 32"], h0: Float[Array, "32"]):
 
 
 def vmap_rows_9000(x: Float[Array, "b9000 t9000 32"], w: Float[Array, "32 12"]):
-    y = jax.vmap(lambda r: r @ w)(x)
+    y = jax.vmap(lambda r: r @ w)(x)  # expected-shape: y=[b9000, t9000, 12]
     z = jax.vmap(jnp.sum)(x)
     e = jnp.einsum('btd,dk->btk', x, w)  # expected-shape: e=[b9000, t9000, 12]
     m = jnp.mean(e, axis=1)  # expected-shape: m=[b9000, 12]
@@ -39,7 +39,7 @@ def scan_ema_9002(xs: Float[Array, "t9002 16"], h0: Float[Array, "16"]):
 
 
 def vmap_rows_9002(x: Float[Array, "b9002 t9002 16"], w: Float[Array, "16 12"]):
-    y = jax.vmap(lambda r: r @ w)(x)
+    y = jax.vmap(lambda r: r @ w)(x)  # expected-shape: y=[b9002, t9002, 12]
     z = jax.vmap(jnp.sum)(x)
     e = jnp.einsum('btd,dk->btk', x, w)  # expected-shape: e=[b9002, t9002, 12]
     m = jnp.mean(e, axis=1)  # expected-shape: m=[b9002, 12]
@@ -212,143 +212,119 @@ def nested_9010(x: Float[Array, "b9010 n9010 d9010"], w: Float[Array, "d9010 d90
 
 def einops_soup_9011(x: Float[Array, "b9011 n9011 32"]):
     e0 = rearrange(x, "b n d -> d n b")  # expected-shape: e0=[32, n9011, b9011]
-    e1 = repeat(x, "b n d -> b n d k", k=3)  # expected-shape: e1=[b9011, n9011, 32, 3]
-    e2 = repeat(x, "b n d -> r b n d", r=2)  # expected-shape: e2=[2, b9011, n9011, 32]
+    e1 = rearrange(x, "b ... d -> d b ...")  # expected-shape: e1=[32, b9011, n9011]
+    e2 = reduce(x, "b ... d -> b ...", "mean")  # expected-shape: e2=[b9011, n9011]
     e3 = rearrange(x, "b n d -> (b n) d")  # expected-shape: e3=[b9011*n9011, 32]
-    e4 = reduce(x, "b n d -> b d", "mean")  # expected-shape: e4=[b9011, 32]
+    e4 = reduce(x, "b n d -> b", "max")  # expected-shape: e4=[b9011]
+    e5 = repeat(x, "b n d -> b n d k", k=3)  # expected-shape: e5=[b9011, n9011, 32, 3]
+    e_two = rearrange(x, "... n ... -> ... n")  # expected-shape: e_two=?
     return e0
 
 
-def scan_ema_9012(xs: Float[Array, "t9012 8"], h0: Float[Array, "8"]):
-    def body(carry, x):
-        new = carry * 0.9 + x * 0.1
-        return new, new * 2.0
-
-    last, ys = jax.lax.scan(body, h0, xs)  # expected-shape: last=[8]; ys=[t9012, 8]
-    total = ys.sum(axis=0)  # expected-shape: total=[8]
-    scaled = ys / 2.0  # expected-shape: scaled=[t9012, 8]
-    return last, scaled
-
-
-def vmap_rows_9012(x: Float[Array, "b9012 t9012 8"], w: Float[Array, "8 12"]):
-    y = jax.vmap(lambda r: r @ w)(x)
-    z = jax.vmap(jnp.sum)(x)
-    e = jnp.einsum('btd,dk->btk', x, w)  # expected-shape: e=[b9012, t9012, 12]
-    m = jnp.mean(e, axis=1)  # expected-shape: m=[b9012, 12]
-    mm = jnp.max(e, axis=(0, 1))  # expected-shape: mm=[12]
-    return y, z, m
-
-
-def mm_helper_9013(a, w):
-    c = a @ w
-    return c
-
-
-def lazy_user_9013(x: Float[Array, "b9013 n9013 d9013"], w: Float[Array, "d9013 k9013"], v: Float[Array, "d9013 7"]):
-    p = mm_helper_9013(x, w)  # expected-shape: p=[b9013, n9013, k9013]
-    q = mm_helper_9013(x, v)  # expected-shape: q=[b9013, n9013, 7]
-    r = p.sum(axis=1)  # expected-shape: r=[b9013, k9013]
-    return p, q, r
-
-
-class Attn9014(nn.Module):
+class SeqModel9012(nn.Module):
     def __init__(self):
         super().__init__()
-        self.qkv = nn.Linear(48, 144)
-        self.proj = nn.Linear(48, 48)
-        self.norm = nn.LayerNorm(48)
+        self.emb = nn.Embedding(5000, 64)
+        self.gru = nn.GRU(64, 32, batch_first=True)
+        self.head = nn.Linear(32, 5000)
+        self.mha = nn.MultiheadAttention(32, 4)
 
-    def forward(self, x: Float[Array, "b9014 s9014 48"]):
-        qkv = self.qkv(x)  # expected-shape: qkv=[b9014, s9014, 144]
-        q, k, v = qkv.chunk(3, dim=-1)  # expected-shape: q=[b9014, s9014, 48]; k=[b9014, s9014, 48]; v=[b9014, s9014, 48]
-        q = q.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: q=[b9014, s9014, 8, 6]
-        k = k.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: k=[b9014, s9014, 8, 6]
-        v = v.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: v=[b9014, s9014, 8, 6]
-        q = q.permute(0, 2, 1, 3)  # expected-shape: q=[b9014, 8, s9014, 6]
-        k = k.permute(0, 2, 3, 1)  # expected-shape: k=[b9014, 8, 6, s9014]
-        v = v.permute(0, 2, 1, 3)  # expected-shape: v=[b9014, 8, s9014, 6]
-        scores = q @ k  # expected-shape: scores=[b9014, 8, s9014, s9014]
-        attn = F.softmax(scores, dim=-1)  # expected-shape: attn=[b9014, 8, s9014, s9014]
-        ctx = attn @ v  # expected-shape: ctx=[b9014, 8, s9014, 6]
-        ctx = ctx.permute(0, 2, 1, 3)  # expected-shape: ctx=[b9014, s9014, 8, 6]
-        ctx = ctx.reshape(x.shape[0], x.shape[1], 48)  # expected-shape: ctx=[b9014, s9014, 48]
-        out = self.proj(ctx)  # expected-shape: out=[b9014, s9014, 48]
-        out = self.norm(out + x)  # expected-shape: out=[b9014, s9014, 48]
+    def forward(self, ids: Float[Array, "b9012 s9012"]):
+        e = self.emb(ids)  # expected-shape: e=[b9012, s9012, 64]
+        out, _ = self.gru(e)  # expected-shape: out=[b9012, s9012, 32]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b9012, s9012, 32]; w=[b9012, s9012, s9012]
+        logits = self.head(att)  # expected-shape: logits=[b9012, s9012, 5000]
+        pooled = logits.mean(dim=1)  # expected-shape: pooled=[b9012, 5000]
+        last = out[:, -1, :]  # expected-shape: last=[b9012, 32]
+        tops, idx = logits.topk(5, dim=-1)  # expected-shape: tops=[b9012, s9012, 5]; idx=[b9012, s9012, 5]
+        return logits
+
+
+class Attn9013(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qkv_9013 = nn.Linear(48, 144)
+        self.proj_9013 = nn.Linear(48, 48)
+        self.norm_9013 = nn.LayerNorm(48)
+
+    def forward(self, x: Float[Array, "b9013 s9013 48"]):
+        qkv = self.qkv_9013(x)  # expected-shape: qkv=[b9013, s9013, 144]
+        q, k, v = qkv.chunk(3, dim=-1)  # expected-shape: q=[b9013, s9013, 48]; k=[b9013, s9013, 48]; v=[b9013, s9013, 48]
+        q = q.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: q=[b9013, s9013, 8, 6]
+        k = k.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: k=[b9013, s9013, 8, 6]
+        v = v.reshape(x.shape[0], x.shape[1], 8, 6)  # expected-shape: v=[b9013, s9013, 8, 6]
+        q = q.permute(0, 2, 1, 3)  # expected-shape: q=[b9013, 8, s9013, 6]
+        k = k.permute(0, 2, 3, 1)  # expected-shape: k=[b9013, 8, 6, s9013]
+        v = v.permute(0, 2, 1, 3)  # expected-shape: v=[b9013, 8, s9013, 6]
+        scores = q @ k  # expected-shape: scores=[b9013, 8, s9013, s9013]
+        attn = F.softmax(scores, dim=-1)  # expected-shape: attn=[b9013, 8, s9013, s9013]
+        ctx = attn @ v  # expected-shape: ctx=[b9013, 8, s9013, 6]
+        ctx = ctx.permute(0, 2, 1, 3)  # expected-shape: ctx=[b9013, s9013, 8, 6]
+        ctx = ctx.reshape(x.shape[0], x.shape[1], 48)  # expected-shape: ctx=[b9013, s9013, 48]
+        out = self.proj_9013(ctx)  # expected-shape: out=[b9013, s9013, 48]
+        out = self.norm_9013(out + x)  # expected-shape: out=[b9013, s9013, 48]
         return out
 
 
-class AttnBlock9014(Attn9014):
+class AttnBlock9013(Attn9013):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(48, 192)
-        self.fc2 = nn.Linear(192, 48)
+        self.fc1_9013 = nn.Linear(48, 192)
+        self.fc2_9013 = nn.Linear(192, 48)
 
-    def forward(self, x: Float[Array, "b9014 s9014 48"]):
-        h = self.norm(x)  # expected-shape: h=[b9014, s9014, 48]
-        h = self.fc1(h)  # expected-shape: h=[b9014, s9014, 192]
-        h = F.gelu(h)  # expected-shape: h=[b9014, s9014, 192]
-        h = self.fc2(h)  # expected-shape: h=[b9014, s9014, 48]
-        qkv2 = self.qkv(h)  # expected-shape: qkv2=[b9014, s9014, 144]
-        o = self.proj(h) + x  # expected-shape: o=[b9014, s9014, 48]
+    def forward(self, x: Float[Array, "b9013 s9013 48"]):
+        h = self.norm_9013(x)  # expected-shape: h=[b9013, s9013, 48]
+        h = self.fc1_9013(h)  # expected-shape: h=[b9013, s9013, 192]
+        h = F.gelu(h)  # expected-shape: h=[b9013, s9013, 192]
+        h = self.fc2_9013(h)  # expected-shape: h=[b9013, s9013, 48]
+        qkv2 = self.qkv_9013(h)  # expected-shape: qkv2=[b9013, s9013, 144]
+        o = self.proj_9013(h) + x  # expected-shape: o=[b9013, s9013, 48]
         return o
 
 
-class BrokenMLP9015(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(32, 64)
-        self.fc2 = nn.Linear(32, 10)
-
-    def forward(self, x: Float[Array, "b9015 32"]):
-        h = self.fc1(x)  # expected-shape: h=[b9015, 64]
-        out = self.fc2(h)  # expected-error: fc2 wants 32, h is 64
-        return out
+def first_col_9014(t):
+    return t[:, 0]
 
 
-@dataclass
-class Config9016:
-    dim: int = 48
-    heads: int = 4
-    name: str = "cfg"
-
-    @property
-    def head_dim(self) -> int:
-        return self.dim // self.heads
+def lazy_user_9014(x: Float[Array, "b9014 n9014 d9014"], y: Float[Array, "n9014 d9014"]):
+    f1 = first_col_9014(x)  # expected-shape: f1=[b9014, d9014]
+    f2 = first_col_9014(y)  # expected-shape: f2=[n9014]
+    f3 = f1 * 2.0 + f1  # expected-shape: f3=[b9014, d9014]
+    return f1, f2, f3
 
 
-def scalar_math_9016(a: float, b: int = 9016) -> float:
-    """Plain Python with no tensors: the analyzer must skip it."""
-    total = 0.0
-    for k in range(b):
-        total += math.sqrt(k + a) * (k % 3)
-    values = [k * 2 for k in range(10) if k % 2 == 0]
-    table = {k: v for k, v in zip(range(5), values)}
-    if total > 10 and len(table) > 2:
-        total = -total
-    return total
+def first_col_9015(t):
+    return t[:, 0]
 
 
-def scan_ema_9017(xs: Float[Array, "t9017 16"], h0: Float[Array, "16"]):
+def lazy_user_9015(x: Float[Array, "b9015 n9015 d9015"], y: Float[Array, "n9015 d9015"]):
+    f1 = first_col_9015(x)  # expected-shape: f1=[b9015, d9015]
+    f2 = first_col_9015(y)  # expected-shape: f2=[n9015]
+    f3 = f1 * 2.0 + f1  # expected-shape: f3=[b9015, d9015]
+    return f1, f2, f3
+
+
+def scan_ema_9016(xs: Float[Array, "t9016 16"], h0: Float[Array, "16"]):
     def body(carry, x):
         new = carry * 0.9 + x * 0.1
         return new, new * 2.0
 
-    last, ys = jax.lax.scan(body, h0, xs)  # expected-shape: last=[16]; ys=[t9017, 16]
+    last, ys = jax.lax.scan(body, h0, xs)  # expected-shape: last=[16]; ys=[t9016, 16]
     total = ys.sum(axis=0)  # expected-shape: total=[16]
-    scaled = ys / 2.0  # expected-shape: scaled=[t9017, 16]
+    scaled = ys / 2.0  # expected-shape: scaled=[t9016, 16]
     return last, scaled
 
 
-def vmap_rows_9017(x: Float[Array, "b9017 t9017 16"], w: Float[Array, "16 12"]):
-    y = jax.vmap(lambda r: r @ w)(x)
+def vmap_rows_9016(x: Float[Array, "b9016 t9016 16"], w: Float[Array, "16 12"]):
+    y = jax.vmap(lambda r: r @ w)(x)  # expected-shape: y=[b9016, t9016, 12]
     z = jax.vmap(jnp.sum)(x)
-    e = jnp.einsum('btd,dk->btk', x, w)  # expected-shape: e=[b9017, t9017, 12]
-    m = jnp.mean(e, axis=1)  # expected-shape: m=[b9017, 12]
+    e = jnp.einsum('btd,dk->btk', x, w)  # expected-shape: e=[b9016, t9016, 12]
+    m = jnp.mean(e, axis=1)  # expected-shape: m=[b9016, 12]
     mm = jnp.max(e, axis=(0, 1))  # expected-shape: mm=[12]
     return y, z, m
 
 
-def nested_9018(x: Float[Array, "b9018 n9018 d9018"], w: Float[Array, "d9018 d9018"]):
+def nested_9017(x: Float[Array, "b9017 n9017 d9017"], w: Float[Array, "d9017 d9017"]):
     def level1(t):
         u = t * 2.0
 
@@ -357,16 +333,16 @@ def nested_9018(x: Float[Array, "b9018 n9018 d9018"], w: Float[Array, "d9018 d90
 
         return level2(u)
 
-    y = level1(x)  # expected-shape: y=[b9018, n9018, d9018]
-    c = x[:, :4]  # expected-shape: c=[b9018, 4, d9018]
-    h = c.sum(axis=1)  # expected-shape: h=[b9018, d9018]
-    top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b9018, n9018, 3]; ix=[b9018, n9018, 3]
-    z = y @ w  # expected-shape: z=[b9018, n9018, d9018]
+    y = level1(x)  # expected-shape: y=[b9017, n9017, d9017]
+    c = x[:, :4]  # expected-shape: c=[b9017, 4, d9017]
+    h = c.sum(axis=1)  # expected-shape: h=[b9017, d9017]
+    top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b9017, n9017, 3]; ix=[b9017, n9017, 3]
+    z = y @ w  # expected-shape: z=[b9017, n9017, d9017]
     return y, h, z
 
 
 @dataclass
-class Config9019:
+class Config9018:
     dim: int = 48
     heads: int = 8
     name: str = "cfg"
@@ -376,7 +352,7 @@ class Config9019:
         return self.dim // self.heads
 
 
-def scalar_math_9019(a: float, b: int = 9019) -> float:
+def scalar_math_9018(a: float, b: int = 9018) -> float:
     """Plain Python with no tensors: the analyzer must skip it."""
     total = 0.0
     for k in range(b):
@@ -388,116 +364,156 @@ def scalar_math_9019(a: float, b: int = 9019) -> float:
     return total
 
 
-def branchy_9020(x: Float[Array, "b9020 n9020 d9020"], y: Float[Array, "b9020 n9020 d9020"], flag9020: bool):
-    z = x + y  # expected-shape: z=[b9020, n9020, d9020]
-    if flag9020:
-        w = z.sum(axis=-1)  # expected-shape: w=[b9020, n9020]
-    elif not flag9020:
-        w = z.mean(axis=1)  # expected-shape: w=[b9020, d9020]
+def branchy_9019(x: Float[Array, "b9019 n9019 d9019"], y: Float[Array, "b9019 n9019 d9019"], flag9019: bool):
+    z = x + y  # expected-shape: z=[b9019, n9019, d9019]
+    if flag9019:
+        w = z.sum(axis=-1)  # expected-shape: w=[b9019, n9019]
+    elif not flag9019:
+        w = z.mean(axis=1)  # expected-shape: w=[b9019, d9019]
     else:
-        w = z[:, :, 0]  # expected-shape: w=[b9020, n9020]
+        w = z[:, :, 0]  # expected-shape: w=[b9019, n9019]
     for _ in range(3):
-        z = z * 0.5  # expected-shape: z=[b9020, n9020, d9020]
+        z = z * 0.5  # expected-shape: z=[b9019, n9019, d9019]
     try:
-        q = z.sum(axis=0)  # expected-shape: q=[n9020, d9020]
+        q = z.sum(axis=0)  # expected-shape: q=[n9019, d9019]
     except ValueError:
-        q = z.mean(axis=0)  # expected-shape: q=[n9020, d9020]
+        q = z.mean(axis=0)  # expected-shape: q=[n9019, d9019]
     with jax.default_device(None):
         s = q.sum()  # expected-shape: s=[]
     helper = lambda t: t + 1
     return w, q, s
 
 
-class Attn9021(nn.Module):
+class Attn9020(nn.Module):
     def __init__(self):
         super().__init__()
-        self.qkv_9021 = nn.Linear(48, 144)
-        self.proj_9021 = nn.Linear(48, 48)
-        self.norm_9021 = nn.LayerNorm(48)
+        self.qkv = nn.Linear(48, 144)
+        self.proj = nn.Linear(48, 48)
+        self.norm = nn.LayerNorm(48)
 
-    def forward(self, x: Float[Array, "b9021 s9021 48"]):
-        qkv = self.qkv_9021(x)  # expected-shape: qkv=[b9021, s9021, 144]
-        q, k, v = qkv.chunk(3, dim=-1)  # expected-shape: q=[b9021, s9021, 48]; k=[b9021, s9021, 48]; v=[b9021, s9021, 48]
-        q = q.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: q=[b9021, s9021, 2, 24]
-        k = k.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: k=[b9021, s9021, 2, 24]
-        v = v.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: v=[b9021, s9021, 2, 24]
-        q = q.permute(0, 2, 1, 3)  # expected-shape: q=[b9021, 2, s9021, 24]
-        k = k.permute(0, 2, 3, 1)  # expected-shape: k=[b9021, 2, 24, s9021]
-        v = v.permute(0, 2, 1, 3)  # expected-shape: v=[b9021, 2, s9021, 24]
-        scores = q @ k  # expected-shape: scores=[b9021, 2, s9021, s9021]
-        attn = F.softmax(scores, dim=-1)  # expected-shape: attn=[b9021, 2, s9021, s9021]
-        ctx = attn @ v  # expected-shape: ctx=[b9021, 2, s9021, 24]
-        ctx = ctx.permute(0, 2, 1, 3)  # expected-shape: ctx=[b9021, s9021, 2, 24]
-        ctx = ctx.reshape(x.shape[0], x.shape[1], 48)  # expected-shape: ctx=[b9021, s9021, 48]
-        out = self.proj_9021(ctx)  # expected-shape: out=[b9021, s9021, 48]
-        out = self.norm_9021(out + x)  # expected-shape: out=[b9021, s9021, 48]
+    def forward(self, x: Float[Array, "b9020 s9020 48"]):
+        qkv = self.qkv(x)  # expected-shape: qkv=[b9020, s9020, 144]
+        q, k, v = qkv.chunk(3, dim=-1)  # expected-shape: q=[b9020, s9020, 48]; k=[b9020, s9020, 48]; v=[b9020, s9020, 48]
+        q = q.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: q=[b9020, s9020, 2, 24]
+        k = k.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: k=[b9020, s9020, 2, 24]
+        v = v.reshape(x.shape[0], x.shape[1], 2, 24)  # expected-shape: v=[b9020, s9020, 2, 24]
+        q = q.permute(0, 2, 1, 3)  # expected-shape: q=[b9020, 2, s9020, 24]
+        k = k.permute(0, 2, 3, 1)  # expected-shape: k=[b9020, 2, 24, s9020]
+        v = v.permute(0, 2, 1, 3)  # expected-shape: v=[b9020, 2, s9020, 24]
+        scores = q @ k  # expected-shape: scores=[b9020, 2, s9020, s9020]
+        attn = F.softmax(scores, dim=-1)  # expected-shape: attn=[b9020, 2, s9020, s9020]
+        ctx = attn @ v  # expected-shape: ctx=[b9020, 2, s9020, 24]
+        ctx = ctx.permute(0, 2, 1, 3)  # expected-shape: ctx=[b9020, s9020, 2, 24]
+        ctx = ctx.reshape(x.shape[0], x.shape[1], 48)  # expected-shape: ctx=[b9020, s9020, 48]
+        out = self.proj(ctx)  # expected-shape: out=[b9020, s9020, 48]
+        out = self.norm(out + x)  # expected-shape: out=[b9020, s9020, 48]
         return out
 
 
-class AttnBlock9021(Attn9021):
+class AttnBlock9020(Attn9020):
     def __init__(self):
         super().__init__()
-        self.fc1_9021 = nn.Linear(48, 192)
-        self.fc2_9021 = nn.Linear(192, 48)
+        self.fc1 = nn.Linear(48, 192)
+        self.fc2 = nn.Linear(192, 48)
 
-    def forward(self, x: Float[Array, "b9021 s9021 48"]):
-        h = self.norm_9021(x)  # expected-shape: h=[b9021, s9021, 48]
-        h = self.fc1_9021(h)  # expected-shape: h=[b9021, s9021, 192]
-        h = F.gelu(h)  # expected-shape: h=[b9021, s9021, 192]
-        h = self.fc2_9021(h)  # expected-shape: h=[b9021, s9021, 48]
-        qkv2 = self.qkv_9021(h)  # expected-shape: qkv2=[b9021, s9021, 144]
-        o = self.proj_9021(h) + x  # expected-shape: o=[b9021, s9021, 48]
+    def forward(self, x: Float[Array, "b9020 s9020 48"]):
+        h = self.norm(x)  # expected-shape: h=[b9020, s9020, 48]
+        h = self.fc1(h)  # expected-shape: h=[b9020, s9020, 192]
+        h = F.gelu(h)  # expected-shape: h=[b9020, s9020, 192]
+        h = self.fc2(h)  # expected-shape: h=[b9020, s9020, 48]
+        qkv2 = self.qkv(h)  # expected-shape: qkv2=[b9020, s9020, 144]
+        o = self.proj(h) + x  # expected-shape: o=[b9020, s9020, 48]
         return o
 
 
-class Level0_9022(nn.Module):
+class Level0_9021(nn.Module):
     def __init__(self):
         super().__init__()
-        self.l0 = nn.Linear(96, 24)
-        self.act0 = nn.ReLU()
+        self.l0_9021 = nn.Linear(96, 24)
+        self.act0_9021 = nn.ReLU()
 
-    def step(self, x: Float[Array, "b9022 96"]):
-        y = self.l0(x)  # expected-shape: y=[b9022, 24]
+    def step(self, x: Float[Array, "b9021 96"]):
+        y = self.l0_9021(x)  # expected-shape: y=[b9021, 24]
         return y
 
 
-class Level1_9022(Level0_9022):
+class Level1_9021(Level0_9021):
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(24, 48)
-        self.act1 = nn.ReLU()
+        self.l1_9021 = nn.Linear(24, 48)
+        self.act1_9021 = nn.ReLU()
 
-    def step(self, x: Float[Array, "b9022 24"]):
-        y = self.l1(x)  # expected-shape: y=[b9022, 48]
+    def step(self, x: Float[Array, "b9021 24"]):
+        y = self.l1_9021(x)  # expected-shape: y=[b9021, 48]
         return y
 
 
-class Level2_9022(Level1_9022):
+class Level2_9021(Level1_9021):
     def __init__(self):
         super().__init__()
-        self.l2 = nn.Linear(48, 64)
-        self.act2 = nn.ReLU()
+        self.l2_9021 = nn.Linear(48, 64)
+        self.act2_9021 = nn.ReLU()
 
-    def step(self, x: Float[Array, "b9022 48"]):
-        y = self.l2(x)  # expected-shape: y=[b9022, 64]
+    def step(self, x: Float[Array, "b9021 48"]):
+        y = self.l2_9021(x)  # expected-shape: y=[b9021, 64]
         return y
 
 
-class Level3_9022(Level2_9022):
+class Level3_9021(Level2_9021):
     def __init__(self):
         super().__init__()
-        self.l3 = nn.Linear(64, 64)
-        self.act3 = nn.ReLU()
+        self.l3_9021 = nn.Linear(64, 64)
+        self.act3_9021 = nn.ReLU()
 
-    def forward(self, x: Float[Array, "b9022 96"]):
-        h0 = self.l0(x)  # expected-shape: h0=[b9022, 24]
-        a0 = self.act0(h0)  # expected-shape: a0=[b9022, 24]
-        h1 = self.l1(a0)  # expected-shape: h1=[b9022, 48]
-        a1 = self.act1(h1)  # expected-shape: a1=[b9022, 48]
-        h2 = self.l2(a1)  # expected-shape: h2=[b9022, 64]
-        a2 = self.act2(h2)  # expected-shape: a2=[b9022, 64]
-        h3 = self.l3(a2)  # expected-shape: h3=[b9022, 64]
-        a3 = self.act3(h3)  # expected-shape: a3=[b9022, 64]
+    def forward(self, x: Float[Array, "b9021 96"]):
+        h0 = self.l0_9021(x)  # expected-shape: h0=[b9021, 24]
+        a0 = self.act0_9021(h0)  # expected-shape: a0=[b9021, 24]
+        h1 = self.l1_9021(a0)  # expected-shape: h1=[b9021, 48]
+        a1 = self.act1_9021(h1)  # expected-shape: a1=[b9021, 48]
+        h2 = self.l2_9021(a1)  # expected-shape: h2=[b9021, 64]
+        a2 = self.act2_9021(h2)  # expected-shape: a2=[b9021, 64]
+        h3 = self.l3_9021(a2)  # expected-shape: h3=[b9021, 64]
+        a3 = self.act3_9021(h3)  # expected-shape: a3=[b9021, 64]
         return a3
+
+
+def einops_soup_9022(x: Float[Array, "b9022 n9022 16"]):
+    e0 = reduce(x, "b n d -> n", "sum")  # expected-shape: e0=[n9022]
+    e1 = reduce(x, "b n d -> b", "max")  # expected-shape: e1=[b9022]
+    e2 = repeat(x, "b n d -> b n d k", k=3)  # expected-shape: e2=[b9022, n9022, 16, 3]
+    e3 = rearrange(x, "b n (h e) -> b h n e", h=4)  # expected-shape: e3=[b9022, 4, n9022, 4]
+    e4 = rearrange(x, "... n d -> ... (n d)")  # expected-shape: e4=[b9022, n9022*16]
+    e_two = rearrange(x, "... n ... -> ... n")  # expected-shape: e_two=?
+    return e0
+
+
+class ConvNet9023(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv0 = nn.Conv2d(1, 16, 3, stride=1, padding=1)
+        self.bn0 = nn.BatchNorm2d(16)
+        self.conv1 = nn.Conv2d(16, 48, 5, stride=1, padding=2)
+        self.bn1 = nn.BatchNorm2d(48)
+        self.conv2 = nn.Conv2d(48, 64, 3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool = nn.MaxPool2d(2)
+        self.fc = nn.Linear(576, 100)
+
+    def forward(self, x: Float[Array, "b9023 1 28 28"]):
+        c0 = self.conv0(x)  # expected-shape: c0=[b9023, 16, 28, 28]
+        n0 = self.bn0(c0)  # expected-shape: n0=[b9023, 16, 28, 28]
+        r0 = F.relu(n0)  # expected-shape: r0=[b9023, 16, 28, 28]
+        p0 = self.pool(r0)  # expected-shape: p0=[b9023, 16, 14, 14]
+        c1 = self.conv1(p0)  # expected-shape: c1=[b9023, 48, 14, 14]
+        n1 = self.bn1(c1)  # expected-shape: n1=[b9023, 48, 14, 14]
+        r1 = F.relu(n1)  # expected-shape: r1=[b9023, 48, 14, 14]
+        p1 = self.pool(r1)  # expected-shape: p1=[b9023, 48, 7, 7]
+        c2 = self.conv2(p1)  # expected-shape: c2=[b9023, 64, 7, 7]
+        n2 = self.bn2(c2)  # expected-shape: n2=[b9023, 64, 7, 7]
+        r2 = F.relu(n2)  # expected-shape: r2=[b9023, 64, 7, 7]
+        p2 = self.pool(r2)  # expected-shape: p2=[b9023, 64, 3, 3]
+        f = p2.flatten(1)  # expected-shape: f=[b9023, 576]
+        logits = self.fc(f)  # expected-shape: logits=[b9023, 100]
+        return logits
 
 

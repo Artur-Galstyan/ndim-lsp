@@ -63,7 +63,7 @@ If the feature is already implemented, **stop and report** — do not add adjace
 
 ## Stress benchmark
 
-`bench/generate_stress.py` writes `bench/stress/`: a 21,518-line Python file, three imported helper modules, and a 500-line paste payload. `tests/lsp_stress.rs` runs the built server against this project over stdio. Both tests are ignored in the normal suite:
+`bench/generate_stress.py` writes `bench/stress/`: a 22,323-line Python file, five imported helper modules, and a 500-line paste payload. `tests/lsp_stress.rs` runs the built server against this project over stdio. Both tests are ignored in the normal suite:
 
 ```sh
 python3 bench/generate_stress.py   # regenerate bench/stress/
@@ -73,7 +73,7 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 `golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
 
-Baseline (the dark spot commit plus the incremental work after it; release, 5 runs, p50, 21,518-line file): an edit while typing takes about 190 to 225 ms, which is a 150 ms debounce plus about 25 to 60 ms of compute plus about 11 to 18 ms of transport. An edit after an idle pause waits 20 to 150 ms (for example 96 ms in total). The worst case is an edit that moves every position of the file (`edit_char_start`): about 400 ms, 239 ms of it compute. Cold open takes about 305 ms. Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis). The numbers depend on the machine.
+Baseline (the work after the last commit, release, 5 runs, p50, 22,323-line file): an edit while typing takes about 200 to 235 ms, which is a 150 ms debounce plus about 30 to 70 ms of compute plus about 16 to 25 ms of transport. An edit after an idle pause waits 20 to 150 ms (for example 120 ms in total). The worst case is an edit that moves every position of the file (`edit_char_start`): about 435 ms, 269 ms of it compute. Cold open takes about 327 ms (316 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis). On the same input file, the code before this work needs 1 to 14 percent less compute for an edit (median about 8 percent) and 4 percent more for a cold open: the new work models more constructs. The numbers depend on the machine.
 
 The debounce column of the benchmark is the value the server chose for the edit. Do not time with `NDIM_VERIFY_INCREMENTAL=1`: it adds a fresh parse and analysis to every edit.
 
@@ -117,9 +117,9 @@ See `llm.txt` for the design.
 - [x] `jnp.squeeze` (multiple axes removal, `size == 1` validation)
 - [x] Reduction ops (`sum`, `mean`, `max`, `min`, `prod`, `std`, `var`) with `keepdims` and multiple axes support
 - [x] Two-operand elementwise functions (`maximum`, `minimum`, `add`, `power`, `arctan2`, ...) broadcast both operands; `clip`/`clamp` broadcast array bounds
-- [x] `torch.bmm`, `F.cross_entropy`, `F.nll_loss`
+- [x] `torch.bmm`, `F.cross_entropy`, `F.nll_loss`, and the loss layers (`nn.MSELoss`, `L1Loss`, `SmoothL1Loss`, `HuberLoss`, `BCELoss`, `BCEWithLogitsLoss`, `CrossEntropyLoss`, `NLLLoss`)
 - [x] `jnp.reshape` (dimension flattening/unflattening tracking)
-- [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`; list and tuple literals only)
+- [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`; list and tuple literals, and list comprehensions over a provable array)
 - [x] `jnp.einsum`
 - [x] `jnp.split`, `jnp.tile`, `jnp.repeat`, `jnp.flatten` (including tuple propagation for `split`)
 - [x] Dynamic `kwargs` handling in function parsing
@@ -141,13 +141,15 @@ See `llm.txt` for the design.
 - [x] Tuple unpacking for known multi-output calls and supported layers (`a, b = func()`)
 - [x] Tuple-literal unpacking (`a, b = x, y`, swaps, starred targets); an array unpacks into rows, a homogeneous tuple carry (`lax.scan`) gives each target the shared shape, and a name that is neither provably is unknown
 - [x] Closures read enclosing variables at call time; `nonlocal` rebinding gives unknown
-- [x] User submodules (`self.blk = Block(...)`, `Block(...)(x)`, `vmap(self.blk)`) through the class MRO
+- [x] User submodules (`self.blk = Block(...)`, `Block(...)(x)`, `vmap(self.blk)`) through the class MRO, including classes imported from other files, `nn.ModuleList` and `nn.Sequential` fields of user modules, and chain loops (`for l in self.layers: x = l(x)`)
+- [x] Module globals and integer constants read in a function (known only when all writes come before the reader and have one shape)
+- [x] Comprehensions and lambdas where the result is used (`stack` of a list comprehension, `sum`, `vmap`, `lax.map`, `lax.scan` and direct calls of a lambda)
 - [x] Provable scalar operands broadcast in binary operations
-- [x] A name whose shape changes across a loop (`x, y = y, x`) is unknown after the loop
+- [x] A name whose shape changes across a loop (`x, y = y, x`) is unknown after the loop, and the hints of the first iteration are taken back
 - [ ] Tuple unpacking for user-defined helper tuple returns
 - [x] Basic array slicing and indexing (`x[:, 1:5, ...]`, integer indices, `None`)
 - [ ] Precise advanced and boolean array indexing
-- [ ] Control flow tracing (handling branches in `if/else`, `for` loops)
+- [x] Control flow tracing: `if`/`elif`/`else`, `match`, `try`, loops and `with` start each arm from the entry state and join the live paths (a name with different shapes is unknown)
 - [x] Cross-function tracing for same-file and imported helper functions
 
 ### LSP Editor Features

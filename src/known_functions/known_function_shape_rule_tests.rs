@@ -2934,6 +2934,108 @@ fn test_einops_parse_shape_always_none() {
     assert_eq!(output, None);
 }
 
+fn einops(
+    func: KnownFunction,
+    x_shape: &[&str],
+    pattern: &str,
+    extra: Vec<CallArgument>,
+) -> Result<Option<Vec<String>>, String> {
+    let mut args = vec![pos("x"), pos(&format!("\"{pattern}\""))];
+    args.extend(extra);
+    let shapes = HashMap::from([("x".to_string(), shape(x_shape))]);
+    apply_known_function(&func, &args, &shapes)
+}
+
+#[test]
+fn test_einops_ellipsis_rearrange_trailing_and_leading() {
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["b", "s", "h", "d"],
+        "... h d -> ... (h d)",
+        vec![],
+    );
+    assert_eq!(out, Ok(Some(shape(&["b", "s", "h*d"]))));
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["2", "3", "4", "5"],
+        "b ... -> ... b",
+        vec![],
+    );
+    assert_eq!(out, Ok(Some(shape(&["3", "4", "5", "2"]))));
+}
+
+#[test]
+fn test_einops_ellipsis_middle_position() {
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["b", "2", "3", "d"],
+        "b ... d -> d b ...",
+        vec![],
+    );
+    assert_eq!(out, Ok(Some(shape(&["d", "b", "2", "3"]))));
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["b", "d"],
+        "b ... d -> d b ...",
+        vec![],
+    );
+    assert_eq!(out, Ok(Some(shape(&["d", "b"]))));
+}
+
+#[test]
+fn test_einops_ellipsis_reduce_and_repeat() {
+    let out = einops(
+        KnownFunction::EinopsReduce,
+        &["b", "h", "w", "c"],
+        "b ... c -> b c",
+        vec![pos("\"mean\"")],
+    );
+    assert_eq!(out, Ok(None));
+    let out = einops(
+        KnownFunction::EinopsReduce,
+        &["b", "h", "w", "c"],
+        "b ... c -> b ... ",
+        vec![pos("\"max\"")],
+    );
+    assert_eq!(out, Ok(Some(shape(&["b", "h", "w"]))));
+    let out = einops(
+        KnownFunction::EinopsRepeat,
+        &["b", "h", "w"],
+        "b ... -> b ... c",
+        vec![kw("c", "3")],
+    );
+    assert_eq!(out, Ok(Some(shape(&["b", "h", "w", "3"]))));
+    let out = einops(
+        KnownFunction::EinopsRepeat,
+        &["b", "h", "w"],
+        "b ... -> ... (n b)",
+        vec![kw("n", "2")],
+    );
+    assert_eq!(out, Ok(Some(shape(&["h", "w", "2*b"]))));
+}
+
+#[test]
+fn test_einops_ellipsis_rank_too_small_errors() {
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["b"],
+        "b ... d -> d b ...",
+        vec![],
+    );
+    assert!(out.is_err());
+}
+
+#[test]
+fn test_einops_two_ellipses_unknown() {
+    let out = einops(
+        KnownFunction::EinopsRearrange,
+        &["a", "b", "c"],
+        "... b ... -> ... b",
+        vec![],
+    );
+    assert_eq!(out, Ok(None));
+}
+
 // ── jax.nn shape rules ──
 
 #[test]

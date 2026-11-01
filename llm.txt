@@ -7,19 +7,20 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified on the dark spot commit ("feat: close dark spots in bindings,
-closures, submodules, and operands") plus the work made after it: the wrong
-shape fixes, incremental parse and analysis, adaptive debounce, and
-incremental sync. That work is not committed yet. After the next commit, read
-this as "verified on that commit". `ndim-lsp` is 0.1.1.
+Verified on the last commit plus the work made after it: branch merge
+(`src/analysis/flow.rs`), module globals and integer constants,
+comprehensions and lambdas (`src/analysis/inner.rs`), module containers,
+imported module classes and loss layers (`src/analysis/modules.rs`), and the
+repair pass. That work is not committed yet. After the next commit, read this
+as "verified on that commit". `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,073 tests pass and six are ignored.
-  - 2,013 library tests (47 of them in `src/incremental_tests.rs`). Two
+- `cargo test --quiet` passes: 2,245 tests pass and six are ignored.
+  - 2,169 library tests (47 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
-  - 5 in `tests/incremental_edits.rs`. One ignored:
+  - 18 in `tests/incremental_edits.rs`. One ignored:
     `stress_main_two_thousand_chained_edits`.
-  - 16 in `tests/lsp_debounce.rs`, 7 in `tests/lsp_helper_save.rs`, and 1 in
+  - 16 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 1 in
     `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
     `golden_dump`, `golden_has_no_internal_names`.
   The known-function tests live in `src/known_functions/*_tests.rs`. The dev
@@ -71,18 +72,22 @@ Shape-changing options that are not static stay unknown.
 `stack`, `concatenate`/`cat`, `vstack`, `hstack`, `dstack`, and `column_stack`
 read each list/tuple element (including inline array expressions) as one
 operand, instead of collapsing a homogeneous tuple into one operand. This
-applies to JAX, NumPy, and PyTorch. A sequence that is not a tuple or list
-literal (for example a variable `xs`) makes the call unknown, because the shape
+applies to JAX, NumPy, and PyTorch. A list comprehension over a provable array
+is expanded to N copies of one element (N from 1 to 256, else unknown). A
+sequence that is not a tuple, list, or such a comprehension (for example a
+variable `xs` or a generator) makes the call unknown, because the shape
 map does not represent container types. An element with an unknown shape
 makes the whole call unknown. `block` with a tuple literal is unknown (NumPy
 and JAX reject it); einops `rearrange`/`reduce`/`repeat` with a tuple of
 tensors are unknown. `einops.pack` reads raw arguments and handles tuples.
+An einops pattern with more than one `...` on a side is unknown (einops rejects
+it).
 
 End-to-end LSP stress benchmark
 -------------------------------
 
 `bench/generate_stress.py` writes `bench/stress/` deterministically (fixed seed):
-a 21,518-line `stress_main.py`, three imported helper modules, and a 500-line
+a 22,323-line `stress_main.py`, five imported helper modules, and a 500-line
 `paste_block.txt`. Regenerate with `python3 bench/generate_stress.py`.
 `tests/lsp_stress.rs` spawns the built `ndim-lsp` binary, talks JSON-RPC over
 stdio, and runs about 40 scenarios (including `typing_plain` and
@@ -127,36 +132,47 @@ analyzer defects inside such a change, because the fix changes the dump.
 `golden_has_no_internal_names` checks that no `__synth_` or `__ellipsis` name
 reaches a message or a hint.
 
+The harness checks about 13,800 expected markers (6,410 in `stress_main.py`,
+6,637 in the paste payload, the rest in the helper modules). A `?` marker
+(`# expected-shape: e=?`) says the name must have no shape: use it where
+unknown is the true answer.
+
 `lsp_stress_benchmark` passes: 0 marker failures and 0 scenario failures. It
 asserts the expected markers and the scenario invariants. Do not loosen the
 test to make it pass. A refactor must keep it green and keep the golden dump
 byte-identical.
 
-Baseline (the dark spot commit plus the work after it, release, 10 CPUs, macOS,
-5 runs, p50, 21,518-line file):
+Baseline (the last commit plus the work after it, release, 10 CPUs, macOS,
+5 runs, p50, 22,323-line file):
 
-- One edit while typing costs about 190 to 225 ms: 150 ms debounce plus
-  about 25 to 60 ms server compute plus about 11 to 18 ms other. Examples:
-  `edit_char_end` 189.8 ms total (25 ms compute), `edit_char_middle` 202.9
-  (37), `edit_unannotated_helper_body` 190.1 (26), `error_insert_matmul` 191.0
-  (26), `edit_base_class_init_layer` 204.9 (42), `paste_500_lines` 215.8 (53),
-  `edit_init_layer` 223.0 (59), `typing_plain` 212.4 (44),
-  `burst_50_changes` 187.7 (24). The old full re-analysis baseline was about
+- One edit while typing costs about 200 to 235 ms: 150 ms debounce plus
+  about 30 to 70 ms server compute plus about 16 to 25 ms other. Examples:
+  `edit_char_end` 203.9 ms total (33 ms compute), `edit_char_middle` 212.5
+  (41), `edit_unannotated_helper_body` 200.9 (31), `error_insert_matmul` 200.4
+  (30), `edit_base_class_init_layer` 218.5 (51), `paste_500_lines` 226.1 (60),
+  `edit_init_layer` 235.9 (68), `typing_plain` 222.9 (48),
+  `burst_50_changes` 197.6 (30). The old full re-analysis baseline was about
   405 to 420 ms per edit (150 ms debounce plus about 242 ms compute).
-- `edit_char_start` is the worst case: 402.3 ms total, 239 ms compute. The
+- `edit_char_start` is the worst case: 435.5 ms total, 269 ms compute. The
   edit moves every position of the file, so the analysis runs in full
   (a "fallback" run).
-- An edit after an idle pause waits less than 150 ms: `edit_after_idle` 96.2 ms
-  total (39 ms debounce, 38 ms compute). `floor_tiny_doc_change` 28.8 ms total
-  (20 ms debounce, 6 ms compute).
-- `cold_open_first_diagnostics`: 297 ms compute, 304.9 ms total. The first
+- An edit after an idle pause waits less than 150 ms: `edit_after_idle` 120.2 ms
+  total (47 ms debounce, 48 ms compute). `floor_tiny_doc_change` 31.9 ms total
+  (20 ms debounce, 8 ms compute).
+- `cold_open_first_diagnostics`: 316 ms compute, 327.1 ms total. The first
   analysis builds no memo.
-- `main_after_helper_saved_to_disk`: 33 ms compute, 195.8 ms total.
-  `main_after_helper_restored`: 128 ms compute, 289.6 ms total. Both pay for
+- `main_after_helper_saved_to_disk`: 37 ms compute, 204.4 ms total.
+  `main_after_helper_restored`: 139 ms compute, 304.3 ms total. Both pay for
   the re-read of the changed helper.
-- `inlay_full_cached` 9.0 ms, `inlay_full_first` 11.5 ms, `hover` 0.3 ms,
+- `inlay_full_cached` 9.4 ms, `inlay_full_first` 11.7 ms, `hover` 0.3 ms,
   `goto_definition` 0.2 ms.
-- Peak RSS 160.9 MB (54.6 MB after open). 34 diagnostics, 14,873 inlay hints.
+- Peak RSS 167.2 MB (57.6 MB after open). 54 diagnostics, 15,496 inlay hints.
+- Control on the same input file: the code of the last commit, run on this
+  22,323-line file, needs 1 to 14 percent less compute for an edit (median
+  about 8 percent, 2 to 4 ms) and 4 percent more for a cold open (329 ms). The
+  extra edit cost is the work for the newly modelled constructs. The older
+  297 ms cold figure belonged to the smaller 21,518-line file and does not
+  compare. Measure a speed change against a control on one input.
 - Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
   If numbers look shifted, run an interleaved control of the old and the new
   binary before you decide.
@@ -245,7 +261,20 @@ The result must always equal a fresh analysis of the same text. Three layers:
    - The setup of the pass (function nodes, scope links, submodules,
      `original_shapes`, `ScopeIndex`) still runs over the whole file on any
      dirty edit (about 14 ms). It is not incremental.
-   - `NDIM_NO_PROPAGATE_MEMO=1` is a kill switch: it turns layer 3 off and runs
+   - Each dependency that an analysis feature adds must be visible to this
+  model. The name test for a new binding reads only the function, or at
+  module level the linked identifiers plus a digest of the global names and
+  wildcard imports. A function that reads a module global joins the group of
+  the global through the shared/reads edge of `names.rs` (a reader mentions
+  the name, and a module write, a class body write, and a `global` statement
+  all join one group), so no new edge type exists. The environment hash also
+  holds the clash set (integer names that annotations use as dims). Module
+  classes of other files record a probe dependency (`Deps` per probe, class
+  source cache), and in-place changes of a field are found by name in the
+  whole file. Comprehension and lambda bodies run inside their unit, and
+  `sum`, `range`, `len` resolve through the unit's definitions, imports, and
+  wildcard imports.
+- `NDIM_NO_PROPAGATE_MEMO=1` is a kill switch: it turns layer 3 off and runs
      the whole-tree propagate pass (the pre-pass memo stays on).
 
 `ResolutionCache` supports the memo with a per-path generation (a count of
@@ -264,7 +293,9 @@ The cost is one extra fresh parse and analysis per edit, so never time with it.
 Tests: `src/incremental_tests.rs` (47 library tests) and
 `tests/incremental_edits.rs` (seeded random edit sequences over `corpus/` and
 `bench/stress/`; after every edit the reparsed tree and the memo analysis must
-equal the fresh ones). The ignored
+equal the fresh ones; seeded edits also change each added dependency, such as
+a module global and its write order, a branch name, a lambda helper, and an
+imported module class). The ignored
 `stress_main_two_thousand_chained_edits` runs 2,000 chained edits of the stress
 file in release (`NDIM_CHAIN_STEPS`, `NDIM_CHAIN_SEED`, `NDIM_CHAIN_TIMES`).
 
@@ -302,6 +333,9 @@ Limits of the incremental path
 - A whole-file edit (`edit_char_start`) is a full run.
 - An unsaved helper buffer is ignored (imports come from disk).
 - Units with a syntax error are not reused.
+- Module-global reads use the shared/reads edge, which over-approximates
+  (every identifier token is a read), so a comprehension target joins the
+  group of an equal global name. That costs reuse, never correctness.
 - Replay clones the segments and the final scope shapes for the output. A clean
   group whose units did not move is shared by reference.
 
@@ -379,6 +413,16 @@ Current file layout
 - `src/incremental_tests.rs`
   - Library tests for the above (47).
 
+- `src/analysis/flow.rs`
+  - Control flow: branch merge for `if`/`elif`/`else`, `match`, `try`, loops,
+    and `with`. Each arm starts from the entry state; the live paths join.
+- `src/analysis/inner.rs`
+  - `Frame` model for lambda and comprehension bodies.
+- `src/analysis/modules.rs`
+  - Module fields (`ModuleList`, `Sequential`, lists, comprehensions, chain
+    loops, indexing), module probes for classes of other files, and loss
+    layers (`LayerKind::Loss`, `LayerApplication.extra_inputs`).
+
 - `src/known_functions/jax.rs`
   - `classify` and shape rules for the JAX 0.10/0.11 additions.
 
@@ -450,7 +494,8 @@ Current file layout
          assignments and class summaries. Over the whole tree, or per
          top-level unit from a `UnitMemo`.
       2. `finish_analysis` runs `propagate_calls`: walk every assignment in
-         source order, dispatching each RHS to `shape_of_expression`
+         source order (arms of a branch start from the entry state and
+         join), dispatching each RHS to `shape_of_expression`
          (recursive); bind single + tuple LHS; collect `ShapeError`s and
          per-assignment `AssignmentShape`s. With a propagation plan the pass
          runs only the dirty units (`propagate_planned`, `run_units`) and
@@ -497,8 +542,9 @@ Current file layout
   - `jax_compat/` holds `cases.json`, `check.py`, `audit.py`, and its README.
   - `generate_stress.py` emits `stress/`, the end-to-end LSP stress project
     (see "End-to-end LSP stress benchmark" below).
-  - `stress/` holds `stress_main.py` (21,518 lines, generated), the imported
-    helper modules `stress_common.py`, `stress_jax.py`, and `stress_torch.py`,
+  - `stress/` holds `stress_main.py` (22,323 lines, generated), the imported
+    helper modules `stress_common.py`, `stress_jax.py`, `stress_torch.py`,
+    `stress_modules.py` (module classes for the probe), and `stress_blocks.py`,
     and `paste_block.txt` (500-line paste payload).
 
 - `tests/lsp_stress.rs`
@@ -630,7 +676,8 @@ What works now
    - Class fields with jaxtyping annotations (e.g.
      `A_log: Float[Array, "d_inner d_state"]`) are extracted into module
      scope; `shape_of_attribute` resolves `self.A_log`, including through
-     chained methods like `self.A_log.astype(jnp.float32)`.
+     chained methods like `self.A_log.astype(jnp.float32)`. A module-level
+     write of the same name makes `self.<name>` unknown.
 
 13. Tuple-pattern unpacking (issue #30)
    - `a, b = jnp.split(x, ...)` binds per-element shapes via
@@ -658,11 +705,20 @@ What works now
      or every assignment to it in its scope is an array expression). A name
      that cannot be told apart gives unknown targets. Never guess a row shape
      for a tuple.
-   - Loops: a name that a `for` or `while` body both reads and writes
-     keeps its shape after the loop only if one pass leaves the shape unchanged
-     (`x = f(x)`). If the shape changes (`x, y = y, x`, a swap through a
-     temp), the iteration count decides, so the name and every name written
-     from it are unknown after the loop (`collect_outer_loops`, loop replay).
+   - Control flow (`src/analysis/flow.rs`): `if`/`elif`/`else`, `match`,
+     `try`, loops, and `with` run each arm from a snapshot of the entry state
+     and join the live paths. A name with one shape on every live path keeps
+     it, any other name is unknown. A name a loop body both reads and writes
+     keeps its shape after the loop only if one pass leaves it unchanged
+     (`x = f(x)`); otherwise it and every name written from it are unknown,
+     and hints of the first iteration are taken back. Loop, `with`, and
+     `except` targets, walrus names, `case` captures, `del`, `def`, `class`,
+     and imports are binding events. Context managers that swallow errors
+     are found by name (import aliases and the last name segment). Module
+     scope does not count a `def` or `class` name as an earlier binding.
+     Open: value statements (`return`, `assert`, bare calls) read the state
+     at the end of the scope; hover shows the joined state; literal
+     conditions are not folded; vmap bindings stay keyed by name.
 
 14. vmap of attribute callables + inline vmap (issue #35)
    - `jax.vmap(self.layer)(x)` resolves `self.layer` to a layer built in
@@ -711,8 +767,14 @@ What works now
      (parameter, assignment, loop or `with` target, import, nested `def`,
      `global`) is local and shadows the enclosing one. A name that a nested
      closure rebinds with `nonlocal` is unknown. A call outside the enclosing
-     function, a `global` name, a comprehension body, and a method closure
-     through a class do not see function locals. Fully annotated closures read
+     function and a method closure through a class do not see function locals.
+     A function reads a module global or integer constant when all writes come
+     before the top-level statement of the reader and have one shape (a
+     global that a class body also binds is unknown; constants must be one
+     decimal literal or int-annotated; a function above the constant stays
+     unknown). Integer constants resolve to the integer in call dims.
+     Comprehension and lambda bodies read the live shapes of the scope where
+     they stand (see item 21). Fully annotated closures read
      the call-time value too, and a mismatch with it is a true error, reported
      once.
 
@@ -729,6 +791,20 @@ What works now
      and the method rebinds a field the method reads, when a base before the
      method is unresolved, and past the depth bound (recursion terminates).
      A same-named function never replaces an unresolved field.
+   - Classes imported from other files run through a probe (depth 2, never
+     for site-packages or library roots). Constructor arguments reach it only
+     as literals, plain names, or simple arithmetic. Errors show at the call.
+     Fields that are `nn.ModuleList`, `nn.Sequential`, a list of modules, or a
+     comprehension of modules, indexing, and chain loops (`x = layer(x)` as
+     the only body statement) are tracked; a repeat count that is not literal
+     is known only if one application keeps the input shape. Any in-place
+     change of a field (by attribute name in the file) makes it unknown, so
+     `self.layers.append(...)` in a loop stays unknown. Modules in locals,
+     `zip`, `reversed`, slices, and `ModuleDict` stay unknown. A class defined
+     twice in one namespace makes its calls unknown. Loss layers (`MSELoss`,
+     `L1Loss`, `SmoothL1Loss`, `HuberLoss`, `BCELoss`, `BCEWithLogitsLoss`,
+     `CrossEntropyLoss`, `NLLLoss`) check input and target and apply the
+     reduction; `weight` and similar options are not read.
    - Annotated callee parameters are checked against the argument shapes: a
      rank mismatch or an integer mismatch is a true error; a named dim against
      an integer annotation, and a variadic annotation, are not errors.
@@ -754,6 +830,20 @@ What works now
      name stops standing for a dim when it is rebound.
    - `golden_has_no_internal_names` and `internal_name_scan_detects_a_leak` in
      `tests/lsp_stress.rs` check the rule over the stress project.
+
+21. Comprehensions and lambdas (`src/analysis/inner.rs`)
+   - A body is evaluated once, where its result is used: a list comprehension
+     in `stack`/`concatenate`, `sum` over a comprehension or generator, a
+     lambda given to `vmap`, `lax.map`, or `lax.scan`, and a direct lambda
+     call. The `Frame` binds the loop variable or parameter to the shapes of
+     one iteration. Iterating needs a provable array. A dim spelled with the
+     loop variable becomes unknown. A scan lambda with a tuple carry binds it
+     unknown. Names a body binds are masked, so an outer name never leaks in.
+   - Not evaluated: `ys = [f(x) for x in xs]` kept in a name, a lambda stored
+     in a name, set and dict comprehensions, filters or several `for` clauses
+     in stack, symbolic lengths, generators in `stack`, tuple results.
+   - Dependency note: `names.rs` counts every identifier token as a read, so
+     targets over-approximate; lambda parameters are skipped as reads.
 
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
@@ -843,8 +933,9 @@ Known limitations / important caveats
   map, so a differently named attribute is not mapped; and subtraction, division,
   and arbitrary parenthesized expressions are not generally normalized.
 - `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
-- Higher-order functions: `vmap` is modeled (free/inline/attribute);
-  `jax.lax.map` and same-file-body `jax.lax.scan` are modeled. `jit`, the
+- Higher-order functions: `vmap` is modeled (free/inline/attribute, named
+  callables and lambdas); `jax.lax.map` and `jax.lax.scan` (same-file body or
+  lambda) are modeled. `jit`, the
   `grad` family, and `pmap` are not.
 - Current known-function shape rules are pragmatic string-based rules. They do not do full symbolic algebra.
 - Some shape rules are approximate by design. Example: `jax.lax.dot_general` currently maps to `Matmul` semantics.
@@ -893,8 +984,8 @@ representative. Current open targets, in impact order:
    actual dark spot rather than increasing the file count.
 
 2. If corpus evidence warrants a richer architecture, choose one coherent
-   extension: branch merge/unification, user-helper tuple returns, or tracking
-   a narrowly scoped non-array literal value. Do not implement a low-value
+   extension: user-helper tuple returns, branch-output unification for
+   `lax.cond`, or tracking a narrowly scoped non-array literal value. Do not implement a low-value
    tracker row in isolation.
 
 3. Improve expression precision where it affects real code: map

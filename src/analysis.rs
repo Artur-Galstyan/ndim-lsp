@@ -11,15 +11,30 @@ use crate::known_functions::{
     compute_torch_split_shapes,
     compute_unbind_shape, multiply_dim,
 };
-use crate::incremental::{PrePass, PropPlan, PropagateOutput, Segment, UnitMemo, UnitRun, unit_nodes};
+use crate::incremental::{
+    NodeRef, PrePass, PropPlan, PropagateOutput, Segment, UnitMemo, UnitRun, unit_nodes,
+};
 use crate::layers::{apply_layer_application, apply_layer_kind, classify_inline_constructor};
 use crate::python_ast::{
-    ClassHierarchy, SelfAttrWrite, build_import_map, extract_call_arguments,
-    self_attr_aliases_from_writes,
+    ClassHierarchy, SelfAttrWrite, build_import_map, dim_symbols, directly_in_class,
+    extract_call_arguments, self_attr_aliases_from_writes,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
 
 use crate::types::*;
+
+mod flow;
+mod inner;
+mod modules;
+use flow::{Marked, Replay, collect_flow};
+use modules::{
+    Field, Module, apply_module, apply_sequence_call, changed_in_place, field_of, imported_class,
+    imported_module_of, loop_variables, shape_of_indexed_module_call, shape_of_loop_module_call,
+};
+use inner::{
+    called_lambda, comprehension_names, is_single_array_argument, lambda_argument,
+    scan_lambda_output, shape_of_batched_lambda, shape_of_direct_lambda, shape_of_sum,
+};
 
 pub fn analyze_layer_shapes<F>(
     node: Node,
@@ -35,8 +50,24 @@ where
     if let Some(cache) = cache {
         cache.revalidate(&[]);
     }
-    let pre = PrePass::whole_tree(node, text, search_roots, &read_file, max_depth, cache)?;
-    finish_analysis(node, text, search_roots, &read_file, max_depth, cache, pre, None)
+    analyze_tree(node, text, search_roots, &read_file, max_depth, cache)
+}
+
+/// `analyze_layer_shapes` without the check of the cache against the disk,
+/// for a nested analysis that runs inside one (see `modules`).
+fn analyze_tree<F>(
+    node: Node,
+    text: &str,
+    search_roots: &[PathBuf],
+    read_file: &F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<LayerShapeAnalysis, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let pre = PrePass::whole_tree(node, text, search_roots, read_file, max_depth, cache)?;
+    finish_analysis(node, text, search_roots, read_file, max_depth, cache, pre, None)
 }
 
 /// Same result as `analyze_layer_shapes`, with the pre-passes taken from
@@ -398,12 +429,51 @@ struct ShapeCtx<'a> {
     submodules: &'a Submodules,
     /// Names some `global` statement of the file mentions, found on first use.
     global_names: std::cell::OnceCell<HashSet<String>>,
+    /// Class bodies by byte range, and where each class starts.
+    classes: ScopeIndex,
+    class_starts: Vec<usize>,
+    /// Plain assignments at module level (class bodies excluded) seen so far,
+    /// per name, so a function can read the name as a module global.
+    module_writes: HashMap<String, ModuleWrites>,
+    /// Names some class body binds. Class bodies share scope 0 with the
+    /// module, so a global of one of these names is not told apart from it.
+    class_body_names: std::cell::OnceCell<HashSet<String>>,
+    /// Per scope and name: where the top-level statement of the scope starts,
+    /// when no function around it binds the name (`module_global`).
+    global_scopes: std::cell::RefCell<HashMap<(usize, String), Option<usize>>>,
+    /// Per name: the end of each module-level assignment (`module_global`).
+    module_values: std::cell::RefCell<HashMap<String, Option<Vec<usize>>>>,
+    /// How the module scope binds each name, found on first use.
+    module_index: std::cell::OnceCell<ModuleIndex>,
+    /// The names the jaxtyping annotations of the file use as dims, found on
+    /// first use. A constant of such a name stays a name (`integer_constant`).
+    annotation_symbols: std::cell::OnceCell<HashSet<String>>,
+    /// Names assigned an integer literal so far, to try them as constant dims.
+    int_names: HashSet<String>,
+    /// Per scope owner (a node id) and name: the integer the name stands for.
+    int_consts: std::cell::RefCell<HashMap<(usize, String), Option<String>>>,
     /// Closure scopes currently being evaluated at a call made from inside
     /// their enclosing function, so a name they do not bind resolves to the
     /// enclosing function's live shapes: Python reads those at call time.
     /// Outside these scopes (the whole-file pass evaluates a closure body at
     /// its definition) enclosing variables stay unknown.
     call_time: Vec<usize>,
+    /// Names a lambda or comprehension being evaluated binds to something
+    /// that is not a known array, per scope: a lookup finds nothing for them,
+    /// whatever an enclosing scope or the module holds under the same name.
+    inner_masked: Vec<(usize, String)>,
+    /// Per binder node (a lambda or comprehension) and name: bound to a Python
+    /// number, or to an array, while the body is evaluated.
+    inner_scalars: HashSet<(usize, String)>,
+    inner_arrays: HashSet<(usize, String)>,
+}
+
+/// The module-level assignments of one name seen so far.
+struct ModuleWrites {
+    count: usize,
+    /// The shape every write left the name with. `None` once a write left it
+    /// unknown or two writes disagreed.
+    shape: Option<Vec<String>>,
 }
 
 /// Lexical facts about function scopes, computed only for closures and the
@@ -423,6 +493,9 @@ struct ScopeLinks {
     poisoned: Vec<HashSet<String>>,
     /// The scope mentions a name that an enclosing function binds.
     captures: Vec<bool>,
+    /// Another function of the same name is defined in the same function or
+    /// class body, or at module level.
+    redefined: Vec<bool>,
 }
 
 struct ScopeLevel<'c> {
@@ -439,10 +512,19 @@ struct ScopeLevel<'c> {
 struct ScopeShapes<'c> {
     here: ScopeLevel<'c>,
     outer: Vec<ScopeLevel<'c>>,
+    /// Where a name no scope binds may be a module global of this scope.
+    globals: (&'c ShapeCtx<'c>, usize),
 }
 
 impl ShapeLookup for ScopeShapes<'_> {
     fn shape(&self, name: &str) -> Option<&Vec<String>> {
+        let ctx = self.globals.0;
+        if !ctx.inner_masked.is_empty()
+            && !self.here.shapes.contains_key(name)
+            && ctx.inner_masked.iter().any(|(scope, n)| *scope == self.globals.1 && n == name)
+        {
+            return None;
+        }
         for level in std::iter::once(&self.here).chain(&self.outer) {
             if level.poisoned.contains(name) {
                 return None;
@@ -458,7 +540,7 @@ impl ShapeLookup for ScopeShapes<'_> {
                 return None;
             }
         }
-        None
+        self.globals.0.module_global(name, self.globals.1)
     }
 }
 
@@ -720,12 +802,129 @@ impl<'a> ShapeCtx<'a> {
     /// Drop a stale binding when a reassignment's RHS can't be shaped.
     /// Keeping the old shape would make every downstream use reason from
     /// stale data and report confident false diagnostics (issue #46).
+    /// Whether an annotation of the file uses `name` as a dim.
+    fn is_annotation_symbol(&self, name: &str) -> bool {
+        self.annotation_symbols
+            .get_or_init(|| {
+                let declared = self.original_shapes.iter().flat_map(|s| s.values().flatten());
+                let returned = self.scopes.iter().flat_map(|s| s.return_shape.iter().flatten());
+                declared
+                    .chain(returned)
+                    .flat_map(|dim| dim_symbols(dim))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .contains(name)
+    }
+
     fn evict_binding(&mut self, scope_idx: usize, name: &str) {
         self.scalar_dims.remove(&(scope_idx, name.to_string()));
         if !self.tuple_carries.is_empty() {
             self.tuple_carries.remove(&(scope_idx, name.to_string()));
         }
         self.scopes[scope_idx].shapes.remove(name);
+    }
+
+    /// Whether `byte` is in a class body with no function between it and the
+    /// class, given the function scope the byte is in.
+    fn in_class_body(&self, byte: usize, scope: Option<usize>) -> bool {
+        let Some(class) = self.classes.lookup(byte) else {
+            return false;
+        };
+        match scope {
+            Some(0) => true,
+            Some(function) => self.class_starts[class] > self.scopes[function].start_byte,
+            None => false,
+        }
+    }
+
+    /// Fold the shape a module-level assignment of `name` just left into the
+    /// record `module_global_shape` reads.
+    fn note_module_write(&mut self, name: &str) {
+        let now = self.scopes[0].shapes.get(name).cloned();
+        let entry = self
+            .module_writes
+            .entry(name.to_string())
+            .or_insert_with(|| ModuleWrites {
+                count: 0,
+                shape: now.clone(),
+            });
+        entry.count += 1;
+        if entry.shape != now {
+            entry.shape = None;
+        }
+    }
+
+    /// The shape a function (scope `scope_idx`) sees for `name` when it reads
+    /// a module global. Python reads the value at call time, so this holds
+    /// only when no write can differ from the others: every module-level
+    /// write is a plain assignment that stands before the top-level statement
+    /// holding the function, all of them left the same shape, and the name
+    /// still has it in scope 0. No function around the reader may bind the
+    /// name, and no `global` statement or class body may write it.
+    fn module_global(&self, name: &str, scope_idx: usize) -> Option<&Vec<String>> {
+        let writes = self.module_writes.get(name)?;
+        let shape = writes.shape.as_ref()?;
+        if scope_idx == 0 || self.scopes[0].shapes.get(name) != Some(shape) {
+            return None;
+        }
+        let function = self.scope_function_nodes.get(scope_idx).copied().flatten()?;
+        let before = *self
+            .global_scopes
+            .borrow_mut()
+            .entry((scope_idx, name.to_string()))
+            .or_insert_with(|| self.global_unbound_before(function, scope_idx, name));
+        let before = before?;
+        let ends = self
+            .module_values
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_insert_with(|| self.module_value_ends(function, name))
+            .clone()?;
+        (ends.len() == writes.count && ends.iter().all(|&end| end <= before)).then_some(shape)
+    }
+
+    /// Start of the top-level statement around `function` when no function
+    /// around the reader binds `name`.
+    fn global_unbound_before(&self, function: Node, scope_idx: usize, name: &str) -> Option<usize> {
+        let mut owner = function;
+        let mut idx = scope_idx;
+        let mut top = function;
+        loop {
+            if !matches!(name_binding(owner, idx, name, self), NameBinding::Unbound) {
+                return None;
+            }
+            loop {
+                let parent = owner.parent()?;
+                if parent.kind() == "module" {
+                    return Some(top.start_byte());
+                }
+                top = parent;
+                owner = parent;
+                if owner.kind() == "function_definition" {
+                    idx = function_scope(owner, self)?;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// End byte of every module-level assignment of `name`, when they are all
+    /// plain assignments and no class body binds the name.
+    fn module_value_ends(&self, function: Node, name: &str) -> Option<Vec<usize>> {
+        let mut root = function;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let NameBinding::Values(values) = name_binding(root, 0, name, self) else {
+            return None;
+        };
+        let classes = self.class_body_names.get_or_init(|| {
+            let mut names = HashSet::new();
+            collect_class_body_names(root, self.text, &mut names);
+            names
+        });
+        (!classes.contains(name)).then(|| values.iter().map(|v| v.end_byte()).collect())
     }
 
     /// Look up a shape by name in the given scope, checking both real
@@ -748,6 +947,7 @@ impl<'a> ShapeCtx<'a> {
         ScopeShapes {
             here: self.scope_level(scope_idx),
             outer,
+            globals: (self, scope_idx),
         }
     }
 
@@ -831,6 +1031,77 @@ fn shape_of_identifier(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     ctx.resolve_shape(name, scope_idx)
 }
 
+/// Whether a function, a lambda, or a comprehension around `at` binds `name`
+/// itself: as a parameter or by an assignment, a loop, a `def`. An import of
+/// the name inside the function binds the same module.
+fn shadowed_locally(at: Node, name: &str, ctx: &ShapeCtx) -> bool {
+    let mut up = at.parent();
+    while let Some(owner) = up {
+        up = owner.parent();
+        match owner.kind() {
+            "function_definition" => {
+                let Some(idx) = function_scope(owner, ctx) else {
+                    return true;
+                };
+                if ctx.scopes[idx].all_params.iter().any(|param| param == name)
+                    || owner
+                        .child_by_field_name("body")
+                        .is_some_and(|body| modules::binders(body, ctx.text, false).contains_key(name))
+                {
+                    return true;
+                }
+            }
+            "lambda" | "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+            | "generator_expression"
+                if inner_scope_binds(owner, name, ctx.text) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn function_scope(function: Node, ctx: &ShapeCtx) -> Option<usize> {
+    ctx.scope_function_nodes
+        .iter()
+        .position(|f| f.is_some_and(|f| f.id() == function.id()))
+}
+
+/// Whether a lambda or a comprehension binds `name` itself: as a parameter,
+/// or as the target of one of its `for` clauses.
+fn inner_scope_binds(node: Node, name: &str, text: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|child| match child.kind() {
+        "lambda_parameters" => mentions_name(child, text, &|other| other == name),
+        "for_in_clause" => child
+            .child_by_field_name("left")
+            .is_some_and(|left| mentions_name(left, text, &|other| other == name)),
+        _ => false,
+    })
+}
+
+/// Names bound directly in a class body, for every class that is not inside
+/// a function (the others do not write scope 0).
+fn collect_class_body_names(node: Node, text: &str, out: &mut HashSet<String>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {}
+            "class_definition" => {
+                if let Some(body) = child.child_by_field_name("body") {
+                    let mut bindings = Bindings::default();
+                    collect_bindings(body, text, &mut bindings);
+                    out.extend(bindings.bound);
+                    collect_class_body_names(body, text, out);
+                }
+            }
+            _ => collect_class_body_names(child, text, out),
+        }
+    }
+}
+
 /// A standalone `attribute` node (not the `function` field of a call).
 ///
 /// Handles `self.<field>` (issue #31): class fields carrying jaxtyping
@@ -852,6 +1123,9 @@ fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         // ponytail: class fields land flat in module scope (scope 0); two
         // classes with a same-named field resolve last-wins. Add per-class
         // scoping if bitten.
+        if ctx.module_writes.contains_key(field) {
+            return None;
+        }
         return ctx.resolve_shape(field, 0);
     }
 
@@ -1072,7 +1346,7 @@ fn collect_name_values<'t>(
             }
             "global_statement" | "nonlocal_statement" | "import_statement"
             | "import_from_statement" | "future_import_statement" | "delete_statement"
-            | "case_pattern" => {
+            | "case_pattern" | "type_alias_statement" => {
                 if mentions(child) {
                     return false;
                 }
@@ -1120,26 +1394,22 @@ fn name_binding<'t>(
     name: &str,
     ctx: &ShapeCtx,
 ) -> NameBinding<'t> {
+    if scope_idx == 0 {
+        return module_binding(owner, name, ctx);
+    }
     let mut values = Vec::new();
     let mut bound = false;
-    if scope_idx != 0 {
-        if ctx.links.poisoned[scope_idx].contains(name) {
+    if ctx.links.poisoned[scope_idx].contains(name) {
+        return NameBinding::Opaque;
+    }
+    if ctx.scopes[scope_idx].all_params.iter().any(|param| param == name) {
+        // A scalar-typed parameter is seeded rank 0 (see `extract_jaxtyping_shapes`).
+        if ctx.original_shapes[scope_idx].get(name).is_none_or(|shape| !shape.is_empty()) {
             return NameBinding::Opaque;
         }
-        if ctx.scopes[scope_idx].all_params.iter().any(|param| param == name) {
-            // A scalar-typed parameter is seeded rank 0 (see `extract_jaxtyping_shapes`).
-            if ctx.original_shapes[scope_idx].get(name).is_none_or(|shape| !shape.is_empty()) {
-                return NameBinding::Opaque;
-            }
-            bound = true;
-        }
+        bound = true;
     }
-    let body = if scope_idx == 0 {
-        Some(owner)
-    } else {
-        owner.child_by_field_name("body")
-    };
-    let Some(body) = body else {
+    let Some(body) = owner.child_by_field_name("body") else {
         return NameBinding::Opaque;
     };
     if !collect_name_values(body, name, ctx.text, &mut values, &mut bound) {
@@ -1148,29 +1418,124 @@ fn name_binding<'t>(
     if !bound {
         return NameBinding::Unbound;
     }
-    if scope_idx == 0 {
-        let globals = ctx.global_names.get_or_init(|| {
-            let mut names = HashSet::new();
-            if ctx.text.contains("global") {
-                collect_global_names(owner, ctx.text, &mut names);
-            }
-            names
-        });
-        if globals.contains(name) {
-            return NameBinding::Opaque;
-        }
-    }
     NameBinding::Values(values)
 }
 
-fn collect_global_names(node: Node, text: &str, out: &mut HashSet<String>) {
-    if node.kind() == "global_statement" {
-        insert_identifiers(node, text, out);
-        return;
-    }
+/// How the module scope binds the names it binds: what `collect_name_values`
+/// finds for one name, found for all of them in one walk, so that a file with
+/// many globals is read once, not once for each.
+#[derive(Default)]
+struct ModuleIndex {
+    /// `from m import *` may bind any name.
+    wildcard: bool,
+    /// Names bound in a way that says nothing about the value.
+    opaque: HashSet<String>,
+    /// Names bound only by plain assignments, and the expressions assigned.
+    values: HashMap<String, Vec<NodeRef>>,
+}
+
+fn index_module(node: Node, text: &str, index: &mut ModuleIndex) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_global_names(child, text, out);
+        match child.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(Ok(name)) = child
+                    .child_by_field_name("name")
+                    .map(|n| n.utf8_text(text.as_bytes()))
+                {
+                    index.opaque.insert(name.to_string());
+                }
+                continue;
+            }
+            "lambda" => continue,
+            "import_from_statement"
+                if child.named_children(&mut child.walk()).any(|c| c.kind() == "wildcard_import") =>
+            {
+                index.wildcard = true;
+                continue;
+            }
+            "global_statement" | "nonlocal_statement" | "import_statement"
+            | "import_from_statement" | "future_import_statement" | "delete_statement"
+            | "case_pattern" | "type_alias_statement" => {
+                insert_identifiers(child, text, &mut index.opaque);
+                continue;
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(left) = child.child_by_field_name("left") {
+                    let mut targets = HashSet::new();
+                    insert_target_names(left, text, &mut targets);
+                    let plain = left.kind() == "identifier" && child.kind() != "for_statement";
+                    let value = child.child_by_field_name("right").filter(|_| plain);
+                    for target in targets {
+                        match value {
+                            Some(value) => index.values.entry(target).or_default().push(NodeRef::of(value)),
+                            None => {
+                                index.opaque.insert(target);
+                            }
+                        }
+                    }
+                }
+            }
+            "named_expression" | "as_pattern" => {
+                if let Some(target) = child
+                    .child_by_field_name("name")
+                    .or_else(|| child.child_by_field_name("alias"))
+                {
+                    insert_identifiers(target, text, &mut index.opaque);
+                }
+            }
+            _ => {}
+        }
+        index_module(child, text, index);
+    }
+}
+
+fn module_binding<'t>(root: Node<'t>, name: &str, ctx: &ShapeCtx) -> NameBinding<'t> {
+    let index = ctx.module_index.get_or_init(|| {
+        let mut index = ModuleIndex::default();
+        index_module(root, ctx.text, &mut index);
+        index
+    });
+    if index.wildcard || index.opaque.contains(name) {
+        return NameBinding::Opaque;
+    }
+    let Some(refs) = index.values.get(name) else {
+        return NameBinding::Unbound;
+    };
+    let globals = ctx.global_names.get_or_init(|| {
+        let mut names = HashSet::new();
+        if ctx.text.contains("global") {
+            collect_global_names(root, ctx.text, &mut names);
+        }
+        names
+    });
+    if globals.contains(name) {
+        return NameBinding::Opaque;
+    }
+    match refs.iter().map(|r| r.find(root)).collect::<Option<Vec<_>>>() {
+        Some(values) => NameBinding::Values(values),
+        None => NameBinding::Opaque,
+    }
+}
+
+/// The names the `global` statements under `node` mention. A statement stands
+/// in a block or a clause of a compound one, never in an expression, so the
+/// walk leaves the expressions out.
+fn collect_global_names(node: Node, text: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "global_statement" => insert_identifiers(n, text, out),
+            "module" | "block" | "function_definition" | "class_definition"
+            | "decorated_definition" | "if_statement" | "elif_clause" | "else_clause"
+            | "for_statement" | "while_statement" | "try_statement" | "except_clause"
+            | "except_group_clause" | "finally_clause" | "with_statement"
+            | "match_statement" | "case_clause" => {
+                let mut cursor = n.walk();
+                stack.extend(n.named_children(&mut cursor));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1186,7 +1551,8 @@ fn name_is_scalar(
     visiting: &mut Vec<(usize, String)>,
 ) -> bool {
     match nearest_binding(at, name, ctx) {
-        (_, NameBinding::Unbound | NameBinding::Opaque) => false,
+        (_, NameBinding::Unbound) => false,
+        (owner, NameBinding::Opaque) => ctx.inner_scalars.contains(&(owner.id(), name.to_string())),
         (owner, NameBinding::Values(values)) => {
             let key = (owner.id(), name.to_string());
             if visiting.contains(&key) {
@@ -1223,6 +1589,15 @@ fn nearest_binding<'t>(at: Node<'t>, name: &str, ctx: &ShapeCtx) -> (Node<'t>, N
             // A class body is a scope of its own, which this does not model.
             "class_definition" if !in_function => return (owner, NameBinding::Opaque),
             "module" => 0,
+            // A lambda or a comprehension that binds the name hides the
+            // scopes around it. `inner_scalars` and `inner_arrays` say what
+            // it holds while its body is evaluated.
+            "lambda" | "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+            | "generator_expression"
+                if inner_scope_binds(owner, name, ctx.text) =>
+            {
+                return (owner, NameBinding::Opaque);
+            }
             _ => continue,
         };
         match name_binding(owner, scope_idx, name, ctx) {
@@ -1635,6 +2010,25 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let func_node = node.child_by_field_name("function")?;
     let args_node = node.child_by_field_name("arguments")?;
 
+    if let Some(lambda) = called_lambda(func_node) {
+        return shape_of_direct_lambda(lambda, args_node, scope_idx, ctx);
+    }
+    if func_node.kind() == "identifier"
+        && let Some(shape) = shape_of_sum(node, scope_idx, ctx)
+    {
+        return Some(shape);
+    }
+    if func_node.kind() == "identifier"
+        && let Some(result) = shape_of_loop_module_call(node, func_node, args_node, scope_idx, ctx)
+    {
+        return result;
+    }
+    if func_node.kind() == "subscript"
+        && let Some(result) = shape_of_indexed_module_call(node, func_node, args_node, scope_idx, ctx)
+    {
+        return result;
+    }
+
     // ── Call-of-a-call ──
     // `jax.vmap(self.layer)(x)` (inline vmap, issue #35) or a layer
     // constructed and applied in one expression like `nn.Dense(64)(x)`
@@ -1699,6 +2093,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 variable: String::new(),
                 layer: format!("self.{method_name}"),
                 input,
+                extra_inputs: extra_layer_inputs(&args, &layer),
                 kind: layer,
                 range: args_node.range(),
             };
@@ -1721,19 +2116,23 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 .submodule_at(&method_name, attr_node.start_byte())
                 .map(|field| field.module.clone())
         {
-            let module = field?;
+            let field = field?;
+            if let Field::One(Module::Imported(module)) = &field {
+                // The arguments are evaluated once the callee is a class.
+                imported_class(module, ctx)?;
+            }
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
             let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
             let display = format!("self.{method_name}");
-            return apply_submodule_call(
-                &module,
-                &display,
-                &args,
-                call_byte,
-                scope_idx,
-                args_node.range(),
-                ctx,
-            );
+            let range = args_node.range();
+            return match field {
+                Field::One(module) => {
+                    apply_module(&module, &display, &args, call_byte, scope_idx, range, ctx)
+                }
+                Field::Many(sequence) => {
+                    apply_sequence_call(&sequence, &display, &args, call_byte, scope_idx, range, ctx)
+                }
+            };
         }
 
         // Distinguish between:
@@ -1882,17 +2281,12 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             variable: String::new(), // filled by caller
             layer: target.clone(),
             input,
+            extra_inputs: extra_layer_inputs(&args, kind),
             kind: kind.clone(),
             range: args_node.range(),
         };
         let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
-        ctx.applications.push(LayerApplication {
-            variable: application.variable.clone(),
-            layer: application.layer.clone(),
-            input: application.input.clone(),
-            kind: application.kind.clone(),
-            range: application.range,
-        });
+        ctx.applications.push(application.clone());
         match result {
             Ok(Some(output)) => return Some(output),
             Ok(None) => return None,
@@ -1911,6 +2305,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             &info,
             &args,
             &ctx.scope_shapes(scope_idx),
+            ctx.links,
             ctx.scopes,
         );
         return match result {
@@ -1933,6 +2328,11 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 CallArgument::Positional { value } => Some(value.clone()),
                 _ => None,
             });
+            if let Some(lambda) = lambda_argument(args_node, 0)
+                && matches!(args.first(), Some(CallArgument::Positional { .. }))
+            {
+                return map_lambda(lambda, args_node, &args[1..], scope_idx, ctx);
+            }
             let callable = positionals.next()?;
             let rest: Vec<CallArgument> = args.iter().skip(1).cloned().collect();
             if let Some(attr) = callable.strip_prefix("self.")
@@ -1953,7 +2353,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     .submodule_at(attr, call_byte)
                     .map(|field| field.module.clone())
             {
-                let module = field?;
+                let Some(Field::One(Module::Local(module))) = field else {
+                    return None;
+                };
                 return apply_vmapped_submodule(&module, &callable, &rest, &[(0, 0)], scope_idx, args_node, ctx);
             }
             if !callable.contains('.') {
@@ -1962,7 +2364,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     in_axes: 0,
                     out_axes: 0,
                 };
-                return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.scopes) {
+                return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes) {
                     Ok(shape) => shape,
                     Err(message) => {
                         ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
@@ -1995,7 +2397,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // re-seeds fresh from `original_shapes` on every call.
     let user_target = target.strip_prefix("self.").unwrap_or(&target);
     if !user_target.contains('.') {
-        let callee_idx = find_callee_scope(user_target, Some((call_byte, ctx.links)), ctx.scopes);
+        let callee_idx = find_callee_scope(user_target, Some(call_byte), ctx.links, ctx.scopes);
         let fully_annotated = callee_idx.is_none_or(|idx| callee_all_params_annotated(idx, ctx));
 
         // A closure that reads an enclosing function's variable has body
@@ -2257,6 +2659,20 @@ fn scrub_internal_names(errors: &mut Vec<ShapeError>, sources: &HashMap<String, 
     });
 }
 
+/// Put the source text of an inline expression where an application names it
+/// by a synthetic name, so the name does not depend on the order of the pass.
+fn scrub_applications(applications: &mut [LayerApplication], sources: &HashMap<String, String>) {
+    for application in applications {
+        for input in std::iter::once(&mut application.input).chain(&mut application.extra_inputs) {
+            if has_internal_name(input)
+                && let Some(restored) = restore_synthetic_text(input, sources)
+            {
+                *input = restored;
+            }
+        }
+    }
+}
+
 /// The dimension an integer expression stands for when it is built from
 /// integer literals, names unpacked from `x.shape`, other plain integer
 /// names, and `*`. `None` for anything else.
@@ -2269,7 +2685,11 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
             (literal.starts_with('-') && literal[1..].bytes().all(|b| b.is_ascii_digit()))
                 .then_some(literal)
         }
-        "identifier" => ctx.scalar_dims.get(&(scope_idx, text.to_string())).cloned(),
+        "identifier" => ctx
+            .scalar_dims
+            .get(&(scope_idx, text.to_string()))
+            .cloned()
+            .or_else(|| integer_constant(node, text, ctx)),
         "parenthesized_expression" => scalar_dim_expr(node.named_child(0)?, scope_idx, ctx),
         "binary_operator" => {
             let op = node.child_by_field_name("operator")?;
@@ -2284,11 +2704,75 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
     }
 }
 
+/// The integer a name stands for when every binding of it, in the scope that
+/// owns it, is a plain assignment of the same decimal literal. Whatever the
+/// call time, the name then holds that integer.
+fn integer_constant(at: Node, name: &str, ctx: &ShapeCtx) -> Option<String> {
+    // An annotation that uses the name as a dim means a size that is not the
+    // value of this name: `x: Float[Array, "D 3"]` next to `D = 64`.
+    if !ctx.int_names.contains(name) || ctx.is_annotation_symbol(name) {
+        return None;
+    }
+    let mut up = at.parent();
+    let mut owner = None;
+    while let Some(node) = up {
+        match node.kind() {
+            "lambda" | "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+            | "generator_expression" => {
+                if inner_scope_binds(node, name, ctx.text) {
+                    return None;
+                }
+            }
+            "function_definition" | "class_definition" | "module" => {
+                owner = Some(node.id());
+                break;
+            }
+            _ => {}
+        }
+        up = node.parent();
+    }
+    let key = (owner?, name.to_string());
+    if let Some(known) = ctx.int_consts.borrow().get(&key) {
+        return known.clone();
+    }
+    let found = integer_literal_of(at, name, ctx);
+    ctx.int_consts.borrow_mut().insert(key, found.clone());
+    found
+}
+
+fn integer_literal_of(at: Node, name: &str, ctx: &ShapeCtx) -> Option<String> {
+    let (owner, NameBinding::Values(values)) = nearest_binding(at, name, ctx) else {
+        return None;
+    };
+    if owner.kind() == "function_definition"
+        && function_scope(owner, ctx)
+            .is_none_or(|idx| ctx.scopes[idx].all_params.iter().any(|p| p == name))
+    {
+        return None;
+    }
+    let mut literal: Option<&str> = None;
+    for value in values {
+        let plain = value.parent().is_some_and(|p| {
+            p.kind() == "assignment"
+                && p.child_by_field_name("type")
+                    .is_none_or(|t| ctx.text.get(t.byte_range()) == Some("int"))
+        });
+        let text = ctx.text.get(value.byte_range())?;
+        if !plain || value.kind() != "integer" || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if *literal.get_or_insert(text) != text {
+            return None;
+        }
+    }
+    literal.map(str::to_string)
+}
+
 /// A call argument that is an integer expression, or a tuple or list of
 /// them, written with real dimensions. `None` when it is not one, or when
 /// writing it with real dimensions changes nothing.
 fn dim_list_text(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String> {
-    if ctx.scalar_dims.is_empty() {
+    if ctx.scalar_dims.is_empty() && ctx.int_names.is_empty() {
         return None;
     }
     let source = ctx.text.get(node.byte_range())?;
@@ -2296,13 +2780,27 @@ fn dim_list_text(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String>
         return scalar_dim_expr(node, scope_idx, ctx).filter(|dim| dim != source);
     }
     let mut cursor = node.walk();
-    let dims = node
-        .named_children(&mut cursor)
-        .map(|element| scalar_dim_expr(element, scope_idx, ctx))
+    let elements: Vec<Node> = node.named_children(&mut cursor).collect();
+    let resolved: Vec<Option<String>> = elements
+        .iter()
+        .map(|element| scalar_dim_expr(*element, scope_idx, ctx))
+        .collect();
+    let written = |element: &Node| ctx.text.get(element.byte_range());
+    if !elements
+        .iter()
+        .zip(&resolved)
+        .any(|(element, dim)| dim.as_deref().is_some_and(|d| Some(d) != written(element)))
+    {
+        return None;
+    }
+    let dims = elements
+        .iter()
+        .zip(resolved)
+        .map(|(element, dim)| dim.or_else(|| written(element).map(str::to_string)))
         .collect::<Option<Vec<_>>>()?;
     let text = format!("({}{})", dims.join(", "), if dims.len() == 1 { "," } else { "" });
     let squeeze = |t: &str| t.split_whitespace().collect::<String>();
-    (!dims.is_empty() && squeeze(&text) != squeeze(source)).then_some(text)
+    (squeeze(&text) != squeeze(source)).then_some(text)
 }
 
 /// Resolve one argument from its matching AST node. Expressions without a
@@ -2462,13 +2960,17 @@ fn resolve_stack_args(
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<CallArgument>> {
-    let mut args = extract_call_arguments(args_node, ctx.text).ok()?;
+    let args = extract_call_arguments(args_node, ctx.text).ok()?;
     let sequence = find_positional_arg_node(args_node, 0).or_else(|| {
         ["arrays", "tensors", "arys", "operands"].iter().find_map(|name| {
             find_keyword_arg_node(args_node, name, ctx.text.as_bytes())?
                 .child_by_field_name("value")
         })
     })?;
+    if sequence.kind() == "list_comprehension" {
+        let names = comprehension_names(sequence, scope_idx, ctx)?;
+        return Some(with_sequence(args, format!("[{}]", names.join(", "))));
+    }
     if !matches!(sequence.kind(), "tuple" | "list") {
         // A sequence variable is not represented by the tensor-shape map.
         return None;
@@ -2490,7 +2992,11 @@ fn resolve_stack_args(
             ctx.text.get(element.byte_range()).unwrap_or_default(),
         ));
     }
-    let value = format!("[{}]", names.join(", "));
+    Some(with_sequence(args, format!("[{}]", names.join(", "))))
+}
+
+/// `args` with the sequence argument of `stack` and its family replaced.
+fn with_sequence(mut args: Vec<CallArgument>, value: String) -> Vec<CallArgument> {
     for arg in &mut args {
         match arg {
             CallArgument::Positional { value: original } => {
@@ -2506,7 +3012,7 @@ fn resolve_stack_args(
             _ => {}
         }
     }
-    Some(args)
+    args
 }
 
 /// Find the Nth positional argument node in an argument_list.
@@ -2682,13 +3188,19 @@ fn prepend_batch_dim(mut shape: Vec<String>, axis: isize, dim: String) -> Vec<St
 /// same pre-order (push-before-recurse) traversal `extract_jaxtyping_shapes`
 /// uses to push scopes — so index `i` here corresponds exactly to
 /// `scopes[i + 1]` (the module scope at index 0 has no function node).
-fn collect_function_definition_nodes<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+fn collect_function_definition_nodes<'t>(
+    node: Node<'t>,
+    out: &mut Vec<Node<'t>>,
+    classes: &mut Vec<(usize, usize)>,
+) {
     if node.kind() == "function_definition" {
         out.push(node);
+    } else if node.kind() == "class_definition" {
+        classes.push((node.start_byte(), node.end_byte()));
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i as u32) {
-            collect_function_definition_nodes(child, out);
+            collect_function_definition_nodes(child, out, classes);
         }
     }
 }
@@ -2795,15 +3307,20 @@ fn mentions_name(node: Node, text: &str, wanted: &dyn Fn(&str) -> bool) -> bool 
 fn build_scope_links(
     scopes: &[FunctionShapeScope],
     function_nodes: &[Option<Node>],
+    class_ranges: &[(usize, usize)],
     text: &str,
 ) -> ScopeLinks {
     let n = scopes.len();
+    let class_index = ScopeIndex::from_ranges(class_ranges.to_vec());
+    // The class whose body holds the definition of each scope, if any.
+    let mut class_of: Vec<Option<usize>> = vec![None; n];
     let mut links = ScopeLinks {
         scope_index: ScopeIndex::new(scopes),
         parent: vec![None; n],
         locals: vec![HashSet::new(); n],
         poisoned: vec![HashSet::new(); n],
         captures: vec![false; n],
+        redefined: vec![false; n],
     };
 
     let mut open: Vec<usize> = Vec::new();
@@ -2834,7 +3351,23 @@ fn build_scope_links(
                 has_closure = true;
             }
         }
+        class_of[i] = class_index.lookup(scopes[i].start_byte).filter(|&class| {
+            open.last().is_none_or(|&p| class_ranges[class].0 > scopes[p].start_byte)
+        });
         open.push(i);
+    }
+    // The enclosing function, the enclosing class, and the name.
+    type Namespace<'a> = (Option<usize>, Option<usize>, &'a str);
+    let mut defined: HashMap<Namespace, Vec<usize>> = HashMap::new();
+    for (i, scope) in scopes.iter().enumerate().skip(1) {
+        if let Some(name) = scope.function_name.as_deref() {
+            defined.entry((links.parent[i], class_of[i], name)).or_default().push(i);
+        }
+    }
+    for twins in defined.values().filter(|twins| twins.len() > 1) {
+        for &i in twins {
+            links.redefined[i] = true;
+        }
     }
     if !has_closure {
         return links;
@@ -2925,8 +3458,9 @@ struct SubmoduleField {
     class_start: usize,
     class_end: usize,
     /// `None` when the class writes the attribute with anything but one
-    /// constructor call of one class of this file, so the call stays unknown.
-    module: Option<Submodule>,
+    /// constructor call of one module class or one sequence of them, so the
+    /// call stays unknown.
+    module: Option<Field>,
 }
 
 struct ClassMethod {
@@ -2944,6 +3478,9 @@ struct Submodules {
     /// class the first entry wins, so `__call__` beats `forward`.
     callables: Vec<ClassMethod>,
     inits: Vec<ClassMethod>,
+    /// The names that a `for` statement binds over a field that holds a
+    /// sequence of modules.
+    loop_variables: HashSet<String>,
 }
 
 /// The class a method is defined directly in.
@@ -2983,6 +3520,7 @@ fn constructed_module(
 }
 
 fn extract_submodules(
+    root: Node,
     text: &str,
     import_map: &HashMap<String, ImportPath>,
     hierarchy: &ClassHierarchy,
@@ -3012,15 +3550,14 @@ fn extract_submodules(
     for write in writes.iter().filter(|w| w.class != (0, usize::MAX)) {
         let module = write
             .value
-            .and_then(|value| constructed_module(value, text, import_map, hierarchy));
+            .and_then(|value| field_of(value, text, import_map, hierarchy));
         let fields = out.fields.entry(write.attr.clone()).or_default();
         match fields
             .iter_mut()
             .find(|f| (f.class_start, f.class_end) == write.class)
         {
             Some(field) => {
-                let same = matches!((&field.module, &module), (Some(a), Some(b))
-                    if a.class == b.class && a.ctor_args == b.ctor_args);
+                let same = matches!((&field.module, &module), (Some(a), Some(b)) if a.same(b));
                 if !same {
                     field.module = None;
                 }
@@ -3031,6 +3568,45 @@ fn extract_submodules(
                 module,
             }),
         }
+    }
+
+    // A sequence that some code changes in place is not the sequence that the
+    // constructor built.
+    let sequences: HashSet<&str> = out
+        .fields
+        .iter()
+        .filter(|(_, fields)| {
+            fields
+                .iter()
+                .any(|f| f.module.as_ref().is_some_and(Field::is_sequence))
+        })
+        .map(|(attr, _)| attr.as_str())
+        .collect();
+    if !sequences.is_empty() {
+        for (attr, class) in changed_in_place(root, text, &sequences) {
+            for field in out.fields.get_mut(&attr).into_iter().flatten() {
+                let own = (field.class_start, field.class_end);
+                let reached = class.is_none_or(|class| {
+                    class == own
+                        || hierarchy.mro(class).contains(&own)
+                        || hierarchy.mro(own).contains(&class)
+                });
+                if reached {
+                    field.module = None;
+                }
+            }
+        }
+        let sequences: HashSet<&str> = out
+            .fields
+            .iter()
+            .filter(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|f| f.module.as_ref().is_some_and(Field::is_sequence))
+            })
+            .map(|(attr, _)| attr.as_str())
+            .collect();
+        out.loop_variables = loop_variables(root, text, &sequences);
     }
     out
 }
@@ -3080,6 +3656,7 @@ fn propagate_calls(
             process_value_statements(value_statements, ctx);
 
             scrub_internal_names(ctx.errors, &ctx.synthetic_text);
+            scrub_applications(ctx.applications, &ctx.synthetic_text);
             Ok(())
         },
     )?;
@@ -3149,18 +3726,6 @@ impl Mark {
     }
 }
 
-/// The outermost loops of one top-level statement, as `collect_outer_loops`
-/// finds them for the module.
-fn unit_loops(unit: Node) -> Vec<Node> {
-    let mut loops = Vec::new();
-    match unit.kind() {
-        "for_statement" | "while_statement" => loops.push(unit),
-        "expression_statement" => {}
-        _ => collect_outer_loops(unit, &mut loops),
-    }
-    loops
-}
-
 /// Run the pass over the dirty units in source order: all their assignments,
 /// then all their value statements. The output of each unit and phase is cut
 /// from the output of the pass, and its internal names are put back.
@@ -3188,7 +3753,7 @@ fn run_units(
                     let mut items = Vec::new();
                     failed |= collect_items_of_child(*node, ctx.text, &mut items).is_err();
                     items.sort_by_key(|(_, rhs, _)| rhs.start_byte());
-                    replay_items(unit_loops(*node), items, None, ctx);
+                    replay_items(collect_flow(*node, ctx.text, ctx.import_map, false), items, None, ctx);
                 } else {
                     let mut statements = Vec::new();
                     failed |=
@@ -3214,12 +3779,14 @@ fn run_units(
             let mut segment_errors: Vec<ShapeError> =
                 errors.by_ref().take(to.errors - from.errors).collect();
             scrub_internal_names(&mut segment_errors, &ctx.synthetic_text);
+            let mut segment_applications: Vec<LayerApplication> = applications
+                .by_ref()
+                .take(to.applications - from.applications)
+                .collect();
+            scrub_applications(&mut segment_applications, &ctx.synthetic_text);
             phases[i][phase] = Segment {
                 errors: segment_errors,
-                applications: applications
-                    .by_ref()
-                    .take(to.applications - from.applications)
-                    .collect(),
+                applications: segment_applications,
                 assignments: std::sync::Arc::new(
                     assignments
                         .by_ref()
@@ -3266,7 +3833,9 @@ fn with_propagation<T>(
     let mut vmap_targets: HashMap<String, VmapInfo> = HashMap::new();
 
     let mut function_nodes = Vec::new();
-    collect_function_definition_nodes(node, &mut function_nodes);
+    let mut class_ranges = Vec::new();
+    collect_function_definition_nodes(node, &mut function_nodes, &mut class_ranges);
+    let class_starts: Vec<usize> = class_ranges.iter().map(|r| r.0).collect();
     let mut scope_function_nodes: Vec<Option<Node>> = std::iter::once(None)
         .chain(function_nodes.into_iter().map(Some))
         .collect();
@@ -3281,8 +3850,9 @@ fn with_propagation<T>(
     let original_shapes: Vec<HashMap<String, Vec<String>>> =
         scopes.iter().map(|s| s.shapes.clone()).collect();
 
-    let links = build_scope_links(scopes, &scope_function_nodes, text);
+    let links = build_scope_links(scopes, &scope_function_nodes, &class_ranges, text);
     let submodules = extract_submodules(
+        node,
         text,
         import_map,
         hierarchy,
@@ -3319,7 +3889,20 @@ fn with_propagation<T>(
         links: &links,
         submodules: &submodules,
         global_names: Default::default(),
+        classes: ScopeIndex::from_ranges(class_ranges),
+        class_starts,
+        module_writes: HashMap::new(),
+        class_body_names: Default::default(),
+        global_scopes: Default::default(),
+        module_values: Default::default(),
+        module_index: Default::default(),
+        annotation_symbols: Default::default(),
+        int_names: HashSet::new(),
+        int_consts: Default::default(),
         call_time: Vec::new(),
+        inner_masked: Vec::new(),
+        inner_scalars: HashSet::new(),
+        inner_arrays: HashSet::new(),
     };
 
     let result = body(&mut ctx)?;
@@ -3338,86 +3921,6 @@ fn process_value_statements(statements: Vec<Node>, ctx: &mut ShapeCtx) {
     }
 }
 
-/// A loop whose body is being replayed once, in source order.
-struct OpenLoop {
-    end_byte: usize,
-    scope_idx: usize,
-    /// Names the body both writes and reads, with the shape each had on entry.
-    carried: Vec<(String, Option<Vec<String>>)>,
-    /// Each name the body writes, with the names its right-hand side reads.
-    deps: Vec<(String, HashSet<String>)>,
-}
-
-/// The `for` and `while` statements under `node` that no other loop encloses.
-fn collect_outer_loops<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "for_statement" | "while_statement" => out.push(child),
-            "expression_statement" => {}
-            _ => collect_outer_loops(child, out),
-        }
-    }
-}
-
-fn open_loop(loop_node: Node, scope_idx: usize, ctx: &ShapeCtx) -> OpenLoop {
-    let items = collect_assignment_items(loop_node, ctx.text).unwrap_or_default();
-    let mut deps: Vec<(String, HashSet<String>)> = Vec::new();
-    let mut reads = HashSet::new();
-    for (lhs, rhs, _) in &items {
-        let mut read = HashSet::new();
-        insert_identifiers(*rhs, ctx.text, &mut read);
-        let written: Vec<&str> = match lhs {
-            Lhs::Single(name) => vec![name],
-            Lhs::Augmented(name) => {
-                read.insert(name.clone());
-                vec![name]
-            }
-            Lhs::Tuple(targets) => targets.iter().flat_map(TupleTarget::names).collect(),
-        };
-        reads.extend(read.iter().cloned());
-        deps.extend(written.into_iter().map(|name| (name.to_string(), read.clone())));
-    }
-    let mut carried: Vec<(String, Option<Vec<String>>)> = Vec::new();
-    for (name, _) in &deps {
-        if reads.contains(name) && !carried.iter().any(|(seen, _)| seen == name) {
-            let entry = ctx.scopes[scope_idx].shapes.get(name).cloned();
-            carried.push((name.clone(), entry));
-        }
-    }
-    OpenLoop { end_byte: loop_node.end_byte(), scope_idx, carried, deps }
-}
-
-/// A name the body reads and writes ends one iteration with a shape that the
-/// next iteration starts from, so replaying the body once is only right when
-/// that shape did not change (`x = f(x)`). Otherwise the iteration count
-/// decides (`x, y = y, x`), and the name is unknown after the loop. So is any
-/// name written from such a name.
-fn close_loop(open: OpenLoop, ctx: &mut ShapeCtx) {
-    let mut unknown: HashSet<String> = open
-        .carried
-        .iter()
-        .filter(|(name, entry)| {
-            entry.is_some() && ctx.scopes[open.scope_idx].shapes.get(name) != entry.as_ref()
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    loop {
-        let before = unknown.len();
-        for (name, read) in &open.deps {
-            if !read.is_disjoint(&unknown) {
-                unknown.insert(name.clone());
-            }
-        }
-        if unknown.len() == before {
-            break;
-        }
-    }
-    for name in unknown {
-        ctx.evict_binding(open.scope_idx, &name);
-    }
-}
-
 /// Replay the assignments under `root` in source order. `only_scope` keeps
 /// the items whose innermost scope is that one.
 fn process_assignment_items(
@@ -3426,47 +3929,35 @@ fn process_assignment_items(
     only_scope: Option<usize>,
     ctx: &mut ShapeCtx,
 ) {
-    let mut loops = Vec::new();
-    collect_outer_loops(root, &mut loops);
-    replay_items(loops, items, only_scope, ctx);
+    let in_class = directly_in_class(root);
+    replay_items(collect_flow(root, ctx.text, ctx.import_map, in_class), items, only_scope, ctx);
 }
 
-/// `process_assignment_items`, with the outermost loops already found.
+/// `process_assignment_items`, with the branches and loops already found. A
+/// branch gives each arm the state before it and joins the arms afterwards
+/// (see `flow`); a loop body is replayed once.
 fn replay_items(
-    loops: Vec<Node>,
+    flow: Vec<Marked>,
     items: Vec<(Lhs, Node, Node)>,
     only_scope: Option<usize>,
     ctx: &mut ShapeCtx,
 ) {
-    let mut loops = loops.into_iter().peekable();
-    let mut open: Vec<OpenLoop> = Vec::new();
-    let mut opened = None;
+    let mut replay = Replay::new(flow);
     for (lhs, rhs_node, assignment_node) in items {
         let byte = rhs_node.start_byte();
+        let scope = ctx.links.scope_index.lookup(byte);
         if let Some(only) = only_scope
-            && ctx.links.scope_index.lookup(byte) != Some(only)
+            && scope != Some(only)
         {
             continue;
         }
-        while let Some(done) = open.pop_if(|l| l.end_byte <= byte) {
-            close_loop(done, ctx);
-        }
-        while loops.next_if(|l| l.end_byte() <= byte).is_some() {}
-        // An item in a nested `def` belongs to another scope, not to the loop.
-        if let Some(&loop_node) = loops.peek()
-            && loop_node.start_byte() <= byte
-            && opened != Some(loop_node.id())
-            && let Some(scope_idx) = ctx.links.scope_index.lookup(byte)
-            && ctx.links.scope_index.lookup(loop_node.start_byte()) == Some(scope_idx)
-        {
-            opened = Some(loop_node.id());
-            open.push(open_loop(loop_node, scope_idx, ctx));
+        replay.advance(byte, ctx);
+        if let Some(scope) = scope {
+            replay.wrote(scope, &lhs, ctx);
         }
         process_assignment_item(lhs, rhs_node, assignment_node, ctx);
     }
-    while let Some(done) = open.pop() {
-        close_loop(done, ctx);
-    }
+    replay.finish(ctx);
 }
 
 /// Process one collected assignment item, binding its LHS to the RHS's
@@ -3475,6 +3966,30 @@ fn replay_items(
 /// (`specialize_callee_call`, which re-collects and replays just a single
 /// callee's own assignments on demand).
 fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx: &mut ShapeCtx) {
+    let name = match &lhs {
+        Lhs::Single(name) | Lhs::Augmented(name) => Some(name.clone()),
+        Lhs::Tuple(_) => None,
+    };
+    if let (Lhs::Single(name), "integer") = (&lhs, rhs_node.kind()) {
+        ctx.int_names.insert(name.clone());
+    }
+    let scope = ctx.links.scope_index.lookup(rhs_node.start_byte());
+    let in_class = ctx.in_class_body(assignment_node.start_byte(), scope);
+    if in_class && scope != Some(0) {
+        return;
+    }
+    process_assignment_item_inner(lhs, rhs_node, assignment_node, ctx);
+    if let (Some(name), Some(0), false) = (name, scope, in_class) {
+        ctx.note_module_write(&name);
+    }
+}
+
+fn process_assignment_item_inner(
+    lhs: Lhs,
+    rhs_node: Node,
+    assignment_node: Node,
+    ctx: &mut ShapeCtx,
+) {
     // Inlay hints display non-annotated assignments only (an annotated
     // assignment already shows the user's written type). `None` here means
     // "bind the shape but emit no inlay record".
@@ -3539,8 +4054,9 @@ fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx:
         && let Some(func_node) = rhs_node.child_by_field_name("function") {
             let target = func_node.utf8_text(ctx.text.as_bytes()).ok().unwrap_or("");
             let call_byte = rhs_node.start_byte();
-            if let Some(kind) =
-                find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, target)
+            if !ctx.is_loop_module(func_node, target)
+                && let Some(kind) =
+                    find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, target)
             {
                 let args_node = rhs_node.child_by_field_name("arguments");
                 if let Some(an) = args_node
@@ -3557,6 +4073,7 @@ fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx:
                                 variable: lhs_name.clone(),
                                 layer: target.to_string(),
                                 input,
+                                extra_inputs: extra_layer_inputs(&args, kind),
                                 kind: kind.clone(),
                                 range: an.range(),
                             };
@@ -3948,7 +4465,8 @@ fn name_is_array(
         return true;
     }
     match nearest_binding(at, name, ctx) {
-        (_, NameBinding::Unbound | NameBinding::Opaque) => false,
+        (_, NameBinding::Unbound) => false,
+        (owner, NameBinding::Opaque) => ctx.inner_arrays.contains(&(owner.id(), name.to_string())),
         (owner, NameBinding::Values(values)) => {
             let key = (owner.id(), name.to_string());
             if visiting.contains(&key) {
@@ -3980,6 +4498,9 @@ fn is_array_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>
         }),
         "identifier" => ctx.links.scope_index.lookup(node.start_byte())
             .is_some_and(|scope_idx| name_is_array(node, text(node), scope_idx, ctx, visiting)),
+        "subscript" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| is_array_expr(value, ctx, visiting)),
         "call" => {
             let Some(func) = node.child_by_field_name("function") else {
                 return false;
@@ -4955,6 +5476,7 @@ fn apply_vmap_call(
     info: &VmapInfo,
     args: &[CallArgument],
     caller_shapes: &dyn ShapeLookup,
+    links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
 ) -> Result<Option<Vec<String>>, String> {
     apply_vmap_call_chain(
@@ -4962,24 +5484,22 @@ fn apply_vmap_call(
         &info.wrapped,
         args,
         caller_shapes,
+        links,
         scopes,
     )
 }
 
-/// Generalized form of `apply_vmap_call` for nested vmaps, e.g.
-/// `jax.vmap(jax.vmap(f))(x)`. `axes` holds `(in_axes, out_axes)` pairs
-/// ordered outermost-to-innermost — one entry per vmap layer wrapping `f`.
-/// Peels one leading batch dim per level (checking cross-argument agreement
-/// at each level independently), resolves `f`'s shape on the fully-peeled
-/// per-example inputs, then re-prepends the batch dims outward-to-inward
-/// in reverse.
-fn apply_vmap_call_chain(
+/// The peeled arguments, each with its name, and the size of every peeled axis.
+type Peeled<'a> = (Vec<(&'a str, Vec<String>)>, Vec<String>);
+
+/// The positional arguments of a vmapped call with one leading axis peeled per
+/// level of `axes`, and the size of each axis. Checks that the arguments agree
+/// on every size. `None` when an argument has no shape or there is none.
+fn peel_vmap_args<'a>(
     axes: &[(isize, isize)],
-    wrapped: &str,
-    args: &[CallArgument],
+    args: &'a [CallArgument],
     caller_shapes: &dyn ShapeLookup,
-    scopes: &[FunctionShapeScope],
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<Option<Peeled<'a>>, String> {
     let mut current: Vec<(&str, Vec<String>)> = Vec::new();
     for arg in args {
         let CallArgument::Positional { value } = arg else {
@@ -5029,9 +5549,30 @@ fn apply_vmap_call_chain(
         // `level_dim` is always `Some` here.
         batch_dims.push(level_dim.unwrap());
     }
+    Ok(Some((current, batch_dims)))
+}
+
+/// Generalized form of `apply_vmap_call` for nested vmaps, e.g.
+/// `jax.vmap(jax.vmap(f))(x)`. `axes` holds `(in_axes, out_axes)` pairs
+/// ordered outermost-to-innermost — one entry per vmap layer wrapping `f`.
+/// Peels one leading batch dim per level (checking cross-argument agreement
+/// at each level independently), resolves `f`'s shape on the fully-peeled
+/// per-example inputs, then re-prepends the batch dims outward-to-inward
+/// in reverse.
+fn apply_vmap_call_chain(
+    axes: &[(isize, isize)],
+    wrapped: &str,
+    args: &[CallArgument],
+    caller_shapes: &dyn ShapeLookup,
+    links: &ScopeLinks,
+    scopes: &[FunctionShapeScope],
+) -> Result<Option<Vec<String>>, String> {
+    let Some((current, batch_dims)) = peel_vmap_args(axes, args, caller_shapes)? else {
+        return Ok(None);
+    };
 
     // Find the wrapped function's FunctionShapeScope.
-    let callee = match find_callee_scope(wrapped, None, scopes) {
+    let callee = match find_callee_scope(wrapped, None, links, scopes) {
         Some(idx) => &scopes[idx],
         None => return Ok(None), // wrapped function not found — skip silently
     };
@@ -5079,6 +5620,9 @@ fn shape_of_inline_vmap(
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
     let (callable_node, axes) = collect_vmap_axes(inner_call, ctx)?;
+    if callable_node.kind() == "lambda" {
+        return vmapped_lambda(callable_node, &axes, outer_args_node, scope_idx, ctx);
+    }
     let callable = callable_node.utf8_text(ctx.text.as_bytes()).ok()?.to_string();
 
     let outer_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
@@ -5107,7 +5651,9 @@ fn shape_of_inline_vmap(
             .submodule_at(attr, outer_args_node.start_byte())
             .map(|field| field.module.clone())
     {
-        let module = field?;
+        let Some(Field::One(Module::Local(module))) = field else {
+            return None;
+        };
         let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
         return apply_vmapped_submodule(&module, &callable, &outer_args, &axes, scope_idx, outer_args_node, ctx);
     }
@@ -5120,6 +5666,7 @@ fn shape_of_inline_vmap(
             &callable,
             &outer_args,
             &ctx.scope_shapes(scope_idx),
+            ctx.links,
             ctx.scopes,
         ) {
             Ok(shape) => shape,
@@ -5131,6 +5678,76 @@ fn shape_of_inline_vmap(
     }
 
     None
+}
+
+/// `jax.vmap(lambda x: ...)(xs)`, also nested: the body is evaluated on the
+/// shapes of one example, then the batch dims are put back. A keyword argument,
+/// a tuple, or an argument without a shape leaves the result unknown.
+fn vmapped_lambda(
+    lambda: Node,
+    axes: &[(isize, isize)],
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let mut cursor = args_node.walk();
+    let all_arrays = args_node
+        .named_children(&mut cursor)
+        .filter(|arg| arg.kind() != "comment")
+        .all(|arg| is_single_array_argument(arg, scope_idx, ctx));
+    if !all_arrays {
+        return None;
+    }
+    let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+    let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+    batched_lambda(lambda, axes, &args, args_node, scope_idx, ctx)
+}
+
+/// `jax.lax.map(lambda x: ..., xs)`: the lambda runs on one row of `xs`.
+fn map_lambda(
+    lambda: Node,
+    args_node: Node,
+    xs: &[CallArgument],
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let mut cursor = args_node.walk();
+    let nodes: Vec<Node> = args_node
+        .named_children(&mut cursor)
+        .filter(|arg| arg.kind() != "comment")
+        .collect();
+    let [_, xs_node] = nodes[..] else {
+        return None;
+    };
+    if !is_single_array_argument(xs_node, scope_idx, ctx) {
+        return None;
+    }
+    batched_lambda(lambda, &[(0, 0)], xs, args_node, scope_idx, ctx)
+}
+
+fn batched_lambda(
+    lambda: Node,
+    axes: &[(isize, isize)],
+    args: &[CallArgument],
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let peeled = peel_vmap_args(axes, args, &ctx.scope_shapes(scope_idx));
+    let (examples, batch_dims) = match peeled {
+        Ok(Some((examples, batch_dims))) => (examples, batch_dims),
+        Ok(None) => return None,
+        Err(message) => {
+            ctx.errors.push(ShapeError::mismatch(String::new(), message, args_node.range()));
+            return None;
+        }
+    };
+    let examples = examples.into_iter().map(|(_, shape)| shape).collect();
+    let mut output = shape_of_batched_lambda(lambda, scope_idx, examples, ctx)?;
+    for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
+        output = prepend_batch_dim(output, out_axes, dim);
+    }
+    Some(output)
 }
 
 /// `jax.vmap(self.blk)(x)` for a user module: peel the batch dim of every
@@ -5197,11 +5814,25 @@ fn shape_of_inline_module(
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let module = constructed_module(ctor_call, ctx.text, ctx.import_map, ctx.hierarchy)?;
+    let module = match constructed_module(ctor_call, ctx.text, ctx.import_map, ctx.hierarchy) {
+        Some(module) => Module::Local(module),
+        None => {
+            // The arguments are evaluated once the callee is a class.
+            let module = imported_module_of(ctor_call, ctx.text, ctx.import_map)?;
+            imported_class(&module, ctx)?;
+            Module::Imported(module)
+        }
+    };
+    // The callee names a class only if no scope around the call binds the
+    // first name of it: a parameter named like the imported module is not it.
+    let callee = ctor_call.child_by_field_name("function")?.utf8_text(ctx.text.as_bytes()).ok()?;
+    if shadowed_locally(ctor_call, callee.split('.').next()?, ctx) {
+        return None;
+    }
     let raw_args = extract_call_arguments(outer_args_node, ctx.text).ok()?;
     let args = resolve_call_args(raw_args, outer_args_node, scope_idx, ctx)?;
     let display = ctor_call.utf8_text(ctx.text.as_bytes()).ok()?;
-    apply_submodule_call(
+    apply_module(
         &module,
         display,
         &args,
@@ -5252,6 +5883,23 @@ fn collect_vmap_axes<'t>(
 /// Resolve `Layer(...)(x)` — a catalogued layer constructed and applied in
 /// one expression, e.g. flax's `nn.Dense(features=64)(x)` or
 /// `eqx.nn.Linear(3, 5)(x)`.
+/// The inputs of a layer call after the first. Only a loss reads one: its
+/// target, which is the second positional argument or `target=`.
+fn extra_layer_inputs(args: &[CallArgument], kind: &LayerKind) -> Vec<String> {
+    if !matches!(kind, LayerKind::Loss { .. }) {
+        return Vec::new();
+    }
+    args.iter()
+        .skip(1)
+        .find_map(|arg| match arg {
+            CallArgument::Positional { value } => Some(value.clone()),
+            CallArgument::Keyword { name, value } if name == "target" => Some(value.clone()),
+            CallArgument::Keyword { .. } => None,
+        })
+        .into_iter()
+        .collect()
+}
+
 fn shape_of_inline_layer(
     ctor_call: Node,
     outer_args_node: Node,
@@ -5272,6 +5920,7 @@ fn shape_of_inline_layer(
         variable: String::new(),
         layer,
         input,
+        extra_inputs: extra_layer_inputs(&args, &kind),
         kind,
         range: outer_args_node.range(),
     };
@@ -5361,16 +6010,19 @@ fn apply_inline_vmap_layer_chain(
 /// excluding the module scope (index 0) and optionally excluding scopes
 /// whose byte range contains `call_byte`.
 ///
-/// - `Some((call_byte, links))`: exclude scopes whose byte range contains this
+/// - `Some(call_byte)`: exclude scopes whose byte range contains this
 ///   byte (used by user-function calls to avoid self-recursive binding) and
 ///   closures defined in a function that does not enclose the call.
 /// - `None`: don't exclude any scope (used by vmap where the call is not
 ///   inside the wrapped function).
 ///
 /// Returns the index of the best (smallest-scope) matching scope, or `None`.
+/// A name that one scope defines twice (`ScopeLinks::redefined`) has no best
+/// scope: which definition runs depends on the path.
 fn find_callee_scope(
     target: &str,
-    call: Option<(usize, &ScopeLinks)>,
+    call: Option<usize>,
+    links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
 ) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None; // (scope index, scope size)
@@ -5382,7 +6034,10 @@ fn find_callee_scope(
         if scope.function_name.as_deref() != Some(target) {
             continue;
         }
-        if let Some((byte, links)) = call {
+        if links.redefined[i] {
+            return None;
+        }
+        if let Some(byte) = call {
             // Don't bind a call to itself (recursive call in the same function body).
             if scope.start_byte <= byte && byte < scope.end_byte {
                 continue;
@@ -5878,7 +6533,7 @@ fn apply_seeded_user_function(
     caller_scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let callee_idx = find_callee_scope(target, Some((call_byte, ctx.links)), ctx.scopes)?;
+    let callee_idx = find_callee_scope(target, Some(call_byte), ctx.links, ctx.scopes)?;
     let all_params = ctx.scopes[callee_idx].all_params.clone();
     let (seeded, carries) = seed_params_from_call(&all_params, args, caller_scope_idx, ctx);
     let result = specialize_callee_call(callee_idx, seeded, carries, call_byte, false, ctx)?;
@@ -6103,6 +6758,23 @@ fn scan_body_ys_shape(
     scan_call_byte: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
+    if body_node.kind() == "lambda" {
+        let scope_idx = ctx.links.scope_index.lookup(scan_call_byte)?;
+        if !is_single_array_argument(xs_node, scope_idx, ctx) {
+            return None;
+        }
+        let xs_shape = shape_of_expression(xs_node, ctx)?;
+        let (leading, rest) = xs_shape.split_first()?;
+        let output = scan_lambda_output(
+            body_node,
+            init_shape.to_vec(),
+            init_is_tuple,
+            rest.to_vec(),
+            scope_idx,
+            ctx,
+        )?;
+        return Some(std::iter::once(leading.clone()).chain(output).collect());
+    }
     let body_name = body_node.utf8_text(ctx.text.as_bytes()).ok()?;
     if body_name.contains('.') {
         return None;
@@ -6112,7 +6784,7 @@ fn scan_body_ys_shape(
     let leading = leading.clone();
     let rest = rest.to_vec();
 
-    let callee_idx = find_callee_scope(body_name, Some((scan_call_byte, ctx.links)), ctx.scopes)?;
+    let callee_idx = find_callee_scope(body_name, Some(scan_call_byte), ctx.links, ctx.scopes)?;
     let all_params = ctx.scopes[callee_idx].all_params.clone();
     let mut seeded = HashMap::new();
     let mut carries = Vec::new();
@@ -6503,7 +7175,8 @@ mod shape_of_expression_tests {
         let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
 
         let mut function_nodes = Vec::new();
-        collect_function_definition_nodes(tree.root_node(), &mut function_nodes);
+        let mut class_ranges = Vec::new();
+        collect_function_definition_nodes(tree.root_node(), &mut function_nodes, &mut class_ranges);
         let mut scope_function_nodes: Vec<Option<Node>> = std::iter::once(None)
             .chain(function_nodes.into_iter().map(Some))
             .collect();
@@ -6511,7 +7184,7 @@ mod shape_of_expression_tests {
         let original_shapes: Vec<HashMap<String, Vec<String>>> =
             scopes.iter().map(|s| s.shapes.clone()).collect();
 
-        let links = build_scope_links(&scopes, &scope_function_nodes, code);
+        let links = build_scope_links(&scopes, &scope_function_nodes, &class_ranges, code);
 
         let mut ctx = ShapeCtx {
             text: code,
@@ -6541,7 +7214,20 @@ mod shape_of_expression_tests {
             links: &links,
             submodules: &Submodules::default(),
             global_names: Default::default(),
+            classes: ScopeIndex::default(),
+            class_starts: Vec::new(),
+            module_writes: HashMap::new(),
+            class_body_names: Default::default(),
+            global_scopes: Default::default(),
+            module_values: Default::default(),
+            module_index: Default::default(),
+            annotation_symbols: Default::default(),
+            int_names: HashSet::new(),
+            int_consts: Default::default(),
             call_time: Vec::new(),
+            inner_masked: Vec::new(),
+            inner_scalars: HashSet::new(),
+            inner_arrays: HashSet::new(),
         };
 
         for (lhs, rhs_node, _assignment_node) in assignments {
@@ -7164,5 +7850,54 @@ def f(x: Float[Array, "4"], uneven: Float[Array, "7"], symbolic: Float[Array, "n
         assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         let range = &analysis.errors[0].range;
         assert_eq!(&code[range.start_byte..range.end_byte], "(x, 3)");
+    }
+
+    fn reference_global_names(node: Node, text: &str, out: &mut HashSet<String>) {
+        if node.kind() == "global_statement" {
+            insert_identifiers(node, text, out);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            reference_global_names(child, text, out);
+        }
+    }
+
+    fn global_names_both(code: &str) -> (HashSet<String>, HashSet<String>) {
+        let tree = parse(code);
+        let (mut fast, mut slow) = (HashSet::new(), HashSet::new());
+        collect_global_names(tree.root_node(), code, &mut fast);
+        reference_global_names(tree.root_node(), code, &mut slow);
+        (fast, slow)
+    }
+
+    #[test]
+    fn global_statements_are_found_wherever_a_statement_can_stand() {
+        let code = "g1 = 0\ndef f():\n    global a, b\n    if c:\n        global d\n    else:\n        global e\n    for i in x:\n        global f1\n    while y:\n        global g\n    try:\n        global h\n    except E:\n        global i1\n    finally:\n        global j\n    with m:\n        global k\n    match z:\n        case 1:\n            global l\n    class C:\n        global n\n        def m(self):\n            global o\n    if q: global p\n@dec\ndef g():\n    global r\nasync def h():\n    async with a:\n        global s\n    async for i in b:\n        global t\nx = lambda: 1\n";
+        let (fast, slow) = global_names_both(code);
+        assert_eq!(fast, slow);
+        assert_eq!(fast.len(), 17, "{fast:?}");
+    }
+
+    #[test]
+    fn global_statements_of_the_project_files_are_found() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for dir in ["corpus", "bench/stress", "bench"] {
+            let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "py")
+                    && let Ok(code) = std::fs::read_to_string(&path)
+                {
+                    let (fast, slow) = global_names_both(&code);
+                    assert_eq!(fast, slow, "{}", path.display());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20);
     }
 }

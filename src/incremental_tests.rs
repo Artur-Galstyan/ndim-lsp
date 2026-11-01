@@ -600,6 +600,7 @@ mod shift {
                 out_features: "3".into(),
             },
             range: range(10, 20, 2),
+            extra_inputs: Vec::new(),
         };
         assert_eq!(shifted(&app, BY).range, range(110, 120, 9));
     }

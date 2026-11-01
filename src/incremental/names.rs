@@ -7,6 +7,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use tree_sitter::Node;
 
+use crate::python_ast::dynamic_attribute;
 use crate::types::ImportPath;
 
 /// FNV-1a. A collision of two names only joins their groups.
@@ -57,6 +58,8 @@ pub(super) struct NameSet {
     /// Plain assignments of a call, at any depth: the last segment of the
     /// callee, and the name assigned. A `vmap` binds a name for the whole file.
     pub calls: Vec<(u64, u64)>,
+    /// Names that a plain assignment gives an integer literal, at any depth.
+    pub ints: Vec<u64>,
     pub globals: Vec<u64>,
     pub wildcard: bool,
 }
@@ -101,12 +104,14 @@ impl NameSet {
         let mut skip = ByteSet::default();
         let mut assigned: Vec<&str> = Vec::new();
         let mut cursor = unit.walk();
-        let mut flags = vec![true];
+        // Per level: the node is at module level, and is in a class body.
+        let mut flags = vec![(true, false)];
         let hash = |n: Node| name_hash(&text.as_bytes()[n.byte_range()]);
         'walk: loop {
             let node = cursor.node();
-            let module_level = *flags.last().unwrap();
+            let (module_level, in_class) = *flags.last().unwrap();
             let mut inner_module_level = module_level;
+            let mut inner_in_class = in_class;
             let mut descend = true;
             match node.kind() {
                 "identifier" => {
@@ -119,8 +124,21 @@ impl NameSet {
                     if let Some(name) = node.child_by_field_name("name") {
                         set.defs.push(hash(name));
                         skip.insert(name.start_byte());
+                        // The statement binds the name in the module scope,
+                        // like an assignment does (a member of a class does
+                        // not).
+                        if module_level && !in_class {
+                            assigned.push(&text[name.byte_range()]);
+                        }
                     }
                     inner_module_level = module_level && node.kind() == "class_definition";
+                    inner_in_class = node.kind() == "class_definition";
+                }
+                "call" => {
+                    // `getattr(obj, "layers")` reads the attribute `layers`.
+                    if let Some(attr) = dynamic_attribute(node, text) {
+                        set.reads.push(name_hash(attr.as_bytes()));
+                    }
                 }
                 "lambda" => inner_module_level = false,
                 "assignment" | "augmented_assignment" | "for_statement" => {
@@ -151,6 +169,14 @@ impl NameSet {
                         }
                         if module_level {
                             shallow_identifiers(left, text, &mut assigned);
+                        }
+                        if node.kind() == "assignment"
+                            && left.kind() == "identifier"
+                            && node
+                                .child_by_field_name("right")
+                                .is_some_and(|right| right.kind() == "integer")
+                        {
+                            set.ints.push(hash(left));
                         }
                         if node.kind() == "assignment"
                             && left.kind() == "identifier"
@@ -223,7 +249,7 @@ impl NameSet {
                 _ => {}
             }
             if descend && cursor.goto_first_child() {
-                flags.push(inner_module_level);
+                flags.push((inner_module_level, inner_in_class));
                 continue;
             }
             while !cursor.goto_next_sibling() {
@@ -241,6 +267,7 @@ impl NameSet {
             &mut set.defs,
             &mut set.shared,
             &mut set.globals,
+            &mut set.ints,
         ] {
             list.sort_unstable();
             list.dedup();

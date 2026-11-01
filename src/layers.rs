@@ -5,7 +5,7 @@ use tree_sitter::Node;
 #[cfg(test)]
 use tree_sitter::Range;
 
-use crate::known_functions::apply_known_einops;
+use crate::known_functions::{apply_known_einops, apply_loss_layer};
 use crate::python_ast::{
     build_import_map, class_ranges, enclosing_class_range, extract_call_arguments, extract_calls,
     extract_self_attr_calls,
@@ -300,6 +300,26 @@ pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .cloned()
                 .unwrap_or_else(|| "1".to_string()),
         }),
+        "MSELoss" | "L1Loss" | "SmoothL1Loss" | "HuberLoss" | "BCELoss" | "BCEWithLogitsLoss"
+        | "CrossEntropyLoss" | "NLLLoss"
+            if is_torch_module =>
+        {
+            let given = |name: &str| call.bindings.get(name).is_some_and(|v| v.trim() != "None");
+            let reduction = if given("size_average") || given("reduce") {
+                None
+            } else {
+                Some(
+                    call.bindings
+                        .get("reduction")
+                        .cloned()
+                        .unwrap_or_else(|| "'mean'".to_string()),
+                )
+            };
+            Some(LayerKind::Loss {
+                name: owner.to_string(),
+                reduction,
+            })
+        }
         "MLP" if is_equinox_module => Some(LayerKind::Mlp {
             in_size: call.bindings.get("in_size")?.clone(),
             out_size: call.bindings.get("out_size")?.clone(),
@@ -589,6 +609,7 @@ fn strip_self_prefixes(kind: LayerKind) -> LayerKind {
                 .map(|(k, v)| (k, strip_self_prefix(&v)))
                 .collect(),
         },
+        loss @ LayerKind::Loss { .. } => loss,
     }
 }
 
@@ -714,6 +735,36 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         | "ReflectionPad3d" | "ReplicationPad1d" | "ReplicationPad2d" | "ReplicationPad3d" => {
             &["self", "padding"]
         }
+        "MSELoss" | "L1Loss" if framework == "torch" => {
+            &["self", "size_average", "reduce", "reduction"]
+        }
+        "SmoothL1Loss" if framework == "torch" => {
+            &["self", "size_average", "reduce", "reduction", "beta"]
+        }
+        "HuberLoss" if framework == "torch" => &["self", "reduction", "delta"],
+        "BCELoss" if framework == "torch" => {
+            &["self", "weight", "size_average", "reduce", "reduction"]
+        }
+        "BCEWithLogitsLoss" if framework == "torch" => {
+            &["self", "weight", "size_average", "reduce", "reduction", "pos_weight"]
+        }
+        "CrossEntropyLoss" if framework == "torch" => &[
+            "self",
+            "weight",
+            "size_average",
+            "ignore_index",
+            "reduce",
+            "reduction",
+            "label_smoothing",
+        ],
+        "NLLLoss" if framework == "torch" => &[
+            "self",
+            "weight",
+            "size_average",
+            "ignore_index",
+            "reduce",
+            "reduction",
+        ],
         "Bilinear" => &["self", "in1_features", "in2_features", "out_features", "use_bias"],
         "CosineSimilarity" => &["self", "dim", "eps"],
         "MLP" if framework == "equinox" => &[
@@ -1192,6 +1243,7 @@ pub fn extract_layer_applications(
             input: value.clone(),
             kind: kind.clone(),
             range: call.args_node_range,
+            extra_inputs: Vec::new(),
         });
     }
 
@@ -1588,6 +1640,12 @@ pub fn apply_layer_application(
     app: &LayerApplication,
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
+    if let LayerKind::Loss { name, reduction } = &app.kind {
+        let Some(target) = app.extra_inputs.first() else {
+            return Ok(None);
+        };
+        return apply_loss_layer(name, reduction.as_deref(), &app.input, target, shapes);
+    }
     let Some(input_shape) = shapes.shape(&app.input) else {
         return Ok(None);
     };
@@ -2119,6 +2177,8 @@ pub(crate) fn apply_layer_kind(
             };
             apply_known_einops(&args, &lookup)
         }
+        // A loss needs its target too: `apply_layer_application` runs it.
+        LayerKind::Loss { .. } => Ok(None),
     }
 }
 
@@ -2189,6 +2249,7 @@ mod apply_layer_application_tests {
             input: input.to_string(),
             kind,
             range: dummy_range(),
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -2341,6 +2402,7 @@ mod apply_layer_applications_tests {
             input: input.to_string(),
             kind,
             range: dummy_range(),
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -2658,6 +2720,7 @@ mod extract_layer_applications_tests {
             input: input.to_string(),
             kind,
             range: dummy_range(),
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -4046,6 +4109,7 @@ mod catalog_first_extract_layer_assignments_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         };
 
         assert_eq!(
@@ -4112,6 +4176,7 @@ mod catalog_first_extract_layer_assignments_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         }
     }
 
@@ -4732,6 +4797,7 @@ mod new_layer_kind_apply_tests {
                 start_point: tree_sitter::Point::new(0, 0),
                 end_point: tree_sitter::Point::new(0, 0),
             },
+            extra_inputs: Vec::new(),
         }
     }
 

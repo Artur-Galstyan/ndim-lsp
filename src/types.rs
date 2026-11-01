@@ -529,6 +529,15 @@ pub enum LayerKind {
         pattern: String,
         kwargs: HashMap<String, String>,
     },
+    /// A `torch.nn` loss module (`MSELoss`, `CrossEntropyLoss`, ...). It takes
+    /// the prediction and a target, so it applies through
+    /// `LayerApplication::extra_inputs`. `reduction` is the raw ctor text
+    /// (`'mean'` by default). It is `None` when a deprecated `size_average` or
+    /// `reduce` argument decides the reduction.
+    Loss {
+        name: String,
+        reduction: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -776,6 +785,8 @@ pub struct LayerApplication {
     pub variable: String,
     pub layer: String,
     pub input: String,
+    /// The inputs after the first, in call order: the target of a loss layer.
+    pub extra_inputs: Vec<String>,
     pub kind: LayerKind,
     pub range: Range,
 }
@@ -785,6 +796,7 @@ impl PartialEq for LayerApplication {
         self.variable == other.variable
             && self.layer == other.layer
             && self.input == other.input
+            && self.extra_inputs == other.extra_inputs
             && self.kind == other.kind
     }
 }
@@ -978,8 +990,10 @@ struct IndexedScope {
 
 impl ScopeIndex {
     pub fn new(scopes: &[FunctionShapeScope]) -> Self {
-        let ranges: Vec<(usize, usize)> =
-            scopes.iter().map(|s| (s.start_byte, s.end_byte)).collect();
+        Self::from_ranges(scopes.iter().map(|s| (s.start_byte, s.end_byte)).collect())
+    }
+
+    pub fn from_ranges(ranges: Vec<(usize, usize)>) -> Self {
         let mut order: Vec<usize> = (0..ranges.len())
             .filter(|&i| ranges[i].0 < ranges[i].1)
             .collect();

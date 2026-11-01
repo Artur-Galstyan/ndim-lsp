@@ -172,6 +172,48 @@ pub fn extract_call_arguments(args_node: Node, text: &str) -> Result<Vec<CallArg
     Ok(args)
 }
 
+/// Whether `node` is in a class body, with no function between: the names
+/// it binds belong to the class, not to the scope around it.
+pub(crate) fn directly_in_class(node: Node) -> bool {
+    let mut up = node.parent();
+    while let Some(owner) = up {
+        match owner.kind() {
+            "class_definition" => return true,
+            "function_definition" => return false,
+            _ => up = owner.parent(),
+        }
+    }
+    false
+}
+
+/// The names in the text of a dimension: `2*D+k` has `D` and `k`.
+pub(crate) fn dim_symbols(dim: &str) -> impl Iterator<Item = &str> {
+    dim.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|token| token.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_'))
+}
+
+/// The attribute that a `getattr`, `setattr`, or `delattr` call names with a
+/// string literal: `getattr(self, "layers")` names `layers`.
+pub(crate) fn dynamic_attribute<'a>(call: Node, text: &'a str) -> Option<&'a str> {
+    // Most calls are something else: look at the text before the tree.
+    let source = text.get(call.start_byte()..)?;
+    if !["getattr", "setattr", "delattr"].iter().any(|name| source.starts_with(name)) {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier"
+        || !matches!(&text[function.byte_range()], "getattr" | "setattr" | "delattr")
+    {
+        return None;
+    }
+    let name = call.child_by_field_name("arguments")?.named_child(1)?;
+    if name.kind() != "string" || name.named_child_count() != 3 {
+        return None;
+    }
+    let content = name.named_child(1).filter(|c| c.kind() == "string_content")?;
+    Some(&text[content.byte_range()])
+}
+
 pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionShapeScope>, String> {
     fn first_identifier(node: Node, text: &str) -> Result<Option<String>, String> {
         if node.kind() == "identifier" {
@@ -432,6 +474,7 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
             && left_node.kind() == "identifier"
             && contains_array_type(type_node, text)?
             && let Some(shape_node) = find_string_literal(type_node)
+            && (current_scope_idx == 0 || !directly_in_class(node))
         {
             let parsed_dims = shape_dims(shape_node, text)?;
             if !parsed_dims.is_empty() {

@@ -591,15 +591,20 @@ fn check_markers(text: &str, diags: &[Value], hints: &[Value]) -> (usize, Vec<Va
                     continue;
                 };
                 checked += 1;
-                let want = if shape == "[]" { "Scalar" } else { shape };
+                // `name=?` expects no hint: the analyzer must leave it unknown.
+                let want = match shape {
+                    "[]" => Some("Scalar"),
+                    "?" => None,
+                    _ => Some(shape),
+                };
                 let got = by_line
                     .get(&row)
                     .and_then(|v| v.iter().find(|(n, _)| n == name))
                     .map(|(_, l)| l.as_str());
-                if got != Some(want) {
+                if got != want {
                     fails.push(json!({
                         "kind": if got.is_none() { "missing-shape" } else { "wrong-shape" },
-                        "line": row + 1, "name": name, "expected": want, "got": got,
+                        "line": row + 1, "name": name, "expected": want.unwrap_or("unknown"), "got": got,
                         "source": line.trim(),
                     }));
                 }
@@ -739,7 +744,12 @@ fn one_run(run: usize, rec: &mut Recorder) {
 
     // 1b. markers in the imported helper modules (checked once, in run 0)
     if first {
-        for name in ["stress_torch.py", "stress_jax.py", "stress_common.py"] {
+        for name in [
+            "stress_torch.py",
+            "stress_jax.py",
+            "stress_common.py",
+            "stress_modules.py",
+        ] {
             let p = root.join(name);
             let text = fs::read_to_string(&p).unwrap();
             let u = format!("file://{}", p.display());

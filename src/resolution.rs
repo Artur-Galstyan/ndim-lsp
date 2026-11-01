@@ -67,7 +67,28 @@ pub struct ResolutionCache {
     /// invalidation of its own. `Tree` is `Send + Sync`, and a clone is a cheap
     /// reference-counted copy that does not borrow the cache.
     parsed: std::sync::Mutex<HashMap<PathBuf, (Arc<str>, Tree)>>,
+    /// Results of module probes (see `analysis::modules`) with the disk state
+    /// each one read. An entry is used while `deps_valid` holds for it.
+    module_probes: std::sync::Mutex<HashMap<String, (Deps, Arc<ModuleProbe>)>>,
+    /// The part of a file that one class needs (see `analysis::modules`),
+    /// per hash of the file's text and class name. The text is part of the
+    /// key, so an entry needs no invalidation.
+    class_sources: std::sync::Mutex<ClassSources>,
 }
+
+/// What analyzing a module of another file on one call gave: the shape it
+/// returned and the messages of the errors the call caused.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ModuleProbe {
+    pub(crate) shape: Option<Vec<String>>,
+    pub(crate) errors: Vec<String>,
+}
+
+/// The part of a file that a class needs, per hash of the text and class name.
+type ClassSources = HashMap<(u64, String), Option<Arc<String>>>;
+
+/// Module probes kept at most. The map is emptied when it is full.
+const MAX_MODULE_PROBES: usize = 512;
 
 /// Parsed files kept at most. The map is emptied when it is full.
 const MAX_PARSED_FILES: usize = 128;
@@ -267,6 +288,50 @@ impl ResolutionCache {
         (out, Some(deps))
     }
 
+    /// The stored result of a module probe, if the files it read are
+    /// unchanged. The recording that is active (see `record_deps`) learns of
+    /// these files too.
+    pub(crate) fn probe_lookup(&self, key: &str) -> Option<Arc<ModuleProbe>> {
+        let (deps, probe) = self.module_probes.lock().unwrap().get(key).cloned()?;
+        if !self.deps_valid(&deps) {
+            return None;
+        }
+        let paths: Arc<[PathBuf]> = deps.paths.iter().map(|(p, _)| p.clone()).collect();
+        touch(&paths);
+        Some(probe)
+    }
+
+    /// `compute(source)`, kept per text of `source` and per `class`.
+    pub(crate) fn class_source(
+        &self,
+        source: &str,
+        class: &str,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<Arc<String>> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let key = (hasher.finish(), class.to_string());
+        if let Some(found) = self.class_sources.lock().unwrap().get(&key) {
+            return found.clone();
+        }
+        let found = compute().map(Arc::new);
+        let mut sources = self.class_sources.lock().unwrap();
+        if sources.len() >= MAX_MODULE_PROBES {
+            sources.clear();
+        }
+        sources.insert(key, found.clone());
+        found
+    }
+
+    /// Keep the result of a module probe that read the files in `deps`.
+    pub(crate) fn probe_store(&self, key: String, deps: Deps, probe: Arc<ModuleProbe>) {
+        let mut probes = self.module_probes.lock().unwrap();
+        if probes.len() >= MAX_MODULE_PROBES && !probes.contains_key(&key) {
+            probes.clear();
+        }
+        probes.insert(key, (deps, probe));
+    }
+
     /// Whether no path in `deps` was marked stale, and the cache was not
     /// cleared, since `deps` was recorded.
     pub fn deps_valid(&self, deps: &Deps) -> bool {
@@ -291,6 +356,8 @@ impl ResolutionCache {
         self.map.write().unwrap().clear();
         self.signatures.write().unwrap().clear();
         self.parsed.lock().unwrap().clear();
+        self.module_probes.lock().unwrap().clear();
+        self.class_sources.lock().unwrap().clear();
     }
 }
 
@@ -318,6 +385,8 @@ pub fn new_resolution_cache() -> Arc<ResolutionCache> {
         misses: AtomicUsize::new(0),
         parses: AtomicUsize::new(0),
         parsed: std::sync::Mutex::new(HashMap::new()),
+        module_probes: std::sync::Mutex::new(HashMap::new()),
+        class_sources: std::sync::Mutex::new(HashMap::new()),
     })
 }
 

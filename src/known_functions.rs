@@ -1165,6 +1165,12 @@ pub(crate) fn apply_known_einops(
         })
         .collect();
 
+    let is_ellipsis = |g: &Vec<String>| g.as_slice() == ["..."];
+    if lhs_groups.iter().filter(|g| is_ellipsis(g)).count() > 1
+        || rhs_groups.iter().filter(|g| is_ellipsis(g)).count() > 1
+    {
+        return Ok(None);
+    }
     let lhs_ellipsis = lhs_groups.iter().position(|g| g.as_slice() == ["..."]);
     let rhs_ellipsis = rhs_groups.iter().position(|g| g.as_slice() == ["..."]);
     if lhs_ellipsis.is_some() != rhs_ellipsis.is_some() {
@@ -2285,6 +2291,15 @@ fn apply_known_cross_entropy(
     shapes: &dyn ShapeLookup,
     probabilities: bool,
 ) -> Result<Option<Vec<String>>, String> {
+    cross_entropy_with_reduction(args, shapes, probabilities, loss_reduction(args))
+}
+
+fn cross_entropy_with_reduction(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    probabilities: bool,
+    reduction: Result<Option<&str>, String>,
+) -> Result<Option<Vec<String>>, String> {
     let name = if probabilities { "cross_entropy" } else { "nll_loss" };
     let Some(input) = nth_positional_or_keyword(args, 0, &["input"]).and_then(|n| shapes.shape(n))
     else {
@@ -2305,7 +2320,7 @@ fn apply_known_cross_entropy(
         .map(|(_, dim)| dim.clone())
         .collect();
 
-    let reduction = loss_reduction(args)?;
+    let reduction = reduction?;
     let scalar_or_items = |reduction: Option<&str>| match reduction {
         Some("none") => Some(per_item.clone()),
         Some(_) => Some(Vec::new()),
@@ -2377,7 +2392,13 @@ fn loss_reduction(args: &[CallArgument]) -> Result<Option<&str>, String> {
     if given(3, "size_average") || given(5, "reduce") {
         return Ok(None);
     }
-    let Some(value) = nth_positional_or_keyword(args, 6, &["reduction"]) else {
+    literal_reduction(nth_positional_or_keyword(args, 6, &["reduction"]))
+}
+
+/// The reduction a loss was given as source text: `None` text is the
+/// default `'mean'`.
+fn literal_reduction(text: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(value) = text else {
         return Ok(Some("mean"));
     };
     let value = value.trim();
@@ -2389,6 +2410,95 @@ fn loss_reduction(args: &[CallArgument]) -> Result<Option<&str>, String> {
         Some(other) => Err(format!("{} is not a valid value for reduction", other)),
         None => Ok(None),
     }
+}
+
+/// A `torch.nn` loss module applied to `input` and `target`. The classification
+/// losses follow the rule of the matching function, with the reduction of the
+/// constructor. `MSELoss`, `L1Loss`, `SmoothL1Loss`, and `HuberLoss` broadcast
+/// the two operands (torch warns, and does not raise). `BCELoss` and
+/// `BCEWithLogitsLoss` need equal sizes. The constructor `weight` and the other
+/// arguments do not change the shape, so they are not read. An unknown operand
+/// gives an unknown result.
+pub(crate) fn apply_loss_layer(
+    name: &str,
+    reduction: Option<&str>,
+    input: &str,
+    target: &str,
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(input_shape), Some(target_shape)) = (shapes.shape(input), shapes.shape(target))
+    else {
+        return Ok(None);
+    };
+    let reduction = match reduction {
+        Some(text) => literal_reduction(Some(text)),
+        None => Ok(None),
+    };
+    if matches!(name, "CrossEntropyLoss" | "NLLLoss") {
+        let args = [
+            CallArgument::Positional { value: input.to_string() },
+            CallArgument::Positional { value: target.to_string() },
+        ];
+        return cross_entropy_with_reduction(&args, shapes, name == "CrossEntropyLoss", reduction);
+    }
+    let reduction = reduction?;
+    let reduced = |items: Vec<String>| match reduction {
+        Some("none") => Some(items),
+        Some(_) => Some(Vec::new()),
+        None => None,
+    };
+    if matches!(name, "BCELoss" | "BCEWithLogitsLoss") {
+        if input_shape.len() != target_shape.len() {
+            return Err(format!(
+                "{name} target shape [{}] must match input shape [{}]",
+                target_shape.join(", "),
+                input_shape.join(", ")
+            ));
+        }
+        for (want, got) in input_shape.iter().zip(target_shape) {
+            if provably_different(want, got) {
+                return Err(format!(
+                    "{name} target shape [{}] must match input shape [{}]",
+                    target_shape.join(", "),
+                    input_shape.join(", ")
+                ));
+            }
+        }
+        return Ok(reduced(input_shape.clone()));
+    }
+    let mut broadcast = Some(Vec::new());
+    for i in 1..=input_shape.len().max(target_shape.len()) {
+        let left = input_shape.len().checked_sub(i).map(|at| &input_shape[at]);
+        let right = target_shape.len().checked_sub(i).map(|at| &target_shape[at]);
+        let dim = match (left, right) {
+            (Some(dim), None) | (None, Some(dim)) => Some(dim.clone()),
+            (Some(a), Some(b)) if dims_canonically_equal(a, b) => Some(a.clone()),
+            (Some(a), Some(b)) if a == "1" => Some(b.clone()),
+            (Some(a), Some(b)) if b == "1" => Some(a.clone()),
+            (Some(a), Some(b)) if provably_different(a, b) => {
+                return Err(format!(
+                    "{name} cannot broadcast input shape [{}] with target shape [{}]: dim {a} vs {b}",
+                    input_shape.join(", "),
+                    target_shape.join(", ")
+                ));
+            }
+            _ => None,
+        };
+        match (&mut broadcast, dim) {
+            (Some(dims), Some(dim)) => dims.insert(0, dim),
+            _ => broadcast = None,
+        }
+    }
+    Ok(match (reduction, broadcast) {
+        (Some("none"), broadcast) => broadcast,
+        (Some(_), _) => Some(Vec::new()),
+        (None, _) => None,
+    })
+}
+
+/// Two dims that are different integers.
+fn provably_different(a: &str, b: &str) -> bool {
+    matches!((a.parse::<u64>(), b.parse::<u64>()), (Ok(a), Ok(b)) if a != b)
 }
 
 fn apply_known_dot(
