@@ -7,18 +7,18 @@ ndim-lsp is a Rust/tower-lsp + tree-sitter-python project for static tensor shap
 
 Current validation baseline
 ---------------------------
-Verified on the code with method resolution by class, constant layer dims
-(`src/analysis/layer_dims.rs`), scoped imports (`src/imports.rs`), and the
-cost-based debounce (`src/sync.rs`). Commit `025e7f2` is the last commit
-without these four items. `ndim-lsp` is 0.1.1.
+Verified on the code with free parameter dims (item 18b), one-binding symbols
+across files, scoped bare names and `vmap` names (item 18a), and module-level
+rebinding of imports (item 22). Commit `c6f2860` is the last commit without
+these four items. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,309 tests pass and six are ignored.
-  - 2,222 library tests (47 of them in `src/incremental_tests.rs`). Two
+- `cargo test --quiet` passes: 2,406 tests pass and six are ignored.
+  - 2,309 library tests (49 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
-  - 26 in `tests/incremental_edits.rs`. One ignored:
+  - 34 in `tests/incremental_edits.rs`. One ignored:
     `stress_main_two_thousand_chained_edits`.
-  - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 1 in
+  - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 3 in
     `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
     `golden_dump`, `golden_has_no_internal_names`.
   The known-function tests live in `src/known_functions/*_tests.rs`. The dev
@@ -124,7 +124,8 @@ Golden gate for refactors: `golden_dump` writes every diagnostic and inlay hint
 of the stress project. Dump before and after a change, then `cmp` the two files.
 A cleanup or a speed change must give a byte-identical dump. Do not fix
 analyzer defects inside such a change, because the fix changes the dump.
-`golden_has_no_internal_names` checks that no `__synth_` or `__ellipsis` name
+`golden_has_no_internal_names` checks that no `__synth_`, `__ellipsis`,
+`__free_`, or `__unproven` name
 reaches a message or a hint.
 
 The harness checks about 13,800 expected markers (6,410 in `stress_main.py`,
@@ -137,47 +138,51 @@ asserts the expected markers and the scenario invariants. Do not loosen the
 test to make it pass. A refactor must keep it green and keep the golden dump
 byte-identical.
 
-Baseline (the code with the cost-based debounce, release, 10 CPUs, macOS,
-5 runs, p50, 22,323-line file):
+Baseline (the code with free parameter dims, scoped bare names, and tracked
+import rebinding, release, 10 CPUs, macOS, 5 runs, p50, 22,323-line file):
 
-- One edit costs about 50 to 75 ms: 20 ms debounce plus about 16 to 40 ms
-  server compute plus about 13 to 17 ms other. Examples: `edit_char_end`
-  51.1 ms total (16 ms compute), `edit_char_middle` 55.8 (20),
-  `edit_unannotated_helper_body` 49.7 (16), `error_insert_matmul` 52.0 (16),
-  `edit_base_class_init_layer` 66.9 (31), `paste_500_lines` 75.2 (40),
-  `edit_init_layer` 75.0 (39), `burst_50_changes` 49.8 (16). The old full
+- One edit costs about 50 to 80 ms: 20 ms debounce plus about 16 to 44 ms
+  server compute plus about 14 to 16 ms other. Examples: `edit_char_end`
+  52.5 ms total (18 ms compute), `edit_char_middle` 54.2 (19),
+  `edit_unannotated_helper_body` 51.7 (17), `error_insert_matmul` 52.3 (18),
+  `edit_base_class_init_layer` 70.5 (35), `paste_500_lines` 79.9 (44),
+  `edit_init_layer` 72.5 (37), `burst_50_changes` 51.3 (17). The old full
   re-analysis baseline was about 405 to 420 ms per edit (150 ms debounce plus
   about 242 ms compute).
-- `typing_plain` 58.0 ms (21 ms compute), `typing_with_inlay_requests` 60.6
-  (19). 12 keys, 100 ms apart, give 12 analyses and 12 publications, also with
+- `typing_plain` 52.2 ms (17 ms compute), `typing_with_inlay_requests` 58.1
+  (18). 12 keys, 100 ms apart, give 12 analyses and 12 publications, also with
   inlay requests.
-- `edit_after_idle` 88.0 ms and `typing_plain_revert` 88.4 ms are the slow side
-  of a normal edit: the debounce is 20 ms, and compute is 45 to 48 ms.
-- `edit_char_start` is the worst case: 448.3 ms total, 281 ms compute, 150 ms
+- `edit_after_idle` 51.7 ms (17 ms compute) and `typing_plain_revert` 52.1 ms
+  (17) cost the same as any small edit.
+- `edit_char_start` is the worst case: 414.9 ms total, 249 ms compute, 150 ms
   debounce. The edit moves every position of the file, so the analysis runs in
   full (a "fallback" run). The next edit also waits 150 ms
-  (`edit_char_start_revert`, 202.7 ms total, 35 ms compute).
-- `floor_tiny_doc_change` 29.2 ms total (20 ms debounce, 6 ms compute).
-- `cold_open_first_diagnostics`: 347 ms compute, 357.9 ms total. The first
+  (`edit_char_start_revert`, 189.4 ms total, 24 ms compute).
+- `floor_tiny_doc_change` 23.7 ms total (20 ms debounce, 1 ms compute).
+- `cold_open_first_diagnostics`: 366 ms compute, 378.1 ms total. The first
   analysis builds no memo.
-- `main_after_helper_saved_to_disk`: 39 ms compute, 206.3 ms total (150 ms
+- `main_after_helper_saved_to_disk`: 45 ms compute, 213.2 ms total (150 ms
   debounce, because the save reset the cost). `main_after_helper_restored`:
-  122 ms compute, 156.5 ms total. Both pay for the re-read of the changed
+  130 ms compute, 169.0 ms total. Both pay for the re-read of the changed
   helper.
-- `inlay_full_cached` 9.6 ms, `inlay_full_first` 12.2 ms, `hover` 0.2 ms,
+- `inlay_full_cached` 10.3 ms, `inlay_full_first` 12.9 ms, `hover` 0.3 ms,
   `goto_definition` 0.2 ms.
-- Peak RSS 157.0 MB (58.1 MB after open). 54 diagnostics, 15,496 inlay hints.
-- Control on one input: commit `025e7f2`, the commit before the cost-based
-  debounce, one 5-run benchmark directly after the other. `typing_plain` 210.9
-  to 58.0 ms, `edit_char_end` 195.0 to 51.1 ms, `edit_init_layer` 224.2 to 75.0
-  ms. CPU time is the cost: the commit ran 1 analysis for the 12 keys of
-  `typing_plain`, and this code runs 12. The compute of the small edits also
-  fell (`edit_char_end` 26 to 16 ms). The cause is not measured, and a short
-  debounce changes the timing of the run, so do not read that as a speed gain.
-  The runs that do more work cost more: cold open 333 to 347 ms compute (4
-  percent), `edit_char_start` 265 to 281 ms (6 percent), and `edit_after_idle`
-  40 to 45 ms (the import scan is about 9 ms of the cold pass). Peak RSS 166.2
-  to 157.0 MB. Measure a speed change against a control on one input.
+- Peak RSS 149.8 MB (58.4 MB after open). 54 diagnostics, 15,434 inlay hints.
+- Control on one input against commit `c6f2860`, two 5-run benchmarks of each
+  code, in turn, on one machine state. Cold open compute 362 and 361 ms to 368
+  and 367 ms (about 2 percent, in the noise). `edit_char_start` is unchanged
+  (254 and 250 ms to 249 and 250 ms). Small edits stay at 16 to 18 ms of
+  compute. Edits that rebuild layers cost 2 to 4 ms more: `edit_init_layer` 33
+  to 35 ms, `edit_base_class_init_layer` 33 to 36 ms, and `paste_500_lines` 41
+  to 45 ms. The cause is not measured. Peak RSS is 2 MB lower.
+- Control at the time of the debounce: commit `025e7f2`, the commit before the
+  cost-based debounce, one 5-run benchmark directly after the other, against the
+  code of that time. `typing_plain` 210.9 to 58.0 ms, `edit_char_end` 195.0 to
+  51.1 ms, `edit_init_layer` 224.2 to 75.0 ms. CPU time is the cost: the commit
+  ran 1 analysis for the 12 keys of `typing_plain`, and the debounce gives 12.
+  Measure a speed change against a control on one input: the numbers of two
+  sessions differ by more than the noise. For example, one session measured
+  `edit_after_idle` at 88 ms, and `c6f2860` gives 51 ms in the control above.
 - Run-to-run noise is about 3 percent. Treat a larger compute slowdown as a regression.
   If numbers look shifted, run an interleaved control of the old and the new
   binary before you decide.
@@ -238,11 +243,13 @@ The result must always equal a fresh analysis of the same text. Three layers:
      (`SyntaxRecord`, `LayerRecord`), and shifted to the new positions with the
      `Shift` trait, `Delta`, and `Remap`.
    - A unit with the same text reuses its `SyntaxRecord`. A `LayerRecord` also
-     needs the same imports (`import_digest`, a digest of the file map and the
-     module map, so an edit of any import line recomputes the layer records of
-     all units) and valid disk dependencies (`ResolutionCache::record_deps`,
+     needs the same imports (`import_digest`, a digest of the file map, the
+     module map, and the rebound names, so an edit of any import line
+     recomputes the layer records of all units) and valid disk dependencies (`ResolutionCache::record_deps`,
      `deps_valid`). A `RegionRecord` holds the import regions of the unit
-     (`ImportRegion`, unit-relative) and needs the same digest. A layer record keeps the raw text of each dim, so that
+     (`ImportRegion`, unit-relative) and needs the same digest. `unit_digest`
+     adds the names that are rebound above the unit. The places of a rebinding
+     are not in the digest, so an edit above a rebinding reruns no unit. A layer record keeps the raw text of each dim, so that
      it does not depend on a constant of another unit. `ShapeCtx::layer_at`
      writes the values at each lookup.
    - A unit with a syntax error is never reused, because its parse can depend
@@ -279,7 +286,11 @@ The result must always equal a fresh analysis of the same text. Three layers:
   all join one group), so no new edge type exists. The environment hash also
   holds the clash set: the annotation symbols that a unit assigns as an integer
   or reads. Add or remove such a symbol, and every group runs again, because
-  `integer_constant` and `layer_at` treat the name differently. Module
+  `integer_constant` and `layer_at` treat the name differently (in `layer_at`
+  a parameter wins over an annotation). A `vmap` assignment has no edge of
+  its own: a reader mentions the name, and `vmap_target` reads only the scope
+  that owns it. A file that binds a tracked name again changes the
+  `Rebound` list, so the first rebinding of a name reruns all units. Module
   classes of other files record a probe dependency (`Deps` per probe, class
   source cache), and in-place changes of a field are found by name in the
   whole file. Comprehension and lambda bodies run inside their unit, and
@@ -301,7 +312,7 @@ server logs `incremental mismatch, used the fresh result: ...`, uses the fresh
 result, and drops the memo. In `cfg!(test)` builds the same difference panics.
 The cost is one extra fresh parse and analysis per edit, so never time with it.
 
-Tests: `src/incremental_tests.rs` (47 library tests) and
+Tests: `src/incremental_tests.rs` (49 library tests) and
 `tests/incremental_edits.rs` (seeded random edit sequences over `corpus/` and
 `bench/stress/`; after every edit the reparsed tree and the memo analysis must
 equal the fresh ones; seeded edits also change each added dependency, such as
@@ -336,8 +347,8 @@ Debounce and sync mode
   gives no result.
 - The ceiling stays 150 ms. On a file with a very long analysis, steady typing
   can keep one core busy, and no result is published until the typing stops.
-  At 100 ms for each key on the stress file, 12 keys cost about 240 ms of CPU
-  time, about 20 percent of one core, and every run gives a publication.
+  At 100 ms for each key on the stress file, 12 keys cost about 200 ms of CPU
+  time, about 17 percent of one core, and every run gives a publication.
 - The first call after a change waits out the debounce of its rev. Hover, inlay,
   and other requests share that one analysis (single-flight per uri and rev,
   one analysis at a time per URI).
@@ -443,7 +454,9 @@ Current file layout
   - `Frame` model for lambda and comprehension bodies.
 - `src/analysis/layer_dims.rs`
   - The values of the names in the dims of a layer constructor (`layer_at`,
-    `argument_value`). See item 18b.
+    `argument_value`), the free mark on the size arguments of a call
+    (`with_free_argument_dims`), and the size of a slice (`slice_size`).
+    See item 18b.
 - `src/analysis/modules.rs`
   - Module fields (`ModuleList`, `Sequential`, lists, comprehensions, chain
     loops, indexing), module probes for classes of other files, and loss
@@ -451,10 +464,10 @@ Current file layout
 
 - `src/imports.rs`
   - What an imported name means at a place of the file. `ImportScopes` holds
-    the module map, the file map (`file()`, for the file-wide backend and vmap
-    decisions), and the `ImportRegion` list. `ImportScopes::at(byte)` gives the
-    map of a place. Function bodies, lambdas, and comprehensions that change a
-    name get a region. See item 22.
+    the module map, the file map (`file()`, for the file-wide backend), the
+    `ImportRegion` list, and the `Rebound` list. `ImportScopes::at(byte)` gives
+    the map of a place. Function bodies, lambdas, and comprehensions that
+    change a name get a region. See item 22.
 
 - `src/known_functions/jax.rs`
   - `classify` and shape rules for the JAX 0.10/0.11 additions.
@@ -466,11 +479,12 @@ Current file layout
   - Pure tree-sitter Python extraction helpers.
   - Important functions:
     - `build_import_map` (scopes: `src/imports.rs`), `module_binds`
+      (`ModuleBind`: the place, `hides_class`, `hides_import`)
     - `extract_calls`
     - `extract_call_arguments`
     - `extract_jaxtyping_shapes` — jaxtyping/NumPy-style dimensions and their
       source ranges
-    - `find_top_level_symbol`
+    - `find_top_level_symbol` — no symbol for a name bound more than once
     - `extract_callable_signature`
     - `extract_self_attr_calls` — `self.<attr> = call(...)` assignments
     - `extract_self_attr_aliases` — `self.<attr> = <ident>` → `{attr -> ident}`
@@ -486,6 +500,8 @@ Current file layout
     - `resolve_reexport_once`
     - `resolve_terminal_symbol_once`
     - `resolve_implementation`
+    - `resolve_imported_function_shape` — only a function directly at the top
+      level of the imported file; `lib.f.g` is an attribute, so it is unknown
     - `resolve_call_signature` — public text-only compatibility entry point;
       the analyzer uses `resolve_call_signature_with_node` with its existing
       AST, so resolving each call does not reparse the whole caller file
@@ -542,7 +558,7 @@ Current file layout
       call. Without a `ResolutionCache` nothing is kept, because a changed
       file on disk could not be seen.
     - `shape_of_expression` and its arms (`shape_of_call`, `shape_of_attribute`,
-      `shape_of_unary`, `shape_of_subscript` + `slice_dim`,
+      `shape_of_unary`, `shape_of_subscript` + `slice_parts`,
       `shape_of_binary_operator`, `shape_of_inline_vmap`, `apply_inline_vmap_layer`)
     - `handle_tuple_assignment` / `tuple_rhs_shapes` — tuple-pattern unpacking
     - `bind_user_function_args` / `trace_user_function_return` — annotated
@@ -630,8 +646,21 @@ What works now
    - No filesystem crawling. Deterministic path lookup.
 
 5. Symbol/re-export following
-   - `find_top_level_symbol` detects top-level class/function/import.
-   - `resolve_implementation` follows import re-exports until class/function found, with max depth and cycle detection.
+   - `find_top_level_symbol` detects top-level class/function/import. A name
+     that the module binds more than once gives no symbol (`bound_once`),
+     also when Python would use the last binding. Two straight-line `def`s,
+     an `@overload` set, a repeated import, and `import a.b` plus `import a.c`
+     all count. A `global` statement for the name, or a wildcard import after
+     the binding, also gives no symbol. A wildcard import before the binding
+     has no effect. `del`, `case`, and `type` statements count when they
+     mention the name, so `del table[proj]` gives unknown too. The module
+     walk does not enter function bodies, and the `global` scan runs only if
+     the text contains that word.
+   - `resolve_implementation` follows import re-exports until class/function
+     found, with max depth and cycle detection. A re-export rebound in its
+     module gives no symbol, so the walk stops.
+   - The analysis does not see dynamic rebinding: `globals()["f"] = g`,
+     `setattr(module, ...)`, or `lib.f = g` from another file.
 
 6. Callable signatures and call bindings
    - `extract_callable_signature` extracts:
@@ -756,7 +785,8 @@ What works now
      scope does not count a `def` or `class` name as an earlier binding.
      Open: value statements (`return`, `assert`, bare calls) read the state
      at the end of the scope; hover shows the joined state; literal
-     conditions are not folded; vmap bindings stay keyed by name.
+     conditions are not folded. `vmap_targets` holds every `name = vmap(...)`
+     per name, and `ShapeCtx::vmap_target` picks the call (item 18a).
 
 14. vmap of attribute callables + inline vmap (issue #35)
    - `jax.vmap(self.layer)(x)` resolves `self.layer` to a layer built in
@@ -804,7 +834,7 @@ What works now
      the functions that enclose them. A name the closure binds itself
      (parameter, assignment, loop or `with` target, import, nested `def`,
      `global`) is local and shadows the enclosing one. A name that a nested
-     closure rebinds with `nonlocal` is unknown. A call outside the enclosing
+     closure or a method in the function rebinds with `nonlocal` is unknown. A call outside the enclosing
      function and a method closure through a class do not see function locals.
      A function reads a module global or integer constant when all writes come
      before the top-level statement of the reader and have one shape (a
@@ -851,8 +881,9 @@ What works now
      rank mismatch or an integer mismatch is a true error; a named dim against
      an integer annotation, and a variadic annotation, are not errors.
    - A name that a module statement binds (`P = load()`, `import`, `with ... as`,
-     a walrus, `del`: `module_binds`, which over-counts on purpose) is not a
-     class of the file, so a base with that name is opaque.
+     a walrus, `del`, `case`, `type`, or a statement under `global P` in a
+     function or a class: `module_binds`, which over-counts on purpose for
+     classes) is not a class of the file, so a base with that name is opaque.
 
 18a. Method calls (`ShapeCtx::method_callee`)
    - `self.m(x)`, `cls.m(x)`, and `super().m(x)` resolve through the MRO of the
@@ -873,23 +904,54 @@ What works now
      the property family are ignored, the same as for free functions.
    - A bare name (`find_callee_scope`) reaches the nearest closure or the module
      function, never a method, and a closure only inside its enclosing
-     function. A recursive bare call is unknown. `vmap(f)` resolves `f` at the
-     vmap site. A parameter or a local that shadows the name is not checked yet.
+     function. A recursive bare call is unknown. The result is also unknown
+     when a place between the call and the function binds the name other than
+     by `def` (`ScopeLinks::hiding`, `poisoned`). For a module function, the
+     module scope counts as such a place. A class body that holds the call
+     counts too, and so does a lambda or a comprehension around the call
+     (`bound_in_expression`). `vmap(f)` resolves `f` at the vmap site with
+     the same rules.
+   - A rebinding `f = T(f)` in the scope of `def f` keeps the function when `T`
+     keeps the signature (`only_wrapped`, `keeps_signature`): `jax.jit`,
+     `jax.checkpoint`, `jax.remat`, `equinox.filter_jit`, each with keywords
+     only after `f`, and `functools.partial(f)` with no bound argument. The
+     import map at the statement must prove `T`. `bound_once` and
+     `rebound_names` apply the same rule to an imported `f`. The memo sees it:
+     the statement shares the name `f` with each reader, and the import digest
+     holds the maps and the rebound names. A rebinding of a method
+     (`m = jax.jit(m)` in a class, `self.m = jax.jit(self.m)`) stays unknown.
+   - These rules cost shapes on purpose. Any other module rebinding such as
+     `f = wrap(f)` makes `f` unknown in the full file, and so does a second
+     binding through a try/except import. A function with `global f` that only
+     reads `f` is unknown. A comprehension hides its name in its full range,
+     also in the first iterable.
+   - `vf = vmap(f)`: `vmap_target` gives the call only when the scope that owns
+     `vf` binds it to this one call and to nothing else. The rule is
+     flow-insensitive, so branches cannot give a wrong shape, and
+     `vf = vmap(f); vf(x); vf = vmap(g); vf(x)` is unknown. A module-level `vf`
+     is unknown in a file with a wildcard import and in a module-level class
+     body, because `nearest_binding` is opaque there.
+   - A callable parameter is not proven: `apply(g, xs)` stays unknown.
    - `vmap(self.helper)`, `lax.map(self.helper, xs)`, `lax.scan(self.step, ...)`,
      `A.helper(self, x)`, and `p, q = self.helper(x)` stay unknown. `super().__init__()`
      is not evaluated, because the result has no use.
 
 18b. Layer constructor dims (`src/analysis/layer_dims.rs`)
    - A layer keeps the text of each dim, and `layer_at` writes the values at
-     each lookup. Each name of a dim becomes one of three things:
+     each lookup. Each name of a dim becomes one of four things:
      - Its integer, when the file proves one: every write gives the same
        literal and, at module level, every write stands before the top-level
        statement of the reader. So `OUT = 4` with `nn.Linear(8, OUT)` gives
        `[n, 4]`. Integer arithmetic folds (`2 * OUT`).
-     - Itself, for a parameter, a dataclass field, a name that an annotation
-       uses as a dim, or a name with no binding. A symbol still differs from an
-       integer, so `def __init__(self, d): nn.Linear(8, d)` gives `[n, d]`, and
-       an add with `[n, 4]` still gives a false error.
+     - Itself with the `FREE_DIM` mark, for a parameter, a dataclass field, or a
+       name with no binding. The caller gives the value, so the dim conflicts
+       with nothing: `def __init__(self, d): nn.Linear(8, d)` gives `[n, d]`,
+       and an add with `[n, 4]` gives `[n, 4]`. A parameter wins over an
+       annotation of the same name.
+     - Itself, for a name that an annotation uses as a dim, when it is no
+       parameter or field and has no binding or one literal value. This name
+       is a claim, so it conflicts with an integer. A constant named like an
+       annotation symbol is here.
      - `UNPROVEN_DIM` otherwise. The output of the layer is unknown, because
        the value can be any integer: `OUT = load()`, an imported name,
        `cfg.size`, `n = x.shape[0]`, or a constant below its reader.
@@ -897,6 +959,54 @@ What works now
      class bodies, and all writes must agree. `self.a = self.b` is unproven. A
      write outside the class (`m.out = 9`) or in another file is not visible.
      `M.OUT` through the class name is unproven.
+   - Free dims (`src/types.rs`). Dims stay strings, so the mark is the text
+     prefix `__free_`, the same method as `UNPROVEN_DIM`. `dims_conflict` is the
+     test of every mismatch check, and a free dim conflicts with nothing.
+     `dims_canonically_equal` ignores the mark. `unified_dim` gives the result:
+     a free dim takes the value of the other side, and two different free dims
+     give `UNPROVEN_DIM`. `shape_of_expression` and `apply_known_function` drop
+     a shape with `UNPROVEN_DIM`, so `[n, d] + [n, e]` is unknown and a hover
+     shows nothing. `record_binding` also refuses such a shape.
+     `without_free_marks` writes `?` for it in the layer of an application. A free dim against an annotation symbol gives the symbol,
+     which is wrong only if that symbol is 1 at run time.
+   - `LayerShapeAnalysis::without_free_marks` removes the marks at the end of
+     the analysis, so that only the analysis sees them. A new comparison of dims
+     must use `dims_conflict`, because the mark has no effect otherwise. A user
+     name that starts with `__free_` reads as marked.
+   - The rule is wider than constructors. `with_free_argument_dims` marks a dim
+     of a known call that comes from a name in an argument, for example
+     `n = load(); jnp.zeros((3, n))` or `torch.zeros(3, self.d)`. An attribute
+     gets the mark also when the class writes one integer to it, because code
+     outside the class can write another. `slice_size` gives the size of
+     a slice. An integer axis with proven start, stop, and step gives the size
+     of Python, with negative values and steps. Any other form is unknown,
+     because `[:2]` on `n` is `min(2, n)`. The exceptions are the forms that
+     keep the whole axis: `[:]`, `[::1]`, `[0:]`, `[::-1]`, and `[:n]` on `n`.
+     `[:n]` keeps the axis only when `n` is an annotation symbol that no scope
+     binds, or an attribute that holds a parameter of that name
+     (`stop_is_axis`). A local, a global, a parameter, a loop target, or a
+     `global` write of `n` in any function gives unknown. A negative step on a
+     proven torch tensor (`is_torch_value`) is unknown, because torch refuses
+     it. Unknown drops the whole shape, also the rank.
+   - A name with a literal value, when an annotation also uses the word as a
+     dim, gets `LITERAL_DIM`: `__free_D__is_64`. An annotation dim `D` is a
+     size that the value of the name does not bind, so the dim equals both 64
+     and the symbol `D`, and it conflicts only with another integer. The reader
+     sees 64. Inside an expression (`D * 2`) the name gets only the free mark.
+     The literal 1 stays an integer, because a dim of size 1 broadcasts.
+     An expression of only such names and integers folds to one mark of its
+     value (`fold_literal_marks`): `D + D` is `__free_D__is_128`, so it still
+     equals an annotation and conflicts with another integer. A value below
+     zero is unknown. A size rule folds the same way (`literal_mark`).
+   - A `padding` that is one name gets `PADDING_NAME` at classification. A
+     string is also a valid padding, so `layer_at` keeps the name only for an
+     integer, a literal, or a parameter annotated `int`. Any other name gives
+     `UNPROVEN_DIM`. An expression such as `k // 2` stays a formula.
+   - The cost is lost errors. The class body is checked with `d` free, and only
+     the result is specialized for a call site, so `M(5)` with `h + y` on
+     `[n, 4]` gives no error. With `x: "n d"` and `__init__(self, d)`, the
+     parameter does not tie to the annotation, so `self.l(x) + y` on `[n, 4]`
+     gives no error.
 
 19. Scalar operands in binary operations
    - A binary-op operand is a provable scalar (`2`, `math.sqrt(k)`, `len`,
@@ -949,9 +1059,28 @@ What works now
      module import.
    - A comprehension region covers the full node, so the first iterable also
      sees the comprehension names. The scan skips `string` and `type` nodes.
-     Module-level rebinding is not tracked: `import numpy as k` then `k = load()`
-     at module level, or `global k; k = load()`, still reads `k` as the import.
-   - `file_backend` and the vmap names stay file-wide (`ImportScopes::file`).
+   - Module-level rebinding follows Python order (`Rebound`, `rebound_names`).
+     With `import numpy as k` then `k = load()`, module code above the statement
+     reads the import, and module code below it reads a value. A binding in a
+     loop counts from the start of the outermost loop. `global k; k = load()`
+     in a function counts from the `global` statement on, also if the function
+     is never called.
+   - A function body runs after the module code above it, so it reads the last
+     map. A function called before the rebinding also reads unknown. A file
+     that rebinds a tracked name pays for one region per top-level function or
+     method. All these regions share one map.
+   - `k = None` in an `except` clause keeps the import, for the idiom
+     `try: import torch` / `except ImportError: torch = None`. If the clause
+     runs, each use as a module raises, so no wrong shape can appear. It does
+     not hide a class name, and any other `= None` counts. `k.seed = 1` and
+     `k[0] = 1` also keep the import, so a monkeypatch of a module is not
+     tracked. For a class, `P.x = 1` makes `P` opaque.
+   - Unknown, not wrong: `np = None` plus `global np; import numpy as np` in a
+     function; `k = 1` then `import numpy as k`; and a value rebinding with a
+     second import of the name, read in a function. A module-level class or
+     comprehension that binds a tracked name, above a rebinding of any tracked
+     name, reads every rebound name as unknown, because regions store no places.
+   - `file_backend` stays file-wide (`ImportScopes::file`).
 
 Lazy call-site parameter seeding (the architecture extension)
 -------------------------------------------------------------
@@ -1027,7 +1156,7 @@ Known limitations / important caveats
   `x.flatten(start_dim, end_dim)` honor the dims (a positional argument that is
   not a string counts as torch); out-of-range dims are unknown.
 - Nested/chained calls in one expression (`jnp.sum(jnp.flatten(x))`, `x.reshape(...).sum(...)`) now propagate via the recursive `shape_of_expression` evaluator — this replaced the flat `extract_calls`-based extraction.
-- Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (numeric `a:b` and `:n` folded; others approximated by the original axis), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. Advanced/boolean array indexing is approximated as a single axis drop.
+- Subscript/indexing is implemented (`shape_of_subscript`): integer-index axis drop, slices (Python size on an integer axis with proven bounds, a form that keeps the whole axis, otherwise the whole shape is unknown), `None`/newaxis insert, ellipsis expansion, trailing implicit full slices. A list of integers gives its length to the axis, alone or next to slices. Every other index that is not a proven integer (`is_integer_expr`) makes the whole shape unknown: an array, a mask, a tuple, a `bool`, a list next to an integer, or two lists. A proven integer is a literal, `len`, `int`, `x.shape[i]`, a parameter annotated `int`, a target of `range` or the index of `enumerate`, or a name with only such bindings.
 - Multi-output tuple assignment covers `split`, default `meshgrid`, default
   linalg `svd`/`qr`/`eig`, top-k-style functions, supported RNN/LSTM/GRU
   layers, and other explicitly modeled calls in `tuple_rhs_shapes`. Its
@@ -1039,7 +1168,7 @@ Known limitations / important caveats
   identifier RHS; layer constructor dims read `self.<attr>` through
   `layer_at` (item 18b), not through the alias map; and subtraction, division,
   and arbitrary parenthesized expressions are not generally normalized.
-- `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise exact symbolic match required), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
+- `apply_matmul_shape` broadcasts batch dims numpy-style (align right; missing or literal-`1` dims broadcast, otherwise the dims must have no `dims_conflict`), so `(b, n, d) @ (d, k)` → `(b, n, k)`.
 - Higher-order functions: `vmap` is modeled (free/inline/attribute, named
   callables and lambdas); `jax.lax.map` and `jax.lax.scan` (same-file body or
   lambda) are modeled. `jit`, the

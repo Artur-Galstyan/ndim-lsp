@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use tree_sitter::{Node, Query, QueryCursor, Range, StreamingIterator};
 
+use crate::imports::{ImportScopes, keeps_signature};
 use crate::types::*;
 
 #[cfg(test)]
@@ -516,6 +517,136 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
     Ok(scopes)
 }
 
+pub(crate) fn insert_identifiers(node: Node, text: &str, out: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        if let Ok(name) = node.utf8_text(text.as_bytes()) {
+            out.insert(name.to_string());
+        }
+        return;
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            insert_identifiers(child, text, out);
+        }
+    }
+}
+
+pub(crate) fn insert_target_names(target: Node, text: &str, out: &mut HashSet<String>) {
+    match target.kind() {
+        "identifier" => insert_identifiers(target, text, out),
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern"
+        | "parenthesized_expression" | "expression_list" | "tuple" | "list" => {
+            for i in 0..target.named_child_count() {
+                if let Some(child) = target.named_child(i as u32) {
+                    insert_target_names(child, text, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The names the `global` statements under `node` mention. The text finds the
+/// keyword, and the tree confirms it, so the common file does not walk the tree.
+pub(crate) fn collect_global_names(node: Node, text: &str, out: &mut HashSet<String>) {
+    for statement in global_statements(node, text) {
+        insert_identifiers(statement, text, out);
+    }
+}
+
+fn global_statements<'t>(node: Node<'t>, text: &str) -> Vec<Node<'t>> {
+    let start = node.start_byte();
+    text[node.byte_range()]
+        .match_indices("global")
+        .filter_map(|(at, keyword)| {
+            let word = node.descendant_for_byte_range(start + at, start + at + keyword.len());
+            word.and_then(|w| w.parent()).filter(|p| p.kind() == "global_statement")
+        })
+        .collect()
+}
+
+/// Whether the module binds `name` in one place only, with no `global`
+/// statement for it and no wildcard import after the binding. A class or a
+/// function body binds names of its own. With `wraps`, a rebinding that
+/// keeps the signature (`keeps_signature`) is not a second place.
+fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, String> {
+    let mentions = |node: Node| {
+        let mut names = HashSet::new();
+        insert_identifiers(node, text, &mut names);
+        names.contains(name)
+    };
+    let mut bindings = Vec::new();
+    let mut wildcards = Vec::new();
+    let mut self_wraps = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let bound = match n.kind() {
+            "function_definition" | "class_definition" => {
+                if n.child_by_field_name("name").is_some_and(|d| &text[d.byte_range()] == name) {
+                    bindings.push(n.start_byte());
+                }
+                continue;
+            }
+            "lambda" => continue,
+            "import_statement" | "import_from_statement" => {
+                let mut cursor = n.walk();
+                if n.named_children(&mut cursor).any(|c| c.kind() == "wildcard_import") {
+                    wildcards.push(n.start_byte());
+                } else if text[n.byte_range()].contains(name)
+                    && build_import_map(n, text)?.contains_key(name)
+                {
+                    bindings.push(n.start_byte());
+                }
+                continue;
+            }
+            "delete_statement" | "case_pattern" | "type_alias_statement" => {
+                if mentions(n) {
+                    bindings.push(n.start_byte());
+                }
+                continue;
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                n.child_by_field_name("left").is_some_and(|left| {
+                    let mut targets = HashSet::new();
+                    insert_target_names(left, text, &mut targets);
+                    targets.contains(name)
+                })
+            }
+            "named_expression" | "as_pattern" => n
+                .child_by_field_name("name")
+                .or_else(|| n.child_by_field_name("alias"))
+                .is_some_and(mentions),
+            _ => false,
+        };
+        if let Some(wrap) = self_wrap(n, name, text).filter(|_| bound && wraps) {
+            self_wraps.push((n.start_byte(), wrap));
+        } else if bound {
+            bindings.push(n.start_byte());
+        }
+        let mut cursor = n.walk();
+        stack.extend(n.named_children(&mut cursor));
+    }
+    let [binding] = bindings[..] else {
+        return Ok(false);
+    };
+    if !self_wraps.is_empty() {
+        let imports = ImportScopes::new(root, text)?;
+        if !self_wraps.iter().all(|(at, wrap)| keeps_signature(wrap, imports.at(*at))) {
+            return Ok(false);
+        }
+    }
+    if wildcards.iter().any(|&wildcard| wildcard > binding) {
+        return Ok(false);
+    }
+    let mut globals = HashSet::new();
+    if text.contains("global") {
+        collect_global_names(root, text, &mut globals);
+    }
+    Ok(!globals.contains(name))
+}
+
+/// The class, function, or import that `name` is at module level. `None` when
+/// the module has no such statement directly in it, or binds the name again.
 pub fn find_top_level_symbol(
     node: Node,
     text: &str,
@@ -592,7 +723,12 @@ pub fn find_top_level_symbol(
         }
     }
 
-    Ok(found)
+    match found {
+        Some(symbol) if bound_once(node, text, name, !matches!(symbol, PythonSymbol::Class { .. }))? => {
+            Ok(Some(symbol))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub fn build_import_map(node: Node, text: &str) -> Result<HashMap<String, ImportPath>, String> {
@@ -1059,9 +1195,9 @@ impl ClassHierarchy {
         Self::from_summaries(&ClassSummary::collect(root, text), &module_binds(root, text))
     }
 
-    /// `module_names` are the names that a module statement binds to something
-    /// that is not a class. Such a name does not mean a class of the file.
-    pub(crate) fn from_summaries(summaries: &[ClassSummary], module_names: &[String]) -> Self {
+    /// `module_binds` are the bindings of the module names. A binding with
+    /// `hides_class` means that the name is not a class of the file.
+    pub(crate) fn from_summaries(summaries: &[ClassSummary], module_binds: &[ModuleBind]) -> Self {
         let n = summaries.len();
         // `None` marks a name defined more than once: ambiguous, so opaque.
         let mut by_name: HashMap<&str, Option<usize>> = HashMap::new();
@@ -1073,8 +1209,8 @@ impl ClassHierarchy {
                     .or_insert(Some(i));
             }
         }
-        for name in module_names {
-            if let Some(class) = by_name.get_mut(name.as_str()) {
+        for bind in module_binds.iter().filter(|bind| bind.hides_class) {
+            if let Some(class) = by_name.get_mut(bind.name.as_str()) {
                 *class = None;
             }
         }
@@ -1301,49 +1437,191 @@ fn class_body_fields(class: Node, text: &str) -> Vec<String> {
 /// Names a class body binds, not entering a `def` or a lambda: `def` names
 /// are not here, a nested class is. A target like `a[i]` also gives `a`.
 fn class_body_attrs(class: Node, text: &str) -> Vec<String> {
-    class.child_by_field_name("body").map_or_else(Vec::new, |body| scope_binds(body, text, false))
+    let mut attrs = Vec::new();
+    if let Some(body) = class.child_by_field_name("body") {
+        scope_binds(body, false, |name, _, _| attrs.extend(name.utf8_text(text.as_bytes()).ok().map(str::to_string)));
+    }
+    attrs
 }
 
-/// The names that the module statements under `node` bind, except with `class`.
-pub(crate) fn module_binds(node: Node, text: &str) -> Vec<String> {
-    scope_binds(node, text, true)
+/// A binding of a module name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModuleBind {
+    pub(crate) name: String,
+    /// Module code at or after this byte reads the new value.
+    pub(crate) at: usize,
+    /// The name is not a class of the file after this binding. `class` does
+    /// not hide a class here: `ClassHierarchy` counts the definitions.
+    pub(crate) hides_class: bool,
+    /// The name is not an import after this binding.
+    pub(crate) hides_import: bool,
+    /// The binding has the form `name = callee(name)`.
+    pub(crate) wrap: Option<SelfWrap>,
 }
 
-fn scope_binds(node: Node, text: &str, module: bool) -> Vec<String> {
-    fn identifiers(node: Node, text: &str, out: &mut Vec<String>) {
+/// The call in `name = callee(name, keyword=value, ...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SelfWrap {
+    pub(crate) callee: String,
+    pub(crate) keywords: bool,
+}
+
+/// The call of `statement` when it wraps `name` in itself.
+fn self_wrap(statement: Node, name: &str, text: &str) -> Option<SelfWrap> {
+    let left = statement.child_by_field_name("left")?;
+    if statement.kind() != "assignment" || left.kind() != "identifier" || &text[left.byte_range()] != name {
+        return None;
+    }
+    let call = statement.child_by_field_name("right").filter(|right| right.kind() == "call")?;
+    let callee = call.child_by_field_name("function")?;
+    let args = call.child_by_field_name("arguments").filter(|args| args.kind() == "argument_list")?;
+    let mut cursor = args.walk();
+    let mut args = args.named_children(&mut cursor).filter(|arg| arg.kind() != "comment");
+    args.next().filter(|first| first.kind() == "identifier" && &text[first.byte_range()] == name)?;
+    let rest: Vec<Node> = args.collect();
+    rest.iter().all(|arg| arg.kind() == "keyword_argument").then(|| SelfWrap {
+        callee: text[callee.byte_range()].to_string(),
+        keywords: !rest.is_empty(),
+    })
+}
+
+/// Whether every binding of `name` in the scope under `body`, other than a
+/// `def`, wraps it in a call that keeps the signature.
+pub(crate) fn only_wrapped(body: Node, name: &str, text: &str, imports: &ImportScopes) -> bool {
+    let mut only = true;
+    scope_binds(body, false, |found, statement, _| {
+        if &text[found.byte_range()] == name {
+            only &= (statement.kind() == "assignment" && !is_target(found, statement, text))
+                || self_wrap(statement, name, text)
+                    .is_some_and(|wrap| keeps_signature(&wrap, imports.at(statement.start_byte())));
+        }
+    });
+    only
+}
+
+/// What is around a statement. `Node::parent` is too slow for each binding of
+/// a module, so the walk carries this down.
+#[derive(Clone, Copy, Default)]
+struct Around {
+    /// The start of the outermost loop. The next iteration reads a value that
+    /// the loop binds, above the binding too.
+    looped: Option<usize>,
+    handler: bool,
+}
+
+/// Whether `name` is a target of `statement`. `k.seed = 1` or `k[0] = 1` keeps
+/// the import `k`, and `with k.f() as e` reads it.
+fn is_target(name: Node, statement: Node, text: &str) -> bool {
+    let target = match statement.kind() {
+        "import_statement" | "import_from_statement" => return false,
+        "assignment" | "augmented_assignment" | "for_statement" => statement.child_by_field_name("left"),
+        "as_pattern" => statement.child_by_field_name("alias"),
+        "named_expression" => statement.child_by_field_name("name"),
+        "delete_statement" => statement.named_child(0),
+        "with_item" => return false,
+        _ => return true,
+    };
+    let mut targets = HashSet::new();
+    if let Some(target) = target.and_then(|t| if t.kind() == "as_pattern_target" { t.named_child(0) } else { Some(t) }) {
+        insert_target_names(target, text, &mut targets);
+    }
+    targets.contains(&text[name.byte_range()])
+}
+
+/// A file that writes `k = None` in an `except` clause keeps the import: if
+/// the clause runs, every use of `k` as a module raises.
+fn module_bind(name: Node, statement: Node, around: Around, text: &str) -> ModuleBind {
+    let none = statement.child_by_field_name("right").is_some_and(|right| right.kind() == "none");
+    ModuleBind {
+        name: text[name.byte_range()].to_string(),
+        at: around.looped.unwrap_or(statement.end_byte()),
+        hides_class: statement.kind() != "class_definition",
+        hides_import: is_target(name, statement, text) && !(around.handler && none),
+        wrap: self_wrap(statement, &text[name.byte_range()], text),
+    }
+}
+
+/// The bindings of module names under `node`: the module statements, and the
+/// statements in a function or a class that a `global` statement sends there.
+/// Such a binding counts from the `global` statement on.
+pub(crate) fn module_binds(node: Node, text: &str) -> Vec<ModuleBind> {
+    let mut binds = Vec::new();
+    scope_binds(node, true, |name, statement, around| binds.push(module_bind(name, statement, around, text)));
+    for global in global_statements(node, text) {
+        let mut at = global.end_byte();
+        let mut owner = None;
+        let mut up = global.parent();
+        while let Some(n) = up {
+            match n.kind() {
+                "function_definition" | "class_definition" => owner = owner.or(Some(n)),
+                "for_statement" | "while_statement" => at = n.start_byte(),
+                _ => {}
+            }
+            up = n.parent();
+        }
+        let Some(body) = owner.and_then(|owner| owner.child_by_field_name("body")) else {
+            continue;
+        };
+        let mut names = HashSet::new();
+        insert_identifiers(global, text, &mut names);
+        scope_binds(body, true, |name, statement, around| {
+            if names.contains(&text[name.byte_range()]) {
+                let bind = module_bind(name, statement, around, text);
+                binds.push(ModuleBind { at, hides_class: true, wrap: None, ..bind });
+            }
+        });
+    }
+    binds
+}
+
+/// Gives each identifier that a statement of the scope under `node` binds, with
+/// the statement. The walk does not enter a `def`, a `class`, or a lambda.
+/// `module` also gives `def` names, which are not attributes of a class.
+fn scope_binds<'t>(node: Node<'t>, module: bool, mut found: impl FnMut(Node<'t>, Node<'t>, Around)) {
+    fn identifiers<'t>(
+        node: Node<'t>,
+        statement: Node<'t>,
+        around: Around,
+        found: &mut impl FnMut(Node<'t>, Node<'t>, Around),
+    ) {
         if node.kind() == "identifier" {
-            out.extend(node.utf8_text(text.as_bytes()).ok().map(str::to_string));
+            found(node, statement, around);
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            identifiers(child, text, out);
+            identifiers(child, statement, around, found);
         }
     }
-    let mut attrs = Vec::new();
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
+    let mut stack = vec![(node, Around::default())];
+    while let Some((n, mut around)) = stack.pop() {
+        match n.kind() {
+            "for_statement" | "while_statement" => {
+                around.looped.get_or_insert(n.start_byte());
+            }
+            "except_clause" | "except_group_clause" => around.handler = true,
+            _ => {}
+        }
         match n.kind() {
             "lambda" => continue,
             "function_definition" | "class_definition" => {
-                let named = (n.kind() == "function_definition") == module;
-                if let Some(name) = n.child_by_field_name("name").filter(|_| named) {
-                    identifiers(name, text, &mut attrs);
+                if let Some(name) = n.child_by_field_name("name").filter(|_| module || n.kind() == "class_definition") {
+                    identifiers(name, n, around, &mut found);
                 }
                 continue;
             }
             "assignment" | "augmented_assignment" | "for_statement" => {
                 if let Some(left) = n.child_by_field_name("left") {
-                    identifiers(left, text, &mut attrs);
+                    identifiers(left, n, around, &mut found);
                 }
             }
             "import_statement" | "import_from_statement" | "with_item" | "as_pattern"
-            | "named_expression" | "delete_statement" => identifiers(n, text, &mut attrs),
+            | "named_expression" | "delete_statement" | "case_pattern"
+            | "type_alias_statement" => identifiers(n, n, around, &mut found),
             _ => {}
         }
         let mut cursor = n.walk();
-        stack.extend(n.named_children(&mut cursor));
+        stack.extend(n.named_children(&mut cursor).map(|child| (child, around)));
     }
-    attrs
 }
 
 /// C3 linearization of class `i`. A failed merge or an inheritance cycle
@@ -2914,23 +3192,23 @@ mod find_top_level_symbol_tests {
     }
 
     #[test]
-    fn test_last_top_level_definition_wins() {
+    fn test_definition_after_an_import_of_the_name_gives_no_symbol() {
         let code = "from foo import Linear\nclass Linear: pass";
         let tree = parse(code);
 
         let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
 
-        assert_eq!(found, Some(class("Linear")));
+        assert_eq!(found, None);
     }
 
     #[test]
-    fn test_last_top_level_import_wins() {
+    fn test_import_after_a_definition_of_the_name_gives_no_symbol() {
         let code = "class Linear: pass\nfrom foo import Linear";
         let tree = parse(code);
 
         let found = find_top_level_symbol(tree.root_node(), code, "Linear").unwrap();
 
-        assert_eq!(found, Some(import("Linear", ip(0, &["foo"], "Linear"))));
+        assert_eq!(found, None);
     }
 }
 

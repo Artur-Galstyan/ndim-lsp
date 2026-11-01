@@ -18,6 +18,7 @@ use super::{
     is_scalar_expr, is_tuple_value, nearest_binding, scalar_dim_expr, shape_of_expression,
 };
 use crate::resolution::resolve_call_target;
+use crate::types::FREE_DIM;
 
 /// The longest sequence a comprehension is expanded to for `stack` and its
 /// family, which take their count from the number of names in the list.
@@ -131,7 +132,10 @@ impl Frame {
             let error = &ctx.errors[i];
             let names = |text: &str| {
                 text.split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .any(|token| self.scalars.iter().any(|s| s == token))
+                    .any(|token| {
+                        let token = token.strip_prefix(FREE_DIM).unwrap_or(token);
+                        self.scalars.iter().any(|s| s == token)
+                    })
             };
             if !names(&error.message) && !names(&error.variable) {
                 ctx.errors.swap(kept, i);
@@ -146,7 +150,10 @@ impl Frame {
     pub(super) fn untainted(&self, shape: &[String]) -> bool {
         shape.iter().all(|dim| {
             !dim.split(|c: char| !c.is_alphanumeric() && c != '_')
-                .any(|token| self.names.iter().any(|name| name == token))
+                .any(|token| {
+                    let token = token.strip_prefix(FREE_DIM).unwrap_or(token);
+                    self.names.iter().any(|name| name == token)
+                })
         })
     }
 }
@@ -165,7 +172,7 @@ fn is_sequence_literal(node: Node) -> bool {
 
 /// Whether `node` is a call of the Python builtin `name`: not imported from a
 /// module, not bound by a scope around the call.
-fn is_builtin_call(node: Node, name: &str, ctx: &ShapeCtx) -> bool {
+pub(super) fn is_builtin_call(node: Node, name: &str, ctx: &ShapeCtx) -> bool {
     node.kind() == "call"
         && node.child_by_field_name("function").is_some_and(|func| {
             func.kind() == "identifier"

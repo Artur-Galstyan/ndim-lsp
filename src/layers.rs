@@ -19,6 +19,11 @@ use crate::types::*;
 /// Stands for a constructor dim whose value the file does not prove.
 pub(crate) const UNPROVEN_DIM: &str = "__unproven";
 
+/// Starts a `padding` that is one name. A string is also a valid padding, so
+/// `ShapeCtx::layer_at` keeps the name only when it proves an integer. Without
+/// that step the padding of the layer stays unknown.
+pub(crate) const PADDING_NAME: &str = "__padding_";
+
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     classify_layer_text(call).map(strip_self_prefixes)
 }
@@ -60,7 +65,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             // Per-axis tuples (e.g. kernel_size=(3,5)) are not yet supported.
             // Detect and refuse to classify so we don't produce garbage symbolic output.
             let kernel_size = call.bindings.get("kernel_size")?;
-            if kernel_size.starts_with('(') {
+            if is_sequence(kernel_size) {
                 return None;
             }
             let stride = call
@@ -68,17 +73,22 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .get("stride")
                 .cloned()
                 .unwrap_or_else(|| "1".to_string());
-            if stride.starts_with('(') {
+            if is_sequence(&stride) {
                 return None;
             }
-            let padding = call
+            let padding = padding_argument(call);
+            if is_sequence(&padding) {
+                return None;
+            }
+            // torch refuses every other string. equinox takes any case.
+            if is_torch_module && string_text(&padding).is_some_and(|text| !matches!(text, "same" | "valid")) {
+                return None;
+            }
+            let dilation = call
                 .bindings
-                .get("padding")
+                .get("dilation")
                 .cloned()
-                .unwrap_or_else(|| "0".to_string());
-            if padding.starts_with('(') {
-                return None;
-            }
+                .unwrap_or_else(|| "1".to_string());
             let in_channels = call.bindings.get("in_channels")?.clone();
             let out_channels = call.bindings.get("out_channels")?.clone();
             let ks = kernel_size.clone();
@@ -89,6 +99,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                     kernel_size: ks,
                     stride,
                     padding,
+                    dilation,
                 }),
                 "Conv2d" => Some(LayerKind::Conv2d {
                     in_channels,
@@ -96,6 +107,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                     kernel_size: ks,
                     stride,
                     padding,
+                    dilation,
                 }),
                 "Conv3d" => Some(LayerKind::Conv3d {
                     in_channels,
@@ -103,6 +115,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                     kernel_size: ks,
                     stride,
                     padding,
+                    dilation,
                 }),
                 _ => None,
             }
@@ -114,7 +127,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             let features = call.bindings.get("features")?.clone();
             let kernel_size = call.bindings.get("kernel_size")?;
             // Spatial rank from the kernel tuple: (3, 3) → 2, scalar → 1.
-            let spatial_rank = if kernel_size.starts_with('(') {
+            let spatial_rank = if is_sequence(kernel_size) {
                 kernel_size.matches(',').count() + usize::from(!kernel_size.ends_with(",)"))
             } else {
                 1
@@ -128,15 +141,24 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             {
                 return None;
             }
+            if call.bindings.contains_key("input_dilation") || call.bindings.contains_key("kernel_dilation") {
+                return None;
+            }
             Some(LayerKind::FlaxConv {
                 features,
                 spatial_rank,
+                kernel_size: kernel_size.clone(),
+                padding: if call.bindings.contains_key("padding") {
+                    padding_argument(call)
+                } else {
+                    "\"SAME\"".to_string()
+                },
             })
         }
         "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
             let spatial_rank = pool_spatial_rank(owner)?;
             let kernel_size = call.bindings.get("kernel_size")?.clone();
-            if kernel_size.starts_with('(') {
+            if is_sequence(&kernel_size) {
                 return None;
             }
             // torch default: stride = kernel_size. (equinox defaults to
@@ -146,15 +168,11 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .get("stride")
                 .cloned()
                 .unwrap_or_else(|| kernel_size.clone());
-            if stride.starts_with('(') {
+            if is_sequence(&stride) {
                 return None;
             }
-            let padding = call
-                .bindings
-                .get("padding")
-                .cloned()
-                .unwrap_or_else(|| "0".to_string());
-            if padding.starts_with('(') {
+            let padding = padding_argument(call);
+            if is_sequence(&padding) {
                 return None;
             }
             Some(LayerKind::Pool {
@@ -169,7 +187,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
         | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => {
             let spatial_rank = pool_spatial_rank(owner)?;
             let output_size = call.bindings.get("output_size")?.clone();
-            if output_size.starts_with('(') {
+            if is_sequence(&output_size) {
                 return None;
             }
             Some(LayerKind::AdaptivePool {
@@ -243,7 +261,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
         "ConvTranspose1d" | "ConvTranspose2d" | "ConvTranspose3d" => {
             let spatial_rank = pool_spatial_rank(owner)?;
             let kernel_size = call.bindings.get("kernel_size")?.clone();
-            if kernel_size.starts_with('(') {
+            if is_sequence(&kernel_size) {
                 return None;
             }
             let stride = call
@@ -251,15 +269,12 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .get("stride")
                 .cloned()
                 .unwrap_or_else(|| "1".to_string());
-            if stride.starts_with('(') {
+            if is_sequence(&stride) {
                 return None;
             }
-            let padding = call
-                .bindings
-                .get("padding")
-                .cloned()
-                .unwrap_or_else(|| "0".to_string());
-            if padding.starts_with('(') {
+            let padding = padding_argument(call);
+            // torch refuses a string padding here. Only equinox has one.
+            if is_sequence(&padding) || (is_torch_module && string_text(&padding).is_some()) {
                 return None;
             }
             Some(LayerKind::ConvTranspose {
@@ -437,12 +452,14 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size,
             stride,
             padding,
+            dilation,
         } => LayerKind::Conv1d {
             in_channels: f(&in_channels),
             out_channels: f(&out_channels),
             kernel_size: f(&kernel_size),
             stride: f(&stride),
             padding: f(&padding),
+            dilation: f(&dilation),
         },
         LayerKind::Conv2d {
             in_channels,
@@ -450,12 +467,14 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size,
             stride,
             padding,
+            dilation,
         } => LayerKind::Conv2d {
             in_channels: f(&in_channels),
             out_channels: f(&out_channels),
             kernel_size: f(&kernel_size),
             stride: f(&stride),
             padding: f(&padding),
+            dilation: f(&dilation),
         },
         LayerKind::Conv3d {
             in_channels,
@@ -463,12 +482,14 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size,
             stride,
             padding,
+            dilation,
         } => LayerKind::Conv3d {
             in_channels: f(&in_channels),
             out_channels: f(&out_channels),
             kernel_size: f(&kernel_size),
             stride: f(&stride),
             padding: f(&padding),
+            dilation: f(&dilation),
         },
         LayerKind::Dense { features } => LayerKind::Dense {
             features: f(&features),
@@ -476,9 +497,13 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
         LayerKind::FlaxConv {
             features,
             spatial_rank,
+            kernel_size,
+            padding,
         } => LayerKind::FlaxConv {
             features: f(&features),
             spatial_rank,
+            kernel_size: f(&kernel_size),
+            padding: f(&padding),
         },
         LayerKind::Pool {
             name,
@@ -647,8 +672,9 @@ fn pool_spatial_rank(name: &str) -> Option<usize> {
 /// not a faithful reproduction of the upstream constructor signatures. They
 /// exist only so `bind_call_arguments` can map positional/keyword arguments to
 /// the names that `classify_layer_call` reads (`in_features`, `out_features`,
-/// `in_channels`, `out_channels`, `kernel_size`, `stride`, `padding`). Extra
-/// trailing params (e.g. `dilation`, `groups`, `use_bias`) are present only to
+/// `in_channels`, `out_channels`, `kernel_size`, `stride`, `padding`,
+/// `dilation`). Extra
+/// trailing params (e.g. `groups`, `use_bias`) are present only to
 /// absorb additional positional args without binding them to the wrong name —
 /// they intentionally diverge from `torch.nn.Conv2d` (which has `padding_mode`
 /// between `groups` and `bias`) and from `equinox.nn.Conv` (which has `key`
@@ -673,7 +699,7 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
     let params: &[&str] = match class_name {
         "Dense" => &["self", "features", "use_bias"],
         "Conv" if framework == "flax" => {
-            &["self", "features", "kernel_size", "strides", "padding"]
+            &["self", "features", "kernel_size", "strides", "padding", "input_dilation", "kernel_dilation"]
         }
         "Linear" => &["self", "in_features", "out_features", "use_bias"],
         "Embedding" => &["self", "num_embeddings", "embedding_size"],
@@ -1277,22 +1303,73 @@ fn apply_offset(expr: &str, offset: isize) -> String {
     }
 }
 
+/// The text of a string literal.
+pub(crate) fn string_text(value: &str) -> Option<&str> {
+    let value = value.trim();
+    ['"', '\'']
+        .iter()
+        .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote))
+}
+
+/// Whether the text of a size argument is a tuple or a list.
+fn is_sequence(value: &str) -> bool {
+    value.starts_with(['(', '['])
+}
+
+/// The text of the `padding` of a constructor. One name gets `PADDING_NAME`.
+fn padding_argument(call: &ResolvedCallSignature) -> String {
+    let Some(padding) = call.bindings.get("padding") else {
+        return "0".to_string();
+    };
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let name = padding.bytes().all(is_word)
+        && !padding.starts_with(|c: char| c.is_ascii_digit())
+        && !matches!(padding.as_str(), "True" | "False" | "None");
+    if name { format!("{PADDING_NAME}{padding}") } else { padding.clone() }
+}
+
+/// What the `padding` of a convolution does to a spatial dim.
+enum ConvPadding<'a> {
+    KeepsSize,
+    Amount(&'a str),
+    Unknown,
+}
+
+/// `"same"` keeps the size only at stride 1: torch refuses another stride, and
+/// equinox gives a size that is not modelled.
+fn conv_padding<'a>(padding: &'a str, stride: &str) -> ConvPadding<'a> {
+    if padding.starts_with(PADDING_NAME) {
+        return ConvPadding::Unknown;
+    }
+    let Some(text) = string_text(padding) else {
+        return ConvPadding::Amount(padding);
+    };
+    match text.to_ascii_lowercase().as_str() {
+        "valid" => ConvPadding::Amount("0"),
+        "same" | "same_lower" if stride == "1" => ConvPadding::KeepsSize,
+        _ => ConvPadding::Unknown,
+    }
+}
+
 /// Compute the output spatial dimension for a convolution.
 /// Formula: floor((L + 2*padding - kernel_size) / stride) + 1
 ///
-/// If all values and the spatial dim are integers, compute concretely.
+/// If all values and the spatial dim are integers, compute concretely: a
+/// window larger than the input has no size, so the dim is `UNPROVEN_DIM`.
 /// Otherwise build a symbolic string with constant-folding where possible.
 fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding: &str) -> String {
+    let inputs = [spatial_dim, kernel_size, stride, padding];
+    let [spatial_dim, kernel_size, stride, padding] = inputs.map(without_literal_mark);
     // Try fully concrete computation
     if let (Ok(l), Ok(k), Ok(s), Ok(p)) = (
-        spatial_dim.parse::<isize>(),
-        kernel_size.parse::<isize>(),
-        stride.parse::<isize>(),
-        padding.parse::<isize>(),
+        spatial_dim.parse::<i64>(),
+        kernel_size.parse::<i64>(),
+        stride.parse::<i64>(),
+        padding.parse::<i64>(),
     ) && s > 0
     {
-        let l_out = (l + 2 * p - k) / s + 1;
-        return l_out.to_string();
+        let span = l + 2 * p - k;
+        return literal_mark(&inputs.concat(), if span < 0 { -1 } else { span / s + 1 });
     }
 
     // Symbolic: (L + 2*p - k) / s + 1
@@ -1370,14 +1447,15 @@ fn conv_transpose_spatial_dim(
     stride: &str,
     padding: &str,
 ) -> String {
+    let inputs = [spatial_dim, kernel_size, stride, padding];
+    let [spatial_dim, kernel_size, stride, padding] = inputs.map(without_literal_mark);
     if let (Ok(l), Ok(k), Ok(s), Ok(p)) = (
-        spatial_dim.parse::<isize>(),
-        kernel_size.parse::<isize>(),
-        stride.parse::<isize>(),
-        padding.parse::<isize>(),
+        spatial_dim.parse::<i64>(),
+        kernel_size.parse::<i64>(),
+        stride.parse::<i64>(),
+        padding.parse::<i64>(),
     ) {
-        let l_out = (l - 1) * s - 2 * p + k;
-        return l_out.to_string();
+        return literal_mark(&inputs.concat(), (l - 1) * s - 2 * p + k);
     }
 
     // Symbolic: (L-1)*stride - 2*padding + kernel
@@ -1399,6 +1477,11 @@ fn conv_transpose_spatial_dim(
     } else {
         format!("{}+{}", result, kernel_size)
     }
+}
+
+/// The integer of a `LITERAL_DIM` dim, and any other dim as it is.
+fn without_literal_mark(dim: &str) -> &str {
+    literal_dim(dim).unwrap_or(dim)
 }
 
 /// Multiply a dim by a literal factor: exact when the dim is a literal int,
@@ -1573,6 +1656,7 @@ fn apply_conv_layer(
     kernel_size: &str,
     stride: &str,
     padding: &str,
+    dilation: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let min_rank = spatial_rank + 1;
     check_min_rank(layer_name, layer, input, input_shape.len(), min_rank)?;
@@ -1588,12 +1672,36 @@ fn apply_conv_layer(
 
     let mut output_shape = input_shape.to_vec();
     output_shape[channels_idx] = out_channels.to_string();
-    for i in 0..spatial_rank {
-        let spatial_idx = channels_idx + 1 + i;
-        output_shape[spatial_idx] =
-            conv_spatial_dim(&input_shape[spatial_idx], kernel_size, stride, padding);
+    match conv_padding(padding, stride) {
+        ConvPadding::KeepsSize => {}
+        ConvPadding::Unknown => return Ok(None),
+        ConvPadding::Amount(padding) => {
+            let Some(dilations) = conv_dilations(dilation, spatial_rank) else {
+                return Ok(None);
+            };
+            for (dim, dilation) in output_shape[channels_idx + 1..].iter_mut().zip(&dilations) {
+                let kernel = without_literal_mark(kernel_size);
+                let Some(kernel) = effective_kernel_size(kernel, dilation) else {
+                    return Ok(None);
+                };
+                let kernel = if dilation == "1" { kernel_size } else { kernel.as_str() };
+                *dim = conv_spatial_dim(dim, kernel, stride, padding);
+            }
+        }
     }
     Ok(Some(output_shape))
+}
+
+/// The dilation of each of `spatial_rank` axes. `None` when one is not known
+/// as a positive integer.
+fn conv_dilations(dilation: &str, spatial_rank: usize) -> Option<Vec<String>> {
+    let dilations = if is_sequence(dilation) {
+        parse_dim_sequence(dilation).filter(|axes| axes.len() == spatial_rank)?
+    } else {
+        vec![dilation.to_string(); spatial_rank]
+    };
+    let dilations: Vec<String> = dilations.iter().map(|axis| without_literal_mark(axis).to_string()).collect();
+    dilations.iter().all(|axis| axis.parse::<i64>().is_ok_and(|d| d > 0)).then_some(dilations)
 }
 
 /// Returns the minimum input rank required by a shape-preserving layer,
@@ -1642,8 +1750,8 @@ fn dims_match(a: &str, b: &str) -> bool {
 /// and the layer's output shape is trusted.
 fn dims_provably_mismatch(expected: &str, actual: &str) -> bool {
     !dims_match(expected, actual)
-        && expected.trim().parse::<u64>().is_ok()
-        && actual.trim().parse::<u64>().is_ok()
+        && without_literal_mark(expected).trim().parse::<u64>().is_ok()
+        && without_literal_mark(actual).trim().parse::<u64>().is_ok()
 }
 
 pub fn apply_layer_application(
@@ -1719,6 +1827,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         } => apply_conv_layer(
             "Conv1d",
             1,
@@ -1730,6 +1839,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         ),
         // Channels-first layout: Conv2d expects [..., C, H, W]
         LayerKind::Conv2d {
@@ -1738,6 +1848,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         } => apply_conv_layer(
             "Conv2d",
             2,
@@ -1749,6 +1860,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         ),
         // Channels-first layout: Conv3d expects [..., C, D, H, W]
         LayerKind::Conv3d {
@@ -1757,6 +1869,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         } => apply_conv_layer(
             "Conv3d",
             3,
@@ -1768,6 +1881,7 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
         ),
         // Returns an (output, weights) tuple — a single shape can't express
         // it, so direct application skips; tuple unpacking is handled in
@@ -1790,13 +1904,43 @@ fn apply_layer_rule(
         LayerKind::FlaxConv {
             features,
             spatial_rank,
+            kernel_size,
+            padding,
         } => {
             check_min_rank("Conv", layer, input, input_shape.len(), spatial_rank + 1)?;
-            // Stride-1 / SAME padding: spatial dims unchanged.
             let mut output_shape = input_shape.to_vec();
             let last = output_shape.len() - 1;
             output_shape[last] = features.clone();
-            Ok(Some(output_shape))
+            let wraps = string_text(padding).is_some_and(|text| {
+                ["CIRCULAR", "REFLECT", "CAUSAL"].contains(&text.to_ascii_uppercase().as_str())
+            });
+            let padding = if wraps { ConvPadding::KeepsSize } else { conv_padding(padding, "1") };
+            match padding {
+                ConvPadding::KeepsSize => Ok(Some(output_shape)),
+                ConvPadding::Unknown => Ok(None),
+                ConvPadding::Amount(padding) => {
+                    let kernels = if kernel_size.starts_with(['(', '[']) {
+                        parse_dim_sequence(kernel_size)
+                    } else {
+                        Some(vec![kernel_size.clone(); *spatial_rank])
+                    };
+                    let Some(kernels) = kernels.filter(|k| k.len() == *spatial_rank) else {
+                        return Ok(None);
+                    };
+                    if without_literal_mark(padding).parse::<i64>().is_err() {
+                        return Ok(None);
+                    }
+                    let spatial = &mut output_shape[last - spatial_rank..last];
+                    for (dim, kernel) in spatial.iter_mut().zip(&kernels) {
+                        *dim = conv_spatial_dim(dim, kernel, "1", padding);
+                        // flax gives an empty axis where torch fails.
+                        if *dim == UNPROVEN_DIM {
+                            *dim = "0".to_string();
+                        }
+                    }
+                    Ok(Some(output_shape))
+                }
+            }
         }
         // Channels-first pooling: channels preserved, trailing spatial dims
         // follow the conv output formula.
@@ -1808,6 +1952,9 @@ fn apply_layer_rule(
             padding,
         } => {
             check_min_rank(name, layer, input, input_shape.len(), spatial_rank + 1)?;
+            if string_text(padding).is_some() || padding.starts_with(PADDING_NAME) {
+                return Ok(None);
+            }
             let mut output_shape = input_shape.to_vec();
             let start = input_shape.len() - spatial_rank;
             for dim in &mut output_shape[start..] {
@@ -1856,14 +2003,14 @@ fn apply_layer_rule(
             }
             let mut output_shape = input_shape.to_vec();
             output_shape[channels_idx] = out_channels.clone();
-            for i in 0..*spatial_rank {
-                let spatial_idx = channels_idx + 1 + i;
-                output_shape[spatial_idx] = conv_transpose_spatial_dim(
-                    &input_shape[spatial_idx],
-                    kernel_size,
-                    stride,
-                    padding,
-                );
+            match conv_padding(padding, stride) {
+                ConvPadding::KeepsSize => {}
+                ConvPadding::Unknown => return Ok(None),
+                ConvPadding::Amount(padding) => {
+                    for dim in &mut output_shape[channels_idx + 1..] {
+                        *dim = conv_transpose_spatial_dim(dim, kernel_size, stride, padding);
+                    }
+                }
             }
             Ok(Some(output_shape))
         }
@@ -4297,6 +4444,7 @@ mod catalog_first_extract_layer_assignments_tests {
                 kernel_size: "3".to_string(),
                 stride: "1".to_string(),
                 padding: "0".to_string(),
+                dilation: "1".to_string(),
             })
         );
     }
@@ -4317,6 +4465,7 @@ mod catalog_first_extract_layer_assignments_tests {
                 kernel_size: "3".to_string(),
                 stride: "2".to_string(),
                 padding: "1".to_string(),
+                dilation: "1".to_string(),
             })
         );
     }
@@ -4643,6 +4792,7 @@ mod catalog_first_extract_layer_assignments_tests {
                 kernel_size: "3".to_string(),
                 stride: "1".to_string(),
                 padding: "0".to_string(),
+                dilation: "1".to_string(),
             })
         );
     }

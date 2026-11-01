@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -20,8 +21,9 @@ use crate::layers::{
     strip_self_prefixes,
 };
 use crate::python_ast::{
-    ClassHierarchy, SelfAttrWrite, dim_symbols, directly_in_class,
-    extract_call_arguments, self_attr_aliases_from_writes,
+    ClassHierarchy, SelfAttrWrite, collect_global_names, dim_symbols, directly_in_class,
+    extract_call_arguments, insert_identifiers, insert_target_names, only_wrapped,
+    self_attr_aliases_from_writes,
 };
 use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
 
@@ -34,12 +36,13 @@ mod modules;
 
 pub(crate) use modules::LIBRARIES;
 use flow::{Marked, Replay, collect_flow};
+use layer_dims::{has_int_annotation, parameter_annotation};
 use modules::{
     Field, Module, apply_module, apply_sequence_call, changed_in_place, field_of, imported_class,
     imported_module_of, loop_variables, shape_of_indexed_module_call, shape_of_loop_module_call,
 };
 use inner::{
-    called_lambda, comprehension_names, is_single_array_argument, lambda_argument,
+    called_lambda, comprehension_names, is_builtin_call, is_single_array_argument, lambda_argument,
     scan_lambda_output, shape_of_batched_lambda, shape_of_direct_lambda, shape_of_sum,
 };
 
@@ -58,6 +61,7 @@ where
         cache.revalidate(&[]);
     }
     analyze_tree(node, text, search_roots, &read_file, max_depth, cache)
+        .map(LayerShapeAnalysis::without_free_marks)
 }
 
 /// `analyze_layer_shapes` without the check of the cache against the disk,
@@ -119,7 +123,7 @@ where
         Ok(_) => next.unwrap_or_default(),
         Err(_) => UnitMemo::default(),
     };
-    analysis
+    analysis.map(LayerShapeAnalysis::without_free_marks)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -373,7 +377,9 @@ struct ShapeCtx<'a> {
     max_depth: usize,
     cache: Option<&'a ResolutionCache>,
     scopes: &'a mut [FunctionShapeScope],
-    vmap_targets: &'a mut HashMap<String, VmapInfo>,
+    /// Every `name = vmap(...)` of the file, per name. `ShapeCtx::vmap_target`
+    /// decides which one a read of the name means.
+    vmap_targets: &'a mut HashMap<String, Vec<VmapInfo>>,
     applications: &'a mut Vec<LayerApplication>,
     errors: &'a mut Vec<ShapeError>,
     /// Per-assignment shape records for inlay hints (issue #28).
@@ -438,7 +444,7 @@ struct ShapeCtx<'a> {
     original_shapes: &'a [HashMap<String, Vec<String>>],
     /// Lexical links between function scopes (closures reading variables of
     /// the enclosing function).
-    links: &'a ScopeLinks,
+    links: &'a ScopeLinks<'a>,
     submodules: &'a Submodules,
     /// Names some `global` statement of the file mentions, found on first use.
     global_names: std::cell::OnceCell<HashSet<String>>,
@@ -492,10 +498,10 @@ struct ModuleWrites {
 /// A class that defines a method, and the scope of the method.
 type MethodScope = ((usize, usize), usize);
 
-/// Lexical facts about function scopes, computed only for closures and the
-/// functions that enclose them (every other entry stays empty).
-#[derive(Default)]
-struct ScopeLinks {
+/// Lexical facts about function scopes. `locals`, `poisoned`, and `captures`
+/// are computed only for closures, methods in a function, and the functions
+/// that enclose them (every other entry stays empty).
+struct ScopeLinks<'t> {
     scope_index: ScopeIndex,
     /// Enclosing function scope. `None` for module-level functions and for
     /// methods, whose class body sits between them and the function.
@@ -504,7 +510,7 @@ struct ScopeLinks {
     /// `with` targets, imports, nested `def`/`class` names, `global` names.
     /// A `nonlocal` name is not local.
     locals: Vec<HashSet<String>>,
-    /// Names a nested closure rebinds through `nonlocal`. A call can change
+    /// Names a nested closure or method rebinds through `nonlocal`. A call can change
     /// them at any time, so lookups in this scope treat them as unknown.
     poisoned: Vec<HashSet<String>>,
     /// The scope mentions a name that an enclosing function binds.
@@ -512,9 +518,71 @@ struct ScopeLinks {
     /// Another function of the same name is defined in the same function or
     /// class body, or at module level.
     redefined: Vec<bool>,
+    /// The names of each scope that may not mean a function: see
+    /// `ScopeLinks::hiding`. Filled on the first look, as most scopes of an
+    /// edit replay from the memo.
+    hiding: Vec<OnceCell<HashSet<String>>>,
+    root: Node<'t>,
+    imports: &'t ImportScopes,
+    function_nodes: &'t [Option<Node<'t>>],
+    class_index: ScopeIndex,
+    class_ranges: &'t [(usize, usize)],
+    text: &'t str,
     /// The class whose body holds the definition of each scope.
     class_of: Vec<Option<(usize, usize)>>,
     methods: HashMap<String, Vec<MethodScope>>,
+}
+
+impl ScopeLinks<'_> {
+    /// Names that scope `idx` (0 is the module) binds other than by `def`, so
+    /// a bare name there may not mean the function. A `global` name is here,
+    /// a `nonlocal` name is not. `f = jax.jit(f)` after `def f` is not here:
+    /// the name still means a function with that signature.
+    fn hiding(&self, idx: usize, scopes: &[FunctionShapeScope]) -> &HashSet<String> {
+        self.hiding[idx].get_or_init(|| {
+            let mut bindings = Bindings::default();
+            let body = self.function_nodes[idx].map_or(Some(self.root), |f| f.child_by_field_name("body"));
+            if let Some(body) = body {
+                collect_bindings(body, self.text, &mut bindings);
+            }
+            let mut names = bindings.bound;
+            if let Some(body) = body {
+                let functions = &bindings.functions;
+                names.retain(|name| {
+                    !functions.contains(name) || !only_wrapped(body, name, self.text, self.imports)
+                });
+            }
+            names.extend(bindings.global);
+            names.retain(|name| !bindings.nonlocal.contains(name));
+            names.extend(scopes[idx].all_params.iter().cloned());
+            if idx == 0 && self.text.contains("global") {
+                collect_global_names(self.root, self.text, &mut names);
+            }
+            names
+        })
+    }
+
+    /// The function around scope `idx`, also when a class body stands between
+    /// them. Scope 0 and a function of the module have none.
+    fn enclosing(&self, idx: usize) -> Option<usize> {
+        self.parent[idx].or_else(|| {
+            let class = self.class_of[idx]?;
+            self.scope_index.lookup(class.0).filter(|&scope| scope != 0)
+        })
+    }
+
+    /// Whether the body of `class` binds `name` other than by `def`.
+    fn class_binds(&self, class: (usize, usize), name: &str) -> bool {
+        let body = self
+            .root
+            .descendant_for_byte_range(class.0, class.1)
+            .and_then(|node| node.child_by_field_name("body"));
+        let mut own = Bindings::default();
+        if let Some(body) = body {
+            collect_bindings(body, self.text, &mut own);
+        }
+        own.bound.contains(name)
+    }
 }
 
 struct ScopeLevel<'c> {
@@ -573,12 +641,9 @@ fn normalize_shape(
     hierarchy: &ClassHierarchy,
     byte: usize,
 ) -> Vec<String> {
-    if aliases.is_empty() {
-        return shape;
-    }
     shape
         .into_iter()
-        .map(|d| normalize_dim(&d, aliases, hierarchy, byte))
+        .map(|d| fold_literal_marks(normalize_dim(&d, aliases, hierarchy, byte)))
         .collect()
 }
 
@@ -916,7 +981,7 @@ impl<'a> ShapeCtx<'a> {
             self.tuple_carries.remove(&(scope_idx, name.to_string()));
         }
         let shape = normalize_shape(shape, self.aliases, self.hierarchy, byte);
-        if shape.iter().any(|dim| has_internal_name(dim)) {
+        if shape.iter().any(|dim| has_internal_name(dim) || dim.contains(UNPROVEN_DIM)) {
             self.evict_binding(scope_idx, name);
             return;
         }
@@ -1087,6 +1152,19 @@ impl<'a> ShapeCtx<'a> {
         }
     }
 
+    /// The `vmap` that the bare name `name` means at `at`: the scope that owns
+    /// the name binds it to that one call and to nothing else.
+    fn vmap_target(&self, name: &str, at: Node) -> Option<VmapInfo> {
+        let recorded = self.vmap_targets.get(name)?;
+        let (_, NameBinding::Values(values)) = nearest_binding(at, name, self) else {
+            return None;
+        };
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        recorded.iter().find(|info| info.site == value.start_byte()).cloned()
+    }
+
     fn scope_level(&self, scope_idx: usize) -> ScopeLevel<'_> {
         ScopeLevel {
             shapes: &self.scopes[scope_idx].shapes,
@@ -1118,7 +1196,7 @@ impl<'a> ShapeCtx<'a> {
 /// (silently skipped — unrecognised function, missing variable shape, etc.).
 /// On error (dimension mismatch etc.) records a `ShapeError` and returns `None`.
 fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
-    match node.kind() {
+    let shape = match node.kind() {
         "call" => shape_of_call(node, ctx),
         "identifier" => shape_of_identifier(node, ctx),
         "attribute" => shape_of_attribute(node, ctx),
@@ -1132,7 +1210,11 @@ fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         "binary_operator" => shape_of_binary_operator(node, ctx),
         "tuple" => shape_of_tuple(node, ctx),
         _ => None,
-    }
+    };
+    let no_size = |dim: &String| dim.contains(UNPROVEN_DIM) || dim.parse::<i64>().is_ok_and(|size| size < 0);
+    shape
+        .map(|shape| shape.into_iter().map(fold_literal_marks).collect::<Vec<_>>())
+        .filter(|shape| !shape.iter().any(no_size))
 }
 
 /// A bare tuple literal (e.g. `(mean0, var0)`, whether inline in a call's
@@ -1218,6 +1300,25 @@ fn inner_scope_binds(node: Node, name: &str, text: &str) -> bool {
     })
 }
 
+/// Whether a lambda or a comprehension of the statement around `at` binds `name`.
+fn bound_in_expression(at: Node, name: &str, text: &str) -> bool {
+    let mut up = at.parent();
+    while let Some(owner) = up {
+        up = owner.parent();
+        match owner.kind() {
+            "function_definition" | "class_definition" | "module" => return false,
+            "lambda" | "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+            | "generator_expression"
+                if inner_scope_binds(owner, name, text) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Names bound directly in a class body, for every class that is not inside
 /// a function (the others do not write scope 0).
 fn collect_class_body_names(node: Node, text: &str, out: &mut HashSet<String>) {
@@ -1230,6 +1331,7 @@ fn collect_class_body_names(node: Node, text: &str, out: &mut HashSet<String>) {
                     let mut bindings = Bindings::default();
                     collect_bindings(body, text, &mut bindings);
                     out.extend(bindings.bound);
+                    out.extend(bindings.functions);
                     collect_class_body_names(body, text, out);
                 }
             }
@@ -1300,15 +1402,17 @@ fn shape_of_unary(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 /// Subscript / indexing: `x[0]`, `x[i:j]`, `x[:, :d]`, `x[..., None]`.
 ///
 /// Walks the index list against the value's shape, numpy-style:
-/// - integer / scalar index → drops that axis (rank −1);
-/// - slice → keeps the axis (dim narrowed where computable, else approximated
-///   by the original axis — preserves rank);
+/// - proven integer → drops that axis (rank −1);
+/// - one list of integers, with no other integer or list → that axis has the
+///   length of the list;
+/// - slice → keeps the axis with the size of `ShapeCtx::slice_size`, and an
+///   unknown size makes the whole shape unknown;
 /// - `None` / newaxis → inserts a size-1 axis;
 /// - `...` (ellipsis) → expands to the un-indexed middle axes, unchanged;
 /// - axes past the last index are kept unchanged (implicit full slices).
 ///
-/// Advanced/boolean array indexing is approximated as a single axis-drop —
-/// the common `x[i]` case is exact; fancy indexing is rare in model code.
+/// Any other index can be an array or a mask, so the shape is unknown. So is a
+/// negative step on a torch tensor, which torch refuses.
 fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let value_node = node.child_by_field_name("value")?;
     let input_shape = shape_of_expression(value_node, ctx)?;
@@ -1318,7 +1422,7 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let mut indices = Vec::new();
     for i in 0..node.named_child_count() {
         let child = node.named_child(i as u32)?;
-        if child.id() != value_node.id() {
+        if child.id() != value_node.id() && child.kind() != "comment" {
             indices.push(child);
         }
     }
@@ -1333,6 +1437,7 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     let mut out: Vec<String> = Vec::new();
     let mut axis = 0usize;
+    let (mut integers, mut lists) = (0usize, 0usize);
 
     for idx in &indices {
         match idx.kind() {
@@ -1345,16 +1450,34 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             "none" => out.push("1".to_string()),
             "slice" => {
                 let orig = input_shape.get(axis)?;
-                let text = idx.utf8_text(ctx.text.as_bytes()).ok()?;
-                out.push(slice_dim(text, orig));
+                let parts = slice_parts(*idx, ctx.text);
+                if ctx.is_negative_step(parts[2], idx.start_byte())
+                    && is_torch_value(value_node, ctx, &mut Vec::new())
+                {
+                    return None;
+                }
+                out.push(ctx.slice_size(parts, orig, idx.start_byte())?);
                 axis += 1;
             }
-            // integer / identifier / other scalar index → drop the axis.
-            _ => {
+            "list" => {
+                input_shape.get(axis)?;
+                let length = integer_list_length(*idx, ctx)?;
+                out.push(length.to_string());
+                axis += 1;
+                lists += 1;
+            }
+            _ if is_integer_expr(*idx, ctx, &mut Vec::new()) => {
                 input_shape.get(axis)?; // bounds-check: over-indexing → None
                 axis += 1;
+                integers += 1;
             }
+            _ => return None,
         }
+    }
+    // With a list, an integer is an array index too, and several array indices
+    // broadcast.
+    if lists > 1 || (lists == 1 && integers > 0) {
+        return None;
     }
 
     // Trailing axes not addressed by any index stay as implicit full slices.
@@ -1366,30 +1489,24 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Resulting dim for a single sliced axis. Computes the length when it's
-/// obvious (`:n` → `n`; numeric `a:b` → `b-a`), otherwise approximates by the
-/// original axis so rank is preserved.
-fn slice_dim(slice_text: &str, orig_dim: &str) -> String {
-    let parts: Vec<&str> = slice_text.trim().split(':').collect();
-    let start = parts.first().copied().unwrap_or("").trim();
-    let stop = parts.get(1).copied().unwrap_or("").trim();
-    let step = parts.get(2).copied().unwrap_or("").trim();
-
-    // Full slice (`:` / `::`) → unchanged.
-    if start.is_empty() && stop.is_empty() && step.is_empty() {
-        return orig_dim.to_string();
-    }
-    // No step, known stop:
-    if step.is_empty() && !stop.is_empty() {
-        if start.is_empty() {
-            return stop.to_string(); // `:n` → n
-        }
-        if let (Ok(a), Ok(b)) = (start.parse::<i64>(), stop.parse::<i64>()) {
-            return (b - a).max(0).to_string(); // numeric `a:b`
+/// The text of the start, the stop, and the step of a `slice` node. An absent
+/// part is empty.
+fn slice_parts<'t>(slice: Node, text: &'t str) -> [&'t str; 3] {
+    let mut parts = [""; 3];
+    let mut part = 0;
+    for i in 0..slice.child_count() {
+        let Some(child) = slice.child(i as u32) else {
+            continue;
+        };
+        if child.kind() == ":" {
+            part += 1;
+        } else if child.kind() != "comment"
+            && let Some(slot) = parts.get_mut(part)
+        {
+            *slot = child.utf8_text(text.as_bytes()).unwrap_or("").trim();
         }
     }
-    // Stepped / symbolic-bounded / start-only: approximate by the original axis.
-    orig_dim.to_string()
+    parts
 }
 
 /// Find the operator text between left and right children of a binary_operator node.
@@ -1626,52 +1743,32 @@ fn index_module(node: Node, text: &str, index: &mut ModuleIndex) {
     }
 }
 
+/// The names that a `global` statement of the file names.
+fn global_writes<'c>(root: Node, ctx: &'c ShapeCtx) -> &'c HashSet<String> {
+    ctx.global_names.get_or_init(|| {
+        let mut names = HashSet::new();
+        if ctx.text.contains("global") {
+            collect_global_names(root, ctx.text, &mut names);
+        }
+        names
+    })
+}
+
 fn module_binding<'t>(root: Node<'t>, name: &str, ctx: &ShapeCtx) -> NameBinding<'t> {
     let index = ctx.module_index.get_or_init(|| {
         let mut index = ModuleIndex::default();
         index_module(root, ctx.text, &mut index);
         index
     });
-    if index.wildcard || index.opaque.contains(name) {
+    if index.wildcard || index.opaque.contains(name) || global_writes(root, ctx).contains(name) {
         return NameBinding::Opaque;
     }
     let Some(refs) = index.values.get(name) else {
         return NameBinding::Unbound;
     };
-    let globals = ctx.global_names.get_or_init(|| {
-        let mut names = HashSet::new();
-        if ctx.text.contains("global") {
-            collect_global_names(root, ctx.text, &mut names);
-        }
-        names
-    });
-    if globals.contains(name) {
-        return NameBinding::Opaque;
-    }
     match refs.iter().map(|r| r.find(root)).collect::<Option<Vec<_>>>() {
         Some(values) => NameBinding::Values(values),
         None => NameBinding::Opaque,
-    }
-}
-
-/// The names the `global` statements under `node` mention. A statement stands
-/// in a block or a clause of a compound one, never in an expression, so the
-/// walk leaves the expressions out.
-fn collect_global_names(node: Node, text: &str, out: &mut HashSet<String>) {
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        match n.kind() {
-            "global_statement" => insert_identifiers(n, text, out),
-            "module" | "block" | "function_definition" | "class_definition"
-            | "decorated_definition" | "if_statement" | "elif_clause" | "else_clause"
-            | "for_statement" | "while_statement" | "try_statement" | "except_clause"
-            | "except_group_clause" | "finally_clause" | "with_statement"
-            | "match_statement" | "case_clause" => {
-                let mut cursor = n.walk();
-                stack.extend(n.named_children(&mut cursor));
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1837,6 +1934,262 @@ fn is_scalar_expr(
     }
 }
 
+/// The number of items of a list of proven integers that is not empty.
+fn integer_list_length(list: Node, ctx: &ShapeCtx) -> Option<usize> {
+    let mut cursor = list.walk();
+    let items: Vec<Node> = list.named_children(&mut cursor).filter(|n| n.kind() != "comment").collect();
+    let integers = !items.is_empty() && items.iter().all(|item| is_integer_expr(*item, ctx, &mut Vec::new()));
+    integers.then_some(items.len())
+}
+
+/// Whether `node` is provably a Python integer: a literal, `len`, `int`,
+/// `x.shape[<integer>]`, a name that holds only integers, or arithmetic on
+/// those that keeps an integer. A `bool` or a float is not one: as an index,
+/// neither drops an axis.
+fn is_integer_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>) -> bool {
+    match node.kind() {
+        "integer" => true,
+        "parenthesized_expression" => {
+            node.named_child(0).is_some_and(|inner| is_integer_expr(inner, ctx, visiting))
+        }
+        "unary_operator" => node
+            .child_by_field_name("argument")
+            .is_some_and(|operand| is_integer_expr(operand, ctx, visiting)),
+        "binary_operator" => {
+            node.child_by_field_name("operator")
+                .is_some_and(|op| matches!(op.kind(), "+" | "-" | "*" | "//" | "%"))
+                && ["left", "right"].iter().all(|side| {
+                    node.child_by_field_name(side)
+                        .is_some_and(|operand| is_integer_expr(operand, ctx, visiting))
+                })
+        }
+        "identifier" => ctx
+            .text
+            .get(node.byte_range())
+            .is_some_and(|name| name_is_integer(node, name, ctx, visiting)),
+        "subscript" => is_scalar_expr(node, ctx, &mut Vec::new()),
+        "call" => is_builtin_call(node, "len", ctx) || is_builtin_call(node, "int", ctx),
+        _ => false,
+    }
+}
+
+/// Whether every binding of `name`, in the scope that owns it, gives an
+/// integer. Flow-insensitive, like `name_is_scalar`.
+fn name_is_integer(
+    at: Node,
+    name: &str,
+    ctx: &ShapeCtx,
+    visiting: &mut Vec<(usize, String)>,
+) -> bool {
+    let (owner, binding) = nearest_binding(at, name, ctx);
+    if matches!(binding, NameBinding::Unbound) {
+        return false;
+    }
+    let key = (owner.id(), name.to_string());
+    if visiting.contains(&key) {
+        return true;
+    }
+    visiting.push(key);
+    let integer = owner_binds_integer(owner, name, ctx, visiting);
+    visiting.pop();
+    integer
+}
+
+fn owner_binds_integer(
+    owner: Node,
+    name: &str,
+    ctx: &ShapeCtx,
+    visiting: &mut Vec<(usize, String)>,
+) -> bool {
+    let bound_in = |node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>| {
+        let mut found = false;
+        only_integer_bindings(node, name, ctx, visiting, &mut found) && found
+    };
+    match owner.kind() {
+        "module" => {
+            !global_writes(owner, ctx).contains(name) && bound_in(owner, ctx, visiting)
+        }
+        "function_definition" => {
+            let Some(scope) = function_scope(owner, ctx) else {
+                return false;
+            };
+            let Some(body) = owner.child_by_field_name("body") else {
+                return false;
+            };
+            if ctx.links.poisoned[scope].contains(name) {
+                return false;
+            }
+            if ctx.scopes[scope].all_params.iter().any(|param| param == name) {
+                let mut found = false;
+                return has_int_annotation(owner, name, ctx.text)
+                    && only_integer_bindings(body, name, ctx, visiting, &mut found);
+            }
+            bound_in(body, ctx, visiting)
+        }
+        "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+        | "generator_expression" => {
+            let mut cursor = owner.walk();
+            owner.named_children(&mut cursor).filter(|n| n.kind() == "for_in_clause").any(|clause| {
+                let field = |field| clause.child_by_field_name(field);
+                field("left").zip(field("right")).is_some_and(|(left, right)| loop_gives_integer(left, right, name, ctx))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a loop `for <left> in <right>` puts an integer in `name`: a target
+/// of `range`, or the first target of `enumerate`.
+fn loop_gives_integer(left: Node, right: Node, name: &str, ctx: &ShapeCtx) -> bool {
+    let is_name = |node: Node| ctx.text.get(node.byte_range()) == Some(name);
+    if is_builtin_call(right, "range", ctx) {
+        return left.kind() == "identifier" && is_name(left);
+    }
+    let mut cursor = left.walk();
+    let targets: Vec<Node> = left.named_children(&mut cursor).collect();
+    is_builtin_call(right, "enumerate", ctx)
+        && matches!(left.kind(), "pattern_list" | "tuple_pattern")
+        && targets.first().is_some_and(|first| first.kind() == "identifier" && is_name(*first))
+        && !targets[1..].iter().any(|target| mentions_name(*target, ctx.text, &|other| other == name))
+}
+
+/// Whether each binding of `name` in the scope of `node` gives an integer: a
+/// plain or an augmented assignment, or a loop. `found` says that one exists.
+/// Nested `def`, `class`, and `lambda` bodies are other scopes.
+fn only_integer_bindings(
+    node: Node,
+    name: &str,
+    ctx: &ShapeCtx,
+    visiting: &mut Vec<(usize, String)>,
+    found: &mut bool,
+) -> bool {
+    let mentions = |n: Node| mentions_name(n, ctx.text, &|other| other == name);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" => {
+                if child.child_by_field_name("name").is_some_and(mentions) {
+                    return false;
+                }
+                continue;
+            }
+            "lambda" => continue,
+            "import_from_statement"
+                if child.named_children(&mut child.walk()).any(|c| c.kind() == "wildcard_import") =>
+            {
+                return false;
+            }
+            "global_statement" | "nonlocal_statement" | "import_statement"
+            | "import_from_statement" | "future_import_statement" | "delete_statement"
+            | "case_pattern" | "type_alias_statement" => {
+                if mentions(child) {
+                    return false;
+                }
+                continue;
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(left) = child.child_by_field_name("left") {
+                    let mut targets = HashSet::new();
+                    insert_target_names(left, ctx.text, &mut targets);
+                    if targets.contains(name) {
+                        let right = child.child_by_field_name("right");
+                        let integer = match child.kind() {
+                            "for_statement" => {
+                                right.is_some_and(|right| loop_gives_integer(left, right, name, ctx))
+                            }
+                            _ => {
+                                left.kind() == "identifier"
+                                    && child.child_by_field_name("type").is_none_or(|t| {
+                                        ctx.text.get(t.byte_range()) == Some("int")
+                                    })
+                                    && right.is_some_and(|right| is_integer_expr(right, ctx, visiting))
+                            }
+                        };
+                        if !integer {
+                            return false;
+                        }
+                        *found = true;
+                    }
+                }
+            }
+            "named_expression" | "as_pattern" => {
+                let target = child
+                    .child_by_field_name("name")
+                    .or_else(|| child.child_by_field_name("alias"));
+                if target.is_some_and(mentions) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        if !only_integer_bindings(child, name, ctx, visiting, found) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `node` is proven a torch tensor: the result of a `torch` call, a
+/// parameter annotated with `Tensor`, a name that holds only such values, or a
+/// method, a subscript, or arithmetic on one.
+fn is_torch_value(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>) -> bool {
+    let text = |n: Node| ctx.text.get(n.byte_range()).unwrap_or("");
+    match node.kind() {
+        "parenthesized_expression" => {
+            node.named_child(0).is_some_and(|inner| is_torch_value(inner, ctx, visiting))
+        }
+        "unary_operator" => node
+            .child_by_field_name("argument")
+            .is_some_and(|operand| is_torch_value(operand, ctx, visiting)),
+        "binary_operator" => ["left", "right"].iter().any(|side| {
+            node.child_by_field_name(side)
+                .is_some_and(|operand| is_torch_value(operand, ctx, visiting))
+        }),
+        "subscript" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| is_torch_value(value, ctx, visiting)),
+        "identifier" => name_is_torch(node, text(node), ctx, visiting),
+        "call" => {
+            let Some(function) = node.child_by_field_name("function") else {
+                return false;
+            };
+            let resolved = resolve_call_target(text(function), ctx.imports.at(node.start_byte()));
+            resolved.parts.first().is_some_and(|root| root == "torch")
+                || function.kind() == "attribute"
+                    && function.child_by_field_name("attribute").is_none_or(|m| text(m) != "numpy")
+                    && function
+                        .child_by_field_name("object")
+                        .is_some_and(|object| is_torch_value(object, ctx, visiting))
+        }
+        _ => false,
+    }
+}
+
+fn name_is_torch(
+    at: Node,
+    name: &str,
+    ctx: &ShapeCtx,
+    visiting: &mut Vec<(usize, String)>,
+) -> bool {
+    let (owner, binding) = nearest_binding(at, name, ctx);
+    if owner.kind() == "function_definition"
+        && parameter_annotation(owner, name, ctx.text).is_some_and(|type_| type_.contains("Tensor"))
+    {
+        return true;
+    }
+    let NameBinding::Values(values) = binding else {
+        return false;
+    };
+    let key = (owner.id(), name.to_string());
+    if values.is_empty() || visiting.contains(&key) {
+        return false;
+    }
+    visiting.push(key);
+    let torch = values.iter().all(|value| is_torch_value(*value, ctx, visiting));
+    visiting.pop();
+    torch
+}
+
 fn binary_mismatch_axes(
     left: &[String],
     right: &[String],
@@ -1854,17 +2207,14 @@ fn binary_mismatch_axes(
             if let (Some(left_axis), Some(right_axis)) = (left_axis, right_axis) {
                 let left_dim = &left[left_axis];
                 let right_dim = &right[right_axis];
-                if !dims_canonically_equal(left_dim, right_dim)
-                    && left_dim != "1"
-                    && right_dim != "1"
-                {
+                if dims_conflict(left_dim, right_dim) && left_dim != "1" && right_dim != "1" {
                     return Some((left_axis, right_axis));
                 }
             }
         }
         let left_axis = left.len() - 1;
         let right_axis = right.len() - 2;
-        return (!dims_canonically_equal(&left[left_axis], &right[right_axis]))
+        return dims_conflict(&left[left_axis], &right[right_axis])
             .then_some((left_axis, right_axis));
     }
 
@@ -1875,10 +2225,7 @@ fn binary_mismatch_axes(
         if let (Some(left_axis), Some(right_axis)) = (left_axis, right_axis) {
             let left_dim = &left[left_axis];
             let right_dim = &right[right_axis];
-            if !dims_canonically_equal(left_dim, right_dim)
-                && left_dim != "1"
-                && right_dim != "1"
-            {
+            if dims_conflict(left_dim, right_dim) && left_dim != "1" && right_dim != "1" {
                 return Some((left_axis, right_axis));
             }
         }
@@ -1979,8 +2326,7 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
     };
 
     match result {
-        Ok(Some(shape)) => Some(shape),
-        Ok(None) => None,
+        Ok(shape) => shape,
         Err(message) => {
             // We don't have a natural variable name here — use the full
             // expression text as the "variable" in the error.
@@ -2323,7 +2669,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     };
                     let result = apply_method_call_for_backend(&known, &receiver_name, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
                     return match result {
-                        Ok(Some(shape)) => Some(shape),
+                        Ok(Some(shape)) => {
+                            Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
+                        }
                         Ok(None) => None,
                         Err(message) => {
                             ctx.errors.push(ShapeError::mismatch(method_name, message, args_node.range()));
@@ -2369,7 +2717,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                         &ctx.scope_shapes(scope_idx),
                     );
                     return match result {
-                        Ok(Some(shape)) => Some(shape),
+                        Ok(Some(shape)) => {
+                            Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
+                        }
                         Ok(None) => None,
                         Err(message) => {
                             ctx.errors.push(ShapeError::mismatch(receiver_name, message, args_node.range()));
@@ -2453,7 +2803,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     }
 
     // 2. vmap-target check
-    if let Some(info) = ctx.vmap_targets.get(&target).cloned() {
+    if let Some(info) = ctx.vmap_target(&target, args_node) {
         let result = apply_vmap_call(
             &info,
             &args,
@@ -2512,6 +2862,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 return apply_vmapped_submodule(&module, &callable, &rest, &[(0, 0)], scope_idx, args_node, ctx);
             }
             if !callable.contains('.') {
+                if bound_in_expression(args_node, &callable, ctx.text) {
+                    return None;
+                }
                 let info = VmapInfo {
                     wrapped: callable,
                     in_axes: 0,
@@ -2532,6 +2885,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 3. User-defined function propagation.
     if !target.contains('.')
+        && !bound_in_expression(args_node, &target, ctx.text)
         && let Some(callee_idx) = find_callee_scope(&target, call_byte, ctx.links, ctx.scopes)
     {
         let call = UserCall {
@@ -2577,7 +2931,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         };
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
-            Ok(Some(shape)) => Some(shape),
+            Ok(Some(shape)) => Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte())),
             Ok(None) => None,
             Err(message) => {
                 // `jax.lax.dot_general` is classified as `KnownFunction::Matmul`
@@ -3164,8 +3518,6 @@ fn find_keyword_arg_node<'a>(args_node: Node<'a>, name: &str, source_bytes: &[u8
 //   as a function name.
 // - Cross-file wrapped functions are not supported: if `f` is imported
 //   from another module, scope lookup will fail and we return Ok(None).
-// - `vmap_targets` is global to the analysis pass, not per-scope. Nested-
-//   scope shadowing of a vmap name is out of scope for v1.
 // - `axis_size` keyword is not supported.
 
 /// Metadata recorded when `jax.vmap(f, ...)` or `equinox.filter_vmap(f, ...)`
@@ -3310,43 +3662,16 @@ fn collect_function_definition_nodes<'t>(
 }
 
 /// Names a function body binds in its own scope. Nested `def`/`class` bodies
-/// and lambdas are not entered; their names are bound here. Comprehension
+/// and lambdas are not entered; their names are bound here, a `def` name in
+/// `functions` unless another form also binds it in `bound`. Comprehension
 /// targets are not bound (Python 3 scopes them to the comprehension), but a
 /// walrus inside one is.
 #[derive(Default)]
 struct Bindings {
     bound: HashSet<String>,
+    functions: HashSet<String>,
     nonlocal: HashSet<String>,
     global: HashSet<String>,
-}
-
-fn insert_identifiers(node: Node, text: &str, out: &mut HashSet<String>) {
-    if node.kind() == "identifier" {
-        if let Ok(name) = node.utf8_text(text.as_bytes()) {
-            out.insert(name.to_string());
-        }
-        return;
-    }
-    for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i as u32) {
-            insert_identifiers(child, text, out);
-        }
-    }
-}
-
-fn insert_target_names(target: Node, text: &str, out: &mut HashSet<String>) {
-    match target.kind() {
-        "identifier" => insert_identifiers(target, text, out),
-        "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern"
-        | "parenthesized_expression" | "expression_list" | "tuple" | "list" => {
-            for i in 0..target.named_child_count() {
-                if let Some(child) = target.named_child(i as u32) {
-                    insert_target_names(child, text, out);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_bindings(node: Node, text: &str, out: &mut Bindings) {
@@ -3357,7 +3682,12 @@ fn collect_bindings(node: Node, text: &str, out: &mut Bindings) {
         match child.kind() {
             "function_definition" | "class_definition" => {
                 if let Some(name) = child.child_by_field_name("name") {
-                    insert_identifiers(name, text, &mut out.bound);
+                    let names = if child.kind() == "class_definition" {
+                        &mut out.bound
+                    } else {
+                        &mut out.functions
+                    };
+                    insert_identifiers(name, text, names);
                 }
                 continue;
             }
@@ -3396,6 +3726,27 @@ fn collect_bindings(node: Node, text: &str, out: &mut Bindings) {
     }
 }
 
+/// The names that a class body in the scope of `node` rebinds through
+/// `nonlocal`. Nested `def` and `lambda` bodies are other scopes.
+fn collect_class_rebinds(node: Node, text: &str, out: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "lambda" => continue,
+            "class_definition" => {
+                let mut bindings = Bindings::default();
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_bindings(body, text, &mut bindings);
+                }
+                let Bindings { bound, functions, nonlocal, .. } = bindings;
+                out.extend(nonlocal.into_iter().filter(|name| bound.contains(name) || functions.contains(name)));
+            }
+            _ => {}
+        }
+        collect_class_rebinds(child, text, out);
+    }
+}
+
 fn mentions_name(node: Node, text: &str, wanted: &dyn Fn(&str) -> bool) -> bool {
     if node.kind() == "identifier" {
         return node.utf8_text(text.as_bytes()).is_ok_and(wanted);
@@ -3408,14 +3759,15 @@ fn mentions_name(node: Node, text: &str, wanted: &dyn Fn(&str) -> bool) -> bool 
 /// Link every nested function to the function that encloses it. `function_
 /// nodes` is aligned with `scopes` (index 0, the module, has no node) and in
 /// document order, so one stack of open ranges finds each parent.
-fn build_scope_links(
+fn build_scope_links<'t>(
+    root: Node<'t>,
     scopes: &[FunctionShapeScope],
-    function_nodes: &[Option<Node>],
-    class_ranges: &[(usize, usize)],
-    text: &str,
-) -> ScopeLinks {
+    function_nodes: &'t [Option<Node<'t>>],
+    class_ranges: &'t [(usize, usize)],
+    imports: &'t ImportScopes,
+    text: &'t str,
+) -> ScopeLinks<'t> {
     let n = scopes.len();
-    let class_index = ScopeIndex::from_ranges(class_ranges.to_vec());
     let mut links = ScopeLinks {
         scope_index: ScopeIndex::new(scopes),
         parent: vec![None; n],
@@ -3423,6 +3775,13 @@ fn build_scope_links(
         poisoned: vec![HashSet::new(); n],
         captures: vec![false; n],
         redefined: vec![false; n],
+        hiding: vec![OnceCell::new(); n],
+        root,
+        imports,
+        function_nodes,
+        class_index: ScopeIndex::from_ranges(class_ranges.to_vec()),
+        class_ranges,
+        text,
         class_of: vec![None; n],
         methods: HashMap::new(),
     };
@@ -3452,10 +3811,11 @@ fn build_scope_links(
             }
             if !through_class {
                 links.parent[i] = Some(p);
-                has_closure = true;
             }
+            has_closure = true;
         }
-        links.class_of[i] = class_index
+        links.class_of[i] = links
+            .class_index
             .lookup(scopes[i].start_byte)
             .map(|class| class_ranges[class])
             .filter(|class| open.last().is_none_or(|&p| class.0 > scopes[p].start_byte));
@@ -3477,18 +3837,31 @@ fn build_scope_links(
             links.redefined[i] = true;
         }
     }
-    if !has_closure {
+    let class_rebinds: Vec<(usize, Vec<String>)> = if text.contains("nonlocal") {
+        (1..n)
+            .filter_map(|i| {
+                let body = function_nodes[i]?.child_by_field_name("body")?;
+                let mut names = Vec::new();
+                collect_class_rebinds(body, text, &mut names);
+                (!names.is_empty()).then_some((i, names))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !has_closure && class_rebinds.is_empty() {
         return links;
     }
 
     let mut needed = vec![false; n];
-    for i in 1..n {
-        let mut cur = links.parent[i].map(|_| i);
+    let around_class = class_rebinds.iter().map(|&(i, _)| Some(i));
+    for start in (1..n).map(|i| links.enclosing(i).map(|_| i)).chain(around_class) {
+        let mut cur = start;
         while let Some(c) = cur
             && !needed[c]
         {
             needed[c] = true;
-            cur = links.parent[c];
+            cur = links.enclosing(c);
         }
     }
     let mut bindings: Vec<Bindings> = (0..n).map(|_| Bindings::default()).collect();
@@ -3505,30 +3878,48 @@ fn build_scope_links(
             .all_params
             .iter()
             .chain(&b.bound)
+            .chain(&b.functions)
             .chain(&b.global)
             .filter(|name| !b.nonlocal.contains(*name))
             .cloned()
             .collect();
     }
 
-    for i in 1..n {
-        if links.parent[i].is_none() {
-            continue;
-        }
-        let rebound: Vec<String> = bindings[i]
-            .nonlocal
-            .intersection(&bindings[i].bound)
-            .cloned()
-            .collect();
-        for name in rebound {
-            let mut owner = links.parent[i];
+    for (i, names) in class_rebinds {
+        for name in names {
+            let mut owner = Some(i);
             while let Some(o) = owner {
                 if links.locals[o].contains(&name) {
                     links.poisoned[o].insert(name);
                     break;
                 }
-                owner = links.parent[o];
+                owner = links.enclosing(o);
             }
+        }
+    }
+
+    for i in 1..n {
+        if links.enclosing(i).is_none() {
+            continue;
+        }
+        let rebound: Vec<String> = bindings[i]
+            .nonlocal
+            .iter()
+            .filter(|name| bindings[i].bound.contains(*name) || bindings[i].functions.contains(*name))
+            .cloned()
+            .collect();
+        for name in rebound {
+            let mut owner = links.enclosing(i);
+            while let Some(o) = owner {
+                if links.locals[o].contains(&name) {
+                    links.poisoned[o].insert(name);
+                    break;
+                }
+                owner = links.enclosing(o);
+            }
+        }
+        if links.parent[i].is_none() {
+            continue;
         }
         let Some(body) = function_nodes[i].and_then(|f| f.child_by_field_name("body")) else {
             continue;
@@ -3938,7 +4329,7 @@ fn with_propagation<T>(
     let mut applications = Vec::new();
     let mut errors = Vec::new();
     let mut assignment_shapes = Vec::new();
-    let mut vmap_targets: HashMap<String, VmapInfo> = HashMap::new();
+    let mut vmap_targets: HashMap<String, Vec<VmapInfo>> = HashMap::new();
 
     let mut function_nodes = Vec::new();
     let mut class_ranges = Vec::new();
@@ -3958,7 +4349,7 @@ fn with_propagation<T>(
     let original_shapes: Vec<HashMap<String, Vec<String>>> =
         scopes.iter().map(|s| s.shapes.clone()).collect();
 
-    let links = build_scope_links(scopes, &scope_function_nodes, &class_ranges, text);
+    let links = build_scope_links(node, scopes, &scope_function_nodes, &class_ranges, imports, text);
     let submodules = extract_submodules(
         node,
         text,
@@ -4000,7 +4391,7 @@ fn with_propagation<T>(
         links: &links,
         submodules: &submodules,
         global_names: Default::default(),
-        classes: ScopeIndex::from_ranges(class_ranges),
+        classes: ScopeIndex::from_ranges(class_ranges.clone()),
         class_starts,
         module_writes: HashMap::new(),
         class_body_names: Default::default(),
@@ -4145,7 +4536,10 @@ fn process_assignment_item_inner(
                 if let Some(an) = args_node
                     && let Ok(args) = extract_call_arguments(an, ctx.text)
                         && let Some(info) = parse_vmap_call(&args, rhs_node.start_byte()) {
-                            ctx.vmap_targets.insert(lhs_name.clone(), info);
+                            let recorded = ctx.vmap_targets.entry(lhs_name.clone()).or_default();
+                            if !recorded.iter().any(|known| known.site == info.site) {
+                                recorded.push(info);
+                            }
                         }
                 // vmap binding has no output shape — skip to next assignment.
                 return;
@@ -5638,7 +6032,7 @@ fn peel_vmap_args<'a>(
             match peel_batch_dim(shape, in_axes) {
                 Ok((peeled, dim)) => {
                     if let Some(ref existing) = level_dim {
-                        if existing != &dim {
+                        if dims_conflict(existing, &dim) {
                             return Err(format!(
                                 "vmap input batch dims disagree: '{}' vs '{}'",
                                 existing, dim
@@ -5773,6 +6167,9 @@ fn shape_of_inline_vmap(
 
     // Case B: the callable is a bare identifier — a user function in this file.
     if !callable.contains('.') {
+        if bound_in_expression(inner_call, &callable, ctx.text) {
+            return None;
+        }
         let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
         return match apply_vmap_call_chain(
             &axes,
@@ -6128,8 +6525,11 @@ fn apply_inline_vmap_layer_chain(
 /// visible only inside its enclosing function.
 ///
 /// `None` also when the name is defined twice in that place
-/// (`ScopeLinks::redefined`), when a class body holds the call and defines the
-/// name, and for a recursive call.
+/// (`ScopeLinks::redefined`), when that place or a scope on the way to it binds
+/// the name in another way (`ScopeLinks::hiding`), when a closure rebinds it
+/// through `nonlocal`, when a class body holds the call and defines the name,
+/// and for a recursive call. A lambda or a comprehension is not a scope here:
+/// see `bound_in_expression`.
 fn find_callee_scope(
     target: &str,
     call: usize,
@@ -6153,7 +6553,7 @@ fn find_callee_scope(
         let levels = match links.parent[i] {
             None => usize::MAX,
             Some(parent) => {
-                let mut chain = std::iter::successors(call_scope, |&up| links.parent[up]);
+                let mut chain = std::iter::successors(call_scope, |&up| links.enclosing(up));
                 match chain.position(|up| up == parent) {
                     Some(levels) => levels,
                     None => continue,
@@ -6164,7 +6564,19 @@ fn find_callee_scope(
             best = Some((levels, i));
         }
     }
-    let (_, i) = best?;
+    let (levels, i) = best?;
+    let hides = |s: usize| links.hiding(s, scopes).contains(target) || links.poisoned[s].contains(target);
+    let module = links.parent[i].is_none().then_some(0);
+    let on_the_way = std::iter::successors(call_scope, |&up| links.enclosing(up)).take(levels.saturating_add(1));
+    if on_the_way.chain(module).any(hides) {
+        return None;
+    }
+    if let Some(class) = links.class_index.lookup(call).map(|c| links.class_ranges[c])
+        && in_body_of(class)
+        && links.class_binds(class, target)
+    {
+        return None;
+    }
     let recursive = scopes[i].start_byte <= call && call < scopes[i].end_byte;
     (!links.redefined[i] && !recursive).then_some(i)
 }
@@ -6334,14 +6746,14 @@ fn build_dim_binding(
             let is_param_concrete = param_dim.parse::<usize>().is_ok();
 
             if is_param_concrete {
-                if param_dim != arg_dim {
+                if dims_conflict(param_dim, arg_dim) {
                     return Err(format!(
                         "call to {}: argument '{}' dim {} expected {}, got {}",
                         target_name, param_name, dim_idx, param_dim, arg_dim
                     ));
                 }
             } else if let Some(existing) = binding.get(param_dim) {
-                if !dims_canonically_equal(existing, arg_dim) {
+                if dims_conflict(existing, arg_dim) {
                     return Err(format!(
                         "call to {}: dim '{}' cannot be both '{}' and '{}'",
                         target_name, param_dim, existing, arg_dim
@@ -6828,7 +7240,7 @@ fn apply_submodule_call(
         .values()
         .flatten()
         .flat_map(|dim| dim.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')))
-        .map(str::to_string)
+        .map(|word| word.trim_start_matches(FREE_DIM).to_string())
         .collect();
     let result = match ctx.scopes[callee_idx].return_shape.clone() {
         Some(annotation) => {
@@ -6933,9 +7345,10 @@ fn rebind_callee_dim(
                 return None;
             }
             out.push_str(&names(attr)??);
-        } else if let Some(value) = names(word) {
+        } else if let Some(value) = names(word.strip_prefix(FREE_DIM).unwrap_or(word)) {
             let value = value?;
-            if value != word && caller_names.contains(word) {
+            let name = word.strip_prefix(FREE_DIM).unwrap_or(word);
+            if value.strip_prefix(FREE_DIM).unwrap_or(&value) != name && caller_names.contains(name) {
                 return None;
             }
             out.push_str(&value);
@@ -6982,7 +7395,7 @@ fn scan_body_ys_shape(
         return Some(std::iter::once(leading.clone()).chain(output).collect());
     }
     let body_name = body_node.utf8_text(ctx.text.as_bytes()).ok()?;
-    if body_name.contains('.') {
+    if body_name.contains('.') || bound_in_expression(body_node, body_name, ctx.text) {
         return None;
     }
     let xs_shape = shape_of_expression(xs_node, ctx)?;
@@ -7143,9 +7556,9 @@ fn apply_matmul_shape(
         let l = left_batch.len().checked_sub(k).map(|i| &left_batch[i]);
         let r = right_batch.len().checked_sub(k).map(|i| &right_batch[i]);
         match (l, r) {
-            (Some(l), Some(r)) if dims_canonically_equal(l, r) => batch.push(l.clone()),
             (Some(l), Some(r)) if l == "1" => batch.push(r.clone()),
             (Some(l), Some(r)) if r == "1" => batch.push(l.clone()),
+            (Some(l), Some(r)) if !dims_conflict(l, r) => batch.push(unified_dim(l, r)),
             (Some(l), Some(r)) => {
                 return Err(format!(
                     "matmul batch dimension mismatch: {} has {}, {} has {} (align from the right)",
@@ -7164,7 +7577,7 @@ fn apply_matmul_shape(
         .expect("invariant: left.len() >= 2 checked above");
     let rhs_second_last = &right[right.len() - 2];
 
-    if !dims_canonically_equal(lhs_last, rhs_second_last) {
+    if dims_conflict(lhs_last, rhs_second_last) {
         return Err(format!(
             "matmul dimension mismatch: {} last dim {} != {} second-to-last dim {}",
             left_name, lhs_last, right_name, rhs_second_last
@@ -7219,13 +7632,15 @@ fn apply_elementwise_shape(
             (Some(a), None) => a.clone(),
             (None, Some(b)) => b.clone(),
             (Some(a), Some(b)) => {
-                if dims_canonically_equal(a, b) || b == "1" {
+                if b == "1" {
                     a.clone()
                 } else if a == "1" {
                     b.clone()
+                } else if !dims_conflict(a, b) {
+                    unified_dim(a, b)
                 } else {
                     // ponytail: unequal non-"1" dims are incompatible, including
-                    // distinct symbolic names ("batch" vs "seq"). Strict in v1;
+                    // distinct annotation symbols ("batch" vs "seq"). Strict in v1;
                     // upgrade to a unification step if it proves too strict.
                     return Err(format!(
                         "elementwise {} incompatible shapes, got [{}] and [{}]",
@@ -7390,7 +7805,7 @@ mod shape_of_expression_tests {
         let original_shapes: Vec<HashMap<String, Vec<String>>> =
             scopes.iter().map(|s| s.shapes.clone()).collect();
 
-        let links = build_scope_links(&scopes, &scope_function_nodes, &class_ranges, code);
+        let links = build_scope_links(tree.root_node(), &scopes, &scope_function_nodes, &class_ranges, &imports, code);
 
         let mut ctx = ShapeCtx {
             text: code,

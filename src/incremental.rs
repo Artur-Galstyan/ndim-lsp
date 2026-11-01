@@ -8,12 +8,14 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Range, Tree};
 
 mod names;
 
-use names::{Dsu, NameSet, link_units, name_hash, vmap_names};
+use names::{Dsu, NameSet, link_units, name_hash};
 
-use crate::imports::{ImportMap, ImportRegion, ImportScopes, import_maps, import_regions};
+use crate::imports::{
+    ImportMap, ImportRegion, ImportScopes, Rebound, import_maps, import_regions, rebound_names,
+};
 use crate::layers::{extract_layer_assignments_scoped, extract_self_attr_layers_by_class};
 use crate::python_ast::{
-    ClassHierarchy, ClassSummary, SelfAttrWrite, dim_symbols,
+    ClassHierarchy, ClassSummary, ModuleBind, SelfAttrWrite, dim_symbols,
     extract_jaxtyping_shapes, extract_self_attr_writes, module_binds,
 };
 use crate::resolution::{Deps, ResolutionCache, search_roots_fingerprint};
@@ -289,6 +291,12 @@ impl<T: Shift> Shift for Option<T> {
         if let Some(item) = self {
             item.shift(by);
         }
+    }
+}
+
+impl Shift for ModuleBind {
+    fn shift(&mut self, by: Delta<'_>) {
+        by.byte(&mut self.at);
     }
 }
 
@@ -674,8 +682,8 @@ struct SyntaxRecord {
     module_imports: ImportMap,
     writes: Vec<WriteRecord>,
     classes: Vec<ClassSummary>,
-    /// The module names of the unit that a statement binds, except `class`.
-    module_binds: Vec<String>,
+    /// The bindings of module names in the unit.
+    module_binds: Vec<ModuleBind>,
     names: NameSet,
     /// Hashes of the names the annotations of the unit use as dims.
     symbols: Vec<u64>,
@@ -719,13 +727,14 @@ impl Shift for SyntaxRecord {
             module_imports: _,
             writes,
             classes,
-            module_binds: _,
+            module_binds,
             names: _,
             symbols: _,
         } = self;
         scopes.shift(by);
         writes.shift(by);
         classes.shift(by);
+        module_binds.shift(by);
     }
 }
 
@@ -806,8 +815,14 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn import_digest(file: &ImportMap, module: &ImportMap) -> u64 {
+/// The places of `rebound` are not in the digest: an edit above them would
+/// run every unit again. `unit_digest` adds what a unit needs of them.
+fn import_digest(file: &ImportMap, module: &ImportMap, rebound: &[Rebound]) -> u64 {
     let mut hasher = DefaultHasher::new();
+    rebound
+        .iter()
+        .fold(0, |names, rebound| names ^ name_hash(rebound.name.as_bytes()))
+        .hash(&mut hasher);
     for map in [file, module] {
         let mut entries: Vec<_> = map.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -817,6 +832,14 @@ fn import_digest(file: &ImportMap, module: &ImportMap) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// `digest`, and the names that are rebound above a unit at `start`.
+fn unit_digest(digest: u64, rebound: &[Rebound], start: usize) -> u64 {
+    rebound
+        .iter()
+        .take_while(|rebound| rebound.at <= start)
+        .fold(digest, |unit, rebound| unit ^ name_hash(rebound.name.as_bytes()))
 }
 
 pub(crate) fn unit_nodes(root: Node) -> Vec<Node> {
@@ -999,7 +1022,11 @@ impl UnitMemo {
                 scope.shift(by);
                 scopes.push(scope);
             }
-            module_names.extend_from_slice(&record.module_binds);
+            for bind in &record.module_binds {
+                let mut bind = bind.clone();
+                bind.shift(by);
+                module_names.push(bind);
+            }
             file_imports.extend(record.imports.clone());
             module_imports.extend(record.module_imports.clone());
             for write in &record.writes {
@@ -1014,11 +1041,12 @@ impl UnitMemo {
             }
         }
 
-        let digest = import_digest(&file_imports, &module_imports);
+        let rebound = rebound_names(&module_names, &module_imports, &file_imports);
+        let digest = import_digest(&file_imports, &module_imports, &rebound);
         let mut regions = Vec::new();
         for (unit, node) in units.iter_mut().zip(&nodes) {
             if unit.regions.as_ref().is_none_or(|rec| rec.import_digest != digest) {
-                let mut found = import_regions(*node, text, &module_imports, &file_imports)?;
+                let mut found = import_regions(*node, text, &module_imports, &file_imports, &rebound)?;
                 found.shift(unit.span.to_new_file().inverse());
                 unit.regions = Some(Arc::new(RegionRecord {
                     import_digest: digest,
@@ -1033,12 +1061,16 @@ impl UnitMemo {
                 regions.push(region);
             }
         }
-        let imports = ImportScopes::from_parts(module_imports, file_imports, regions);
+        let unit_digests: Vec<u64> = units
+            .iter()
+            .map(|unit| unit_digest(digest, &rebound, unit.span.start))
+            .collect();
+        let imports = ImportScopes::from_parts(module_imports, file_imports, regions, rebound);
 
         let mut layer_records = Vec::new();
         let mut self_attr_layers: HashMap<String, Vec<ScopedSelfAttrLayer>> = HashMap::new();
         let mut layer_hit = Vec::with_capacity(units.len());
-        for (unit, node) in units.iter_mut().zip(&nodes) {
+        for ((unit, node), &digest) in units.iter_mut().zip(&nodes).zip(&unit_digests) {
             let valid = unit.layers.as_ref().is_some_and(|rec| {
                 rec.import_digest == digest
                     && rec.deps.as_ref().is_some_and(|d| cache.deps_valid(d))
@@ -1098,7 +1130,7 @@ impl UnitMemo {
 
         let mut env = 0;
         let plan = if propagate_memo_enabled() {
-            let built = PropPlan::build(old, &mut units, &found, &layer_hit, imports.file(), digest, cache);
+            let built = PropPlan::build(old, &mut units, &found, &layer_hit, digest, cache);
             stats.replayed_units = built.plan.replay.iter().flatten().count();
             stats.propagate_full = stats.replayed_units == 0;
             env = built.env;
@@ -1246,7 +1278,6 @@ impl PropPlan {
         units: &mut [Unit],
         found: &[Option<usize>],
         layer_hit: &[bool],
-        import_map: &HashMap<String, ImportPath>,
         digest: u64,
         cache: &ResolutionCache,
     ) -> BuiltPlan {
@@ -1257,7 +1288,7 @@ impl PropPlan {
         globals.sort_unstable();
         globals.dedup();
         // A name that an annotation uses as a dim is not read as an integer
-        // (`integer_constant`), and stays a name in a layer dim (`layer_at`).
+        // (`integer_constant`), and has a mark in a dim (`layer_at`).
         let symbols: HashSet<u64> = units.iter().flat_map(|u| u.syntax.symbols.iter().copied()).collect();
         let mut clashes: Vec<u64> = sets
             .iter()
@@ -1280,7 +1311,7 @@ impl PropPlan {
 
         // The groups of units that share names, in the new text.
         let mut dsu = Dsu::new(n + m);
-        link_units(&sets, &vmap_names(import_map), 0, &mut dsu);
+        link_units(&sets, 0, &mut dsu);
         let comp: Vec<u32> = (0..n).map(|i| dsu.find(i) as u32).collect();
         drop(sets);
         for (unit, comp) in units.iter_mut().zip(&comp) {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::layers::{UNPROVEN_DIM, string_text};
 use crate::types::*;
 
 mod jax;
@@ -658,12 +659,12 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
             .map(String::as_str)
             .unwrap_or("1");
 
-        let dim = if dims_canonically_equal(left_dim, right_dim) {
+        let dim = if right_dim == "1" {
             left_dim.to_string()
         } else if left_dim == "1" {
             right_dim.to_string()
-        } else if right_dim == "1" {
-            left_dim.to_string()
+        } else if !dims_conflict(left_dim, right_dim) {
+            unified_dim(left_dim, right_dim)
         } else {
             return Err(format!(
                 "cannot broadcast dim {} with {} (shapes [{}] and [{}])",
@@ -678,6 +679,13 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
 
     result.reverse();
     Ok(result)
+}
+
+/// Whether `other` cannot broadcast to `target`.
+fn broadcast_changes(target: &[String], other: &[String]) -> Result<bool, String> {
+    let broadcast = broadcast_two_shapes(target, other)?;
+    Ok(broadcast.len() != target.len()
+        || broadcast.iter().zip(target).any(|(a, b)| dims_conflict(a, b)))
 }
 
 fn concat_dim(dims: &[String]) -> String {
@@ -842,6 +850,18 @@ fn synthesize_method_args(
 }
 
 pub fn apply_known_function(
+    function: &KnownFunction,
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let result = apply_known_rule(function, args, shapes);
+    match &result {
+        Ok(Some(shape)) if shape.iter().any(|dim| dim.contains(UNPROVEN_DIM)) => Ok(None),
+        _ => result,
+    }
+}
+
+fn apply_known_rule(
     function: &KnownFunction,
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -1278,8 +1298,9 @@ pub(crate) fn apply_known_einops(
 
 /// `flax.linen.avg_pool(x, window_shape=(2, 2), strides=(2, 2))` — channels-
 /// LAST: the window applies to the dims immediately before the trailing
-/// channel dim. Default strides = 1, default padding VALID:
-/// out = (d - w)/s + 1. Concrete dims only in v1; symbolic inputs skip.
+/// channel dim. Default strides = 1, default padding VALID: out = (d - w)/s + 1,
+/// or 0 when the window is larger than `d`. SAME: out = ceil(d / s). Any other
+/// padding is unknown. Concrete dims only in v1; symbolic inputs skip.
 fn apply_known_flax_pool(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -1299,6 +1320,15 @@ fn apply_known_flax_pool(
     if strides.len() != window.len() {
         return Ok(None);
     }
+
+    let same = match nth_positional_or_keyword(args, 3, &["padding"]) {
+        None => false,
+        Some(padding) => match string_text(padding).map(str::to_ascii_uppercase).as_deref() {
+            Some("VALID") => false,
+            Some("SAME" | "SAME_LOWER") => true,
+            _ => return Ok(None),
+        },
+    };
 
     let spatial_rank = window.len();
     if input_shape.len() < spatial_rank + 1 {
@@ -1323,7 +1353,14 @@ fn apply_known_flax_pool(
         if s <= 0 {
             return Ok(None);
         }
-        output[start + i] = ((d - w) / s + 1).to_string();
+        output[start + i] = if same {
+            (d + s - 1) / s
+        } else if d < w {
+            0
+        } else {
+            (d - w) / s + 1
+        }
+        .to_string();
     }
     Ok(Some(output))
 }
@@ -1495,6 +1532,7 @@ fn apply_known_concatenate(
     }
     let axis = axis as usize;
 
+    let mut output = first_shape.clone();
     for shape in &input_shapes {
         if shape.len() != rank {
             return Err(format!(
@@ -1507,16 +1545,16 @@ fn apply_known_concatenate(
             if dim_idx == axis {
                 continue;
             }
-            if !dims_canonically_equal(&shape[dim_idx], &first_shape[dim_idx]) {
+            if dims_conflict(&shape[dim_idx], &output[dim_idx]) {
                 return Err(format!(
                     "concatenate dimension mismatch at axis {}: expected {}, got {}",
-                    dim_idx, first_shape[dim_idx], shape[dim_idx]
+                    dim_idx, output[dim_idx], shape[dim_idx]
                 ));
             }
+            output[dim_idx] = unified_dim(&output[dim_idx], &shape[dim_idx]);
         }
     }
 
-    let mut output = first_shape.clone();
     let concat_dims = input_shapes
         .iter()
         .map(|shape| shape[axis].clone())
@@ -1549,6 +1587,7 @@ fn apply_known_stack(
         return Ok(None);
     };
 
+    let mut stacked = first_shape.clone();
     for shape in &input_shapes {
         if shape.len() != first_shape.len() {
             return Err(format!(
@@ -1557,13 +1596,14 @@ fn apply_known_stack(
                 shape.len()
             ));
         }
-        for (dim_idx, (expected, got)) in first_shape.iter().zip(shape.iter()).enumerate() {
-            if !dims_canonically_equal(expected, got) {
+        for (dim_idx, got) in shape.iter().enumerate() {
+            if dims_conflict(&stacked[dim_idx], got) {
                 return Err(format!(
                     "stack dimension mismatch at axis {}: expected {}, got {}",
-                    dim_idx, expected, got
+                    dim_idx, stacked[dim_idx], got
                 ));
             }
+            stacked[dim_idx] = unified_dim(&stacked[dim_idx], got);
         }
     }
 
@@ -1585,7 +1625,7 @@ fn apply_known_stack(
         ));
     }
 
-    let mut output = first_shape.clone();
+    let mut output = stacked;
     output.insert(axis as usize, input_shapes.len().to_string());
     Ok(Some(output))
 }
@@ -2005,7 +2045,7 @@ fn positional_arg_values(args: &[CallArgument]) -> Vec<String> {
 }
 
 fn numeric_min_dim(left: &str, right: &str) -> String {
-    if left == right {
+    if dims_canonically_equal(left, right) {
         return left.to_string();
     }
     if let (Ok(left), Ok(right)) = (left.parse::<usize>(), right.parse::<usize>()) {
@@ -2044,7 +2084,7 @@ fn require_square_matrix(shape: &[String], context: &str) -> Result<(), String> 
     }
     let last = &shape[shape.len() - 1];
     let second_last = &shape[shape.len() - 2];
-    if last != second_last {
+    if dims_conflict(last, second_last) {
         return Err(format!(
             "{} requires last two dimensions to match, got {} and {}",
             context, second_last, last
@@ -2054,7 +2094,7 @@ fn require_square_matrix(shape: &[String], context: &str) -> Result<(), String> 
 }
 
 fn check_dim_match(left: &str, right: &str, context: &str) -> Result<(), String> {
-    if dims_canonically_equal(left, right) {
+    if !dims_conflict(left, right) {
         Ok(())
     } else {
         Err(format!(
@@ -2902,6 +2942,7 @@ fn concat_shapes_along_axis(
         ));
     }
 
+    let mut output = first_shape.clone();
     for shape in input_shapes {
         if shape.len() != rank {
             return Err(format!(
@@ -2914,16 +2955,16 @@ fn concat_shapes_along_axis(
             if dim_idx == axis {
                 continue;
             }
-            if !dims_canonically_equal(&shape[dim_idx], &first_shape[dim_idx]) {
+            if dims_conflict(&shape[dim_idx], &output[dim_idx]) {
                 return Err(format!(
                     "concat dimension mismatch at axis {}: expected {}, got {}",
-                    dim_idx, first_shape[dim_idx], shape[dim_idx]
+                    dim_idx, output[dim_idx], shape[dim_idx]
                 ));
             }
+            output[dim_idx] = unified_dim(&output[dim_idx], &shape[dim_idx]);
         }
     }
 
-    let mut output = first_shape.clone();
     output[axis] = concat_dim(
         &input_shapes
             .iter()
@@ -3387,11 +3428,11 @@ fn apply_known_multinomial(
             }
         }
     };
-    if broadcast_two_shapes(&batch, p_batch)? != batch {
+    if broadcast_changes(&batch, p_batch)? {
         return Err("random.multinomial shape cannot broadcast p batch dimensions".to_string());
     }
     if let Some(n) = nth_positional_or_keyword(args, 1, &["n"]).and_then(|n| shapes.shape(n))
-        && broadcast_two_shapes(&batch, n)? != batch
+        && broadcast_changes(&batch, n)?
     {
         return Err("random.multinomial n cannot broadcast to the batch shape".to_string());
     }
@@ -4189,7 +4230,11 @@ fn apply_known_lax_conv_general_dilated(
         let out = match &padding {
             Some(pads) => {
                 let (lo, hi) = pads[i];
-                ((d + lo + hi - eff_k) / s) + 1
+                let span = d + lo + hi - eff_k;
+                if span < 0 {
+                    return Ok(None);
+                }
+                span / s + 1
             }
             None => (d + s - 1) / s, // 'SAME': ceil(d / s)
         };
@@ -5633,7 +5678,11 @@ fn apply_known_functional_conv(
         };
         let s = stride[i].max(1);
         let eff_k = (k - 1) * dilation[i] + 1;
-        output[idx] = ((d + 2 * padding[i] - eff_k) / s + 1).to_string();
+        let span = d + 2 * padding[i] - eff_k;
+        if span < 0 {
+            return Ok(None);
+        }
+        output[idx] = (span / s + 1).to_string();
     }
     Ok(Some(output))
 }
@@ -5641,8 +5690,8 @@ fn apply_known_functional_conv(
 /// `torch.nn.functional.max_pool1d/2d/3d` / `avg_pool1d/2d/3d(input,
 /// kernel_size, stride=None, padding=0, ...)` — channels-first; `stride`
 /// defaults to `kernel_size` (torch convention) when omitted. `dilation`
-/// (max_pool only) isn't modelled (assumed 1), matching the approximation
-/// already used for conv layers with `dilation != 1`.
+/// (max_pool only) isn't modelled (assumed 1). A window larger than the input
+/// is unknown, as torch refuses it.
 fn apply_known_functional_pool(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -5682,7 +5731,11 @@ fn apply_known_functional_pool(
             return Ok(None);
         };
         let s = stride[i].max(1);
-        output[idx] = ((d + 2 * padding[i] - kernel[i]) / s + 1).to_string();
+        let span = d + 2 * padding[i] - kernel[i];
+        if span < 0 {
+            return Ok(None);
+        }
+        output[idx] = (span / s + 1).to_string();
     }
     Ok(Some(output))
 }

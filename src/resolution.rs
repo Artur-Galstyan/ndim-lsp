@@ -859,6 +859,10 @@ where
     let Some(PythonSymbol::Function { name }) = &implementation.symbol else {
         return Ok(None);
     };
+    // `lib.f.g` is an attribute of the function, not the function.
+    if implementation.target.symbol_parts.len() != 1 {
+        return Ok(None);
+    }
 
     let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
     let cache_key = (implementation.target.file_path.clone(), name.clone());
@@ -876,12 +880,18 @@ where
     let tree = parse_implementation(cache, &implementation.target.file_path, &text)?;
 
     let scopes = extract_jaxtyping_shapes(tree.root_node(), &text)?;
-    let found = scopes
-        .iter()
-        .enumerate()
-        .filter(|(i, scope)| *i != 0 && scope.function_name.as_deref() == Some(name.as_str()))
-        .min_by_key(|(_, scope)| scope.end_byte - scope.start_byte)
-        .map(|(_, scope)| scope.clone());
+    let root = tree.root_node();
+    let definition = root.named_children(&mut root.walk()).find(|node| {
+        node.kind() == "function_definition"
+            && node.child_by_field_name("name").is_some_and(|n| text[n.byte_range()] == **name)
+    });
+    let found = definition.and_then(|definition| {
+        scopes
+            .iter()
+            .skip(1)
+            .find(|scope| scope.start_byte == definition.start_byte())
+            .cloned()
+    });
 
     if let Some(cache) = cache {
         let mut tracked = cache.tracked.write().unwrap();

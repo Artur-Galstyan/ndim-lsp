@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::analysis::LIBRARIES;
-use crate::python_ast::{build_import_map, visit_imports};
+use crate::python_ast::{ModuleBind, SelfWrap, build_import_map, module_binds, visit_imports};
+use crate::resolution::resolve_call_target;
 use crate::types::ImportPath;
 
 pub type ImportMap = HashMap<String, ImportPath>;
@@ -23,6 +24,23 @@ const SHADOWED: &str = "<local>";
 /// Whether `name` is an import in `map`.
 pub fn is_imported(map: &ImportMap, name: &str) -> bool {
     map.get(name).is_some_and(|import| import.name != SHADOWED)
+}
+
+/// Whether the result of `wrap` takes the same arguments as the function that
+/// it wraps. A keyword of `partial` binds an argument. The other transforms
+/// have keywords for options only.
+pub(crate) fn keeps_signature(wrap: &SelfWrap, imports: &ImportMap) -> bool {
+    if !wrap.callee.split('.').next().is_some_and(|root| is_imported(imports, root)) {
+        return false;
+    }
+    let target = resolve_call_target(&wrap.callee, imports);
+    let parts: Vec<&str> = target.parts.iter().map(String::as_str).collect();
+    match parts[..] {
+        _ if target.dots != 0 => false,
+        ["jax", "jit" | "checkpoint" | "remat"] | ["equinox", "filter_jit"] => true,
+        ["functools", "partial"] => !wrap.keywords,
+        _ => false,
+    }
 }
 
 /// A byte range with its own import map. `None` is the module map.
@@ -43,32 +61,92 @@ pub struct ImportScopes {
     file: ImportMap,
     /// In order of start. A region after another is nested in it or after it.
     regions: Vec<ImportRegion>,
+    /// Module code changes the module map from each of these places on.
+    rebound: Vec<Rebound>,
+}
+
+/// The first place where a statement gives the name `name` another value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rebound {
+    pub(crate) at: usize,
+    pub(crate) name: String,
+    /// The module map from `at` on.
+    map: Arc<ImportMap>,
+}
+
+/// What a module rebinds of the names that `file` holds, in source order. A
+/// module with none of these pays nothing.
+pub(crate) fn rebound_names(binds: &[ModuleBind], module: &ImportMap, file: &ImportMap) -> Vec<Rebound> {
+    let keeps = |bind: &ModuleBind| {
+        bind.wrap.as_ref().is_some_and(|wrap| {
+            let root = wrap.callee.split('.').next();
+            keeps_signature(wrap, module)
+                && !binds.iter().any(|other| other.hides_import && Some(other.name.as_str()) == root)
+        })
+    };
+    let mut first: HashMap<&str, usize> = HashMap::new();
+    for bind in binds.iter().filter(|bind| bind.hides_import && tracked(&bind.name, file) && !keeps(bind)) {
+        let at = first.entry(&bind.name).or_insert(bind.at);
+        *at = bind.at.min(*at);
+    }
+    let mut first: Vec<_> = first.into_iter().collect();
+    first.sort_unstable_by_key(|&(name, at)| (at, name));
+    let mut map = module.clone();
+    first
+        .into_iter()
+        .map(|(name, at)| {
+            map.insert(name.to_string(), shadowed());
+            Rebound { at, name: name.to_string(), map: Arc::new(map.clone()) }
+        })
+        .collect()
+}
+
+fn tracked(name: &str, file: &ImportMap) -> bool {
+    file.contains_key(name) || LIBRARIES.contains(&name)
+}
+
+fn shadowed() -> ImportPath {
+    ImportPath { dots: 0, module: Vec::new(), name: SHADOWED.to_string() }
 }
 
 impl ImportScopes {
     pub fn new(root: Node, text: &str) -> Result<Self, String> {
         let (file, module) = import_maps(root, text)?;
-        let regions = import_regions(root, text, &module, &file)?;
-        Ok(Self::from_parts(module, file, regions))
+        let rebound = rebound_names(&module_binds(root, text), &module, &file);
+        let regions = import_regions(root, text, &module, &file, &rebound)?;
+        Ok(Self::from_parts(module, file, regions, rebound))
     }
 
-    pub(crate) fn from_parts(module: ImportMap, file: ImportMap, regions: Vec<ImportRegion>) -> Self {
-        Self { module, file, regions }
+    pub(crate) fn from_parts(
+        module: ImportMap,
+        file: ImportMap,
+        regions: Vec<ImportRegion>,
+        rebound: Vec<Rebound>,
+    ) -> Self {
+        Self { module, file, regions, rebound }
+    }
+
+    /// The module map that module code at `byte` reads.
+    fn module_at(&self, byte: usize) -> &ImportMap {
+        match self.rebound.partition_point(|rebound| rebound.at <= byte).checked_sub(1) {
+            Some(last) => &self.rebound[last].map,
+            None => &self.module,
+        }
     }
 
     /// The imports that a name at `byte` can read.
     pub fn at(&self, byte: usize) -> &ImportMap {
         let last = self.regions.partition_point(|region| region.start <= byte);
         let Some(mut i) = last.checked_sub(1) else {
-            return &self.module;
+            return self.module_at(byte);
         };
         loop {
             let region = &self.regions[i];
             if byte < region.end {
-                return region.map.as_deref().unwrap_or(&self.module);
+                return region.map.as_deref().unwrap_or_else(|| self.module_at(byte));
             }
             if region.up == 0 {
-                return &self.module;
+                return self.module_at(byte);
             }
             i -= region.up;
         }
@@ -193,20 +271,23 @@ fn may_bind(expression: &str) -> bool {
 }
 
 /// The regions of the scopes under `node` that change what an import name
-/// means. `module` is the module map, and `file` holds every import of the
-/// file. The result is the same for a unit as for the whole tree.
+/// means. `module` is the module map, `file` holds every import of the file,
+/// and `rebound` holds what the module rebinds. A body runs after the module
+/// code above it, so it gets the last map of `rebound`, and so does a class or
+/// a comprehension that changes a name. The result depends on the names in
+/// `rebound`, not on their places, and is the same for a unit as for the tree.
 pub fn import_regions(
     node: Node,
     text: &str,
     module: &ImportMap,
     file: &ImportMap,
+    rebound: &[Rebound],
 ) -> Result<Vec<ImportRegion>, String> {
-    let tracked = |name: &str| file.contains_key(name) || LIBRARIES.contains(&name);
     let source = text.as_bytes();
     let bind = |scopes: &mut Vec<Scope>, name: Node, at: usize| {
         if at != 0
             && let Ok(name) = name.utf8_text(source)
-            && tracked(name)
+            && tracked(name, file)
         {
             scopes[at].bound.push(name.to_string());
         }
@@ -298,10 +379,11 @@ pub fn import_regions(
             }
         }
     }
-    Ok(regions_of(scopes, module))
+    Ok(regions_of(scopes, module, rebound.last().map(|last| &last.map)))
 }
 
-fn regions_of(mut scopes: Vec<Scope>, module: &ImportMap) -> Vec<ImportRegion> {
+fn regions_of(mut scopes: Vec<Scope>, module: &ImportMap, last: Option<&Arc<ImportMap>>) -> Vec<ImportRegion> {
+    let module = last.map_or(module, |map| &**map);
     let n = scopes.len();
     // A parent comes before its children in `scopes`. `inherited` is what the
     // scopes inside a scope see, which skips a class.
@@ -312,12 +394,14 @@ fn regions_of(mut scopes: Vec<Scope>, module: &ImportMap) -> Vec<ImportRegion> {
         let parent = scopes[i].parent;
         let parent_is_class = scopes[parent].kind == ScopeKind::Class;
         let scope = &mut scopes[i];
+        let body = scope.kind == ScopeKind::Function;
         let Scope { imports, bound, globals, .. } = scope;
         imports.retain(|(alias, _)| !globals.contains(alias));
         bound.retain(|name| !globals.contains(name));
         let base = inherited[parent].clone();
         // A `global` name skips the functions around the scope.
         globals.retain(|name| base.as_deref().is_some_and(|map| map.get(name) != module.get(name)));
+        let late = base.is_none() && body && last.is_some();
         let changed = !imports.is_empty() || !bound.is_empty() || !globals.is_empty();
         let map = if changed {
             let mut map = base.as_deref().unwrap_or(module).clone();
@@ -331,15 +415,16 @@ fn regions_of(mut scopes: Vec<Scope>, module: &ImportMap) -> Vec<ImportRegion> {
             // last import of a name wins.
             map.extend(imports.drain(..).rev());
             for name in bound.drain(..) {
-                let shadowed = ImportPath { dots: 0, module: Vec::new(), name: SHADOWED.to_string() };
-                map.insert(name, shadowed);
+                map.insert(name, shadowed());
             }
             Some(Arc::new(map))
+        } else if late {
+            last.cloned()
         } else {
             base.clone()
         };
         // The region of a class must not reach the scopes inside it.
-        kept[i] = changed || (parent_is_class && kept[parent]);
+        kept[i] = changed || late || (parent_is_class && kept[parent]);
         inherited[i] = if scope.kind == ScopeKind::Class { base } else { map.clone() };
         maps[i] = map;
     }

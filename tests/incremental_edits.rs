@@ -448,6 +448,110 @@ fn incremental_analysis_survives_helper_saves() {
     assert!(hits > 0);
 }
 
+const BOUND_HELPER: &str = "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"n 3\"]) -> Float[Array, \"n 4\"]:\n    return x\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(3, 5)\n\n    def forward(self, x):\n        return self.fc(x)\n";
+const BOUND_MAIN: &str = "from jaxtyping import Float, Array\nfrom helper import proj, Block\n\ndef f(x: Float[Array, \"n 3\"]):\n    y = proj(x)\n    return y\n\ndef g(x: Float[Array, \"n 3\"]):\n    z = Block()(x)\n    return z\n\ndef other(x: Float[Array, \"n 3\"]):\n    w = x\n    return w\n";
+
+/// Each line changes what `f` means in `read`, in another statement of the
+/// file. Each edit must give the same analysis from the memo as from a fresh
+/// run, and `want` tells if the wrap keeps the function.
+#[test]
+fn a_rebinding_of_a_function_follows_each_edit() {
+    const HEAD: &str = "from jaxtyping import Float, Array\n";
+    const REST: &str = "\ndef f(x: Float[Array, \"n 3\"]) -> Float[Array, \"n 9\"]:\n    return x\n\nf = WRAP\n\ndef other(x: Float[Array, \"n 3\"]):\n    z = x\n\ndef read(x: Float[Array, \"n 3\"]):\n    y = f(x)\n";
+    const CASES: [(&str, &str, bool); 7] = [
+        ("import jax", "jax.jit(f)", true),
+        ("import jax", "wrap(f)", false),
+        ("import jax", "jax.grad(f)", false),
+        ("import flax as jax", "jax.jit(f)", false),
+        ("from jax import jit", "jit(f)", true),
+        ("from torch import jit", "jit(f)", false),
+        ("import functools", "functools.partial(f, 2)", false),
+    ];
+    let mut memo = UnitMemo::default();
+    let mut parser = new_parser();
+    let mut rng = Rng(SEED ^ 0x3a9);
+    let code = |case: &(&str, &str, bool)| format!("{}\n{HEAD}{}", case.0, REST.replace("WRAP", case.1));
+    let mut text = code(&CASES[0]);
+    let mut tree = parser.parse(&text, None).unwrap();
+    let read = |_: &PathBuf| None;
+    for step in 0..120 {
+        let case = CASES[rng.below(CASES.len())];
+        let edited = code(&case);
+        if edited != text {
+            tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+            text = edited;
+        }
+        let got = analyze_layer_shapes_with_memo(tree.root_node(), &text, &[], read, 8, None, &mut memo).unwrap();
+        let want = analyze_layer_shapes(tree.root_node(), &text, &[], read, 8, None).unwrap();
+        assert_same_analysis("wrap", step, &got, &want);
+        let found = got.scopes.iter().any(|scope| scope.shapes.contains_key("y"));
+        assert_eq!(found, case.2, "step {step}: {}", case.1);
+    }
+}
+
+/// Each tail of the helper changes what `proj` or `Block` resolves to in
+/// `BOUND_MAIN`: a method and a nested function of the same name do not, a
+/// second binding in the module does, for that name only. Each save must give
+/// the same analysis from the memo as from a fresh run.
+#[test]
+fn imported_names_follow_the_bindings_of_their_module() {
+    const TAILS: [(&str, bool, bool); 9] = [
+        ("", true, true),
+        ("\nclass C:\n    def proj(self, x: Float[Array, \"n 3\"]) -> Float[Array, \"n 9\"]: ...\n", true, true),
+        ("\ndef outer():\n    def Block(): ...\n", true, true),
+        ("\nproj = wrap(proj)\n", false, true),
+        ("\nimport jax\nproj = jax.jit(proj)\n", true, true),
+        ("\nif c:\n    def proj(x: Float[Array, \"n 3\"]) -> Float[Array, \"n 9\"]: ...\n", false, true),
+        ("\nfrom other import Block\n", true, false),
+        ("\nfrom other import *\n", false, false),
+        ("\ndef swap():\n    global proj\n    proj = None\n", false, true),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let helper = tmp.path().join("helper.py");
+    std::fs::write(&helper, BOUND_HELPER).unwrap();
+    let roots = vec![tmp.path().to_path_buf()];
+    let cache = new_resolution_cache();
+    let mut memo = UnitMemo::default();
+    let mut parser = new_parser();
+    let mut rng = Rng(SEED ^ 0xb017d);
+    let (mut text, mut tree) = (BOUND_MAIN.to_string(), parser.parse(BOUND_MAIN, None).unwrap());
+    let read = |p: &PathBuf| std::fs::read_to_string(p).ok();
+    let shape_of = |analysis: &LayerShapeAnalysis, name: &str| {
+        analysis.scopes.iter().find_map(|scope| scope.shapes.get(name).cloned())
+    };
+    let (mut hits, mut seen) = (0, [false; 9]);
+    for step in 0..200 {
+        let pick = rng.below(TAILS.len());
+        let (tail, proj_known, block_known) = TAILS[pick];
+        seen[pick] = true;
+        std::fs::write(&helper, format!("{BOUND_HELPER}{tail}")).unwrap();
+        cache.revalidate(std::slice::from_ref(&helper));
+        if rng.below(3) == 0 {
+            let edited = text.replace("w = x", "w = x + 0");
+            let edited = if edited == text { text.replace("w = x + 0", "w = x") } else { edited };
+            tree = reparse(&mut parser, &text, &tree, &edited).unwrap();
+            text = edited;
+        }
+        let got = analyze_layer_shapes_with_memo(
+            tree.root_node(),
+            &text,
+            &roots,
+            read,
+            8,
+            Some(&cache),
+            &mut memo,
+        )
+        .unwrap();
+        hits += memo.stats().layer_hits;
+        let want = analyze_layer_shapes(tree.root_node(), &text, &roots, read, 8, None).unwrap();
+        assert_same_analysis("bound", step, &got, &want);
+        assert_eq!(shape_of(&got, "y").is_some(), proj_known, "step {step}: {tail}");
+        assert_eq!(shape_of(&got, "z").is_some(), block_known, "step {step}: {tail}");
+    }
+    assert!(hits > 0);
+    assert!(seen.iter().all(|&s| s));
+}
+
 /// A digit run and the line it is on, picked by position.
 fn number_at(text: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
@@ -1815,13 +1919,13 @@ fn an_import_binds_only_in_its_scope_across_edits() {
     assert!(replayed > 0, "no step replayed a unit");
 }
 
-/// A function import of `vmap` under another name binds the vmapped name for
-/// the whole file, and a function import of `torch` sets the backend of the
-/// file: both reach readers in other statements.
+/// An import of `vmap` under another name makes the module name a vmap, and a
+/// function import of `torch` sets the backend of the file: both reach readers
+/// in other statements.
 #[test]
-fn a_function_import_of_vmap_or_a_backend_reaches_the_file() {
+fn an_import_of_vmap_or_a_backend_reaches_the_file() {
     let base = format!(
-        "import jax\nfrom jaxtyping import Float, Array\n\n\ndef double(x: Float[Array, \"3\"]) -> Float[Array, \"3\"]:\n    return x\n\n\ndef writer():\n    from jax import jit as v\n    batched = v(double)\n\n\ndef reader(b: Float[Array, \"7 3\"]):\n    r = batched(b)\n\n\ndef maxes(x: Float[Array, \"3 4\"]):\n    m = x.max(0)\n{}",
+        "import jax\nfrom jax import jit as v\nfrom jaxtyping import Float, Array\n\n\ndef double(x: Float[Array, \"3\"]) -> Float[Array, \"3\"]:\n    return x\n\n\nbatched = v(double)\n\n\ndef writer():\n    pass\n\n\ndef reader(b: Float[Array, \"7 3\"]):\n    r = batched(b)\n\n\ndef maxes(x: Float[Array, \"3 4\"]):\n    m = x.max(0)\n{}",
         independent_functions()
     );
     let steps = [
@@ -1836,6 +1940,42 @@ fn a_function_import_of_vmap_or_a_backend_reaches_the_file() {
         assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
         assert_eq!(shape_named(analysis, "m"), maxes[step], "step {step}\n{text}");
     });
+}
+
+/// A bare callee follows every statement that changes what the name means: a
+/// parameter or a local of the reader, a second module binding, the function
+/// itself, and a `vmap` name written in another function or at module level.
+#[test]
+fn a_bare_callee_follows_the_bindings_of_its_name() {
+    let base = format!(
+        "import jax\nfrom jax import vmap\nfrom jaxtyping import Float, Array\n\n\ndef f(x: Float[Array, \"n\"]) -> Float[Array, \"m\"]:\n    pass\n\n\ndef mid():\n    return 1\n\n\ndef reader(xs: Float[Array, \"B n\"]):\n    r = vmap(f)(xs)\n\n\ndef vmapped(xs: Float[Array, \"B n\"]):\n    s = vf(xs)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("def reader(xs:", "def reader(f, xs:"),
+        ("def reader(f, xs:", "def reader(xs:"),
+        ("    r = vmap(f)(xs)", "    for f in fs:\n        r = vmap(f)(xs)"),
+        ("    for f in fs:\n        r = vmap(f)(xs)", "    r = vmap(f)(xs)"),
+        ("    r = vmap(f)(xs)", "    r = sum(vmap(f)(xs) for f in fs)"),
+        ("    r = sum(vmap(f)(xs) for f in fs)", "    r = vmap(f)(xs)"),
+        ("def mid():", "f = load()\n\n\ndef mid():"),
+        ("f = load()\n\n\n", ""),
+        ("def mid():\n    return 1", "def mid():\n    global f\n    f = load()"),
+        ("def mid():\n    global f\n    f = load()", "def mid():\n    return 1"),
+        ("def f(x: Float[Array, \"n\"]) -> Float[Array, \"m\"]:", "def f(x: Float[Array, \"n\"]) -> Float[Array, \"k\"]:"),
+        ("def mid():\n    return 1", "def mid():\n    vf = vmap(f)"),
+        ("def mid():\n    vf = vmap(f)", "vf = vmap(f)\n\n\ndef mid():\n    return 1"),
+        ("vf = vmap(f)\n\n\n", ""),
+        ("def mid():", "vf = vmap(f)\nvf = load()\n\n\ndef mid():"),
+    ];
+    let (m, k) = (dims(&["B", "m"]), dims(&["B", "k"]));
+    let r = [&m, &None, &m, &None, &m, &None, &m, &None, &m, &None, &m, &k, &k, &k, &k, &k];
+    let s = [&None, &None, &None, &None, &None, &None, &None, &None, &None, &None, &None, &None, &None, &k, &None, &None];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(&shape_named(analysis, "r"), r[step], "step {step}\n{text}");
+        assert_eq!(&shape_named(analysis, "s"), s[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
 }
 
 /// A layer takes its dim from a constant in another statement. Each edit is
@@ -1875,7 +2015,7 @@ fn a_layer_dim_follows_the_constant_and_the_statements_around_it() {
         (four.clone(), six.clone()),
         (none.clone(), six.clone()),
         (four.clone(), six.clone()),
-        (dims(&["n", "OUT"]), six.clone()),
+        (four.clone(), six.clone()),
         (four.clone(), six.clone()),
         (four.clone(), none.clone()),
         (four.clone(), six.clone()),
@@ -1883,7 +2023,7 @@ fn a_layer_dim_follows_the_constant_and_the_statements_around_it() {
         (four.clone(), none.clone()),
         (four, six.clone()),
         (none.clone(), six.clone()),
-        (dims(&["n", "OUT"]), six.clone()),
+        (none.clone(), six.clone()),
         (none, six),
     ];
     let replayed = walk_edits(&base, &steps, |step, analysis, text| {
@@ -1894,8 +2034,9 @@ fn a_layer_dim_follows_the_constant_and_the_statements_around_it() {
 }
 
 /// A function builds a shape from the module constant `D`. An annotation
-/// anywhere in the file that uses `D` as a dim makes `D` a name, not 64: the
-/// memo must follow an edit of such an annotation in another statement.
+/// anywhere in the file that uses `D` as a dim marks the dim, and the memo must
+/// follow an edit of such an annotation in another statement. The reader sees
+/// the integer in each step.
 #[test]
 fn a_constant_follows_the_annotations_of_the_file() {
     let base = format!(
@@ -1911,15 +2052,36 @@ fn a_constant_follows_the_annotations_of_the_file() {
         ("D = 64\n", "D = 64\nE = 7\n"),
         ("\"E\"", "\"n\""),
     ];
+    let replayed = walk_edits(&base, &steps, |step, a, text| {
+        assert_eq!(shape_named(a, "z"), dims(&["64", "2"]), "step {step}\n{text}");
+    });
+    assert!(replayed > 0);
+}
+
+/// A slice reads its start and its step like its stop. The memo must follow an
+/// edit of the constant, and of an annotation that uses the name as a dim.
+#[test]
+fn a_slice_follows_the_constant_of_its_bound() {
+    let base = format!(
+        "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\nK = 1\n\n\ndef cut():\n    z = jnp.zeros((6, 2))[K:]\n    return z\n\n\ndef other(x: Float[Array, \"n 3\"]):\n    return x\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("K = 1\n", "K = 2\n"),
+        ("\"n 3\"", "\"K 3\""),
+        ("[K:]", "[::K]"),
+        ("K = 2\n", "K = 4\n"),
+        ("\"K 3\"", "\"n 3\""),
+        ("K = 4\n", "K = load()\n"),
+    ];
     let want = [
-        dims(&["64", "2"]),
-        dims(&["D", "2"]),
-        dims(&["D", "2"]),
-        dims(&["64", "2"]),
-        dims(&["D", "2"]),
-        dims(&["64", "2"]),
-        dims(&["64", "2"]),
-        dims(&["64", "2"]),
+        dims(&["5", "2"]),
+        dims(&["4", "2"]),
+        dims(&["4", "2"]),
+        dims(&["3", "2"]),
+        dims(&["2", "2"]),
+        dims(&["2", "2"]),
+        None,
     ];
     let replayed = walk_edits(&base, &steps, |step, a, text| {
         assert_eq!(shape_named(a, "z"), want[step], "step {step}\n{text}");
@@ -2107,6 +2269,63 @@ fn a_base_follows_the_statements_that_rebind_its_name() {
     assert!(replayed > 0, "no step replayed a unit");
 }
 
+/// A module statement and a `global` statement rebind the import `k` or the
+/// base `P`, or give them back. A move of the rebinding over a reader changes
+/// what the reader sees, and the text of the reader stays the same.
+#[test]
+fn a_rebound_import_or_base_follows_edits() {
+    let base = format!(
+        "import numpy as k\nimport torch.nn as nn\nfrom jaxtyping import Float, Array\n\n\nclass P:\n    def helper(self, v):\n        return v.T\n\n\nearly = k.zeros((2, 3))\nlayer = k.Linear(8, 4)\n\n\ndef mid():\n    return 1\n\n\nclass B(P):\n    def go(self, x: Float[Array, \"3 4\"]):\n        r = self.helper(x)\n\n\ndef reader():\n    z = k.zeros((2, 3))\n{}",
+        independent_functions()
+    );
+    let bind = "k = load()\n\n\n";
+    let global = "    global k\n    k = load()\n";
+    let steps = [
+        ("def mid():", "k = load()\n\n\ndef mid():"),
+        (bind, ""),
+        ("    return 1", global),
+        (global, "    global P\n    P = load()\n"),
+        ("    global P\n    P = load()\n", "    return 1"),
+        ("early = k", "k = load()\n\n\nearly = k"),
+        ("k = load()\n\n\nearly = k.zeros((2, 3))\nlayer", "early = k.zeros((2, 3))\nk = load()\n\n\nlayer"),
+        ("early = k.zeros((2, 3))\nk = load()\n\n\nlayer", "early = k.zeros((2, 3))\nlayer"),
+    ];
+    let two_three = dims(&["2", "3"]);
+    let t = dims(&["4", "3"]);
+    let none: Dims = None;
+    let z = [&two_three, &none, &two_three, &none, &two_three, &two_three, &none, &none, &two_three];
+    let early = [&two_three, &two_three, &two_three, &two_three, &two_three, &two_three, &none, &two_three, &two_three];
+    let r = [&t, &t, &t, &t, &none, &t, &t, &t, &t];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(&shape_named(analysis, "z"), z[step], "step {step}\n{text}");
+        assert_eq!(&shape_named(analysis, "early"), early[step], "step {step}\n{text}");
+        assert_eq!(&shape_named(analysis, "r"), r[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A layer at module level reads `nn`. A move of the rebinding over the layer
+/// changes the layer, and the units around it keep their text.
+#[test]
+fn a_rebinding_that_moves_over_a_layer_follows_edits() {
+    let base = format!(
+        "import torch.nn as nn\nfrom jaxtyping import Float, Array\n\n\nfirst = nn.Linear(8, 4)\n\n\nsecond = nn.Linear(4, 2)\n\n\ndef reader(x: Float[Array, \"n 8\"]):\n    return x\n\n\na = first(reader(ones))\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("second =", "nn = load()\n\n\nsecond ="),
+        ("first = nn.Linear(8, 4)\n\n\nnn = load()\n", "nn = load()\n\n\nfirst = nn.Linear(8, 4)\n"),
+        ("nn = load()\n\n\nfirst = nn.Linear(8, 4)\n", "first = nn.Linear(8, 4)\n\n\nnn = load()\n"),
+        ("nn = load()\n\n\n", ""),
+    ];
+    let first = [true, true, false, true, true];
+    let second = [true, false, false, false, true];
+    walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(analysis.layers.contains_key("first"), first[step], "step {step}\n{text}");
+        assert_eq!(analysis.layers.contains_key("second"), second[step], "step {step}\n{text}");
+    });
+}
+
 /// A `self.<attr>` write through a `for` or `with` target is in another
 /// statement than the reader when a subclass makes it.
 #[test]
@@ -2126,4 +2345,69 @@ fn a_loop_write_of_an_attribute_follows_edits() {
     walk_edits(&base, &steps, |step, analysis, text| {
         assert_eq!(shape_named(analysis, "r"), want[step], "step {step}\n{text}");
     });
+}
+
+/// A dim of a parameter or a field is free. The same name as a global, an
+/// annotation dim, or a local of the reader changes what the dim means.
+#[test]
+fn a_free_dim_follows_the_statements_that_name_it() {
+    let base = format!(
+        "import torch.nn as nn\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\ndef mid():\n    return 1\n\n\nclass M(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.l = nn.Linear(8, d)\n\n    def forward(self, x: Float[Array, \"n 8\"], y: Float[Array, \"n 4\"]):\n        r = self.l(x) + y\n\n\ndef last(y: Float[Array, \"3 4\"]):\n    s = jnp.zeros((3, w)) + y\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("def __init__(self, d):", "def __init__(self):"),
+        ("def mid():", "d = 5\n\n\ndef mid():"),
+        ("d = 5\n\n\n", ""),
+        ("def __init__(self):", "def __init__(self, d):"),
+        ("def mid():", "def other(v: Float[Array, \"n d\"]):\n    pass\n\n\ndef mid():"),
+        ("def __init__(self, d):", "def __init__(self):"),
+        ("def __init__(self):", "def __init__(self, d):"),
+        ("def other(v: Float[Array, \"n d\"]):\n    pass\n\n\n", ""),
+        ("def mid():", "w = 9\n\n\ndef mid():"),
+        ("w = 9\n\n\n", ""),
+    ];
+    let four = dims(&["n", "4"]);
+    let want = [&four, &four, &None, &four, &four, &four, &None, &four, &four, &four, &four];
+    let error_count = [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(&shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+        assert_eq!(analysis.errors.len(), error_count[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
+/// A slice bound, a name that an annotation also uses, and a name around a
+/// class take their meaning from statements of other units.
+#[test]
+fn a_size_follows_the_statements_of_other_units() {
+    let base = format!(
+        "import torch\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\nd = cfg.d\n\n\ndef mid():\n    return 1\n\n\ndef reader(v: Float[Array, \"3 4\"]):\n    r = jnp.zeros((3, d)) + v\n    s = v[:k]\n\n\ndef last(x: Float[Array, \"n 3\"]):\n    def inner(y: Float[Array, \"n 3\"]):\n        class C:\n            def m(self, z: Float[Array, \"n 3\"]):\n                t = make(z)\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("def mid():", "k = 2\n\n\ndef mid():"),
+        ("def mid():", "def other(a: Float[Array, \"n d\"]):\n    pass\n\n\ndef mid():"),
+        ("d = cfg.d\n", "d = 5\n"),
+        ("d = 5\n", "d = cfg.d\n"),
+        ("k = 2\n\n\n", ""),
+        ("def mid():", "def make(a: Float[Array, \"n 3\"]) -> Float[Array, \"n 9\"]:\n    return a\n\n\ndef mid():"),
+        ("def last(x:", "def last(make, x:"),
+        ("def last(make, x:", "def last(x:"),
+    ];
+    let four = dims(&["3", "4"]);
+    let two = dims(&["2", "4"]);
+    let none = &None;
+    let r_want = [&four, &four, &four, none, &four, &four, &four, &four, &four];
+    let s_want = [none, &two, &two, &two, &two, none, none, none, none];
+    let nine = dims(&["n", "9"]);
+    let t_want = [none, none, none, none, none, none, &nine, none, &nine];
+    let error_count = [0, 0, 0, 1, 0, 0, 0, 0, 0];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(&shape_named(analysis, "r"), r_want[step], "step {step}\n{text}");
+        assert_eq!(&shape_named(analysis, "s"), s_want[step], "step {step}\n{text}");
+        assert_eq!(&shape_named(analysis, "t"), t_want[step], "step {step}\n{text}");
+        assert_eq!(analysis.errors.len(), error_count[step], "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
 }

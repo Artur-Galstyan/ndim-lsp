@@ -1547,7 +1547,7 @@ fn build_golden() -> String {
     serde_json::to_string_pretty(&Value::Object(out)).unwrap() + "\n"
 }
 
-const INTERNAL_PREFIXES: [&str; 2] = ["__synth_", "__ellipsis"];
+const INTERNAL_PREFIXES: [&str; 4] = ["__synth_", "__ellipsis", "__free_", "__unproven"];
 
 fn assert_no_internal_names(golden: &str) {
     for prefix in INTERNAL_PREFIXES {
@@ -1563,6 +1563,56 @@ fn assert_no_internal_names(golden: &str) {
 #[should_panic(expected = "internal name")]
 fn internal_name_scan_detects_a_leak() {
     assert_no_internal_names("{\"shape\": [\"__synth_2\", \"c\"]}");
+}
+
+#[test]
+#[should_panic(expected = "internal name `__unproven`")]
+fn internal_name_scan_detects_an_unproven_dim() {
+    assert_no_internal_names("{\"shape\": [\"3\", \"__unproven\"]}");
+}
+
+/// Each body gives `w` two different free dims, so that `w` and `p` are unknown.
+#[test]
+fn an_unproven_dim_reaches_no_hover_hint_or_diagnostic() {
+    const BODIES: [&str; 6] = [
+        "w = jnp.add(x, y)",
+        "w = jnp.maximum(x, y)",
+        "w = torch.add(x, y)",
+        "w = x\n    w += y",
+        "w = x\n    w -= y",
+        "w = jnp.zeros((a, 3, 3))\n    w @= jnp.zeros((b, 3, 3))",
+    ];
+    let mut text = String::from("import torch\nimport jax.numpy as jnp\n\n");
+    for (i, body) in BODIES.iter().enumerate() {
+        text.push_str(&format!(
+            "def f{i}(a, b):\n    x = jnp.zeros((3, a)); y = jnp.zeros((3, b))\n    {body}\n    bad = w + jnp.zeros((2, 7))\n    return w\n\ndef g{i}(a, b):\n    p = f{i}(a, b)\n\n"
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leak.py");
+    fs::write(&path, &text).unwrap();
+    let mut srv = Server::spawn(&fs::canonicalize(dir.path()).unwrap());
+    let uri = format!("file://{}", fs::canonicalize(&path).unwrap().display());
+    let (doc, _) = open_doc(&mut srv, &uri, &text);
+    let (hints, _) = full_hints(&mut srv, &doc);
+    let mut hovers = Vec::new();
+    for (line, source) in text.lines().enumerate() {
+        for (character, _) in source.match_indices(|c: char| c.is_ascii_alphabetic()) {
+            let (hover, _) = srv.request(
+                "textDocument/hover",
+                json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}),
+            );
+            if !hover.is_null() {
+                hovers.push(hover);
+            }
+        }
+    }
+    srv.kill();
+    let shown = json!({"hints": hints, "hovers": hovers, "diagnostics": doc.diags}).to_string();
+    assert!(!hovers.is_empty());
+    assert_eq!(doc.diags, Vec::<Value>::new());
+    assert_no_internal_names(&shown);
+    assert!(!shown.contains("p: "), "{shown}");
 }
 
 #[test]

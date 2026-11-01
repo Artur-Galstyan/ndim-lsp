@@ -1000,7 +1000,7 @@ fn apply_chain(
         // count, so one application must give back the input.
         Items::Repeat { item, count: None } => {
             let out = quietly(ctx, |ctx| step(item, format!("{display}[0]"), input, ctx))?;
-            (out == start).then_some(start)
+            shapes_canonically_equal(&out, &start).then_some(start)
         }
         Items::Repeat {
             item,
@@ -1011,7 +1011,7 @@ fn apply_chain(
                 let label = format!("{display}[{i}]");
                 let out = step(item, label.clone(), &name, ctx)?;
                 // The same module on the same shape: nothing changes again.
-                if out == shape {
+                if shapes_canonically_equal(&out, &shape) {
                     break;
                 }
                 name = ctx.bind_synthetic(out.clone(), scope, call_byte, &format!("{label}(...)"));
@@ -1545,7 +1545,7 @@ fn run_probe(
         let foreign = error
             .message
             .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|word| constants.contains(word));
+            .any(|word| constants.contains(word.strip_prefix(FREE_DIM).unwrap_or(word)));
         if (!has_probe_name(&error.message) || error.message.contains("__ndim_a"))
             && !foreign
             && !messages.contains(&error.message)

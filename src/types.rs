@@ -2,6 +2,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 use tree_sitter::Range;
 
+use crate::layers::map_layer_dims;
+
 /// Name → shape resolution for the apply helpers. Implemented by plain
 /// per-scope `HashMap`s and by `ScopeShapes` in `analysis`, which also sees
 /// synthetic bindings without cloning the scope map (#43).
@@ -13,6 +15,159 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
     fn shape(&self, name: &str) -> Option<&Vec<String>> {
         self.get(name)
     }
+}
+
+/// Starts a name in a dim that holds a value the analysis does not know: a
+/// parameter, a dataclass field, or a size argument of an unknown name. Such a
+/// dim is not a claim like an annotation symbol: it can equal any other dim,
+/// so it never conflicts (`dims_conflict`). The mark stays in a shape for the
+/// full analysis. `LayerShapeAnalysis::without_free_marks` removes it at the
+/// end, so that only the analysis sees it.
+pub(crate) const FREE_DIM: &str = "__free_";
+
+pub(crate) fn is_free_dim(dim: &str) -> bool {
+    dim.contains(FREE_DIM) || dim.contains(crate::layers::UNPROVEN_DIM)
+}
+
+/// Joins a free name to its integer: `__free_D__is_64`. The file binds `D` to
+/// the literal 64 and an annotation also uses `D` as a symbol, for a size that
+/// the value of the name does not bind. So the dim equals both the integer and
+/// the symbol. It conflicts only with another integer.
+pub(crate) const LITERAL_DIM: &str = "__is_";
+
+/// The integer of a dim that is one `LITERAL_DIM` name.
+pub(crate) fn literal_dim(dim: &str) -> Option<&str> {
+    let (name, value) = dim.strip_prefix(FREE_DIM)?.rsplit_once(LITERAL_DIM)?;
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b >= 0x80;
+    (name.bytes().all(is_word) && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(value)
+}
+
+/// `dim`, an expression of `LITERAL_DIM` names and integers, as one
+/// `LITERAL_DIM` name of its value: it still equals an annotation, but
+/// conflicts with another integer. A value of 1 stays an integer, as a dim of
+/// size 1 broadcasts. No size is negative, so such a value is `UNPROVEN_DIM`.
+/// A dim with another name stays as it is.
+pub(crate) fn fold_literal_marks(dim: String) -> String {
+    if !dim.contains(LITERAL_DIM) || literal_dim(&dim).is_some() {
+        return dim;
+    }
+    match fold_integers(&without_dim_marks(&dim)) {
+        Some(value) => literal_mark(&dim, value),
+        None => dim,
+    }
+}
+
+/// `value` as the result of a size rule whose inputs have the literal marks of
+/// `source`.
+pub(crate) fn literal_mark(source: &str, value: i64) -> String {
+    let name = source.find(FREE_DIM).and_then(|start| {
+        let rest = &source[start + FREE_DIM.len()..];
+        rest.find(LITERAL_DIM).map(|end| &rest[..end])
+    });
+    match name {
+        _ if value < 0 => crate::layers::UNPROVEN_DIM.to_string(),
+        Some(name) if value != 1 => format!("{FREE_DIM}{name}{LITERAL_DIM}{value}"),
+        _ => value.to_string(),
+    }
+}
+
+/// `text` as a reader sees it: a `LITERAL_DIM` name is its integer, and a free
+/// name is the name.
+fn without_dim_marks(text: &str) -> String {
+    let mut text = text.to_string();
+    while let Some(end) = text.find(LITERAL_DIM) {
+        let start = text[..end].rfind(FREE_DIM).unwrap_or(end);
+        text.replace_range(start..end + LITERAL_DIM.len(), "");
+    }
+    text.replace(FREE_DIM, "")
+}
+
+/// The value of `text` when it is integers with `+`, `-`, `*`, `//`, and
+/// parentheses.
+pub(crate) fn fold_integers(text: &str) -> Option<i64> {
+    let tokens: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut at = 0;
+    let value = fold_sum(&tokens, &mut at)?;
+    (at == tokens.len()).then_some(value)
+}
+
+fn fold_sum(tokens: &[u8], at: &mut usize) -> Option<i64> {
+    let mut value = fold_product(tokens, at)?;
+    while let Some(&op @ (b'+' | b'-')) = tokens.get(*at) {
+        *at += 1;
+        let right = fold_product(tokens, at)?;
+        value = if op == b'+' { value.checked_add(right)? } else { value.checked_sub(right)? };
+    }
+    Some(value)
+}
+
+fn fold_product(tokens: &[u8], at: &mut usize) -> Option<i64> {
+    let mut value = fold_atom(tokens, at)?;
+    loop {
+        match tokens.get(*at..*at + 2) {
+            Some([b'*', b'*']) => return None,
+            Some([b'/', b'/']) => {
+                *at += 2;
+                let right = fold_atom(tokens, at)?;
+                value = value.checked_div_euclid(Some(right).filter(|r| *r > 0)?)?;
+            }
+            _ if tokens.get(*at) == Some(&b'*') => {
+                *at += 1;
+                value = value.checked_mul(fold_atom(tokens, at)?)?;
+            }
+            _ => return Some(value),
+        }
+    }
+}
+
+fn fold_atom(tokens: &[u8], at: &mut usize) -> Option<i64> {
+    match tokens.get(*at)? {
+        b'(' => {
+            *at += 1;
+            let value = fold_sum(tokens, at)?;
+            (tokens.get(*at) == Some(&b')')).then(|| *at += 1)?;
+            Some(value)
+        }
+        b'-' => {
+            *at += 1;
+            fold_atom(tokens, at)?.checked_neg()
+        }
+        _ => {
+            let start = *at;
+            while tokens.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            std::str::from_utf8(&tokens[start..*at]).ok()?.parse().ok()
+        }
+    }
+}
+
+/// Whether the two dims are different at run time, as far as the file proves.
+/// A free dim conflicts with nothing.
+pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
+    let other_integer = |value: &str, dim: &str| dim.parse::<i64>().is_ok() && dim != value;
+    match (literal_dim(a), literal_dim(b)) {
+        (Some(left), Some(right)) => left != right,
+        (Some(value), None) => other_integer(value, b),
+        (None, Some(value)) => other_integer(value, a),
+        (None, None) => a != b && !is_free_dim(a) && !is_free_dim(b) && !dims_canonically_equal(a, b),
+    }
+}
+
+/// The dim that two dims without a conflict give together. A free dim takes
+/// the value of the other side. Two different free dims give `UNPROVEN_DIM`.
+pub(crate) fn unified_dim(a: &str, b: &str) -> String {
+    match (is_free_dim(a), is_free_dim(b)) {
+        (true, false) => b.to_string(),
+        (true, true) if !dims_canonically_equal(a, b) => crate::layers::UNPROVEN_DIM.to_string(),
+        _ => a.to_string(),
+    }
+}
+
+/// Shape equality under [`dims_canonically_equal`].
+pub(crate) fn shapes_canonically_equal(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| dims_canonically_equal(a, b))
 }
 
 /// Canonicalize a symbolic-dim expression for equality comparison.
@@ -32,7 +187,8 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
 ///   so commutative reorderings compare equal (`d*2` ≡ `2*d`, `a+b*2` ≡
 ///   `2*b+a`);
 /// * drops additive-identity `0` terms (`d+0` → `d`), unless every term is
-///   zero.
+///   zero;
+/// * adds the integer terms into one (`4+d+4` → `8+d`).
 ///
 /// Anything containing parens, subtraction, or division is returned
 /// unchanged (whitespace-stripped only) — those aren't provably commutative
@@ -44,6 +200,11 @@ impl ShapeLookup for HashMap<String, Vec<String>> {
 /// before the conservative bail-out.
 pub fn canonicalize_dim(dim: &str) -> String {
     let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+    let stripped = if stripped.contains(FREE_DIM) {
+        without_dim_marks(&stripped)
+    } else {
+        stripped
+    };
     if stripped.is_empty() {
         return stripped;
     }
@@ -54,10 +215,16 @@ pub fn canonicalize_dim(dim: &str) -> String {
         return stripped;
     }
 
-    let mut terms: Vec<String> = stripped.split('+').map(canonicalize_product_term).collect();
-    terms.retain(|t| t != "0");
-    if terms.is_empty() {
-        terms.push("0".to_string());
+    let mut integers = 0i64;
+    let mut terms: Vec<String> = Vec::new();
+    for term in stripped.split('+').map(canonicalize_product_term) {
+        match term.parse::<i64>() {
+            Ok(value) => integers = integers.saturating_add(value),
+            Err(_) => terms.push(term),
+        }
+    }
+    if integers != 0 || terms.is_empty() {
+        terms.push(integers.to_string());
     }
     terms.sort_unstable();
     terms.join("+")
@@ -137,10 +304,8 @@ fn canonicalize_product_term(term: &str) -> String {
     }
 }
 
-/// Dim equality under [`canonicalize_dim`] — the shared comparison boundary
-/// for every mismatch/broadcast check across `known_functions.rs` and
-/// `analysis.rs` (and, via `layers.rs`'s own `canonical_dim`, layer ctor-arg
-/// validation).
+/// Dim equality under [`canonicalize_dim`], with or without the `FREE_DIM`
+/// mark. A check that reports a mismatch uses [`dims_conflict`].
 pub fn dims_canonically_equal(a: &str, b: &str) -> bool {
     canonicalize_dim(a) == canonicalize_dim(b)
 }
@@ -168,6 +333,12 @@ mod canonicalize_dim_tests {
     #[test]
     fn test_commutative_sum_matches() {
         assert_eq!(canonicalize_dim("a+b*2"), canonicalize_dim("2*b+a"));
+    }
+
+    #[test]
+    fn test_integer_terms_add_up() {
+        assert_eq!(canonicalize_dim("4+4"), "8");
+        assert_eq!(canonicalize_dim("4+d+4"), canonicalize_dim("8+d"));
     }
 
     #[test]
@@ -306,6 +477,7 @@ pub enum LayerKind {
         kernel_size: String,
         stride: String,
         padding: String,
+        dilation: String,
     },
     Conv2d {
         in_channels: String,
@@ -313,6 +485,7 @@ pub enum LayerKind {
         kernel_size: String,
         stride: String,
         padding: String,
+        dilation: String,
     },
     Conv3d {
         in_channels: String,
@@ -320,6 +493,7 @@ pub enum LayerKind {
         kernel_size: String,
         stride: String,
         padding: String,
+        dilation: String,
     },
     /// flax.linen.Dense — channels-last: replaces the last dim with
     /// `features`. Input width is runtime-inferred by flax, so there is
@@ -327,12 +501,14 @@ pub enum LayerKind {
     Dense {
         features: String,
     },
-    /// flax.linen.Conv with default stride / SAME padding: channels-last,
-    /// spatial dims unchanged, last dim becomes `features`. Non-default
+    /// flax.linen.Conv: channels-last, spatial dims follow `kernel_size` and
+    /// `padding` (default SAME), last dim becomes `features`. Non-default
     /// strides are refused at classification time.
     FlaxConv {
         features: String,
         spatial_rank: usize,
+        kernel_size: String,
+        padding: String,
     },
     /// Max/Avg pooling, channels-first like Conv: channels preserved, the
     /// trailing `spatial_rank` dims follow the conv output formula.
@@ -962,6 +1138,41 @@ pub struct LayerShapeAnalysis {
 }
 
 impl LayerShapeAnalysis {
+    /// The analysis without the `FREE_DIM` marks, for the reader of the result.
+    /// A shape or a message has no `UNPROVEN_DIM`: the analysis drops those. A
+    /// layer of an application keeps it, so it becomes `?` here.
+    pub(crate) fn without_free_marks(mut self) -> Self {
+        fn clean(text: &mut String) {
+            if text.contains(FREE_DIM) {
+                *text = without_dim_marks(text);
+            }
+        }
+        for scope in &mut self.scopes {
+            scope.shapes.values_mut().flatten().for_each(clean);
+            scope.return_shape.iter_mut().flatten().for_each(clean);
+            for site in &mut scope.dimension_sites {
+                clean(&mut site.value);
+            }
+        }
+        for binding in &mut self.assignment_shapes {
+            binding.shape.iter_mut().for_each(clean);
+        }
+        for error in &mut self.errors {
+            clean(&mut error.message);
+            if let Some((_, message)) = &mut error.related {
+                clean(message);
+            }
+        }
+        for application in &mut self.applications {
+            application.kind = map_layer_dims(application.kind.clone(), &|dim| {
+                without_dim_marks(dim)
+                    .replace(crate::layers::UNPROVEN_DIM, "?")
+                    .replace(crate::layers::PADDING_NAME, "")
+            });
+        }
+        self
+    }
+
     pub fn scope_for_byte(&self, byte: usize) -> Option<&FunctionShapeScope> {
         scope_for_byte(&self.scopes, byte)
     }

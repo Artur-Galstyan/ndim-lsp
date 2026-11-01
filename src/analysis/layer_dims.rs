@@ -6,22 +6,36 @@
 //!
 //! - its integer, when the file proves one: every write gives the same literal
 //!   and, in the module scope, every write stands before the reader.
-//! - itself, when it means a size the caller gives or the file does not bind
-//!   it: a parameter, a dataclass field, a name that an annotation uses as a
-//!   dim, or a name with no binding.
-//! - `UNPROVEN_DIM` otherwise. A symbol would differ from any integer, and the
-//!   value can be that integer, so the output of the layer stays unknown.
+//! - itself with the `FREE_DIM` mark, when it means a size the caller gives or
+//!   the file does not bind it: a parameter, a dataclass field, or a name with
+//!   no binding. The value is not known here, so the dim conflicts with nothing.
+//! - itself with the `LITERAL_DIM` mark and its integer, when the file proves
+//!   the integer and an annotation also uses the word as a dim: the dim equals
+//!   both. An expression of such a name gets only the `FREE_DIM` mark.
+//! - itself, when an annotation uses it as a dim and the file does not bind it:
+//!   the name is a claim.
+//! - `UNPROVEN_DIM` otherwise. The output of the layer stays unknown.
 
 use tree_sitter::Node;
 
 use super::modules::KEYWORDS;
-use super::{NameBinding, ShapeCtx, collect_name_values, function_scope, literal_constant, nearest_binding};
-use crate::layers::{UNPROVEN_DIM, map_layer_dims};
-use crate::types::LayerKind;
+use super::{
+    NameBinding, ShapeCtx, collect_name_values, function_scope, literal_constant, nearest_binding,
+    normalize_dim,
+};
+use crate::layers::{PADDING_NAME, UNPROVEN_DIM, map_layer_dims};
+use crate::python_ast::dim_symbols;
+use crate::types::{
+    CallArgument, FREE_DIM, LITERAL_DIM, LayerKind, dims_canonically_equal, fold_integers, is_free_dim,
+    literal_dim,
+};
 
 enum Value {
     Integer(String),
+    /// A literal of a name that an annotation also uses as a dim.
+    Literal { name: String, value: String },
     Name(String),
+    Free(String),
     Unproven,
 }
 
@@ -35,6 +49,104 @@ impl ShapeCtx<'_> {
     /// when the file does not prove what it holds.
     pub(super) fn argument_value(&self, value: &str, byte: usize) -> Option<String> {
         Some(self.dim_at(value, byte)).filter(|written| written != UNPROVEN_DIM)
+    }
+
+    /// `shape`, the result of a call, with the `FREE_DIM` mark on each dim that
+    /// has a name from the text of an argument: `torch.zeros(3, self.d)`. An
+    /// attribute gets the mark also when the class writes one integer to it:
+    /// code outside the class can write another.
+    pub(super) fn with_free_argument_dims(
+        &self,
+        shape: Vec<String>,
+        args: &[CallArgument],
+        byte: usize,
+    ) -> Vec<String> {
+        let values = || {
+            args.iter().map(|arg| match arg {
+                CallArgument::Positional { value } | CallArgument::Keyword { value, .. } => value,
+            })
+        };
+        let from_argument = |dim: &str| {
+            dim_symbols(dim).any(|name| values().flat_map(|v| dim_symbols(v)).any(|word| word == name))
+        };
+        shape
+            .into_iter()
+            .map(|dim| {
+                if dim.contains(FREE_DIM) || !from_argument(&dim) {
+                    return dim;
+                }
+                let dim = normalize_dim(&dim, self.aliases, self.hierarchy, byte);
+                let written = self.dim_at(&dim, byte);
+                if written.contains(UNPROVEN_DIM) || dim.contains("self.") {
+                    format!("{FREE_DIM}{dim}")
+                } else {
+                    written
+                }
+            })
+            .collect()
+    }
+
+    /// The size of `[start:stop:step]` on an axis of size `axis`. An integer
+    /// axis with proven bounds gives the size of Python. `None` when the size
+    /// depends on a value that is not known: `[:2]` on `n` is `min(2, n)`.
+    pub(super) fn slice_size(
+        &self,
+        [start, stop, step]: [&str; 3],
+        axis: &str,
+        byte: usize,
+    ) -> Option<String> {
+        let step = self.slice_bound(step, byte)?.unwrap_or(1);
+        let start = self.slice_bound(start, byte)?;
+        if step == 1 && start.unwrap_or(0) == 0 && self.stop_is_axis(stop, axis, byte) {
+            return Some(axis.to_string());
+        }
+        let stop = self.slice_bound(stop, byte)?;
+        let whole = stop.is_none()
+            && match step {
+                1 => start.unwrap_or(0) == 0,
+                -1 => start.is_none(),
+                _ => false,
+            };
+        if whole {
+            return Some(axis.to_string());
+        }
+        if step == 0 {
+            return None;
+        }
+        let axis = literal_dim(axis).unwrap_or(axis).parse().ok()?;
+        Some(python_slice_len(start, stop, step, axis).to_string())
+    }
+
+    /// Whether the value of `stop` is the size of `axis`: an integer, or a name
+    /// that is an annotation symbol and that no scope binds. An attribute that
+    /// holds a parameter stands for the name of the parameter.
+    fn stop_is_axis(&self, stop: &str, axis: &str, byte: usize) -> bool {
+        if stop.is_empty() {
+            return false;
+        }
+        let written = self.dim_at(&normalize_dim(stop, self.aliases, self.hierarchy, byte), byte);
+        !is_free_dim(&written) && dims_canonically_equal(&written, axis)
+    }
+
+    /// Whether `step` is a proven negative integer.
+    pub(super) fn is_negative_step(&self, step: &str, byte: usize) -> bool {
+        self.slice_bound(step, byte).flatten().is_some_and(|step| step < 0)
+    }
+
+    /// The value of one part of a slice: `Some(None)` when the part is absent.
+    fn slice_bound(&self, bound: &str, byte: usize) -> Option<Option<i64>> {
+        if bound.is_empty() || bound == "None" {
+            return Some(None);
+        }
+        let bound = normalize_dim(bound, self.aliases, self.hierarchy, byte);
+        if bound.contains("self.") {
+            return None;
+        }
+        let written = self.dim_at(&bound, byte);
+        literal_dim(&written)
+            .and_then(|value| value.parse().ok())
+            .or_else(|| fold_integers(&written))
+            .map(Some)
     }
 
     fn dim_at(&self, dim: &str, byte: usize) -> String {
@@ -59,7 +171,8 @@ impl ShapeCtx<'_> {
         let mut i = 0;
         while i < dim.len() {
             if matches!(bytes[i], b'"' | b'\'') {
-                return dim.to_string();
+                let literal = i == 0 && bytes.last() == Some(&bytes[0]);
+                return if literal { dim.to_string() } else { UNPROVEN_DIM.to_string() };
             }
             if !is_word(bytes[i]) {
                 written.push(bytes[i] as char);
@@ -83,7 +196,17 @@ impl ShapeCtx<'_> {
                     replaced = true;
                     written.push_str(&value);
                 }
+                Value::Literal { name, value } if word.len() == dim.len() => {
+                    written.push_str(FREE_DIM);
+                    written.push_str(&name);
+                    written.push_str(LITERAL_DIM);
+                    written.push_str(&value);
+                }
                 Value::Name(name) => written.push_str(&name),
+                Value::Literal { name, .. } | Value::Free(name) => {
+                    written.push_str(FREE_DIM);
+                    written.push_str(&name);
+                }
                 Value::Unproven => return UNPROVEN_DIM.to_string(),
             }
         }
@@ -98,6 +221,16 @@ impl ShapeCtx<'_> {
     }
 
     fn word_value(&self, word: &str, at: Node) -> Value {
+        if let Some(name) = word.strip_prefix(FREE_DIM) {
+            return Value::Free(name.to_string());
+        }
+        if let Some(name) = word.strip_prefix(PADDING_NAME) {
+            return match self.word_value(name, at) {
+                Value::Name(_) => Value::Unproven,
+                Value::Free(_) if !self.is_integer_parameter(name, at) => Value::Unproven,
+                value => value,
+            };
+        }
         match word.strip_prefix("self.") {
             Some(attr) if !attr.contains('.') => self.attr_value(attr, at),
             None if !word.contains('.') => self.name_value(word, at),
@@ -106,21 +239,34 @@ impl ShapeCtx<'_> {
     }
 
     fn name_value(&self, name: &str, at: Node) -> Value {
-        if self.is_annotation_symbol(name) {
-            return Value::Name(name.to_string());
-        }
-        if let Some(value) = self.constant_before(at, name) {
-            return Value::Integer(value);
-        }
         let (owner, binding) = nearest_binding(at, name, self);
         let parameter = owner.kind() == "function_definition"
             && function_scope(owner, self)
                 .is_some_and(|idx| self.scopes[idx].all_params.iter().any(|p| p == name));
-        if parameter || matches!(binding, NameBinding::Unbound) {
-            Value::Name(name.to_string())
+        if parameter {
+            return if has_string_default(owner, name, self.text) {
+                Value::Unproven
+            } else {
+                Value::Free(name.to_string())
+            };
+        }
+        let symbol = self.is_annotation_symbol(name);
+        if symbol && matches!(binding, NameBinding::Unbound) {
+            return Value::Name(name.to_string());
+        }
+        if let Some(value) = self.constant_before(at, name) {
+            return literal_value(name, value, symbol);
+        }
+        if matches!(binding, NameBinding::Unbound) {
+            Value::Free(name.to_string())
         } else {
             Value::Unproven
         }
+    }
+
+    fn is_integer_parameter(&self, name: &str, at: Node) -> bool {
+        let (owner, _) = nearest_binding(at, name, self);
+        owner.kind() == "function_definition" && has_int_annotation(owner, name, self.text)
     }
 
     /// The integer `name` holds at `at`. A module global holds it only when
@@ -148,9 +294,13 @@ impl ShapeCtx<'_> {
     /// from may write it: every write must agree, in `__init__`, in any other
     /// method, and in a class body.
     fn attr_value(&self, attr: &str, at: Node) -> Value {
-        if self.is_annotation_symbol(attr) {
-            return Value::Name(attr.to_string());
+        match self.attr_held(attr, at) {
+            Value::Integer(value) => literal_value(attr, value, self.is_annotation_symbol(attr)),
+            held => held,
         }
+    }
+
+    fn attr_held(&self, attr: &str, at: Node) -> Value {
         let mut class = at;
         while class.kind() != "class_definition" {
             let Some(parent) = class.parent() else {
@@ -163,7 +313,7 @@ impl ShapeCtx<'_> {
         let mut named = false;
         let mut found = |value: Value| match value {
             Value::Integer(value) if *integer.get_or_insert_with(|| value.clone()) == value => true,
-            Value::Name(_) => {
+            Value::Name(_) | Value::Free(_) => {
                 named = true;
                 true
             }
@@ -176,7 +326,7 @@ impl ShapeCtx<'_> {
         }
         for &class in &family {
             let held = if self.hierarchy.fields(class).iter().any(|field| field == attr) {
-                Value::Name(attr.to_string())
+                Value::Free(attr.to_string())
             } else if self.hierarchy.binds_attr(class, attr) {
                 self.class_constant(class, attr).map_or(Value::Unproven, Value::Integer)
             } else {
@@ -188,7 +338,7 @@ impl ShapeCtx<'_> {
         }
         match (integer, named) {
             (Some(value), false) => Value::Integer(value),
-            (None, true) => Value::Name(attr.to_string()),
+            (None, true) => Value::Free(attr.to_string()),
             _ => Value::Unproven,
         }
     }
@@ -241,62 +391,61 @@ impl ShapeCtx<'_> {
     }
 }
 
-/// The value of `text` when it is integers with `+`, `-`, `*`, `//`, and
-/// parentheses.
-fn fold_integers(text: &str) -> Option<i64> {
-    let tokens: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut at = 0;
-    let value = fold_sum(&tokens, &mut at)?;
-    (at == tokens.len()).then_some(value)
+/// The node of parameter `name` of `function`.
+fn parameter<'t>(function: Node<'t>, name: &str, text: &str) -> Option<Node<'t>> {
+    let parameters = function.child_by_field_name("parameters")?;
+    (0..parameters.named_child_count()).filter_map(|i| parameters.named_child(i as u32)).find(|parameter| {
+        let target = match parameter.kind() {
+            "default_parameter" | "typed_default_parameter" => parameter.child_by_field_name("name"),
+            "typed_parameter" => parameter.named_child(0),
+            _ => Some(*parameter),
+        };
+        target.is_some_and(|n| n.utf8_text(text.as_bytes()) == Ok(name))
+    })
 }
 
-fn fold_sum(tokens: &[u8], at: &mut usize) -> Option<i64> {
-    let mut value = fold_product(tokens, at)?;
-    while let Some(&op @ (b'+' | b'-')) = tokens.get(*at) {
-        *at += 1;
-        let right = fold_product(tokens, at)?;
-        value = if op == b'+' { value.checked_add(right)? } else { value.checked_sub(right)? };
-    }
-    Some(value)
+/// Whether parameter `name` of `function` has a string as its default.
+fn has_string_default(function: Node, name: &str, text: &str) -> bool {
+    parameter(function, name, text)
+        .and_then(|parameter| parameter.child_by_field_name("value"))
+        .is_some_and(|value| value.kind() == "string")
 }
 
-fn fold_product(tokens: &[u8], at: &mut usize) -> Option<i64> {
-    let mut value = fold_atom(tokens, at)?;
-    loop {
-        match tokens.get(*at..*at + 2) {
-            Some([b'*', b'*']) => return None,
-            Some([b'/', b'/']) => {
-                *at += 2;
-                let right = fold_atom(tokens, at)?;
-                value = value.checked_div_euclid(Some(right).filter(|r| *r > 0)?)?;
-            }
-            _ if tokens.get(*at) == Some(&b'*') => {
-                *at += 1;
-                value = value.checked_mul(fold_atom(tokens, at)?)?;
-            }
-            _ => return Some(value),
-        }
+/// Whether the annotation of parameter `name` of `function` is `int`.
+pub(super) fn has_int_annotation(function: Node, name: &str, text: &str) -> bool {
+    parameter_annotation(function, name, text) == Some("int")
+}
+
+/// The text of the annotation of parameter `name` of `function`.
+pub(super) fn parameter_annotation<'t>(function: Node, name: &str, text: &'t str) -> Option<&'t str> {
+    let annotation = parameter(function, name, text)?.child_by_field_name("type")?;
+    text.get(annotation.byte_range())
+}
+
+/// The value of a literal. `1` stays an integer: a dim of size 1 broadcasts.
+fn literal_value(name: &str, value: String, symbol: bool) -> Value {
+    if symbol && value != "1" {
+        Value::Literal { name: name.to_string(), value }
+    } else {
+        Value::Integer(value)
     }
 }
 
-fn fold_atom(tokens: &[u8], at: &mut usize) -> Option<i64> {
-    match tokens.get(*at)? {
-        b'(' => {
-            *at += 1;
-            let value = fold_sum(tokens, at)?;
-            (tokens.get(*at) == Some(&b')')).then(|| *at += 1)?;
-            Some(value)
-        }
-        b'-' => {
-            *at += 1;
-            fold_atom(tokens, at)?.checked_neg()
-        }
-        _ => {
-            let start = *at;
-            while tokens.get(*at).is_some_and(u8::is_ascii_digit) {
-                *at += 1;
-            }
-            std::str::from_utf8(&tokens[start..*at]).ok()?.parse().ok()
-        }
-    }
+/// The number of items of `range(n)[start:stop:step]`. `step` is not 0.
+fn python_slice_len(start: Option<i64>, stop: Option<i64>, step: i64, n: i64) -> i64 {
+    let (n, step) = (i128::from(n), i128::from(step));
+    let (low, high) = if step > 0 { (0, n) } else { (-1, n - 1) };
+    let index = |bound: Option<i64>, default: i128| {
+        bound.map_or(default, |bound| {
+            let bound = i128::from(bound);
+            if bound < 0 { (bound + n).max(low) } else { bound.min(high) }
+        })
+    };
+    let (first, last) = if step > 0 {
+        (index(start, low), index(stop, high))
+    } else {
+        (index(start, high), index(stop, low))
+    };
+    let span = if step > 0 { last - first } else { first - last };
+    if span <= 0 { 0 } else { ((span - 1) / step.abs() + 1) as i64 }
 }

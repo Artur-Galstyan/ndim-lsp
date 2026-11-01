@@ -203,8 +203,8 @@ def nested_9010(x: Float[Array, "b9010 n9010 d9010"], w: Float[Array, "d9010 d90
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b9010, n9010, d9010]
-    c = x[:, :4]  # expected-shape: c=[b9010, 4, d9010]
-    h = c.sum(axis=1)  # expected-shape: h=[b9010, d9010]
+    c = x[:, :4]  # expected-shape: c=?
+    h = c.sum(axis=1)  # expected-shape: h=?
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b9010, n9010, 3]; ix=[b9010, n9010, 3]
     z = y @ w  # expected-shape: z=[b9010, n9010, d9010]
     return y, h, z
@@ -334,8 +334,8 @@ def nested_9017(x: Float[Array, "b9017 n9017 d9017"], w: Float[Array, "d9017 d90
         return level2(u)
 
     y = level1(x)  # expected-shape: y=[b9017, n9017, d9017]
-    c = x[:, :4]  # expected-shape: c=[b9017, 4, d9017]
-    h = c.sum(axis=1)  # expected-shape: h=[b9017, d9017]
+    c = x[:, :4]  # expected-shape: c=?
+    h = c.sum(axis=1)  # expected-shape: h=?
     top, ix = jax.lax.top_k(y, 3)  # expected-shape: top=[b9017, n9017, 3]; ix=[b9017, n9017, 3]
     z = y @ w  # expected-shape: z=[b9017, n9017, d9017]
     return y, h, z

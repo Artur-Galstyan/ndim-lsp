@@ -105,13 +105,7 @@ pub(super) fn apply_broadcast_like(
     else {
         return Ok(None);
     };
-    let broadcast = broadcast_two_shapes(&arr, &like)?;
-    if broadcast.len() != like.len()
-        || !broadcast
-            .iter()
-            .zip(&like)
-            .all(|(a, b)| dims_canonically_equal(a, b))
-    {
+    if broadcast_changes(&like, &arr)? {
         return Err("broadcast_like cannot broadcast input to the reference shape".into());
     }
     Ok(Some(like))

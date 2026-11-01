@@ -73,9 +73,9 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 `golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
 
-Baseline (the code with the cost-based debounce of "Incremental analysis", release, 5 runs, p50, 22,323-line file): an edit takes about 50 to 75 ms, which is a 20 ms debounce plus about 16 to 40 ms of compute plus about 13 to 17 ms of transport. Typing runs one analysis for each key: `typing_plain` takes 58 ms for each key and gives 12 analyses and 12 publications for 12 keys. Some edits take more: `edit_after_idle` takes 88 ms (45 ms of compute). The worst case is an edit that moves every position of the file (`edit_char_start`): about 448 ms, 281 ms of it compute, with the full 150 ms debounce. The next edit also waits 150 ms (`edit_char_start_revert`, 203 ms). Cold open takes about 358 ms (347 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis).
+Baseline (the code with free parameter dims, scoped bare names, and tracked import rebinding, release, 5 runs, p50, 22,323-line file): an edit takes about 50 to 80 ms, which is a 20 ms debounce plus about 16 to 44 ms of compute plus about 14 to 16 ms of transport. Typing runs one analysis for each key: `typing_plain` takes 52 ms for each key and gives 12 analyses and 12 publications for 12 keys. The worst case is an edit that moves every position of the file (`edit_char_start`): about 415 ms, 249 ms of it compute, with the full 150 ms debounce. The next edit also waits 150 ms (`edit_char_start_revert`, 189 ms). Cold open takes about 378 ms (366 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis).
 
-Control on one input, one 5-run benchmark after the other, against commit `025e7f2`, the commit before the cost-based debounce: `typing_plain` falls from 211 to 58 ms, and `edit_char_end` from 195 to 51 ms. The cost is CPU time: at 100 ms for each key, the commit ran 1 analysis for 12 keys and this code runs 12. Compute is 4 percent higher for a cold open (333 to 347 ms) and 6 percent higher for `edit_char_start` (265 to 281 ms), because the analysis does more work. The numbers depend on the machine.
+Control on one input against commit `c6f2860`, two 5-run benchmarks of each code, in turn: cold open compute rises about 2 percent (362 to 368 ms), inside the noise, and small edits and `edit_char_start` do not change. Edits that rebuild layers cost 2 to 4 ms more (`paste_500_lines` 41 to 45 ms). An older control against commit `025e7f2`, the commit before the cost-based debounce, showed `typing_plain` falling from 211 to 58 ms and `edit_char_end` from 195 to 51 ms. The cost is CPU time: at 100 ms for each key, that commit ran 1 analysis for 12 keys and the debounce gives 12. The numbers depend on the machine and on the session, so compare only runs of one session.
 
 The debounce column of the benchmark is the value the server chose for the edit. Do not time with `NDIM_VERIFY_INCREMENTAL=1`: it adds a fresh parse and analysis to every edit.
 
@@ -131,7 +131,7 @@ See `llm.txt` for the design.
 - [x] **Equinox:** `equinox.nn.Linear` (validates `in_features`, modifies shape to `out_features`, supports `kwargs` and positional args)
 - [x] **PyTorch:** `torch.nn.Linear`
 - [x] **Flax:** `flax.linen.Dense`
-- [x] Convolutional layers (`Conv1d`, `Conv2d`, `Conv3d`) tracking spatial dimension reductions
+- [x] Convolutional layers (`Conv1d`, `Conv2d`, `Conv3d`) tracking spatial dimension reductions, with `padding="same"`, `padding="valid"`, and `dilation`. A padding name without an integer proof, and a torch padding string that is not lower case, are unknown
 - [x] Attention mechanisms (`MultiheadAttention` for PyTorch and Equinox, plus functional attention rules)
 - [x] Shape-preserving layers (`Dropout{,1d,2d,3d}`, `BatchNorm{,1d,2d,3d}`, `LayerNorm`, `GroupNorm`, `ReLU`, `GELU`, etc.)
 - [x] More layers (transposed convolution, pooling, `Embedding`, RNN/LSTM/GRU, `Flatten`/`Unflatten`, `Upsample`, `Sequential`, einops layers): see `TO_IMPLEMENT.md`
@@ -142,18 +142,22 @@ See `llm.txt` for the design.
 - [x] Evaluate parenthesized expressions (`(a + b) @ c`)
 - [x] Tuple unpacking for known multi-output calls and supported layers (`a, b = func()`)
 - [x] Tuple-literal unpacking (`a, b = x, y`, swaps, starred targets); an array unpacks into rows, a homogeneous tuple carry (`lax.scan`) gives each target the shared shape, and a name that is neither provably is unknown
-- [x] Closures read enclosing variables at call time; `nonlocal` rebinding gives unknown
+- [x] Closures read enclosing variables at call time; `nonlocal` rebinding, also from a method, gives unknown
 - [x] User submodules (`self.blk = Block(...)`, `Block(...)(x)`, `vmap(self.blk)`) through the class MRO, including classes imported from other files, `nn.ModuleList` and `nn.Sequential` fields of user modules, and chain loops (`for l in self.layers: x = l(x)`)
 - [x] Module globals and integer constants read in a function (known only when all writes come before the reader and have one shape)
 - [x] Integer constants and `self.<attr>` constants in layer constructor dims (`nn.Linear(8, OUT)`); a dim with no proven value makes the layer output unknown
+- [x] A parameter or a dataclass-field dim conflicts with nothing, because the caller gives its value: `nn.Linear(8, d)` plus a literal `[n, 4]` gives `[n, 4]`, not an error
 - [x] Methods resolve by class: `self.m()`, `cls.m()`, and `super().m()` follow the MRO of the class of the call, and an override in the file gives unknown
-- [x] Imports follow Python scopes: a function-local import, a parameter, or a local name changes the meaning of a name only in its own scope
+- [x] Imports follow Python scopes: a function-local import, a parameter, or a local name changes the meaning of a name only in its own scope, and a module-level rebinding applies from its statement on and to function bodies
+- [x] Bare names follow Python scopes: a function name that a parameter, a local, or a rebinding hides gives unknown, and a `vf = vmap(f)` name resolves by the scope that owns it. `f = jax.jit(f)`, `jax.checkpoint`, `equinox.filter_jit`, and `functools.partial(f)` with no bound argument keep the function
+- [x] Imported names resolve to one top-level definition: a name bound more than once gives unknown, and a method of the same name never replaces it
 - [x] Comprehensions and lambdas where the result is used (`stack` of a list comprehension, `sum`, `vmap`, `lax.map`, `lax.scan` and direct calls of a lambda)
 - [x] Provable scalar operands broadcast in binary operations
 - [x] A name whose shape changes across a loop (`x, y = y, x`) is unknown after the loop, and the hints of the first iteration are taken back
 - [ ] Tuple unpacking for user-defined helper tuple returns
-- [x] Basic array slicing and indexing (`x[:, 1:5, ...]`, integer indices, `None`)
-- [ ] Precise advanced and boolean array indexing
+- [x] Basic array slicing and indexing (`x[:, 1:5, ...]`, integer indices, `None`). A slice of an integer axis with integer bounds has the size of Python. Other slices that do not keep the whole axis are unknown: `x[:2]` on `n` is `min(2, n)`. A negative step on a torch tensor is unknown
+- [x] A list of integers as an index gives its length to the axis. Any other index that is not a proven integer or a slice (an array, a mask, a tuple) is unknown
+- [ ] Precise array and boolean indexing
 - [x] Control flow tracing: `if`/`elif`/`else`, `match`, `try`, loops and `with` start each arm from the entry state and join the live paths (a name with different shapes is unknown)
 - [x] Cross-function tracing for same-file and imported helper functions
 

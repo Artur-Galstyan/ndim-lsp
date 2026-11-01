@@ -22,7 +22,7 @@ use super::{
 };
 use crate::imports::ImportScopes;
 use crate::resolution::resolve_call_target;
-use crate::types::ImportPath;
+use crate::types::{ImportPath, shapes_canonically_equal};
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Role {
@@ -577,6 +577,14 @@ struct Binding {
 }
 
 impl Binding {
+    fn same_as(&self, other: &Binding) -> bool {
+        self == other
+            || (self.carry == other.carry
+                && self.dim == other.dim
+                && matches!((&self.shape, &other.shape),
+                    (Some(a), Some(b)) if shapes_canonically_equal(a, b)))
+    }
+
     fn unknown() -> Self {
         Binding {
             shape: None,
@@ -840,7 +848,9 @@ fn unstable_names(open: &Open, backs: &[&Exit], ctx: &ShapeCtx) -> HashSet<Strin
         if reads.contains(name)
             && backs.iter().any(|b| {
                 b.get(name)
-                    .is_some_and(|(binding, _)| binding.shape.as_ref() != Some(entry))
+                    .is_some_and(|(binding, _)| {
+                        !binding.shape.as_ref().is_some_and(|shape| shapes_canonically_equal(shape, entry))
+                    })
             })
         {
             unknown.insert(name.clone());
@@ -1245,7 +1255,7 @@ impl<'t> Replay<'t> {
                     }
                     match &chosen {
                         None => chosen = Some(binding.clone()),
-                        Some(seen) if seen != binding => conflict = true,
+                        Some(seen) if !seen.same_as(binding) => conflict = true,
                         Some(_) => {}
                     }
                 }

@@ -826,10 +826,10 @@ mod propagate_memo {
     }
 
     #[test]
-    fn the_last_vmap_writer_of_a_name_decides() {
+    fn a_second_module_vmap_of_a_name_invalidates_its_readers() {
         let funcs = "def f1(x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return x\n\n\ndef f2(x: Float[Array, \"d\"]) -> Float[Array, \"k\"]:\n    return x[:3]\n\n\n";
-        let make1 = "def make1():\n    vf = jax.vmap(f1)\n    return vf\n\n\n";
-        let make2 = "def make2():\n    vf = jax.vmap(f2)\n    return vf\n\n\n";
+        let make1 = "vf = jax.vmap(f1)\n\n\n";
+        let make2 = "vf = jax.vmap(f2)\n\n\n";
         let user = "def user(xs: Float[Array, \"n d\"]):\n    ys = vf(xs)\n    return ys\n\n\n";
         let before = format!("{}{funcs}{make1}{make2}{user}", filler(FILLERS));
         let after = format!("{}{funcs}{make1}{user}", filler(FILLERS));
@@ -950,4 +950,57 @@ mod propagate_memo {
             }
         }
     }
+}
+
+/// The shape of `y` in `new`, after the memo of `old`, and with no memo.
+fn memo_y_shape(old: &str, new: &str) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let y_of = |analysis: &LayerShapeAnalysis| {
+        analysis.scopes.iter().find_map(|scope| scope.shapes.get("y")).cloned()
+    };
+    let (cache, mut memo) = (new_resolution_cache(), UnitMemo::default());
+    let mut run = |text: &str| {
+        let tree = parse(text);
+        analyze_layer_shapes_with_memo(tree.root_node(), text, &[], read, 5, Some(&cache), &mut memo).unwrap()
+    };
+    run(old);
+    let memoized = run(new);
+    let tree = parse(new);
+    let fresh = analyze_layer_shapes(tree.root_node(), new, &[], read, 5, None).unwrap();
+    (y_of(&memoized), y_of(&fresh))
+}
+
+#[test]
+fn an_edit_of_another_unit_reaches_a_subscript() {
+    let head = "import torch\nimport jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n";
+    let reader = "def g(x: Float[Array, \"n m\"], w: Float[Array, \"n m\"]):\n    y = w[:n]\n    return y\n";
+    let indexed = "def g(x: Float[Array, \"3 4\"]):\n    y = x[i]\n    return y\n";
+    let stepped = "def g():\n    y = v[::-1]\n    return y\n";
+    let looped = "def g(x: Float[Array, \"3 4\"]):\n    for k in range(3):\n        y = x[k]\n    return y\n";
+    for (before, after, body) in [
+        ("q = 1\n", "n = 2\n", reader),
+        ("q = load()\n", "def s():\n    global n\n    n = 2\n", reader),
+        ("i = 1\n", "i = load()\n", indexed),
+        ("i = load()\n", "i = 1\n", indexed),
+        ("v = torch.zeros(3, 4)\n", "v = jnp.zeros((3, 4))\n", stepped),
+        ("v = jnp.zeros((3, 4))\n", "v = torch.zeros(3, 4)\n", stepped),
+        ("q = 1\n", "range = load\n", looped),
+    ] {
+        for (old, new) in [(before, after), (after, before)] {
+            let [old, new] = [old, new].map(|bind| format!("{head}{bind}\n{body}"));
+            let (memoized, fresh) = memo_y_shape(&old, &new);
+            assert_eq!(memoized, fresh, "{old}\n->\n{new}");
+        }
+    }
+}
+
+#[test]
+fn an_edit_of_a_class_body_reaches_the_function_around_it() {
+    let body = |line: &str| {
+        format!("import torch\n\ndef h():\n    f = torch.zeros(3, 4)\n    class C:\n        nonlocal f\n{line}    y = f\n")
+    };
+    let (poisoned, plain) = (body("        f = load()\n"), body("        g = f\n"));
+    assert_eq!(memo_y_shape(&plain, &poisoned), (None, None));
+    let (memoized, fresh) = memo_y_shape(&poisoned, &plain);
+    assert_eq!(memoized, fresh);
+    assert!(memoized.is_some());
 }

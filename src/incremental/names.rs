@@ -8,7 +8,6 @@ use std::hash::{BuildHasherDefault, Hasher};
 use tree_sitter::Node;
 
 use crate::python_ast::dynamic_attribute;
-use crate::types::ImportPath;
 
 /// FNV-1a. A collision of two names only joins their groups.
 pub(super) fn name_hash(name: &[u8]) -> u64 {
@@ -55,9 +54,6 @@ pub(super) struct NameSet {
     pub shared: Vec<u64>,
     /// The module scope names, to record the shape each ends with.
     pub assigned: Vec<String>,
-    /// Plain assignments of a call, at any depth: the last segment of the
-    /// callee, and the name assigned. A `vmap` binds a name for the whole file.
-    pub calls: Vec<(u64, u64)>,
     /// Names that a plain assignment gives an integer literal, at any depth.
     pub ints: Vec<u64>,
     pub globals: Vec<u64>,
@@ -178,16 +174,6 @@ impl NameSet {
                         {
                             set.ints.push(hash(left));
                         }
-                        if node.kind() == "assignment"
-                            && left.kind() == "identifier"
-                            && let Some(call) = node.child_by_field_name("right")
-                            && call.kind() == "call"
-                            && let Some(func) = call.child_by_field_name("function")
-                        {
-                            let callee = &text[func.byte_range()];
-                            let last = callee.rsplit('.').next().unwrap_or(callee);
-                            set.calls.push((name_hash(last.as_bytes()), hash(left)));
-                        }
                     }
                 }
                 "as_pattern" | "named_expression" => {
@@ -274,8 +260,6 @@ impl NameSet {
         }
         set.assigned.sort_unstable();
         set.assigned.dedup();
-        set.calls.sort_unstable();
-        set.calls.dedup();
         set
     }
 }
@@ -309,31 +293,11 @@ impl Dsu {
     }
 }
 
-/// The names that make a call to `vmap` bind a name for the whole file.
-pub(super) fn vmap_names(import_map: &HashMap<String, ImportPath>) -> Vec<u64> {
-    let mut names = vec![name_hash(b"vmap"), name_hash(b"filter_vmap")];
-    for (alias, import) in import_map {
-        if import.name == "vmap" || import.name == "filter_vmap" {
-            names.push(name_hash(alias.as_bytes()));
-        }
-    }
-    names
-}
-
 /// Join, in `dsu`, node `base + i` with every node that shares a name with
 /// statement `i`.
-pub(super) fn link_units(sets: &[&NameSet], vmaps: &[u64], base: usize, dsu: &mut Dsu) {
+pub(super) fn link_units(sets: &[&NameSet], base: usize, dsu: &mut Dsu) {
     // Per name: its node, and whether a statement reads it.
     let mut names: NameMap<(usize, bool)> = NameMap::default();
-    let shared_of = |set: &NameSet| -> Vec<u64> {
-        let mut extra = Vec::new();
-        for (callee, assigned) in &set.calls {
-            if vmaps.contains(callee) {
-                extra.push(*assigned);
-            }
-        }
-        extra
-    };
     let node_of = |names: &mut NameMap<(usize, bool)>, dsu: &mut Dsu, name: u64| -> usize {
         names.entry(name).or_insert_with(|| (dsu.push(), false)).0
     };
@@ -341,7 +305,7 @@ pub(super) fn link_units(sets: &[&NameSet], vmaps: &[u64], base: usize, dsu: &mu
         for &name in set.defs.iter().chain(&set.shared) {
             node_of(&mut names, dsu, name);
         }
-        for name in set.shared.iter().copied().chain(shared_of(set)) {
+        for &name in &set.shared {
             let node = node_of(&mut names, dsu, name);
             dsu.union(base + i, node);
         }
