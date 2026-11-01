@@ -12,11 +12,7 @@ cargo install --path .
 
 An editor extension starts the server. Both extensions look for `ndim-lsp` on `PATH`.
 
-**VS Code** (extension `ndim-lsp`, in `../ndim-lsp-vscode`). Settings:
-
-- `ndim-lsp.serverPath`: path to the binary (default `ndim-lsp`).
-- `ndim-lsp.diagnosticSeverity`: severity of shape mismatches (default `error`).
-- `ndim-lsp.approximationSeverity`: severity of approximate rules (default `warning`).
+**VS Code** (extension `ndim-lsp`, in `../ndim-lsp-vscode`). The setting `ndim-lsp.serverPath` is the path to the binary (default `ndim-lsp`). A change to this setting restarts the server.
 
 **Zed** (extension `ndim-lsp-zed`, in `../ndim-lsp-zed`). In your Zed settings:
 
@@ -25,16 +21,31 @@ An editor extension starts the server. Both extensions look for `ndim-lsp` on `P
   "lsp": {
     "ndim-lsp": {
       "binary": { "path": "/path/to/ndim-lsp" },
-      "initialization_options": {
+      "settings": {
         "diagnostic_severity": "error",
-        "approximation_severity": "warning"
+        "approximation_severity": "warning",
+        "inlay_hints": true,
+        "inlay_hints_max_length": 0
       }
     }
   }
 }
 ```
 
-Severity values are `error`, `warning`, `information`, and `hint`. The server reads them at start, so restart it after a change. An invalid value uses the default.
+Rebuild the Zed extension to get live changes. The `extension.wasm` file must include `language_server_workspace_configuration`. The `initialization_options` object takes the same keys, and Zed uses it for live changes if `settings` is not set.
+
+### Options
+
+| Key | Default | VS Code setting | Zed setting (under `lsp.ndim-lsp.settings`) |
+| --- | --- | --- | --- |
+| `diagnostic_severity` | `"error"` | `ndim-lsp.diagnosticSeverity` | `diagnostic_severity` |
+| `approximation_severity` | `"warning"` | `ndim-lsp.approximationSeverity` | `approximation_severity` |
+| `inlay_hints` | `true` | `ndim-lsp.inlayHints` | `inlay_hints` |
+| `inlay_hints_max_length` | `0` (no limit) | `ndim-lsp.inlayHintsMaxLength` | `inlay_hints_max_length` |
+
+Severity values are `error`, `warning`, `information`, and `hint`, in any case. `inlay_hints: false` gives no hints. A label longer than `inlay_hints_max_length` chars is cut to that length with an ellipsis, and the tooltip keeps the full shape. An invalid value uses the default.
+
+The server reads the options from `initializationOptions` at start. A `workspace/didChangeConfiguration` notification changes them with no restart. The keys go under `ndim-lsp` or at the top level of `settings`. A key that is not in the notification keeps its value, so a key removed from the editor settings stays in use until the next restart. If the notification has no option, a client with `workspace/configuration` gets a pull of section `ndim-lsp`. A change republishes diagnostics from the cached analysis and sends `workspace/inlayHint/refresh`.
 
 ## Scoped shape support
 
@@ -167,6 +178,8 @@ See `llm.txt` for the design.
 - [x] **Diagnostics:** Error squiggles on invalid matmul or dimension mismatches
 - [x] **Hover:** Show shapes of variables and arguments on hover
 - [x] **Inlay Hints:** Display inferred dimensions inline directly in the editor
+- [x] Inlay hint options: `inlay_hints` turns hints off, and `inlay_hints_max_length` cuts long labels
+- [x] Live settings: `workspace/didChangeConfiguration` applies all options with no restart
 - [x] Show exact shapes and operators in diagnostic error messages
 - [x] Point two-operand mismatch diagnostics at both conflicting operands
 - [x] Highlight exact conflicting dimension tokens for direct binary operations on annotated variables

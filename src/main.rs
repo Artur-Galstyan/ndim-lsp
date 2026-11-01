@@ -8,8 +8,9 @@ use tokio::sync::{RwLock, watch};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeActionResponse, Diagnostic, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    CodeActionProviderCapability, CodeActionResponse, ConfigurationItem, Diagnostic,
+    DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentChanges, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
@@ -36,6 +37,96 @@ use sync::{Pace, Run, apply_changes};
 /// Longest quiet time after a change before its text is analyzed. `Pace`
 /// shortens it for a document with a known, low analysis cost.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// The section of the client settings for this server.
+const SETTINGS_SECTION: &str = "ndim-lsp";
+const SETTINGS_KEYS: [&str; 4] = [
+    "diagnostic_severity",
+    "approximation_severity",
+    "inlay_hints",
+    "inlay_hints_max_length",
+];
+
+/// Editor options, from `initializationOptions` and later from
+/// `workspace/didChangeConfiguration`.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Settings {
+    /// Severity for `ShapeErrorKind::Mismatch` diagnostics.
+    diagnostic_severity: DiagnosticSeverity,
+    /// Severity for `ShapeErrorKind::Approximation` diagnostics. It does not
+    /// depend on `diagnostic_severity`.
+    approximation_severity: DiagnosticSeverity,
+    inlay_hints: bool,
+    /// Longest hint label in chars. 0 means no limit.
+    inlay_hints_max_length: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            diagnostic_severity: DiagnosticSeverity::ERROR,
+            approximation_severity: DiagnosticSeverity::WARNING,
+            inlay_hints: true,
+            inlay_hints_max_length: 0,
+        }
+    }
+}
+
+impl Settings {
+    /// These settings with the keys of `opts` applied. An absent key keeps its
+    /// value, and an invalid value gives the default.
+    fn updated(self, opts: &serde_json::Value) -> Settings {
+        let default = Settings::default();
+        let severity = |key, current, default| {
+            if opts.get(key).is_some() {
+                parse_severity(opts, key, default)
+            } else {
+                current
+            }
+        };
+        Settings {
+            diagnostic_severity: severity(
+                "diagnostic_severity",
+                self.diagnostic_severity,
+                default.diagnostic_severity,
+            ),
+            approximation_severity: severity(
+                "approximation_severity",
+                self.approximation_severity,
+                default.approximation_severity,
+            ),
+            inlay_hints: opts.get("inlay_hints").map_or(self.inlay_hints, |v| {
+                v.as_bool().unwrap_or(default.inlay_hints)
+            }),
+            inlay_hints_max_length: opts
+                .get("inlay_hints_max_length")
+                .map_or(self.inlay_hints_max_length, |v| {
+                    v.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(default.inlay_hints_max_length)
+                }),
+        }
+    }
+}
+
+/// The object with our keys in a settings value: under `SETTINGS_SECTION`, or
+/// at the top level.
+fn settings_section(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let has_keys = |v: &&serde_json::Value| SETTINGS_KEYS.iter().any(|k| v.get(k).is_some());
+    value
+        .get(SETTINGS_SECTION)
+        .filter(has_keys)
+        .or(Some(value).filter(has_keys))
+}
+
+/// `label` in at most `max` chars, with an ellipsis if it was cut. 0 is no limit.
+fn truncate_label(label: String, max: usize) -> String {
+    if max == 0 || label.chars().count() <= max {
+        return label;
+    }
+    let end = label.char_indices().nth(max - 1).map_or(0, |(i, _)| i);
+    format!("{}…", &label[..end])
+}
 
 /// Analysis plus the exact text/tree it was computed from, so hover and
 /// inlay hints reuse the parse instead of re-parsing per request.
@@ -112,17 +203,18 @@ pub struct Backend {
     /// Keyed on (import-path-segments, search-roots-fingerprint).
     /// Invalidated when workspace folders change.
     pub resolution_cache: Arc<ResolutionCache>,
-    /// Severity for `ShapeErrorKind::Mismatch` diagnostics, set from
-    /// `initializationOptions.diagnostic_severity`.
-    pub diagnostic_severity: Arc<RwLock<DiagnosticSeverity>>,
-    /// Severity for `ShapeErrorKind::Approximation` diagnostics, set from
-    /// `initializationOptions.approximation_severity` (defaults to WARNING,
-    /// independent of `diagnostic_severity`).
-    pub approximation_severity: Arc<RwLock<DiagnosticSeverity>>,
+    /// A publication holds a read lock until it sends, so diagnostics with an
+    /// old severity cannot arrive after those of a new one.
+    pub settings: Arc<RwLock<Settings>>,
+    /// Counts `workspace/didChangeConfiguration` notifications: a pull reply
+    /// is old if a newer notification arrived.
+    pub settings_changes: Arc<AtomicU64>,
     /// The client accepts `workspace/didChangeWatchedFiles` registration.
     pub can_watch_files: Arc<AtomicBool>,
     /// The client accepts `workspace/inlayHint/refresh`.
     pub can_refresh_hints: Arc<AtomicBool>,
+    /// The client accepts `workspace/configuration`.
+    pub can_pull_settings: Arc<AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -147,13 +239,12 @@ impl LanguageServer for Backend {
             let refresh = ws.inlay_hint.as_ref().and_then(|c| c.refresh_support);
             self.can_refresh_hints
                 .store(refresh == Some(true), Ordering::Relaxed);
+            self.can_pull_settings
+                .store(ws.configuration == Some(true), Ordering::Relaxed);
         }
 
         if let Some(opts) = params.initialization_options.as_ref() {
-            *self.diagnostic_severity.write().await =
-                parse_severity(opts, "diagnostic_severity", DiagnosticSeverity::ERROR);
-            *self.approximation_severity.write().await =
-                parse_severity(opts, "approximation_severity", DiagnosticSeverity::WARNING);
+            *self.settings.write().await = Settings::default().updated(opts);
         }
 
         Ok(InitializeResult {
@@ -282,6 +373,17 @@ impl LanguageServer for Backend {
             .await;
     }
 
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        let change = self.settings_changes.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(section) = settings_section(&params.settings) {
+            self.apply_settings(section).await;
+        } else if self.can_pull_settings.load(Ordering::Relaxed) {
+            // In a task of its own: a client that does not reply holds no slot.
+            let this = self.clone();
+            tokio::spawn(async move { this.pull_settings(change).await });
+        }
+    }
+
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
         {
             let mut lock = self.workspace_roots.write().unwrap();
@@ -325,7 +427,13 @@ impl LanguageServer for Backend {
         if self.document(&uri).is_none() {
             return Ok(None);
         }
-        Ok(self.compute_inlay_hints(&uri, &visible_range).await)
+        let settings = *self.settings.read().await;
+        if !settings.inlay_hints {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(self
+            .compute_inlay_hints(&uri, &visible_range, settings.inlay_hints_max_length)
+            .await)
     }
 
     async fn goto_definition(
@@ -371,6 +479,66 @@ impl Backend {
         }
     }
 
+    /// Ask the client for the settings. The reply is dropped if a notification
+    /// newer than `change` arrived.
+    async fn pull_settings(&self, change: u64) {
+        let item = ConfigurationItem {
+            scope_uri: None,
+            section: Some(SETTINGS_SECTION.to_string()),
+        };
+        let values = match self.client.configuration(vec![item]).await {
+            Ok(values) => values,
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::WARNING, format!("settings pull failed: {e}"))
+                    .await;
+                return;
+            }
+        };
+        if self.settings_changes.load(Ordering::Relaxed) != change {
+            return;
+        }
+        if let Some(section) = values.first().and_then(settings_section) {
+            self.apply_settings(section).await;
+        }
+    }
+
+    /// Apply `section`. No option changes an analysis, so a change republishes
+    /// the cached ones. A document with no cached result for its text has a
+    /// publication that is not complete, and that one reads the new settings.
+    async fn apply_settings(&self, section: &serde_json::Value) {
+        {
+            let mut settings = self.settings.write().await;
+            let next = settings.updated(section);
+            if next == *settings {
+                return;
+            }
+            *settings = next;
+        }
+        let open: Vec<(Url, u64)> = self
+            .documents
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(uri, doc)| (uri.clone(), doc.rev))
+            .collect();
+        for (uri, rev) in open {
+            if self.cache_hit(&uri, rev).is_some() {
+                self.spawn_publish(uri, rev);
+            }
+        }
+        self.refresh_inlay_hints();
+    }
+
+    fn refresh_inlay_hints(&self) {
+        if self.can_refresh_hints.load(Ordering::Relaxed) {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let _ = client.inlay_hint_refresh().await;
+            });
+        }
+    }
+
     /// New revs for every open document, then an analysis and a publication
     /// for each, so no result built before this call is used again.
     fn reanalyze_open_documents(&self) {
@@ -391,12 +559,7 @@ impl Backend {
         for (uri, rev) in revs {
             self.spawn_publish(uri, rev);
         }
-        if self.can_refresh_hints.load(Ordering::Relaxed) {
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                let _ = client.inlay_hint_refresh().await;
-            });
-        }
+        self.refresh_inlay_hints();
     }
 
     /// Store new text. `monotonic` drops a version older than the stored one.
@@ -680,8 +843,7 @@ impl Backend {
     /// is still the newest text when the result is ready.
     async fn publish_diagnostics_for(&self, uri: &Url, rev: u64) {
         let cached = self.get_analysis(uri).await;
-        let mismatch_severity = *self.diagnostic_severity.read().await;
-        let approximation_severity = *self.approximation_severity.read().await;
+        let settings = self.settings.read().await;
         let Some(doc) = self.document(uri) else {
             return;
         };
@@ -699,8 +861,8 @@ impl Backend {
                         e,
                         uri,
                         &cached.text,
-                        mismatch_severity,
-                        approximation_severity,
+                        settings.diagnostic_severity,
+                        settings.approximation_severity,
                     )
                 })
                 .collect(),
@@ -717,6 +879,7 @@ impl Backend {
         &self,
         uri: &Url,
         visible_range: &Range,
+        max_length: usize,
     ) -> Option<Vec<InlayHint>> {
         let t_total = Instant::now();
 
@@ -769,7 +932,7 @@ impl Backend {
                     line,
                     character: char_pos,
                 },
-                label: InlayHintLabel::String(label),
+                label: InlayHintLabel::String(truncate_label(label, max_length)),
                 kind: Some(InlayHintKind::TYPE),
                 text_edits: None,
                 tooltip: Some(tooltip),
@@ -1035,7 +1198,7 @@ fn line_lengths_in_range(text: &str, start: u32, end: u32) -> HashMap<u32, u32> 
         .collect()
 }
 
-/// Map an `initializationOptions` value at `key` to a diagnostic severity.
+/// Map a settings value at `key` to a diagnostic severity.
 /// Unknown / missing / malformed -> `default`. Used for both
 /// `diagnostic_severity` (Mismatch errors, defaults to ERROR) and
 /// `approximation_severity` (Approximation errors, defaults to WARNING) —
@@ -1060,9 +1223,9 @@ fn parse_severity(
 }
 
 /// Resolve a `ShapeError` to a diagnostic, picking severity by `error.kind`:
-/// `Mismatch` uses `mismatch_severity` (`initializationOptions.diagnostic_severity`,
+/// `Mismatch` uses `mismatch_severity` (the `diagnostic_severity` option,
 /// defaults to ERROR); `Approximation` uses `approximation_severity`
-/// (`initializationOptions.approximation_severity`, defaults to WARNING).
+/// (the option of that name, defaults to WARNING).
 /// `error.related` (e.g. the other operand's node range in a binary-op
 /// mismatch) becomes a single-entry `related_information`, anchored at
 /// `uri` (the document the diagnostic itself belongs to — `ShapeError`'s
@@ -1368,10 +1531,11 @@ fn new_backend(client: Client) -> Backend {
         gates: Default::default(),
         pace: Default::default(),
         resolution_cache: new_resolution_cache(),
-        diagnostic_severity: Arc::new(RwLock::new(DiagnosticSeverity::ERROR)),
-        approximation_severity: Arc::new(RwLock::new(DiagnosticSeverity::WARNING)),
+        settings: Default::default(),
+        settings_changes: Default::default(),
         can_watch_files: Default::default(),
         can_refresh_hints: Default::default(),
+        can_pull_settings: Default::default(),
     }
 }
 

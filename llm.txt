@@ -12,14 +12,14 @@ across files, scoped bare names and `vmap` names (item 18a), and module-level
 rebinding of imports (item 22). Commit `c6f2860` is the last commit without
 these four items. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,476 tests pass and seven are ignored.
+- `cargo test --quiet` passes: 2,497 tests pass and seven are ignored.
   - 2,356 library tests (52 of them in `src/incremental_tests.rs`). Two
     ignored: `bench_large_file` and `bench_repeated_helper_calls`.
   - 31 unit tests in `src/main.rs` (server and `src/sync.rs`).
   - 34 in `tests/incremental_edits.rs`. One ignored:
     `stress_main_two_thousand_chained_edits`.
-  - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, and 3 in
-    `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
+  - 19 in `tests/lsp_debounce.rs`, 10 in `tests/lsp_helper_save.rs`, 21 in
+    `tests/lsp_settings.rs`, and 3 in `tests/lsp_stress.rs`. Three ignored there: `lsp_stress_benchmark`,
     `golden_dump`, `golden_has_no_internal_names`.
   - 13 in `tests/dim_growth.rs` (one more ignored: `growth_probe`) and 10 in
     `tests/variadic_rank.rs`.
@@ -1213,10 +1213,25 @@ Known limitations / important caveats
   “Append `.T` to the right operand” only when the analyzer proves a rank-2
   transpose resolves that exact mismatch; the edit is UTF-16-safe and
   document-versioned.
-- Diagnostic severity is independently configurable, case-insensitively, via
-  `initializationOptions.diagnostic_severity` for `Mismatch` errors (default
-  `ERROR`) and `initializationOptions.approximation_severity` for
-  `Approximation` errors (default `WARNING`).
+- `Settings` holds four options, read from `initializationOptions`:
+  `diagnostic_severity` for `Mismatch` errors (default `ERROR`, any case),
+  `approximation_severity` for `Approximation` errors (default `WARNING`),
+  `inlay_hints` (default true, false gives an empty list and no analysis), and
+  `inlay_hints_max_length` (default 0, no limit; counts chars, the ellipsis
+  included, and the tooltip stays full). An invalid value gives the default.
+- `workspace/didChangeConfiguration` changes the options live. The value is
+  under `ndim-lsp` or at the top level. An absent key keeps its value. With no
+  option in the value, a client with `workspace/configuration` gets a pull of
+  section `ndim-lsp`, in its own task, and a reply is dropped if a newer
+  notification arrived. An equal result does nothing. A real change republishes
+  only documents with a cache hit and refreshes hints. No option changes an
+  analysis, so this starts none: a document with no hit has a publish that is
+  not complete, and that publish reads the new settings. A publish holds the
+  `settings` read lock until it sends, so an old severity cannot follow a new
+  one. Editor setting names are in `README.md`. The VS Code extension sends the
+  notification with snake_case keys, and restarts only for `serverPath`. The
+  Zed extension returns `settings`, or else `initialization_options`, under the
+  key `ndim-lsp`.
 - Import resolution searches the workspace roots, then site-packages found
   through `$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`
   (no Python call). The resolution cache is keyed by (path, name) and checks file
