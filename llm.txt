@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,177 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,188 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1289,8 +1289,19 @@ Known limitations / important caveats
 Open defects
 ------------
 
-- At `62e9ebd`, the diagnostic of `a = x + y` on two annotated parameters has
-  its primary range on the annotations (the `def` line), not on the statement.
+- The diagnostic of `a = x + y` on two annotated parameters has its primary
+  range on the annotations (the `def` line), not on the statement. A move to
+  the statement is blocked by four things: 13 markers in
+  `bench/stress/stress_main.py` sit on `def` lines and the harness matches by
+  line; `ShapeCtx::report` decides the variadic exemption from the range;
+  `related` holds one entry; and the `reads` of an error would change.
+- In a partly annotated callee, `x + a` with `a` seeded as `[3]` gives a false
+  "d vs 3" warning.
+- `annotation_dimension_range` can match an annotation of the outer function
+  when a lambda parameter has the same name.
+- The method form `a.where(c, b)` is unknown.
+- The memo at open is not built: it made open 12 to 17 percent slower and the
+  first edit 396 to 41 ms faster. The owner decides this trade.
 - `ponytail:` in `shape_of_attribute`: class fields are in the module scope,
   so two classes with a same-named field resolve last-wins.
 - Two `TODO`s in `process_assignment_item_inner`: the vmap recording and the layer
@@ -1310,6 +1321,20 @@ cargo clippy --all-targets --all-features
 ```
 
 Keep clippy clean. Do not run `cargo fmt` in a change.
+
+Rules added after `62e9ebd` (round three):
+- The vmap path and the same-file binding path bind against `original_shapes`,
+  never against the live shape of a parameter that the body assigns again.
+- An imported function binds its arguments over the full signature
+  (`resolve_imported_function_signature`, `bind_call_arguments`).
+- The pieces of `split` and `chunk` must match the number of targets
+  (`fit_pieces`). A symbolic `chunk` gives each piece the size `?`, except when
+  a literal factor divides the size.
+- `linspace`, `logspace`, and `geomspace` with array endpoints give
+  `[num, *broadcast(start, stop)]`. `TorchLinspace` needs scalar endpoints.
+- `x.sort()` has a shape only in a file that imports jax and no numpy or torch.
+- `where` checks each pair of operands that has a shape.
+- `tests/robustness.rs` analyzes truncated corpus files and asserts no panic.
 
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the
