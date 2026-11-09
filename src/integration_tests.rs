@@ -5321,6 +5321,23 @@ def f(x: Float[Array, "batch 4"]) -> None:
         );
     }
 
+    /// A parameter that the body assigns again binds by its annotation, not
+    /// by the last shape of the name.
+    #[test]
+    fn test_user_function_binds_the_annotation_of_a_reassigned_parameter() {
+        let tmp = tempfile::tempdir().unwrap();
+        for ret in ["-> Float[Array, \"b a\"]", "-> None"] {
+            let code = format!(
+                "def f(x: Float[Array, \"a b\"]) {ret}:\n    x = x.T\n    return x\n\ndef c(y: Float[Array, \"3 4\"]) -> None:\n    z = f(y)\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{ret}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "c", "z"), Some(&shape(&["4", "3"])), "{ret}");
+        }
+    }
+
     /// An imported helper binds its arguments by the full parameter list:
     /// an unannotated parameter takes a position, `*` and `/` hold.
     #[test]
@@ -5849,6 +5866,34 @@ def caller(x: Float[Array, "B n"]) -> None:
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
         );
+    }
+
+    /// A vmapped call of a partly annotated callee binds against the
+    /// annotations, not against the shapes an earlier call specialized.
+    #[test]
+    fn test_vmap_ignores_an_earlier_specialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        for vmapped in ["jax.vmap(g)(r, s)", "vg(r, s)"] {
+            let code = format!(
+                r#"
+import jax
+
+def g(a, x: Float[Array, "d"]) -> Float[Array, "d"]:
+    return x
+
+vg = jax.vmap(g)
+
+def caller(p: Float[Array, "3"], q: Float[Array, "3"], r: Float[Array, "b 5"], s: Float[Array, "b 5"]) -> None:
+    u = g(p, q)
+    v = {vmapped}
+"#
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{vmapped}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "caller", "v"), Some(&shape(&["b", "5"])), "{vmapped}");
+        }
     }
 }
 

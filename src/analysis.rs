@@ -3008,6 +3008,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             &ctx.scope_shapes(scope_idx),
             ctx.links,
             ctx.scopes,
+            ctx.original_shapes,
         );
         return ctx.check(result, target, args_node.range()).flatten();
     }
@@ -3058,7 +3059,14 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     out_axes: 0,
                     site: call_byte,
                 };
-                let result = apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes);
+                let result = apply_vmap_call(
+                    &info,
+                    &rest,
+                    &ctx.scope_shapes(scope_idx),
+                    ctx.links,
+                    ctx.scopes,
+                    ctx.original_shapes,
+                );
                 return ctx.check(result, "", args_node.range()).flatten();
             }
             return None;
@@ -6167,6 +6175,7 @@ fn apply_vmap_call(
     caller_shapes: &dyn ShapeLookup,
     links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
+    original_shapes: &[HashMap<String, Vec<String>>],
 ) -> Result<Option<Vec<String>>, String> {
     apply_vmap_call_chain(
         &[(info.in_axes, info.out_axes)],
@@ -6176,6 +6185,7 @@ fn apply_vmap_call(
         caller_shapes,
         links,
         scopes,
+        original_shapes,
     )
 }
 
@@ -6248,7 +6258,9 @@ fn peel_vmap_args<'a>(
 /// Peels one leading batch dim per level (checking cross-argument agreement
 /// at each level independently), resolves `f`'s shape on the fully-peeled
 /// per-example inputs, then re-prepends the batch dims outward-to-inward
-/// in reverse.
+/// in reverse. The callee binds its annotations (`original_shapes`), not the
+/// shapes that an earlier call specialized.
+#[allow(clippy::too_many_arguments)]
 fn apply_vmap_call_chain(
     axes: &[(isize, isize)],
     wrapped: &str,
@@ -6257,6 +6269,7 @@ fn apply_vmap_call_chain(
     caller_shapes: &dyn ShapeLookup,
     links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
+    original_shapes: &[HashMap<String, Vec<String>>],
 ) -> Result<Option<Vec<String>>, String> {
     let Some((current, batch_dims)) = peel_vmap_args(axes, args, caller_shapes)? else {
         return Ok(None);
@@ -6266,7 +6279,10 @@ fn apply_vmap_call_chain(
     let Some(callee_idx) = find_callee_scope(wrapped, site, links, scopes) else {
         return Ok(None); // wrapped function not found — skip silently
     };
-    let callee = &scopes[callee_idx];
+    let Some(original) = original_shapes.get(callee_idx) else {
+        return Ok(None);
+    };
+    let callee = &FunctionShapeScope { shapes: original.clone(), ..scopes[callee_idx].clone() };
 
     // If the callee has no jaxtyping annotations at all, skip.
     if callee.shapes.is_empty() && callee.return_shape.is_none() {
@@ -6370,6 +6386,7 @@ fn shape_of_inline_vmap(
             &ctx.scope_shapes(scope_idx),
             ctx.links,
             ctx.scopes,
+            ctx.original_shapes,
         );
         return ctx.check(result, "", outer_args_node.range()).flatten();
     }
@@ -6866,6 +6883,7 @@ fn apply_user_function(
     let bound = bound_parameters(function, ctx.text, args);
     if let Some(result) = bind_user_function_args(
         &ctx.scopes[callee_idx],
+        &ctx.original_shapes[callee_idx],
         name,
         &bound,
         &ctx.scope_shapes(scope_idx),
@@ -7100,11 +7118,12 @@ fn substitute_dim(dim: &str, binding: &HashMap<String, String>) -> String {
 /// than building a general expression re-evaluator across scopes.
 fn trace_user_function_return(
     callee: &FunctionShapeScope,
+    declared: &HashMap<String, Vec<String>>,
     target_name: &str,
     positional_arg_shapes: &[(&str, Vec<String>)],
     (func_node, text): (Node, &str),
 ) -> Result<Option<Vec<String>>, String> {
-    let binding = build_dim_binding(&callee.shapes, target_name, positional_arg_shapes)?;
+    let binding = build_dim_binding(declared, target_name, positional_arg_shapes)?;
     let Some(body) = func_node.child_by_field_name("body") else {
         return Ok(None);
     };
@@ -7870,6 +7889,7 @@ fn scan_body_ys_shape(
 /// annotations only.
 fn bind_user_function_args(
     callee: &FunctionShapeScope,
+    declared: &HashMap<String, Vec<String>>,
     target: &str,
     bound: &[(String, &str)],
     caller_shapes: &dyn ShapeLookup,
@@ -7877,26 +7897,27 @@ fn bind_user_function_args(
 ) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
-    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+    if declared.is_empty() && callee.return_shape.is_none() {
         return None;
     }
 
     // An argument without a shape for an array parameter skips the call.
     let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new();
     for (param, value) in bound {
-        let Some(declared) = callee.shapes.get(param) else {
+        let Some(annotation) = declared.get(param) else {
             continue;
         };
         match caller_shapes.shape(value) {
             Some(shape) => arg_shapes.push((param.as_str(), shape.clone())),
-            None if declared.is_empty() => {}
+            None if annotation.is_empty() => {}
             None => return Some(Ok(None)),
         }
     }
     if callee.return_shape.is_some() {
-        Some(bind_and_substitute(callee, target, &arg_shapes))
+        let annotated = FunctionShapeScope { shapes: declared.clone(), ..callee.clone() };
+        Some(bind_and_substitute(&annotated, target, &arg_shapes))
     } else if let Some(function) = function {
-        Some(trace_user_function_return(callee, target, &arg_shapes, function))
+        Some(trace_user_function_return(callee, declared, target, &arg_shapes, function))
     } else {
         Some(Ok(None))
     }
@@ -7944,7 +7965,7 @@ fn apply_imported_user_function(
         .iter()
         .filter_map(|param| Some((param.clone(), bindings.get(param)?.as_str())))
         .collect();
-    bind_user_function_args(&callee, target, &bound, caller_shapes, None)
+    bind_user_function_args(&callee, &callee.shapes, target, &bound, caller_shapes, None)
 }
 
 fn apply_matmul_shape(
