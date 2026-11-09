@@ -6895,8 +6895,8 @@ def running_ema(
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "init"), Some(&shape(&["features"])));
-        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "init"), None);
+        assert_eq!(find_shape(&analysis, "final_carry"), None);
         assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
         // `means` (ys): xs's leading "seq" axis prepended to the body's
@@ -6952,7 +6952,7 @@ class LSTMEncoder(eqx.Module):
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "step_h"), Some(&shape(&["hidden"])));
-        assert_eq!(find_shape(&analysis, "carry_final"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "carry_final"), None);
         assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "c_final"), Some(&shape(&["hidden"])));
         // `hs`: encoded's leading "seq" axis prepended to the body's
@@ -7123,6 +7123,18 @@ mod augmented_assignment_tests {
     }
 
     #[test]
+    fn test_unproven_right_side_evicts_the_shape() {
+        for (op, rhs) in [("@=", "w"), ("+=", "w"), ("*=", "w"), ("@=", "2")] {
+            let code = format!("def f(x: Float[Array, \"n 8\"], w):\n    x {op} {rhs}\n    y = x\n");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{op} {rhs}");
+            assert_eq!(find_shape(&analysis, "y"), None, "{op} {rhs}");
+        }
+        let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"a 8\"]):\n    n, m = x.shape\n    n += 1\n    z = jnp.zeros((n, m))\n";
+        assert_ne!(find_shape(&analyze(code), "z"), Some(&shape(&["a", "8"])));
+    }
+
+    #[test]
     fn test_plus_equals_with_call_rhs() {
         let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"batch f\"], y: Float[Array, \"batch f\"]):\n    x += jnp.exp(y)";
         let analysis = analyze(code);
@@ -7243,6 +7255,33 @@ mod symbolic_ctor_dim_tests {
             Some(&vec!["hidden_size".to_string()])
         );
     }
+
+    /// A user name with the text of a mark (`__free_`, `__is_`) cannot be
+    /// told apart from the mark, so its dim is unknown, never an integer.
+    #[test]
+    fn a_name_with_the_text_of_a_mark_gives_no_dim() {
+        let module = |init: &str, ctor: &str| {
+            format!("import torch.nn as nn\n{init}class M(nn.Module):\n    def __init__(self, n__is_3, __free_k):\n        self.l = nn.Linear(8, {ctor})\n    def forward(self, x: Float[Array, \"b 8\"], y: Float[Array, \"b 4\"]):\n        h = self.l(x)\n        z = h + y\n")
+        };
+        let function = |params: &str, size: &str| {
+            format!("import jax.numpy as jnp\ndef f({params}, y: Float[Array, \"4\"]):\n    h = jnp.zeros(({size},))\n    z = h + y\n")
+        };
+        for code in [
+            module("", "n__is_3"),
+            module("", "__free_k"),
+            module("__free_OUT = 4\n", "__free_OUT"),
+            module("__free_OUT__is_3 = 4\n", "__free_OUT__is_3"),
+            function("n__is_3", "n__is_3"),
+            function("__free_n__is_3", "__free_n__is_3"),
+            "def f(h: Float[Array, \"__free_n__is_3\"], y: Float[Array, \"4\"]):\n    z = h + y\n".to_string(),
+        ] {
+            let tree = parse(&code);
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &[], |_| None, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{code}: {:?}", analysis.errors);
+            let h = find_shape(&analysis, "h");
+            assert!(h.is_none_or(|h| h == &["?"]), "{code}: {h:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7356,7 +7395,7 @@ mod literal_binop_scan_method_tests {
         let code = "import jax\ndef f(h0: Float[Array, \"hidden\"], c0: Float[Array, \"hidden\"], xs: Float[Array, \"seq hidden\"]):\n    def body(carry, x):\n        return carry, x\n    final_carry, ys = jax.lax.scan(body, (h0, c0), xs)";
         let analysis = analyze(code);
 
-        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["hidden"])));
+        assert_eq!(find_shape(&analysis, "final_carry"), None);
     }
 
     #[test]
@@ -7372,8 +7411,8 @@ mod literal_binop_scan_method_tests {
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "init"), Some(&shape(&["features"])));
-        assert_eq!(find_shape(&analysis, "final_carry"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "init"), None);
+        assert_eq!(find_shape(&analysis, "final_carry"), None);
         assert_eq!(find_shape(&analysis, "final_mean"), Some(&shape(&["features"])));
         assert_eq!(find_shape(&analysis, "final_var"), Some(&shape(&["features"])));
         assert_eq!(
@@ -9518,6 +9557,24 @@ def f(a: Float[Array, \"3 4\"], b: Float[Array, \"5\"]):
         assert_eq!(find_shape(&analysis, "out_b"), Some(&shape(&["5"])));
     }
 
+    /// An error in the body of the callee names the variable of its own
+    /// statement, not the variable of the call.
+    #[test]
+    fn test_callee_body_error_keeps_its_own_variable() {
+        for (helper, variable) in [
+            ("def helper(a):\n    b = a + a.T\n    return b\n", "b"),
+            ("def helper(a):\n    return a + a.T\n", ""),
+        ] {
+            let code = format!("{helper}\ndef f(x: Float[Array, \"n 8\"]):\n    y = helper(x)\n");
+            let analysis = analyze(&code);
+            assert!(!analysis.errors.is_empty());
+            for error in &analysis.errors {
+                assert_eq!(error.variable, variable, "{:?}", analysis.errors);
+                assert_eq!(error.range.start_point.row, 1);
+            }
+        }
+    }
+
     /// Same as above but with three call sites and a keyword-argument call
     /// mixed in, to exercise both positional and keyword seeding across
     /// multiple independent specializations of the same scope.
@@ -11115,9 +11172,26 @@ mod unpack_and_broadcast_tests {
             "{HEADER}def f(h0: Float[Array, \"hid\"], c0: Float[Array, \"hid\"], xs: Float[Array, \"seq hid\"]):\n    def body(carry, x):\n        h, c = carry\n        return (h, c), x\n    init = (h0, c0)\n    fc, ys = jax.lax.scan(body, init, xs)\n    a, b = fc\n    s = (h0, c0)\n    p, q = s\n"
         );
         let analysis = analyze(&code);
-        for n in ["fc", "a", "b", "p", "q", "h", "c"] {
+        for n in ["a", "b", "p", "q", "h", "c"] {
             assert_eq!(find_shape(&analysis, n), Some(&shape(&["hid"])), "{n}");
         }
+        for n in ["fc", "init", "s"] {
+            assert_eq!(find_shape(&analysis, n), None, "{n}");
+        }
+    }
+
+    #[test]
+    fn test_a_tuple_carry_is_no_array_operand() {
+        let code = format!(
+            "{HEADER}def f(x: Float[Array, \"n 8\"], w: Float[Array, \"8 4\"]):\n    t = (x, x)\n    a = jnp.asarray(t)\n    b = t @ w\n    c, d = t\n"
+        );
+        let analysis = analyze(&code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for n in ["t", "a", "b"] {
+            assert_eq!(find_shape(&analysis, n), None, "{n}");
+        }
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["n", "8"])));
+        assert!(!analysis.assignment_shapes.iter().any(|r| r.name == "t"));
     }
 
     #[test]
@@ -11328,6 +11402,10 @@ mod branch_merge_tests {
         known(body, "a", &["5"]);
         let differ = "    while True:\n        if c:\n            a = jnp.zeros(6)\n            break\n        a = jnp.zeros(5)\n";
         unknown(differ, "a");
+        for rebind in ["for a in y:\n                pass", "with c as a:\n                pass", "import a"] {
+            let body = format!("    while True:\n        try:\n            a = jnp.zeros(5)\n            break\n        finally:\n            {rebind}\n");
+            unknown(&body, "a");
+        }
     }
 
     #[test]
@@ -11840,6 +11918,11 @@ mod comprehension_lambda_tests {
         known(&["out = jnp.stack([xs[i] for i in range(xs.shape[0])])"], "out", &["5", "3", "4"]);
         known(&["out = jnp.stack([w for _ in range(2, 5)])"], "out", &["3", "4", "2"]);
         known(&["out = jnp.stack([w for _ in range(5, 0, -2)])"], "out", &["3", "4", "2"]);
+        let max = i64::MAX;
+        unknown(&[&format!("out = jnp.stack([w for _ in range(-{max}, {max})])")], "out");
+        unknown(&[&format!("out = jnp.stack([w for _ in range({max}, -{max}, -1)])")], "out");
+        unknown(&["out = jnp.stack([w for _ in range(5, 0, -9223372036854775808)])"], "out");
+        known(&[&format!("out = jnp.stack([w for _ in range(0, {max}, {max})])")], "out", &["1", "4", "2"]);
     }
 
     #[test]
@@ -11931,6 +12014,9 @@ mod comprehension_lambda_tests {
         let a = run(&body(&["out = jnp.stack([y @ jnp.ones((i, 2)) for i in range(5, 7)])"]));
         assert!(a.errors.is_empty(), "{:?}", a.errors);
         let a = run(&body(&["out = y @ jnp.ones((7, 2))"]));
+        assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
+        // A loop variable named like a word of the message reads no dim.
+        let a = run(&body(&["out = jnp.stack([jnp.concatenate([y, v], axis=1) for axis in range(3)])"]));
         assert_eq!(a.errors.len(), 1, "{:?}", a.errors);
     }
 
@@ -12775,6 +12861,21 @@ mod imported_module_tests {
         );
         assert_eq!(find_shape(&analysis, "ok"), Some(&shape(&["n", "16"])));
         assert_eq!(find_shape(&analysis, "bad"), None);
+    }
+
+    #[test]
+    fn a_constant_named_like_a_word_of_the_message_keeps_the_error() {
+        for constant in ["width", "dim"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                &dir,
+                "scaled.py",
+                &format!("import torch.nn as nn\n\n{constant} = 2\n\nclass Scaled(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(4, 16)\n        self.k = {constant}\n\n    def forward(self, x):\n        return self.fc(x)\n"),
+            );
+            let code = format!("from scaled import Scaled\n{}", net("self.blk = Scaled()", "a = self.blk(x)"));
+            let analysis = analyze_in(dir.path(), &code, None);
+            assert_eq!(analysis.errors.len(), 1, "{constant}: {:?}", analysis.errors);
+        }
     }
 
     #[test]

@@ -423,6 +423,8 @@ impl Shift for ShapeError {
             kind: _,
             related,
             fix,
+            reads: _,
+            named: _,
         } = self;
         range.shift(by);
         if let Some((related_range, _)) = related {

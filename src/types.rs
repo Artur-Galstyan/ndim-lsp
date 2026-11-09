@@ -181,6 +181,23 @@ pub(crate) fn offset_dim(dim: &str, amount: i64) -> Option<String> {
 /// the symbol. It conflicts only with another integer.
 pub(crate) const LITERAL_DIM: &str = "__is_";
 
+/// Whether `text` holds a sequence that the analysis uses to mark a dim or to
+/// name an internal value. A user name with one cannot be told apart from a
+/// mark, so it enters no dim. The `__ndim` names of a probe are parameters of
+/// the probe function, and a probe gives no shape with such a name.
+pub(crate) fn has_mark(text: &str) -> bool {
+    [
+        FREE_DIM,
+        LITERAL_DIM,
+        crate::layers::UNPROVEN_DIM,
+        crate::layers::PADDING_NAME,
+        "__synth_",
+        "__ellipsis",
+    ]
+    .iter()
+    .any(|mark| text.contains(mark))
+}
+
 /// The integer of a dim that is one `LITERAL_DIM` name.
 pub(crate) fn literal_dim(dim: &str) -> Option<&str> {
     let (name, value) = dim.strip_prefix(FREE_DIM)?.rsplit_once(LITERAL_DIM)?;
@@ -411,8 +428,12 @@ pub fn canonicalize_dim(dim: &str) -> String {
 
 /// The sorted terms of a flat sum without its integers, with a `-` on a
 /// subtracted term, and the sum of the integers. `None` for a sign that does
-/// not start a term: `n*-1`.
+/// not start a term (`n*-1`), and for brackets or a division, which are no
+/// flat sum.
 fn flat_sum(stripped: &str) -> Option<(Vec<String>, i64)> {
+    if stripped.contains(['(', ')', '/']) {
+        return None;
+    }
     let mut integers = 0i64;
     let mut terms: Vec<String> = Vec::new();
     let mut rest = stripped;
@@ -474,9 +495,8 @@ fn fold_paren_cancellation(stripped: &str) -> Option<String> {
     let inner_op = inner_chars.next()?;
     let inner_lit: i64 = inner_chars.as_str().parse().ok()?;
 
-    let inner_signed = if inner_op == '-' { -inner_lit } else { inner_lit };
-    let outer_signed = if outer_op == '-' { -outer_lit } else { outer_lit };
-    if inner_signed + outer_signed == 0 {
+    let signed = |op: char, lit: i64| if op == '-' { lit.checked_neg() } else { Some(lit) };
+    if signed(inner_op, inner_lit)?.checked_add(signed(outer_op, outer_lit)?)? == 0 {
         Some(expr.to_string())
     } else {
         None
@@ -581,6 +601,31 @@ mod canonicalize_dim_tests {
         assert_eq!(canonicalize_dim("a-b-c"), canonicalize_dim("a-c-b"));
         assert_ne!(canonicalize_dim("a-b"), canonicalize_dim("b-a"));
         assert_eq!(canonicalize_dim("n*-1"), "n*-1");
+    }
+
+    #[test]
+    fn test_a_mark_is_found_anywhere_in_a_name() {
+        for name in ["__free_k", "n__is_3", "a__unproven", "__padding_p", "__synth_1", "__ellipsis0__"] {
+            assert!(has_mark(name), "{name}");
+        }
+        for name in ["n", "d_out", "__init__", "_free", "is_3"] {
+            assert!(!has_mark(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_brackets_are_no_flat_sum() {
+        assert!(!dims_conflict("(n+1)-1+1", "(n+1)"));
+        assert!(!dims_conflict("(n+1)", "(n+1)-1+1"));
+        assert!(dims_conflict("(n+1)", "n"));
+        assert!(dims_conflict("n-1", "n"));
+    }
+
+    #[test]
+    fn test_paren_cancellation_does_not_overflow() {
+        let max = i64::MAX;
+        assert_eq!(canonicalize_dim(&format!("(d+{max})+{max}")), format!("(d+{max})+{max}"));
+        assert_eq!(canonicalize_dim("(d-1)--9223372036854775808"), "(d-1)--9223372036854775808");
     }
 
     #[test]
@@ -1348,7 +1393,7 @@ pub enum ShapeFix {
     },
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct ShapeError {
     pub variable: String,
     pub message: String,
@@ -1360,6 +1405,24 @@ pub struct ShapeError {
     /// for errors that don't have a natural second location.
     pub related: Option<(Range, String)>,
     pub fix: Option<ShapeFix>,
+    /// The names that the source of the error reads, and the dim names of
+    /// their shapes, without marks. Filters test these, not the message.
+    /// Not part of equality.
+    pub(crate) reads: Vec<String>,
+    /// Whether the statement of the error gave `variable`, so that a statement
+    /// around it (a call into the function) keeps it. Not part of equality.
+    pub(crate) named: bool,
+}
+
+impl PartialEq for ShapeError {
+    fn eq(&self, other: &Self) -> bool {
+        self.variable == other.variable
+            && self.message == other.message
+            && self.range == other.range
+            && self.kind == other.kind
+            && self.related == other.related
+            && self.fix == other.fix
+    }
 }
 
 impl ShapeError {
@@ -1372,6 +1435,8 @@ impl ShapeError {
             kind: ShapeErrorKind::Mismatch,
             related: None,
             fix: None,
+            reads: Vec::new(),
+            named: false,
         }
     }
 
@@ -1390,6 +1455,8 @@ impl ShapeError {
             kind: ShapeErrorKind::Approximation,
             related: None,
             fix: None,
+            reads: Vec::new(),
+            named: false,
         }
     }
 

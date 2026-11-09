@@ -20,7 +20,7 @@
 
 use tree_sitter::Node;
 
-use super::modules::KEYWORDS;
+use super::modules::{KEYWORDS, PROBE_FUNCTION};
 use super::{
     NameBinding, ShapeCtx, collect_name_values, function_scope, literal_constant, nearest_binding,
     normalize_dim,
@@ -29,7 +29,7 @@ use crate::layers::{PADDING_NAME, UNPROVEN_DIM, map_layer_dims};
 use crate::python_ast::dim_symbols;
 use crate::types::{
     CallArgument, FREE_DIM, LITERAL_DIM, LayerKind, MAX_DIM_TEXT, UNKNOWN_DIM, dims_canonically_equal, factor_text,
-    fold_integers, is_free_dim, is_named_size, literal_dim, min_form, offset_dim,
+    fold_integers, has_mark, is_free_dim, is_named_size, literal_dim, min_form, offset_dim,
 };
 
 enum Value {
@@ -71,9 +71,20 @@ impl ShapeCtx<'_> {
         let from_argument = |dim: &str| {
             dim_symbols(dim).any(|name| values().flat_map(|v| dim_symbols(v)).any(|word| word == name))
         };
+        // A name of the file with the text of a mark.
+        let marked_name = |dim: &str| {
+            dim_symbols(dim).any(|name| {
+                has_mark(name)
+                    && !self.synthetic_text.contains_key(name)
+                    && values().flat_map(|v| dim_symbols(v)).any(|word| word == name)
+            })
+        };
         shape
             .into_iter()
             .map(|dim| {
+                if marked_name(&dim) {
+                    return UNPROVEN_DIM.to_string();
+                }
                 if dim.contains(FREE_DIM) || !from_argument(&dim) {
                     return dim;
                 }
@@ -241,7 +252,14 @@ impl ShapeCtx<'_> {
 
     fn word_value(&self, word: &str, at: Node) -> Value {
         if let Some(name) = word.strip_prefix(FREE_DIM) {
-            return Value::Free(name.to_string());
+            // The file may bind the marked text itself as a name. The probe
+            // function takes marked dims of the caller as parameters.
+            let (owner, binding) = nearest_binding(at, word, self);
+            let probe = owner.kind() == "function_definition"
+                && owner.child_by_field_name("name").and_then(|n| self.text.get(n.byte_range()))
+                    == Some(PROBE_FUNCTION);
+            let user = has_mark(name) || !(matches!(binding, NameBinding::Unbound) || probe);
+            return if user { Value::Unproven } else { Value::Free(name.to_string()) };
         }
         if let Some(name) = word.strip_prefix(PADDING_NAME) {
             return match self.word_value(name, at) {
@@ -258,6 +276,9 @@ impl ShapeCtx<'_> {
     }
 
     fn name_value(&self, name: &str, at: Node) -> Value {
+        if has_mark(name) {
+            return Value::Unproven;
+        }
         let (owner, binding) = nearest_binding(at, name, self);
         let parameter = owner.kind() == "function_definition"
             && function_scope(owner, self)

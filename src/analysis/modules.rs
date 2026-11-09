@@ -76,7 +76,7 @@ pub(crate) const LIBRARIES: [&str; 18] = [
     "abc",
 ];
 
-const PROBE_FUNCTION: &str = "__ndim_probe__";
+pub(super) const PROBE_FUNCTION: &str = "__ndim_probe__";
 const PROBE_OUTPUT: &str = "__ndim_out__";
 
 thread_local! {
@@ -1536,10 +1536,7 @@ fn run_probe(
     }
     let mut messages: Vec<String> = Vec::new();
     for error in errors {
-        let foreign = error
-            .message
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|word| constants.contains(word.strip_prefix(FREE_DIM).unwrap_or(word)));
+        let foreign = error.reads.iter().any(|name| constants.contains(name));
         if (!has_probe_name(&error.message) || error.message.contains("__ndim_a"))
             && !foreign
             && !messages.contains(&error.message)

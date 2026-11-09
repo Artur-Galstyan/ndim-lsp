@@ -1547,7 +1547,7 @@ fn build_golden() -> String {
     serde_json::to_string_pretty(&Value::Object(out)).unwrap() + "\n"
 }
 
-const INTERNAL_PREFIXES: [&str; 4] = ["__synth_", "__ellipsis", "__free_", "__unproven"];
+const INTERNAL_PREFIXES: [&str; 6] = ["__synth_", "__ellipsis", "__free_", "__unproven", "__ndim", "__padding_"];
 
 fn assert_no_internal_names(golden: &str) {
     for prefix in INTERNAL_PREFIXES {
