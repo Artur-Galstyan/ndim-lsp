@@ -263,13 +263,49 @@ fn a_helper_buffer_equal_to_the_disk_does_not_republish() {
 }
 
 fn check(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let (code, out, _) = check_with_summary(dir, args);
+    (code, out)
+}
+
+fn check_with_summary(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     let out = std::process::Command::new(common::BIN)
         .arg("check")
         .args(args)
         .current_dir(dir)
         .output()
         .unwrap();
-    (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// A directory walk skips environments and build output, an explicit file
+/// always runs, files run once in sorted order, a `src` layout resolves from
+/// the project root, and stderr gets a summary.
+#[test]
+fn check_mode_walks_a_project_like_a_compiler() {
+    let bad = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    y = a @ b\n";
+    let helper = "from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"b d\"]) -> Float[Array, \"b 5\"]:\n    return x\n";
+    let user = "from jaxtyping import Float, Array\nimport pkg.other\n\ndef f(x: Float[Array, \"b 4\"], v: Float[Array, \"4 3\"]):\n    y = pkg.other.proj(x) @ v\n";
+    let (_dir, root) = project(&[]);
+    for dir in [".venv", "venv", "node_modules", "build", "dist", "__pycache__", "lib/site-packages", ".git", "src/pkg", "z"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        if dir != "src/pkg" {
+            std::fs::write(root.join(dir).join("bad.py"), bad).unwrap();
+        }
+    }
+    std::fs::write(root.join("src/pkg/__init__.py"), "").unwrap();
+    std::fs::write(root.join("src/pkg/other.py"), helper).unwrap();
+    std::fs::write(root.join("src/pkg/mod.py"), user).unwrap();
+    std::fs::write(root.join("a.py"), bad).unwrap();
+    let (code, out, summary) = check_with_summary(&root, &["z", ".", ".venv/bad.py"]);
+    assert_eq!(code, 1, "{out}");
+    let files: Vec<&str> = out.lines().map(|l| l.split(':').next().unwrap()).collect();
+    assert_eq!(files, ["./a.py", "./src/pkg/mod.py", "./z/bad.py", ".venv/bad.py"], "{out}");
+    assert!(out.contains("./src/pkg/mod.py:5:9: error: y: matmul dimension mismatch"), "{out}");
+    assert_eq!(summary, "6 files, 4 errors, 0 warnings\n");
 }
 
 #[test]
@@ -293,4 +329,24 @@ fn check_mode_prints_diagnostics_like_a_compiler() {
     );
     let (code, _) = check(&root, &[]);
     assert_eq!(code, 2);
+}
+
+/// The server resolves a `src` layout of a workspace folder, but not a `src`
+/// that is a package itself.
+#[test]
+fn server_resolves_a_src_layout() {
+    let helper = "from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"b d\"]) -> Float[Array, \"b 5\"]:\n    return x\n";
+    let user = "from jaxtyping import Float, Array\nimport pkg.other\n\ndef f(x: Float[Array, \"b 4\"], v: Float[Array, \"4 3\"]):\n    y = pkg.other.proj(x) @ v\n";
+    for (package, want) in [(false, 1), (true, 0)] {
+        let (_dir, root) = project(&[]);
+        std::fs::create_dir_all(root.join("src/pkg")).unwrap();
+        std::fs::write(root.join("src/pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("src/pkg/other.py"), helper).unwrap();
+        if package {
+            std::fs::write(root.join("src/__init__.py"), "").unwrap();
+        }
+        let mut c = Client::start(&root, json!({}));
+        let got = c.open(&file_uri(&root.join("src/pkg/mod.py")), user);
+        assert_eq!(got.len(), want, "src is a package: {package}: {got:?}");
+    }
 }

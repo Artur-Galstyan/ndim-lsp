@@ -7,12 +7,15 @@ use std::sync::Arc;
 use ndim_lsp::{ShapeErrorKind, new_resolution_cache};
 
 use crate::sync::{Encoding, LineIndex};
-use crate::{Buffers, CachedAnalysis, analyze_text, assignment_line, python_site_packages_roots};
+use crate::{
+    Buffers, CachedAnalysis, analyze_text, assignment_line, python_site_packages_roots, with_src_layout,
+};
 
 const USAGE: &str = "usage: ndim-lsp check [--shapes] <path>...";
 
 /// Run the check of `args` (the arguments after `check`). Returns the exit
 /// code: 1 if a shape mismatch was found, 2 for a usage or read error, else 0.
+/// Files run in sorted path order. A summary line goes to stderr.
 pub fn run(args: &[String]) -> i32 {
     let shapes = args.iter().any(|a| a == "--shapes");
     let paths: Vec<&String> = args.iter().filter(|a| *a != "--shapes").collect();
@@ -32,11 +35,16 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     }
+    files.sort();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
     let root = std::env::current_dir().unwrap_or_default();
-    let mut search_roots = vec![root.clone()];
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let mut search_roots = with_src_layout(std::slice::from_ref(&root));
     search_roots.extend(python_site_packages_roots(&[root]));
     let cache = new_resolution_cache();
     let mut code = 0;
+    let (mut analyzed, mut errors, mut warnings) = (0, 0, 0);
     for file in files {
         let Ok(text) = std::fs::read_to_string(&file) else {
             eprintln!("{}: cannot read the file", file.display());
@@ -54,6 +62,7 @@ pub fn run(args: &[String]) -> i32 {
                 continue;
             }
         };
+        analyzed += 1;
         let path = file.display();
         let lines = LineIndex::new(&text);
         for error in &run.analysis.errors {
@@ -61,9 +70,13 @@ pub fn run(args: &[String]) -> i32 {
             let severity = match error.kind {
                 ShapeErrorKind::Mismatch => {
                     code = code.max(1);
+                    errors += 1;
                     "error"
                 }
-                ShapeErrorKind::Approximation => "warning",
+                ShapeErrorKind::Approximation => {
+                    warnings += 1;
+                    "warning"
+                }
             };
             let message = if error.variable.is_empty() {
                 error.message.clone()
@@ -92,10 +105,14 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
+    eprintln!("{analyzed} files, {errors} errors, {warnings} warnings");
     code
 }
 
-/// The `*.py` files under `dir`, sorted, without hidden directories.
+/// Directories that a walk skips: environments, build output, and caches.
+const SKIPPED: [&str; 7] = [".venv", "venv", "node_modules", "build", "dist", "__pycache__", "site-packages"];
+
+/// The `*.py` files under `dir`, without hidden and `SKIPPED` directories.
 fn python_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -103,9 +120,9 @@ fn python_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
-        let hidden = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
         if path.is_dir() {
-            if !hidden {
+            if !name.starts_with('.') && !SKIPPED.contains(&&*name) {
                 python_files(&path, out);
             }
         } else if path.extension().is_some_and(|e| e == "py") {

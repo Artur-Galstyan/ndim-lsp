@@ -37,8 +37,9 @@ use crate::types::*;
 /// exist, has a stamp, and each entry knows which paths it looked at.
 /// `revalidate` compares the stamps with the disk and drops only the entries
 /// that looked at a changed path, so a saved, created, or deleted file never
-/// leaves a stale entry. Imports always read the disk, never an unsaved
-/// editor buffer.
+/// leaves a stale entry. Imports read files through the caller's `read_file`,
+/// which in the server gives the editor text of an open document; a change
+/// of that text drops entries through `buffer_changed`.
 pub struct ResolutionCache {
     pub map: std::sync::RwLock<ResolvedMap>,
     /// Session-lifetime cache for extracted jaxtyping `FunctionShapeScope`s of
@@ -568,6 +569,14 @@ where
     if target.dots > 0 || target.parts.is_empty() {
         return None;
     }
+    // As `sys.path`: the first root with the top-level package or module owns
+    // it and its submodules. A namespace package (no `__init__.py`) has no
+    // owner, so every root is searched.
+    let owner = search_roots.iter().find(|root| {
+        let top = root.join(&target.parts[0]);
+        probe(&top.join("__init__.py"), probes) || probe(&top.with_extension("py"), probes)
+    });
+    let search_roots = owner.map_or(search_roots, std::slice::from_ref);
 
     for len in (1..=target.parts.len()).rev() {
         let module_parts = &target.parts[..len];
@@ -732,7 +741,8 @@ where
         return resolve_implementation(start, &roots, read_file, max_depth, cache);
     }
     let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
-    // Cache lookup — only for absolute (dots==0) targets with non-empty parts.
+    // Cache lookup for non-empty targets. A relative target of the document
+    // was made absolute above, so it uses the cache too.
     if start.dots == 0
         && !start.parts.is_empty()
         && let Some(cache) = cache
@@ -1476,6 +1486,35 @@ mod resolve_implementation_tests {
         for (files, target, expected) in cases {
             let expected = expected.clone().map(|(file, symbol)| (file.to_string(), symbol));
             assert_eq!(resolve_in(files, target), expected, "{target:?} in {files:?}");
+        }
+    }
+
+    /// The first root with the top-level package or module owns it, as in
+    /// `sys.path`. Its submodules come from that root only. A name with no
+    /// regular package (a namespace package) is looked up in every root.
+    #[test]
+    fn test_first_root_owns_the_top_level_package() {
+        type Case<'a> = (&'a [&'a str], &'a [&'a str], &'a [&'a str], Option<&'a str>);
+        let cases: &[Case] = &[
+            (&["pkg/__init__.py"], &["pkg/__init__.py", "pkg/sub.py"], &["pkg", "sub", "f"], None),
+            (&["pkg.py"], &["pkg/__init__.py", "pkg/sub.py"], &["pkg", "sub", "f"], None),
+            (&["pkg/__init__.py", "pkg/sub.py"], &["pkg/__init__.py", "pkg/sub.py"], &["pkg", "sub", "f"], Some("a/pkg/sub.py")),
+            (&["other/__init__.py"], &["pkg/__init__.py", "pkg/sub.py"], &["pkg", "sub", "f"], Some("b/pkg/sub.py")),
+            (&["ns/x.py"], &["ns/sub.py"], &["ns", "sub", "f"], Some("b/ns/sub.py")),
+        ];
+        for (a, b, target, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            for (root, files) in [("a", a), ("b", b)] {
+                for file in files.iter() {
+                    let path = tmp.path().join(root).join(file);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, "def f(): pass").unwrap();
+                }
+            }
+            let roots = vec![tmp.path().join("a"), tmp.path().join("b")];
+            let found = resolve_implementation(self::target(target), &roots, read, 10, None).unwrap();
+            let file = found.map(|f| f.target.file_path.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned());
+            assert_eq!(file.as_deref(), *expected, "{a:?} then {b:?}");
         }
     }
 
@@ -2533,5 +2572,102 @@ mod record_deps_tests {
         let paths: Vec<_> = outer.paths.iter().map(|(p, _)| p.to_str().unwrap()).collect();
         assert_eq!(paths, ["/inner.py", "/outer.py"]);
         assert!(cache.deps_valid(&outer));
+    }
+
+}
+
+#[cfg(test)]
+mod relative_import_tests {
+    use super::*;
+    use std::fs;
+
+    fn parse(text: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    fn read(p: &PathBuf) -> Option<String> {
+        fs::read_to_string(p).ok()
+    }
+
+    /// `<tmp>/pkg/__init__.py`, `<tmp>/pkg/sub/__init__.py`, and `files`.
+    fn package(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for (name, text) in [("pkg/__init__.py", ""), ("pkg/sub/__init__.py", "")].iter().chain(files) {
+            fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+            fs::write(root.join(name), text).unwrap();
+        }
+        (tmp, root)
+    }
+
+    /// The memo of a document sees a save of the file that a relative import
+    /// of the document names, as for an absolute import.
+    #[test]
+    fn a_memo_sees_a_saved_relative_import() {
+        let helper = |ret: &str| {
+            format!("from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"b d\"], w: Float[Array, \"d k\"]) -> Float[Array, \"{ret}\"]:\n    return x @ w\n")
+        };
+        let cases = [
+            ("pkg/main.py", "from .helpers import proj", "proj"),
+            ("pkg/main.py", "from . import helpers", "helpers.proj"),
+            ("pkg/sub/main.py", "from .. import helpers", "helpers.proj"),
+        ];
+        for (document, import, call) in cases {
+            let (_tmp, root) = package(&[("pkg/helpers.py", &helper("b k"))]);
+            let path = root.join("pkg/helpers.py");
+            let roots = vec![root.clone()];
+            let cache = new_resolution_cache();
+            let text = format!(
+                "from jaxtyping import Float, Array\n{import}\n\ndef f(x: Float[Array, \"b 4\"], w: Float[Array, \"4 8\"], v: Float[Array, \"8 3\"]):\n    y = {call}(x, w) @ v\n"
+            );
+            let tree = parse(&text);
+            let mut memo = crate::incremental::UnitMemo::default();
+            let errors = |memo: &mut crate::incremental::UnitMemo| {
+                with_document(Some(&root.join(document)), || {
+                    crate::analysis::analyze_layer_shapes_with_memo(
+                        tree.root_node(), &text, &roots, read, 8, Some(&cache), memo,
+                    )
+                    .unwrap()
+                    .errors
+                    .len()
+                })
+            };
+            assert_eq!(errors(&mut memo), 0, "{import}");
+            assert_eq!(errors(&mut memo), 0, "{import}");
+            assert!(memo.stats().layer_hits > 0, "{import}: no memo reuse");
+            fs::write(&path, helper("b d")).unwrap();
+            cache.revalidate(std::slice::from_ref(&path));
+            assert_eq!(errors(&mut memo), 1, "{import}: stale memo after a save");
+        }
+    }
+
+    /// A module class of another file is analyzed without the path of the
+    /// document: its relative import does not resolve next to the document.
+    /// The same import written absolute gives the shape.
+    #[test]
+    fn a_nested_analysis_does_not_see_the_document() {
+        let block = |import: &str| {
+            format!("import torch.nn as nn\nfrom jaxtyping import Float, Array\nfrom {import} import proj\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, x: Float[Array, \"n 8\"]):\n        return proj(x)\n")
+        };
+        let helper = "from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"n 8\"]) -> Float[Array, \"n 5\"]:\n    return x\n";
+        let main = "from jaxtyping import Float, Array\nfrom pkg.blocks import Block\n\ndef f(x: Float[Array, \"n 8\"]):\n    y = Block()(x)\n";
+        for (import, want) in [("pkg.sub.helpers", Some(vec!["n".to_string(), "5".to_string()])), (".helpers", None)] {
+            let (_tmp, root) = package(&[("pkg/sub/helpers.py", helper), ("pkg/blocks.py", &block(import))]);
+            let roots = vec![root.clone()];
+            let cache = new_resolution_cache();
+            let tree = parse(main);
+            let analysis = with_document(Some(&root.join("pkg/sub/main.py")), || {
+                crate::analysis::analyze_layer_shapes(tree.root_node(), main, &roots, read, 8, Some(&cache)).unwrap()
+            });
+            let y = analysis
+                .scopes
+                .iter()
+                .find(|s| s.function_name.as_deref() == Some("f"))
+                .and_then(|s| s.shapes.get("y"))
+                .cloned();
+            assert_eq!(y, want, "{import}");
+        }
     }
 }

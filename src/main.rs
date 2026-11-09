@@ -1811,6 +1811,20 @@ fn python_site_packages_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
     result
 }
 
+/// `roots`, each followed by its `src` directory when that exists and is not
+/// a package itself (the `src` layout of a project).
+fn with_src_layout(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        out.push(root.clone());
+        let src = root.join("src");
+        if src.is_dir() && !src.join("__init__.py").exists() {
+            out.push(src);
+        }
+    }
+    out
+}
+
 struct AnalysisRun {
     analysis: LayerShapeAnalysis,
     tree: Tree,
@@ -1838,7 +1852,7 @@ fn compute_analysis(
     buffers: &Buffers,
 ) -> std::result::Result<AnalysisRun, String> {
     let t_roots = Instant::now();
-    let mut search_roots = workspace_roots.to_vec();
+    let mut search_roots = with_src_layout(workspace_roots);
     search_roots.extend(python_site_packages_roots(workspace_roots));
     let roots_ms = t_roots.elapsed().as_millis();
     let mut run = analyze_text(text, base, &search_roots, resolution_cache, buffers, *VERIFY)?;
