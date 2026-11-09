@@ -36,79 +36,24 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
 
     if is_jax_numpy || is_numpy {
         return match name.as_str() {
-            "concatenate" | "concat" => Some(KnownFunction::Concatenate),
-            "stack" => Some(KnownFunction::Stack),
-            "reshape" => Some(KnownFunction::Reshape),
             "transpose" => Some(KnownFunction::Transpose),
             "expand_dims" => Some(KnownFunction::ExpandDims),
-            "squeeze" => Some(KnownFunction::Squeeze),
-            "sum" => Some(KnownFunction::Sum),
-            "mean" => Some(KnownFunction::Mean),
             "max" | "amax" => Some(KnownFunction::Max),
             "min" | "amin" => Some(KnownFunction::Min),
             "minmax" if is_jax_numpy => Some(KnownFunction::MinMax),
-            "prod" => Some(KnownFunction::Prod),
-            "std" => Some(KnownFunction::Std),
-            "var" => Some(KnownFunction::Var),
-            "all" => Some(KnownFunction::All),
-            "any" => Some(KnownFunction::Any),
-            "argmax" => Some(KnownFunction::ArgMax),
-            "argmin" => Some(KnownFunction::ArgMin),
-            "argsort" => Some(KnownFunction::Argsort),
-            "sort" => Some(KnownFunction::Sort),
-            "cumsum" => Some(KnownFunction::Cumsum),
-            "cumprod" => Some(KnownFunction::Cumprod),
-            "matmul" => Some(KnownFunction::Matmul),
-            "dot" => Some(KnownFunction::Dot),
-            "tensordot" => Some(KnownFunction::TensorDot),
-            "outer" => Some(KnownFunction::Outer),
-            "inner" => Some(KnownFunction::Inner),
             "vdot" => Some(KnownFunction::Vdot),
-            "einsum" => Some(KnownFunction::Einsum),
             "split" => Some(KnownFunction::Split),
             "array_split" => Some(KnownFunction::ArraySplit),
-            "tile" => Some(KnownFunction::Tile),
-            "repeat" => Some(KnownFunction::Repeat),
             "flatten" => Some(KnownFunction::Flatten),
-            "ravel" => Some(KnownFunction::Ravel),
             "moveaxis" => Some(KnownFunction::MoveAxis),
-            "swapaxes" => Some(KnownFunction::SwapAxes),
-            "where" => Some(KnownFunction::Where),
-            "clip" => Some(KnownFunction::Clamp),
             "zeros" => Some(KnownFunction::Zeros),
             "ones" => Some(KnownFunction::Ones),
-            "full" => Some(KnownFunction::Full),
             "empty" => Some(KnownFunction::Empty),
-            "zeros_like" => Some(KnownFunction::ZerosLike),
-            "ones_like" => Some(KnownFunction::OnesLike),
-            "full_like" => Some(KnownFunction::FullLike),
-            "empty_like" => Some(KnownFunction::EmptyLike),
-            "arange" => Some(KnownFunction::Arange),
-            "linspace" => Some(KnownFunction::Linspace),
             "logspace" => Some(KnownFunction::Logspace),
-            "eye" => Some(KnownFunction::Eye),
             "identity" => Some(KnownFunction::Identity),
-            "broadcast_to" => Some(KnownFunction::BroadcastTo),
             "broadcast_arrays" => Some(KnownFunction::BroadcastArrays),
-            "atleast_1d" => Some(KnownFunction::AtLeast1D),
-            "atleast_2d" => Some(KnownFunction::AtLeast2D),
-            "atleast_3d" => Some(KnownFunction::AtLeast3D),
             "pad" if is_numpy => Some(KnownFunction::NumpyPad),
             "pad" => Some(KnownFunction::Pad),
-            "roll" => Some(KnownFunction::Roll),
-            "flip" | "fliplr" | "flipud" => Some(KnownFunction::Flip),
-            "rot90" => Some(KnownFunction::Rot90),
-            "take" => Some(KnownFunction::Take),
-            "diag" => Some(KnownFunction::Diag),
-            "diagonal" => Some(KnownFunction::Diagonal),
-            "trace" => Some(KnownFunction::Trace),
-            "triu" => Some(KnownFunction::Triu),
-            "tril" => Some(KnownFunction::Tril),
-            "meshgrid" => Some(KnownFunction::Meshgrid),
-            "vstack" | "row_stack" => Some(KnownFunction::Vstack),
-            "hstack" => Some(KnownFunction::Hstack),
-            "dstack" => Some(KnownFunction::Dstack),
-            "column_stack" => Some(KnownFunction::ColumnStack),
             "block" => Some(KnownFunction::Block),
             "array" => Some(KnownFunction::Array),
             "asarray" => Some(KnownFunction::AsArray),
@@ -116,7 +61,6 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "tri" => Some(KnownFunction::Tri),
             "indices" => Some(KnownFunction::Indices),
             "bincount" => Some(KnownFunction::BinCount),
-            "unique" => Some(KnownFunction::Unique),
             "select" => Some(KnownFunction::Select),
             "rollaxis" => Some(KnownFunction::RollAxis),
             "resize" => Some(KnownFunction::Resize),
@@ -141,80 +85,28 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "count_nonzero" => Some(KnownFunction::Sum),
             "ptp" => Some(KnownFunction::Max),
             "cross" => Some(KnownFunction::Cross),
-            _ => None,
+            _ => classify_array_function(name),
         };
     }
 
     if is_torch {
         return match name.as_str() {
-            "cat" | "concat" | "concatenate" => Some(KnownFunction::Concatenate),
-            "stack" => Some(KnownFunction::Stack),
-            "reshape" => Some(KnownFunction::Reshape),
-            "transpose" | "swapaxes" | "swapdims" => Some(KnownFunction::SwapAxes),
+            "cat" => Some(KnownFunction::Concatenate),
+            "transpose" | "swapdims" => Some(KnownFunction::SwapAxes),
             "unsqueeze" => Some(KnownFunction::ExpandDims),
-            "squeeze" => Some(KnownFunction::Squeeze),
-            "sum" => Some(KnownFunction::Sum),
-            "mean" => Some(KnownFunction::Mean),
             "max" | "min" => Some(KnownFunction::TorchMaxMin),
-            "prod" => Some(KnownFunction::Prod),
-            "std" => Some(KnownFunction::Std),
-            "var" => Some(KnownFunction::Var),
-            "matmul" => Some(KnownFunction::Matmul),
             "bmm" => Some(KnownFunction::Bmm),
-            "dot" => Some(KnownFunction::Dot),
-            "tensordot" => Some(KnownFunction::TensorDot),
-            "outer" => Some(KnownFunction::Outer),
-            "inner" => Some(KnownFunction::Inner),
-            "einsum" => Some(KnownFunction::Einsum),
             // Real torch `split` semantics: 2nd arg is a chunk *size*, not a
             // section count. `tensor_split` keeps numpy/jnp `array_split`
             // semantics (verified against torch docs).
             "split" => Some(KnownFunction::TorchSplit),
             "tensor_split" => Some(KnownFunction::ArraySplit),
-            "tile" => Some(KnownFunction::Tile),
-            "repeat" => Some(KnownFunction::Repeat),
             "flatten" => Some(KnownFunction::TorchFlatten),
-            "ravel" => Some(KnownFunction::Ravel),
-            "where" => Some(KnownFunction::Where),
-            "clip" | "clamp" => Some(KnownFunction::Clamp),
-            "all" => Some(KnownFunction::All),
-            "any" => Some(KnownFunction::Any),
-            "argmax" => Some(KnownFunction::ArgMax),
-            "argmin" => Some(KnownFunction::ArgMin),
-            "argsort" => Some(KnownFunction::Argsort),
-            "sort" => Some(KnownFunction::Sort),
-            "cumsum" => Some(KnownFunction::Cumsum),
-            "cumprod" => Some(KnownFunction::Cumprod),
+            "clamp" => Some(KnownFunction::Clamp),
             "zeros" | "ones" | "empty" | "rand" | "randn" => {
                 Some(KnownFunction::TorchSizeConstructor)
             }
-            "full" => Some(KnownFunction::Full),
-            "zeros_like" => Some(KnownFunction::ZerosLike),
-            "ones_like" => Some(KnownFunction::OnesLike),
-            "full_like" => Some(KnownFunction::FullLike),
-            "empty_like" => Some(KnownFunction::EmptyLike),
-            "arange" => Some(KnownFunction::Arange),
-            "linspace" => Some(KnownFunction::Linspace),
-            "eye" => Some(KnownFunction::Eye),
-            "broadcast_to" => Some(KnownFunction::BroadcastTo),
             "broadcast_tensors" => Some(KnownFunction::BroadcastArrays),
-            "atleast_1d" => Some(KnownFunction::AtLeast1D),
-            "atleast_2d" => Some(KnownFunction::AtLeast2D),
-            "atleast_3d" => Some(KnownFunction::AtLeast3D),
-            "roll" => Some(KnownFunction::Roll),
-            "flip" | "fliplr" | "flipud" => Some(KnownFunction::Flip),
-            "rot90" => Some(KnownFunction::Rot90),
-            "take" => Some(KnownFunction::Take),
-            "diag" => Some(KnownFunction::Diag),
-            "diagonal" => Some(KnownFunction::Diagonal),
-            "trace" => Some(KnownFunction::Trace),
-            "triu" => Some(KnownFunction::Triu),
-            "tril" => Some(KnownFunction::Tril),
-            "meshgrid" => Some(KnownFunction::Meshgrid),
-            "vstack" | "row_stack" => Some(KnownFunction::Vstack),
-            "hstack" => Some(KnownFunction::Hstack),
-            "dstack" => Some(KnownFunction::Dstack),
-            "column_stack" => Some(KnownFunction::ColumnStack),
             "permute" => Some(KnownFunction::Permute),
             "tensor" => Some(KnownFunction::Array),
             "as_tensor" => Some(KnownFunction::AsArray),
@@ -231,11 +123,10 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "index_select" => Some(KnownFunction::IndexSelect),
             "kthvalue" => Some(KnownFunction::KthValue),
             "median" | "mode" => Some(KnownFunction::MedianDim),
-            "unique" => Some(KnownFunction::Unique),
             "combinations" => Some(KnownFunction::Combinations),
             "cartesian_prod" => Some(KnownFunction::CartesianProd),
             "block_diag" => Some(KnownFunction::BlockDiag),
-            _ => None,
+            _ => classify_array_function(name),
         };
     }
 
@@ -257,19 +148,15 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "avg_pool1d" => Some(KnownFunction::FunctionalAvgPool1d),
             "avg_pool2d" => Some(KnownFunction::FunctionalAvgPool2d),
             "avg_pool3d" => Some(KnownFunction::FunctionalAvgPool3d),
-            "softmax" | "log_softmax" | "normalize" => Some(KnownFunction::Copy),
             "one_hot" => Some(KnownFunction::OneHot),
             "cross_entropy" => Some(KnownFunction::CrossEntropy),
             "nll_loss" => Some(KnownFunction::NllLoss),
             "embedding" => Some(KnownFunction::FunctionalEmbedding),
-            // Full activation family: all shape-preserving (elementwise),
-            // same rule as `softmax`/`log_softmax`/`normalize` above.
-            "relu" | "relu6" | "gelu" | "silu" | "sigmoid" | "tanh" | "softplus"
-            | "softsign" | "selu" | "celu" | "elu" | "leaky_relu" | "hardtanh"
-            | "hardswish" | "hardsigmoid" | "mish" => Some(KnownFunction::Copy),
-            // Dropout family: shape-preserving (a no-op at inference / same
-            // rule as `torch.nn.Dropout*` layers).
-            "dropout" | "dropout2d" | "dropout3d" => Some(KnownFunction::Copy),
+            // Activations, normalization, and dropout keep the shape.
+            "softmax" | "log_softmax" | "normalize" | "relu" | "relu6" | "gelu" | "silu"
+            | "sigmoid" | "tanh" | "softplus" | "softsign" | "selu" | "celu" | "elu"
+            | "leaky_relu" | "hardtanh" | "hardswish" | "hardsigmoid" | "mish" | "dropout"
+            | "dropout2d" | "dropout3d" => Some(KnownFunction::Copy),
             // `glu` halves a dim rather than preserving shape.
             "glu" => Some(KnownFunction::FunctionalGlu),
             _ => None,
@@ -390,16 +277,72 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     None
 }
 
+/// The names with one rule in `numpy`, `jax.numpy`, and `torch`.
+fn classify_array_function(name: &str) -> Option<KnownFunction> {
+    match name {
+        "concatenate" | "concat" => Some(KnownFunction::Concatenate),
+        "swapaxes" => Some(KnownFunction::SwapAxes),
+        "clip" => Some(KnownFunction::Clamp),
+        "stack" => Some(KnownFunction::Stack),
+        "reshape" => Some(KnownFunction::Reshape),
+        "squeeze" => Some(KnownFunction::Squeeze),
+        "sum" => Some(KnownFunction::Sum),
+        "mean" => Some(KnownFunction::Mean),
+        "prod" => Some(KnownFunction::Prod),
+        "std" => Some(KnownFunction::Std),
+        "var" => Some(KnownFunction::Var),
+        "all" => Some(KnownFunction::All),
+        "any" => Some(KnownFunction::Any),
+        "argmax" => Some(KnownFunction::ArgMax),
+        "argmin" => Some(KnownFunction::ArgMin),
+        "argsort" => Some(KnownFunction::Argsort),
+        "sort" => Some(KnownFunction::Sort),
+        "cumsum" => Some(KnownFunction::Cumsum),
+        "cumprod" => Some(KnownFunction::Cumprod),
+        "matmul" => Some(KnownFunction::Matmul),
+        "dot" => Some(KnownFunction::Dot),
+        "tensordot" => Some(KnownFunction::TensorDot),
+        "outer" => Some(KnownFunction::Outer),
+        "inner" => Some(KnownFunction::Inner),
+        "einsum" => Some(KnownFunction::Einsum),
+        "tile" => Some(KnownFunction::Tile),
+        "repeat" => Some(KnownFunction::Repeat),
+        "ravel" => Some(KnownFunction::Ravel),
+        "where" => Some(KnownFunction::Where),
+        "full" => Some(KnownFunction::Full),
+        "zeros_like" => Some(KnownFunction::ZerosLike),
+        "ones_like" => Some(KnownFunction::OnesLike),
+        "full_like" => Some(KnownFunction::FullLike),
+        "empty_like" => Some(KnownFunction::EmptyLike),
+        "arange" => Some(KnownFunction::Arange),
+        "linspace" => Some(KnownFunction::Linspace),
+        "eye" => Some(KnownFunction::Eye),
+        "broadcast_to" => Some(KnownFunction::BroadcastTo),
+        "atleast_1d" => Some(KnownFunction::AtLeast1D),
+        "atleast_2d" => Some(KnownFunction::AtLeast2D),
+        "atleast_3d" => Some(KnownFunction::AtLeast3D),
+        "roll" => Some(KnownFunction::Roll),
+        "flip" | "fliplr" | "flipud" => Some(KnownFunction::Flip),
+        "rot90" => Some(KnownFunction::Rot90),
+        "take" => Some(KnownFunction::Take),
+        "diag" => Some(KnownFunction::Diag),
+        "diagonal" => Some(KnownFunction::Diagonal),
+        "trace" => Some(KnownFunction::Trace),
+        "triu" => Some(KnownFunction::Triu),
+        "tril" => Some(KnownFunction::Tril),
+        "meshgrid" => Some(KnownFunction::Meshgrid),
+        "vstack" | "row_stack" => Some(KnownFunction::Vstack),
+        "hstack" => Some(KnownFunction::Hstack),
+        "dstack" => Some(KnownFunction::Dstack),
+        "column_stack" => Some(KnownFunction::ColumnStack),
+        "unique" => Some(KnownFunction::Unique),
+        _ => None,
+    }
+}
+
 fn parse_simple_sequence_names(value: &str) -> Option<Vec<String>> {
     let trimmed = value.trim();
-    let inner = if (trimmed.starts_with('[') && trimmed.ends_with(']'))
-        || (trimmed.starts_with('(') && trimmed.ends_with(')'))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-
+    let inner = bracket_inner(trimmed).unwrap_or(trimmed);
     let names = split_top_level(inner)
         .into_iter()
         .map(str::trim)
@@ -430,13 +373,7 @@ fn parse_axis_list(value: &str) -> Option<Vec<isize>> {
     if let Some(axis) = parse_axis(trimmed) {
         return Some(vec![axis]);
     }
-    let inner = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        return None;
-    };
+    let inner = bracket_inner(trimmed)?;
     if inner.trim().is_empty() {
         return Some(Vec::new());
     }
@@ -511,6 +448,30 @@ fn nth_positional_or_keyword<'a>(
     value
 }
 
+/// The shape of the array that [`nth_positional_or_keyword`] finds.
+fn shape_arg<'a>(
+    args: &[CallArgument],
+    skip: usize,
+    keywords: &[&str],
+    shapes: &'a dyn ShapeLookup,
+) -> Option<&'a Vec<String>> {
+    shapes.shape(nth_positional_or_keyword(args, skip, keywords)?)
+}
+
+/// The axis that [`nth_positional_or_keyword`] finds, or `default`, as an
+/// index for `rank`. `Ok(None)` when there is no value or it is not an int.
+fn axis_at(
+    args: &[CallArgument],
+    skip: usize,
+    keywords: &[&str],
+    default: Option<&str>,
+    rank: usize,
+    context: &str,
+) -> Result<Option<usize>, String> {
+    let axis = nth_positional_or_keyword(args, skip, keywords).or(default).and_then(parse_axis);
+    axis.map(|axis| normalize_axis(axis, rank, context)).transpose()
+}
+
 /// Two-slot variant of [`nth_positional_or_keyword`]: after skipping the
 /// first `skip` positional arguments, the next two positional arguments fill
 /// `a` and `b` in order, unless overridden by a keyword argument matching
@@ -550,11 +511,16 @@ fn nth_two_positional_or_keywords<'a>(
     (a, b)
 }
 
+/// The text between a first `(` or `[` and a last matching `)` or `]`.
+fn bracket_inner(text: &str) -> Option<&str> {
+    text.strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .or_else(|| text.strip_prefix('[')?.strip_suffix(']'))
+}
+
 /// The text inside the brackets of a sequence. `(a)*(b)` has no outer pair.
 fn sequence_inner(text: &str) -> Option<&str> {
-    if !(text.starts_with('(') && text.ends_with(')') || text.starts_with('[') && text.ends_with(']')) {
-        return None;
-    }
+    let inner = bracket_inner(text)?;
     let mut depth = 0usize;
     for (at, c) in text.char_indices() {
         match c {
@@ -568,7 +534,7 @@ fn sequence_inner(text: &str) -> Option<&str> {
             _ => {}
         }
     }
-    Some(&text[1..text.len() - 1])
+    Some(inner)
 }
 
 /// Whether `text` calls something: `get(1)`, but not `(n-1)*2`.
@@ -908,7 +874,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "repeat" | "repeat_interleave" => Some(KnownFunction::Repeat),
         "expand" | "broadcast_to" => Some(KnownFunction::BroadcastTo),
         "astype" => Some(KnownFunction::Astype),
-        "copy" | "byteswap" => Some(KnownFunction::Copy),
+        "copy" | "byteswap" | "clone" | "cpu" | "cuda" | "float" | "long" | "int" | "bool"
+        | "double" | "half" | "softmax" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
@@ -927,11 +894,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "item" => Some(KnownFunction::Item),
         "new_zeros" | "new_ones" | "new_empty" => Some(KnownFunction::NewSizeConstructor),
         "new_full" => Some(KnownFunction::NewConstructor),
-        "clone" => Some(KnownFunction::Copy),
-        "cpu" | "cuda" => Some(KnownFunction::Copy),
-        "float" | "long" | "int" | "bool" | "double" | "half" => Some(KnownFunction::Copy),
         "clamp" | "clip" => Some(KnownFunction::Clamp),
-        "softmax" => Some(KnownFunction::Copy),
         "norm" => Some(KnownFunction::Sum),
         "diagonal" => Some(KnownFunction::Diagonal),
         "tril" => Some(KnownFunction::Tril),
@@ -1069,7 +1032,22 @@ fn apply_known_rule(
         | KnownFunction::Argsort
         | KnownFunction::Sort
         | KnownFunction::Cumsum
-        | KnownFunction::Cumprod => apply_known_shape_preserving(args, shapes),
+        | KnownFunction::Cumprod
+        | KnownFunction::Roll
+        | KnownFunction::Flip
+        | KnownFunction::Triu
+        | KnownFunction::Tril
+        | KnownFunction::Astype
+        | KnownFunction::Copy
+        | KnownFunction::Detach
+        | KnownFunction::Contiguous
+        | KnownFunction::To
+        | KnownFunction::LaxScatter
+        | KnownFunction::LaxDynamicUpdateSlice
+        | KnownFunction::LaxSort
+        | KnownFunction::PutAlongAxis
+        | KnownFunction::Scatter
+        | KnownFunction::MaskedFill => apply_known_shape_preserving(args, shapes),
         KnownFunction::Arange => apply_known_arange(args),
         KnownFunction::Linspace | KnownFunction::Logspace => apply_known_linspace(args),
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
@@ -1088,15 +1066,6 @@ fn apply_known_rule(
         KnownFunction::BroadcastArrays => apply_known_broadcast_arrays(args, shapes),
         KnownFunction::Tile => apply_known_tile(args, shapes),
         KnownFunction::Repeat => apply_known_repeat(args, shapes),
-        KnownFunction::Roll
-        | KnownFunction::Flip
-        | KnownFunction::Triu
-        | KnownFunction::Tril
-        | KnownFunction::Astype
-        | KnownFunction::Copy
-        | KnownFunction::Detach
-        | KnownFunction::Contiguous
-        | KnownFunction::To => apply_known_shape_preserving(args, shapes),
         KnownFunction::Clamp => apply_known_clamp(args, shapes),
         KnownFunction::Pad => apply_known_pad(args, shapes),
         KnownFunction::NumpyPad => apply_known_numpy_pad(args, shapes),
@@ -1120,9 +1089,7 @@ fn apply_known_rule(
         KnownFunction::TorchMaxMin => apply_known_torch_max_min(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgMatrixSqrth => {
-            let Some(input_shape) =
-                nth_positional_or_keyword(args, 0, &["A"]).and_then(|name| shapes.shape(name))
-            else {
+            let Some(input_shape) = shape_arg(args, 0, &["A"], shapes) else {
                 return Ok(None);
             };
             require_square_matrix(input_shape, "linalg.matrix_sqrth")?;
@@ -1146,24 +1113,19 @@ fn apply_known_rule(
         KnownFunction::EinopsRearrange | KnownFunction::EinopsReduce
         | KnownFunction::EinopsRepeat => apply_known_einops(args, shapes),
         KnownFunction::EinopsEinsum => apply_known_einops_einsum(args, shapes),
-        KnownFunction::EinopsParseShape => {
-            // Returns a dict of axis-name -> size, not an array shape — never
-            // meaningful to store as a tensor shape.
-            Ok(None)
-        }
-        KnownFunction::LaxScatter | KnownFunction::LaxDynamicUpdateSlice | KnownFunction::LaxSort => {
-            apply_known_shape_preserving(args, shapes)
-        }
-        KnownFunction::LaxWhileLoop => apply_known_lax_carry(args, shapes, 2, "init_val"),
-        KnownFunction::LaxForiLoop => apply_known_lax_carry(args, shapes, 3, "init_val"),
-        KnownFunction::LaxAssociativeScan => apply_known_lax_carry(args, shapes, 1, "elems"),
+        // The carry of a loop and the elems of a scan keep their shape.
+        KnownFunction::LaxWhileLoop => Ok(shape_arg(args, 2, &["init_val"], shapes).cloned()),
+        KnownFunction::LaxForiLoop => Ok(shape_arg(args, 3, &["init_val"], shapes).cloned()),
+        KnownFunction::LaxAssociativeScan => Ok(shape_arg(args, 1, &["elems"], shapes).cloned()),
         KnownFunction::LaxConvGeneralDilated => {
             apply_known_lax_conv_general_dilated(args, shapes)
         }
         KnownFunction::LaxReduceWindow => apply_known_lax_reduce_window(args, shapes),
         KnownFunction::LaxPad => apply_known_lax_pad(args, shapes),
         KnownFunction::LaxBroadcast => apply_known_lax_broadcast(args, shapes),
-        KnownFunction::LaxBroadcastInDim => apply_known_lax_broadcast_in_dim(args),
+        KnownFunction::LaxBroadcastInDim => {
+            Ok(nth_positional_or_keyword(args, 1, &["shape"]).and_then(parse_shape_value))
+        }
         KnownFunction::LaxSlice => apply_known_lax_slice(args, shapes),
         KnownFunction::LaxDynamicSlice => apply_known_lax_dynamic_slice(args, shapes),
         KnownFunction::LaxGather => apply_known_lax_gather(args, shapes),
@@ -1174,16 +1136,19 @@ fn apply_known_rule(
         KnownFunction::Indices => apply_known_indices(args),
         KnownFunction::Select => apply_known_select(args, shapes),
         KnownFunction::RollAxis => apply_known_rollaxis(args, shapes),
-        KnownFunction::Resize => apply_known_resize(args),
+        KnownFunction::Resize => {
+            Ok(nth_positional_or_keyword(args, 1, &["new_shape"]).and_then(parse_shape_value))
+        }
         KnownFunction::Insert => apply_known_insert(args, shapes),
         KnownFunction::Delete => apply_known_delete(args, shapes),
         KnownFunction::Append => apply_known_append(args, shapes),
         KnownFunction::Kron => apply_known_kron(args, shapes),
         KnownFunction::Block => apply_known_block(args, shapes),
-        KnownFunction::TakeAlongAxis => apply_known_take_along_axis(args, shapes),
-        KnownFunction::PutAlongAxis => apply_known_shape_preserving(args, shapes),
+        // The result has the shape of `indices` or of the searched values `v`.
+        KnownFunction::TakeAlongAxis | KnownFunction::SearchSorted => {
+            Ok(positional_arg_values(args).get(1).and_then(|name| shapes.shape(name)).cloned())
+        }
         KnownFunction::Argwhere => apply_known_argwhere(args, shapes),
-        KnownFunction::SearchSorted => apply_known_searchsorted(args, shapes),
         KnownFunction::Histogram => apply_known_histogram(args),
         KnownFunction::Cross => apply_known_cross(args, shapes),
         KnownFunction::TorchCross => apply_known_torch_cross(args, shapes),
@@ -1195,17 +1160,15 @@ fn apply_known_rule(
         KnownFunction::NllLoss => apply_known_cross_entropy(args, shapes, false),
         KnownFunction::DotProductAttention => apply_known_dot_product_attention(args, shapes),
         KnownFunction::Gather => apply_known_gather(args, shapes),
-        KnownFunction::Scatter | KnownFunction::MaskedFill => {
-            apply_known_shape_preserving(args, shapes)
-        }
         KnownFunction::IndexSelect => apply_known_index_select(args, shapes),
         KnownFunction::Narrow => apply_known_narrow(args, shapes),
         KnownFunction::SelectDim => apply_known_select_dim(args, shapes),
-        KnownFunction::MaskedSelect => Ok(None),
         KnownFunction::Unfold => apply_known_unfold(args, shapes),
-        KnownFunction::ShapeAs => apply_known_shape_as(args, shapes),
+        KnownFunction::ShapeAs => Ok(shape_arg(args, 1, &["other"], shapes).cloned()),
         KnownFunction::Item => Ok(Some(Vec::new())),
-        KnownFunction::NewConstructor => apply_known_new_constructor(args),
+        KnownFunction::NewConstructor => {
+            Ok(nth_positional_or_keyword(args, 1, &["size", "shape"]).and_then(parse_shape_value))
+        }
         KnownFunction::NewSizeConstructor => apply_known_torch_size(&args[args.len().min(1)..]),
         KnownFunction::TorchSizeConstructor => apply_known_torch_size(args),
         KnownFunction::Chunk => {
@@ -1216,7 +1179,10 @@ fn apply_known_rule(
             let _ = compute_chunk_shapes(args, shapes)?;
             Ok(None)
         }
-        KnownFunction::TopK
+        // A dict of axis sizes, a data-dependent size, or a tuple of arrays.
+        KnownFunction::EinopsParseShape
+        | KnownFunction::MaskedSelect
+        | KnownFunction::TopK
         | KnownFunction::MinMax
         | KnownFunction::Unbind
         | KnownFunction::KthValue
@@ -1329,17 +1295,7 @@ pub(crate) fn apply_known_einops(
     let Some(input_shape) = shapes.shape(input_name.as_str()) else {
         return Ok(None);
     };
-    let Some(pattern_raw) = positional.get(1) else {
-        return Ok(None);
-    };
-
-    let trimmed = pattern_raw.trim();
-    let pattern = if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
+    let Some(pattern) = positional.get(1).and_then(|raw| string_text(raw)) else {
         return Ok(None);
     };
     let Some((lhs, rhs)) = pattern.split_once("->") else {
@@ -1530,16 +1486,16 @@ fn apply_known_flax_pool(
         if s <= 0 {
             return Ok(None);
         }
-        output[start + i] = if same {
-            (d + s - 1) / s
-        } else if d < w {
-            0
-        } else {
-            (d - w) / s + 1
-        }
-        .to_string();
+        let count = if same { (d + s - 1) / s } else { window_count(d, w, s).unwrap_or(0) };
+        output[start + i] = count.to_string();
     }
     Ok(Some(output))
+}
+
+/// The count of windows of size `window` at steps of `stride` in `padded`
+/// elements, or `None` when one window is larger than `padded`.
+fn window_count(padded: isize, window: isize, stride: isize) -> Option<isize> {
+    (padded >= window).then(|| (padded - window) / stride + 1)
 }
 
 fn sequence_arg_value(args: &[CallArgument]) -> Option<&str> {
@@ -1571,20 +1527,8 @@ fn apply_known_einsum(
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     let positional_values = positional_arg_values(args);
-    let Some(equation) = positional_values.first() else {
-        return Ok(None);
-    };
-
-    let equation_trimmed = equation.trim();
-
-    // Remove quotes if present
-    let equation_str = if equation_trimmed.len() >= 2
-        && ((equation_trimmed.starts_with('"') && equation_trimmed.ends_with('"'))
-            || (equation_trimmed.starts_with('\'') && equation_trimmed.ends_with('\'')))
-    {
-        &equation_trimmed[1..equation_trimmed.len() - 1]
-    } else {
-        // Not a string literal
+    let Some(equation_str) = positional_values.first().and_then(|equation| string_text(equation))
+    else {
         return Ok(None);
     };
 
@@ -1714,14 +1658,7 @@ fn apply_known_concatenate(
     }
 
     let rank = first_shape.len();
-    let axis = if axis < 0 { rank as isize + axis } else { axis };
-    if axis < 0 || axis as usize >= rank {
-        return Err(format!(
-            "concatenate axis {} out of bounds for rank {}",
-            axis, rank
-        ));
-    }
-    let axis = axis as usize;
+    let axis = normalize_axis(axis, rank, "concatenate")?;
 
     let mut output = first_shape.clone();
     for shape in &input_shapes {
@@ -2501,12 +2438,10 @@ fn apply_known_bmm(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(left) = nth_positional_or_keyword(args, 0, &["input"]).and_then(|n| shapes.shape(n))
-    else {
+    let Some(left) = shape_arg(args, 0, &["input"], shapes) else {
         return Ok(None);
     };
-    let Some(right) = nth_positional_or_keyword(args, 1, &["mat2"]).and_then(|n| shapes.shape(n))
-    else {
+    let Some(right) = shape_arg(args, 1, &["mat2"], shapes) else {
         return Ok(None);
     };
     for (operand, dims) in [("input", left), ("mat2", right)] {
@@ -2543,12 +2478,10 @@ fn cross_entropy_with_reduction(
     reduction: Result<Option<&str>, String>,
 ) -> Result<Option<Vec<String>>, String> {
     let name = if probabilities { "cross_entropy" } else { "nll_loss" };
-    let Some(input) = nth_positional_or_keyword(args, 0, &["input"]).and_then(|n| shapes.shape(n))
-    else {
+    let Some(input) = shape_arg(args, 0, &["input"], shapes) else {
         return Ok(None);
     };
-    let Some(target) = nth_positional_or_keyword(args, 1, &["target"]).and_then(|n| shapes.shape(n))
-    else {
+    let Some(target) = shape_arg(args, 1, &["target"], shapes) else {
         return Ok(None);
     };
     if input.is_empty() {
@@ -3502,14 +3435,7 @@ pub fn apply_known_reduction(
 
     let mut normalized = Vec::new();
     for axis in axes {
-        let axis = if axis < 0 { rank as isize + axis } else { axis };
-        if axis < 0 || axis as usize >= rank {
-            return Err(format!(
-                "reduction axis {} out of bounds for rank {}",
-                axis, rank
-            ));
-        }
-        let axis = axis as usize;
+        let axis = normalize_axis(axis, rank, "reduction")?;
         if normalized.contains(&axis) {
             return Err(format!("duplicate reduction axis {}", axis));
         }
@@ -3551,7 +3477,7 @@ fn apply_known_lax_polynomial(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(x) = nth_positional_or_keyword(args, 0, &["x"]).and_then(|x| shapes.shape(x)) else {
+    let Some(x) = shape_arg(args, 0, &["x"], shapes) else {
         return Ok(None);
     };
     let Some(coeffs) = nth_positional_or_keyword(args, 1, &["coeffs"]) else {
@@ -3599,7 +3525,7 @@ fn apply_known_multinomial(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(p) = nth_positional_or_keyword(args, 2, &["p"]).and_then(|p| shapes.shape(p)) else {
+    let Some(p) = shape_arg(args, 2, &["p"], shapes) else {
         return Ok(None);
     };
     let Some((categories, p_batch)) = p.split_last() else {
@@ -3633,7 +3559,7 @@ fn apply_known_multinomial(
     if broadcast_changes(&batch, p_batch)? {
         return Err("random.multinomial shape cannot broadcast p batch dimensions".to_string());
     }
-    if let Some(n) = nth_positional_or_keyword(args, 1, &["n"]).and_then(|n| shapes.shape(n))
+    if let Some(n) = shape_arg(args, 1, &["n"], shapes)
         && broadcast_changes(&batch, n)?
     {
         return Err("random.multinomial n cannot broadcast to the batch shape".to_string());
@@ -3750,11 +3676,9 @@ fn compute_split_shapes_impl(
     let rank = input_shape.len();
 
     // ── axis ─────────────────────────────────────────────────────────
-    let axis_raw = nth_positional_or_keyword(args, 2, &["axis", "dim"]).unwrap_or("0");
-    let Some(axis) = parse_axis(axis_raw) else {
+    let Some(axis) = axis_at(args, 2, &["axis", "dim"], Some("0"), rank, "split")? else {
         return Ok(None);
     };
-    let axis = normalize_axis(axis, rank, "split")?;
 
     // ── split specification (second positional or keyword) ───────────
     let Some(split_spec) =
@@ -3812,19 +3736,13 @@ fn compute_split_shapes_impl(
             format!("split({}, {})", axis_dim, n)
         };
 
-        let mut output_shapes = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut out = input_shape.clone();
-            out[axis] = chunk_dim.clone();
-            output_shapes.push(out);
-        }
-        return Ok(Some(output_shapes));
+        let mut out = input_shape.clone();
+        out[axis] = chunk_dim;
+        return Ok(Some(vec![out; n]));
     }
 
     // ── CASE 2: list literal of indices ──────────────────────────────
-    if (trimmed_spec.starts_with('[') && trimmed_spec.ends_with(']'))
-        || (trimmed_spec.starts_with('(') && trimmed_spec.ends_with(')'))
-    {
+    if bracket_inner(trimmed_spec).is_some() {
         let indices = parse_simple_sequence_names(trimmed_spec).unwrap_or_default();
         if indices.is_empty() {
             return Ok(Some(vec![input_shape.clone()]));
@@ -3933,11 +3851,9 @@ pub fn compute_torch_split_shapes(
     // positional slot is the axis), split has a meaningful positional at
     // index 1 (the size spec) before `dim`, so we look for `dim` starting
     // after position 2, not position 0.
-    let axis_raw = nth_positional_or_keyword(args, 2, &["dim"]).unwrap_or("0");
-    let Some(axis) = parse_axis(axis_raw) else {
+    let Some(axis) = axis_at(args, 2, &["dim"], Some("0"), rank, "split")? else {
         return Ok(None);
     };
-    let axis = normalize_axis(axis, rank, "split")?;
     let axis_dim = &input_shape[axis];
 
     let Some(split_spec) =
@@ -3972,12 +3888,9 @@ pub fn compute_torch_split_shapes(
         let Some(k) = n_targets.filter(|k| *k > 0) else {
             return Ok(None);
         };
-        let mut output_shapes = Vec::with_capacity(k);
-        for _ in 0..k.saturating_sub(1) {
-            let mut out = input_shape.clone();
-            out[axis] = size.to_string();
-            output_shapes.push(out);
-        }
+        let mut out = input_shape.clone();
+        out[axis] = size.to_string();
+        let mut output_shapes = vec![out; k - 1];
         let consumed = size * (k - 1);
         let mut last = input_shape.clone();
         last[axis] = if consumed == 0 {
@@ -4103,14 +4016,7 @@ pub fn compute_fixed_axis_split_shapes(
 /// padding pairs). Splits on top-level commas only, respecting nested
 /// paren/bracket depth.
 fn parse_nested_int_tuples(value: &str) -> Option<Vec<Vec<isize>>> {
-    let trimmed = value.trim();
-    let inner = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        return None;
-    };
+    let inner = bracket_inner(value.trim())?;
     let mut groups = Vec::new();
     let mut depth = 0i32;
     let mut current = String::new();
@@ -4142,22 +4048,6 @@ fn parse_nested_int_tuples(value: &str) -> Option<Vec<Vec<isize>>> {
     Some(groups.iter().map(|g| parse_ints(g)).collect())
 }
 
-/// Shared "output equals the shape of one named/positional carry argument"
-/// rule for `jax.lax.while_loop`/`fori_loop` (carry invariant across
-/// iterations) and `jax.lax.associative_scan` (shape-preserving scan
-/// variant).
-fn apply_known_lax_carry(
-    args: &[CallArgument],
-    shapes: &dyn ShapeLookup,
-    skip: usize,
-    keyword: &str,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(name) = nth_positional_or_keyword(args, skip, &[keyword]) else {
-        return Ok(None);
-    };
-    Ok(shapes.shape(name).cloned())
-}
-
 /// `jax.lax.broadcast(operand, sizes)` — prepends `sizes` as new leading
 /// dims.
 fn apply_known_lax_broadcast(
@@ -4174,17 +4064,6 @@ fn apply_known_lax_broadcast(
     let mut output = sizes;
     output.extend(input_shape.clone());
     Ok(Some(output))
-}
-
-/// `jax.lax.broadcast_in_dim(operand, shape, broadcast_dimensions)` — the
-/// output is the explicit target `shape` argument; `operand`'s own shape
-/// isn't needed to determine it.
-fn apply_known_lax_broadcast_in_dim(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
-    let Some(target) = nth_positional_or_keyword(args, 1, &["shape"]).and_then(parse_shape_value)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(target))
 }
 
 /// `jax.lax.slice(operand, start_indices, limit_indices, strides=None)`.
@@ -4337,13 +4216,13 @@ fn apply_known_lax_reduce_window(
         let w = window[i];
         let s = strides[i].max(1);
         let padded = d + lo + hi;
-        if padded < w {
+        let Some(count) = window_count(padded, w, s) else {
             return Err(format!(
                 "reduce_window: padded dim {} smaller than window {}",
                 padded, w
             ));
-        }
-        output.push((((padded - w) / s) + 1).to_string());
+        };
+        output.push(count.to_string());
     }
     Ok(Some(output))
 }
@@ -4365,16 +4244,10 @@ fn apply_known_lax_conv_general_dilated(
     {
         return Ok(None);
     }
-    let Some(lhs_name) = first_array_arg(args) else {
+    let Some((_, lhs_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(lhs_shape) = shapes.shape(lhs_name) else {
-        return Ok(None);
-    };
-    let Some(rhs_name) = nth_positional_or_keyword(args, 1, &["rhs"]) else {
-        return Ok(None);
-    };
-    let Some(rhs_shape) = shapes.shape(rhs_name) else {
+    let Some(rhs_shape) = shape_arg(args, 1, &["rhs"], shapes) else {
         return Ok(None);
     };
     if lhs_shape.len() < 3 || rhs_shape.len() != lhs_shape.len() {
@@ -4432,11 +4305,10 @@ fn apply_known_lax_conv_general_dilated(
         let out = match &padding {
             Some(pads) => {
                 let (lo, hi) = pads[i];
-                let span = d + lo + hi - eff_k;
-                if span < 0 {
+                let Some(count) = window_count(d + lo + hi, eff_k, s) else {
                     return Ok(None);
-                }
-                span / s + 1
+                };
+                count
             }
             None => (d + s - 1) / s, // 'SAME': ceil(d / s)
         };
@@ -4545,16 +4417,10 @@ fn apply_known_lax_gather(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(operand_name) = first_array_arg(args) else {
+    let Some((_, operand_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(operand_shape) = shapes.shape(operand_name) else {
-        return Ok(None);
-    };
-    let Some(indices_name) = nth_positional_or_keyword(args, 1, &["start_indices"]) else {
-        return Ok(None);
-    };
-    let Some(indices_shape) = shapes.shape(indices_name) else {
+    let Some(indices_shape) = shape_arg(args, 1, &["start_indices"], shapes) else {
         return Ok(None);
     };
     let Some(dimension_numbers_raw) =
@@ -4580,10 +4446,7 @@ fn apply_known_lax_gather(
     let Some(slice_sizes_raw) = nth_positional_or_keyword(args, 3, &["slice_sizes"]) else {
         return Ok(None);
     };
-    let trimmed = slice_sizes_raw.trim();
-    if !((trimmed.starts_with('(') && trimmed.ends_with(')'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-    {
+    if bracket_inner(slice_sizes_raw.trim()).is_none() {
         return Ok(None);
     }
     let slice_sizes_ints = parse_ints(slice_sizes_raw);
@@ -4666,13 +4529,12 @@ fn apply_known_rollaxis(
         return Ok(None);
     };
     let rank = input_shape.len();
-    let Some(axis) = nth_positional_or_keyword(args, 1, &["axis"]).and_then(parse_axis) else {
+    let Some(axis) = axis_at(args, 1, &["axis"], None, rank, "rollaxis")? else {
         return Ok(None);
     };
     let start = nth_positional_or_keyword(args, 2, &["start"])
         .and_then(parse_axis)
         .unwrap_or(0);
-    let axis = normalize_axis(axis, rank, "rollaxis")?;
     let start_norm = if start < 0 {
         (rank as isize + start).max(0) as usize
     } else {
@@ -4691,16 +4553,6 @@ fn apply_known_rollaxis(
     ))
 }
 
-/// `jnp.resize(a, new_shape)` — output is exactly `new_shape` (tiling or
-/// truncating the data as needed doesn't change the *shape* rule).
-fn apply_known_resize(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
-    let Some(target) = nth_positional_or_keyword(args, 1, &["new_shape"]).and_then(parse_shape_value)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(target))
-}
-
 /// `np.insert(arr, obj, values, axis=None)` — axis length grows by the
 /// number of inserted values. Only the `axis` given + concrete insertion
 /// count case is modelled (a scalar literal inserts 1; a known array/list
@@ -4713,13 +4565,9 @@ fn apply_known_insert(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(axis_raw) = nth_positional_or_keyword(args, 3, &["axis"]) else {
+    let Some(axis) = axis_at(args, 3, &["axis"], None, input_shape.len(), "insert")? else {
         return Ok(None);
     };
-    let Some(axis) = parse_axis(axis_raw) else {
-        return Ok(None);
-    };
-    let axis = normalize_axis(axis, input_shape.len(), "insert")?;
     let Some(values_raw) = nth_positional_or_keyword(args, 2, &["values"]) else {
         return Ok(None);
     };
@@ -4751,13 +4599,9 @@ fn apply_known_delete(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(axis_raw) = nth_positional_or_keyword(args, 2, &["axis"]) else {
+    let Some(axis) = axis_at(args, 2, &["axis"], None, input_shape.len(), "delete")? else {
         return Ok(None);
     };
-    let Some(axis) = parse_axis(axis_raw) else {
-        return Ok(None);
-    };
-    let axis = normalize_axis(axis, input_shape.len(), "delete")?;
     let Some(obj_raw) = nth_positional_or_keyword(args, 1, &["obj"]) else {
         return Ok(None);
     };
@@ -4802,12 +4646,8 @@ fn apply_known_append(
             let Some(axis) = parse_axis(raw) else {
                 return Ok(None);
             };
-            let rank = arr_shape.len();
-            let axis = if axis < 0 { rank as isize + axis } else { axis };
-            if axis < 0 || axis as usize >= rank {
-                return Err(format!("append axis {} out of bounds for rank {}", axis, rank));
-            }
-            concat_shapes_along_axis(&[arr_shape.clone(), val_shape.clone()], axis as usize)
+            let axis = normalize_axis(axis, arr_shape.len(), "append")?;
+            concat_shapes_along_axis(&[arr_shape.clone(), val_shape.clone()], axis)
         }
     }
 }
@@ -4934,19 +4774,6 @@ fn apply_known_block(
     Ok(shape)
 }
 
-/// `jnp.take_along_axis(arr, indices, axis)` — output shape matches
-/// `indices` exactly.
-fn apply_known_take_along_axis(
-    args: &[CallArgument],
-    shapes: &dyn ShapeLookup,
-) -> Result<Option<Vec<String>>, String> {
-    let values = positional_arg_values(args);
-    let Some(idx_name) = values.get(1) else {
-        return Ok(None);
-    };
-    Ok(shapes.shape(idx_name).cloned())
-}
-
 /// `np.argwhere(a)` — shape `(N, ndim)`: the element count `N` is
 /// data-dependent (an opaque symbolic dim), but `ndim` is known statically
 /// from `a`'s rank.
@@ -4963,19 +4790,6 @@ fn apply_known_argwhere(
     ]))
 }
 
-/// `jnp.searchsorted(a, v, ...)` — output shape follows `v` (the values
-/// being searched for), not `a`.
-fn apply_known_searchsorted(
-    args: &[CallArgument],
-    shapes: &dyn ShapeLookup,
-) -> Result<Option<Vec<String>>, String> {
-    let values = positional_arg_values(args);
-    let Some(v_name) = values.get(1) else {
-        return Ok(None);
-    };
-    Ok(shapes.shape(v_name).cloned())
-}
-
 /// `jnp.histogram(a, bins=10, ...)` — 1D output of length `bins` when
 /// `bins` is an integer literal, or `len(edges) - 1` when `bins` is a
 /// literal list of bin edges. Otherwise unresolvable statically.
@@ -4987,9 +4801,7 @@ fn apply_known_histogram(args: &[CallArgument]) -> Result<Option<Vec<String>>, S
     if let Ok(n) = trimmed.parse::<usize>() {
         return Ok(Some(vec![n.to_string()]));
     }
-    let looks_like_list = (trimmed.starts_with('[') && trimmed.ends_with(']'))
-        || (trimmed.starts_with('(') && trimmed.ends_with(')'));
-    if looks_like_list
+    if bracket_inner(trimmed).is_some()
         && let Some(edges) = parse_simple_sequence_names(trimmed)
         && edges.len() >= 2
     {
@@ -5002,12 +4814,10 @@ fn apply_known_cross(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(a) = nth_positional_or_keyword(args, 0, &["a"]).and_then(|name| shapes.shape(name))
-    else {
+    let Some(a) = shape_arg(args, 0, &["a"], shapes) else {
         return Ok(None);
     };
-    let Some(b) = nth_positional_or_keyword(args, 1, &["b"]).and_then(|name| shapes.shape(name))
-    else {
+    let Some(b) = shape_arg(args, 1, &["b"], shapes) else {
         return Ok(None);
     };
     let axis = nth_positional_or_keyword(args, 5, &["axis"]);
@@ -5049,14 +4859,10 @@ fn apply_known_torch_cross(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(a) =
-        nth_positional_or_keyword(args, 0, &["input"]).and_then(|name| shapes.shape(name))
-    else {
+    let Some(a) = shape_arg(args, 0, &["input"], shapes) else {
         return Ok(None);
     };
-    let Some(b) =
-        nth_positional_or_keyword(args, 1, &["other"]).and_then(|name| shapes.shape(name))
-    else {
+    let Some(b) = shape_arg(args, 1, &["other"], shapes) else {
         return Ok(None);
     };
     if a.len() != b.len() {
@@ -5172,13 +4978,7 @@ fn apply_known_einops_einsum(
         return Ok(None);
     }
     let (equation, operand_names) = positional_values.split_last().unwrap();
-
-    let trimmed = equation.trim();
-    let equation_str = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
+    let Some(equation_str) = string_text(equation) else {
         return Ok(None);
     };
     if equation_str.contains("...") {
@@ -5256,16 +5056,7 @@ pub fn compute_einops_pack_shape(
     let Some(tensors_raw) = positional.first() else {
         return Ok(None);
     };
-    let Some(pattern_raw) = positional.get(1) else {
-        return Ok(None);
-    };
-    let trimmed = pattern_raw.trim();
-    let pattern = if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
+    let Some(pattern) = positional.get(1).and_then(|raw| string_text(raw)) else {
         return Ok(None);
     };
     let tokens: Vec<&str> = pattern.split_whitespace().collect();
@@ -5372,18 +5163,10 @@ fn apply_known_index_select(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let rank = input_shape.len();
-    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+    let Some(dim) = axis_at(args, 1, &["dim"], None, input_shape.len(), "index_select")? else {
         return Ok(None);
     };
-    let Some(dim) = parse_axis(dim_raw) else {
-        return Ok(None);
-    };
-    let dim = normalize_axis(dim, rank, "index_select")?;
-    let Some(index_name) = nth_positional_or_keyword(args, 2, &["index"]) else {
-        return Ok(None);
-    };
-    let Some(index_shape) = shapes.shape(index_name) else {
+    let Some(index_shape) = shape_arg(args, 2, &["index"], shapes) else {
         return Ok(None);
     };
     let Some(len) = index_shape.first() else {
@@ -5403,14 +5186,9 @@ fn apply_known_narrow(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let rank = input_shape.len();
-    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+    let Some(dim) = axis_at(args, 1, &["dim"], None, input_shape.len(), "narrow")? else {
         return Ok(None);
     };
-    let Some(dim) = parse_axis(dim_raw) else {
-        return Ok(None);
-    };
-    let dim = normalize_axis(dim, rank, "narrow")?;
     let Some(length) = nth_positional_or_keyword(args, 3, &["length"]) else {
         return Ok(None);
     };
@@ -5429,14 +5207,9 @@ fn apply_known_select_dim(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let rank = input_shape.len();
-    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dim"]) else {
+    let Some(dim) = axis_at(args, 1, &["dim"], None, input_shape.len(), "select")? else {
         return Ok(None);
     };
-    let Some(dim) = parse_axis(dim_raw) else {
-        return Ok(None);
-    };
-    let dim = normalize_axis(dim, rank, "select")?;
     let mut output = input_shape.clone();
     output.remove(dim);
     Ok(Some(output))
@@ -5452,14 +5225,9 @@ fn apply_known_unfold(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let rank = input_shape.len();
-    let Some(dim_raw) = nth_positional_or_keyword(args, 1, &["dimension", "dim"]) else {
+    let Some(dim) = axis_at(args, 1, &["dimension", "dim"], None, input_shape.len(), "unfold")? else {
         return Ok(None);
     };
-    let Some(dim) = parse_axis(dim_raw) else {
-        return Ok(None);
-    };
-    let dim = normalize_axis(dim, rank, "unfold")?;
     let Some(size_raw) = nth_positional_or_keyword(args, 2, &["size"]) else {
         return Ok(None);
     };
@@ -5485,29 +5253,6 @@ fn apply_known_unfold(
     Ok(Some(output))
 }
 
-/// `x.view_as(other)` / `x.reshape_as(other)` / `x.expand_as(other)` — the
-/// output shape is simply `other`'s shape.
-fn apply_known_shape_as(
-    args: &[CallArgument],
-    shapes: &dyn ShapeLookup,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(other_name) = nth_positional_or_keyword(args, 1, &["other"]) else {
-        return Ok(None);
-    };
-    Ok(shapes.shape(other_name).cloned())
-}
-
-/// `x.new_zeros(size)` / `x.new_ones(size)` / `x.new_full(size, value)` /
-/// `x.new_empty(size)` — output shape from `size` (the receiver is only a
-/// dtype/device template, positional[0] after synthesis; the shape spec is
-/// the next positional/keyword arg).
-fn apply_known_new_constructor(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
-    match nth_positional_or_keyword(args, 1, &["size", "shape"]) {
-        Some(v) => Ok(parse_shape_value(v)),
-        None => Ok(None),
-    }
-}
-
 // ── torch tuple-output methods ──────────────────────────────────────────
 
 /// `torch.topk(input, k, dim=-1, ...)` / `x.topk(k, dim=-1, ...)` — shared
@@ -5529,11 +5274,9 @@ pub fn apply_known_topk_shape(
     let Some(k) = nth_positional_or_keyword(args, 1, &["k"]) else {
         return Ok(None);
     };
-    let dim_raw = nth_positional_or_keyword(args, 2, &["dim", "axis"]).unwrap_or("-1");
-    let Some(dim) = parse_axis(dim_raw) else {
+    let Some(dim) = axis_at(args, 2, &["dim", "axis"], Some("-1"), rank, "topk")? else {
         return Ok(None);
     };
-    let dim = normalize_axis(dim, rank, "topk")?;
     let k_dim = if let Ok(value) = k.parse::<isize>() {
         if value < 0
             || input_shape[dim]
@@ -5581,16 +5324,9 @@ pub fn apply_known_kthvalue_shape(
             value: dim.to_string(),
         });
     }
-    for arg in args {
-        if let CallArgument::Keyword { name, value } = arg
-            && (name == "keepdim" || name == "keepdims")
-        {
-            synthesized.push(CallArgument::Keyword {
-                name: name.clone(),
-                value: value.clone(),
-            });
-        }
-    }
+    synthesized.extend(args.iter().filter(|arg| {
+        matches!(arg, CallArgument::Keyword { name, .. } if name == "keepdim" || name == "keepdims")
+    }).cloned());
     apply_known_reduction(&synthesized, shapes)
 }
 
@@ -5611,11 +5347,9 @@ pub fn compute_unbind_shape(
     if rank == 0 {
         return Err("unbind requires rank >= 1 input".to_string());
     }
-    let dim_raw = nth_positional_or_keyword(args, 1, &["dim", "axis"]).unwrap_or("0");
-    let Some(dim) = parse_axis(dim_raw) else {
+    let Some(dim) = axis_at(args, 1, &["dim", "axis"], Some("0"), rank, "unbind")? else {
         return Ok(None);
     };
-    let dim = normalize_axis(dim, rank, "unbind")?;
     let Ok(size) = input_shape[dim].parse::<usize>() else {
         return Ok(None);
     };
@@ -5656,22 +5390,15 @@ pub fn compute_chunk_shapes(
     if n == 0 {
         return Err("chunk requires chunks > 0".to_string());
     }
-    let dim_raw = nth_positional_or_keyword(args, 2, &["dim"]).unwrap_or("0");
-    let Some(dim) = parse_axis(dim_raw) else {
+    let Some(dim) = axis_at(args, 2, &["dim"], Some("0"), rank, "chunk")? else {
         return Ok(None);
     };
-    let dim = normalize_axis(dim, rank, "chunk")?;
     let axis_dim = &input_shape[dim];
 
     let Ok(axis_size) = axis_dim.parse::<usize>() else {
-        let chunk_dim = format!("chunk({}, {})", axis_dim, n);
-        let mut output_shapes = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut out = input_shape.clone();
-            out[dim] = chunk_dim.clone();
-            output_shapes.push(out);
-        }
-        return Ok(Some(output_shapes));
+        let mut out = input_shape.clone();
+        out[dim] = format!("chunk({}, {})", axis_dim, n);
+        return Ok(Some(vec![out; n]));
     };
 
     let chunk_size = axis_size.div_ceil(n).max(1);
@@ -5830,10 +5557,7 @@ fn apply_known_functional_conv(
     if input_shape.len() != spatial_rank + 2 {
         return Ok(None);
     }
-    let Some(weight_name) = nth_positional_or_keyword(args, 1, &["weight"]) else {
-        return Ok(None);
-    };
-    let Some(weight_shape) = shapes.shape(weight_name) else {
+    let Some(weight_shape) = shape_arg(args, 1, &["weight"], shapes) else {
         return Ok(None);
     };
     if weight_shape.len() != spatial_rank + 2 {
@@ -5877,11 +5601,10 @@ fn apply_known_functional_conv(
         };
         let s = stride[i].max(1);
         let eff_k = (k - 1) * dilation[i] + 1;
-        let span = d + 2 * padding[i] - eff_k;
-        if span < 0 {
+        let Some(count) = window_count(d + 2 * padding[i], eff_k, s) else {
             return Ok(None);
-        }
-        output[idx] = (span / s + 1).to_string();
+        };
+        output[idx] = count.to_string();
     }
     Ok(Some(output))
 }
@@ -5930,11 +5653,10 @@ fn apply_known_functional_pool(
             return Ok(None);
         };
         let s = stride[i].max(1);
-        let span = d + 2 * padding[i] - kernel[i];
-        if span < 0 {
+        let Some(count) = window_count(d + 2 * padding[i], kernel[i], s) else {
             return Ok(None);
-        }
-        output[idx] = (span / s + 1).to_string();
+        };
+        output[idx] = count.to_string();
     }
     Ok(Some(output))
 }
@@ -6014,10 +5736,7 @@ fn apply_known_functional_embedding(
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let Some(weight_name) = nth_positional_or_keyword(args, 1, &["weight"]) else {
-        return Ok(None);
-    };
-    let Some(weight_shape) = shapes.shape(weight_name) else {
+    let Some(weight_shape) = shape_arg(args, 1, &["weight"], shapes) else {
         return Ok(None);
     };
     let Some(embed_dim) = weight_shape.last() else {

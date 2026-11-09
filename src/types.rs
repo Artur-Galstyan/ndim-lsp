@@ -747,23 +747,9 @@ pub enum LayerKind {
         in_features: String,
         out_features: String,
     },
-    Conv1d {
-        in_channels: String,
-        out_channels: String,
-        kernel_size: String,
-        stride: String,
-        padding: String,
-        dilation: String,
-    },
-    Conv2d {
-        in_channels: String,
-        out_channels: String,
-        kernel_size: String,
-        stride: String,
-        padding: String,
-        dilation: String,
-    },
-    Conv3d {
+    /// Conv1d/2d/3d (torch + equinox), channels-first.
+    Conv {
+        spatial_rank: usize,
         in_channels: String,
         out_channels: String,
         kernel_size: String,
@@ -851,7 +837,7 @@ pub enum LayerKind {
     },
     /// ConvTranspose1d/2d/3d (torch + equinox): inverse of the conv output
     /// formula: `out = (in-1)*stride - 2*padding + kernel`. Channels-first
-    /// layout, same convention as `Conv1d`/`Conv2d`/`Conv3d`. `output_padding`
+    /// layout, same convention as `Conv`. `output_padding`
     /// and `dilation` are not modelled (assumed 0 / 1).
     ConvTranspose {
         spatial_rank: usize,

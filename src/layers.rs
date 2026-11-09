@@ -24,6 +24,19 @@ pub(crate) const UNPROVEN_DIM: &str = "__unproven";
 /// that step the padding of the layer stays unknown.
 pub(crate) const PADDING_NAME: &str = "__padding_";
 
+/// Layers whose output shape is the input shape. LocalResponseNorm normalizes
+/// across a window of neighboring channels. TransformerEncoderLayer and
+/// TransformerDecoderLayer preserve d_model on their primary input; the
+/// second (`memory`) input of the decoder is not tracked, the same
+/// single-input limit as Bilinear/CosineSimilarity.
+const SHAPE_PRESERVING_LAYERS: [&str; 25] = [
+    "Dropout", "Dropout1d", "Dropout2d", "Dropout3d", "BatchNorm", "BatchNorm1d", "BatchNorm2d",
+    "BatchNorm3d", "LayerNorm", "GroupNorm", "ReLU", "GELU", "Sigmoid", "Tanh", "Softmax", "PReLU",
+    "Identity", "InstanceNorm1d", "InstanceNorm2d", "InstanceNorm3d", "RMSNorm", "AlphaDropout",
+    "LocalResponseNorm", "TransformerEncoderLayer", "TransformerDecoderLayer",
+];
+
+#[cfg(test)]
 pub fn classify_layer_call(call: &ResolvedCallSignature) -> Option<LayerKind> {
     classify_layer_text(call).map(strip_self_prefixes)
 }
@@ -62,6 +75,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             out_features: call.bindings.get("out_features")?.clone(),
         }),
         "Conv1d" | "Conv2d" | "Conv3d" => {
+            let spatial_rank = pool_spatial_rank(owner)?;
             // Per-axis tuples (e.g. kernel_size=(3,5)) are not yet supported.
             // Detect and refuse to classify so we don't produce garbage symbolic output.
             let kernel_size = call.bindings.get("kernel_size")?;
@@ -89,36 +103,15 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .get("dilation")
                 .cloned()
                 .unwrap_or_else(|| "1".to_string());
-            let in_channels = call.bindings.get("in_channels")?.clone();
-            let out_channels = call.bindings.get("out_channels")?.clone();
-            let ks = kernel_size.clone();
-            match owner {
-                "Conv1d" => Some(LayerKind::Conv1d {
-                    in_channels,
-                    out_channels,
-                    kernel_size: ks,
-                    stride,
-                    padding,
-                    dilation,
-                }),
-                "Conv2d" => Some(LayerKind::Conv2d {
-                    in_channels,
-                    out_channels,
-                    kernel_size: ks,
-                    stride,
-                    padding,
-                    dilation,
-                }),
-                "Conv3d" => Some(LayerKind::Conv3d {
-                    in_channels,
-                    out_channels,
-                    kernel_size: ks,
-                    stride,
-                    padding,
-                    dilation,
-                }),
-                _ => None,
-            }
+            Some(LayerKind::Conv {
+                spatial_rank,
+                in_channels: call.bindings.get("in_channels")?.clone(),
+                out_channels: call.bindings.get("out_channels")?.clone(),
+                kernel_size: kernel_size.clone(),
+                stride,
+                padding,
+                dilation,
+            })
         }
         "Dense" => Some(LayerKind::Dense {
             features: call.bindings.get("features")?.clone(),
@@ -220,22 +213,9 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .or_else(|| call.bindings.get("embedding_dim"))?
                 .clone(),
         }),
-        // Shape-preserving layers (Dropout, BatchNorm, LayerNorm, GroupNorm, activations,
-        // Identity, InstanceNorm, RMSNorm, AlphaDropout, LocalResponseNorm (normalizes
-        // across a window of neighboring channels, output shape == input shape), and the
-        // two Transformer*Layer modules — TransformerEncoderLayer/TransformerDecoderLayer
-        // preserve d_model on their primary input; TransformerDecoderLayer's second
-        // (`memory`) input isn't tracked, same single-input limitation as
-        // Bilinear/CosineSimilarity below).
-        "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
-        | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
-        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
-        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout" | "LocalResponseNorm"
-        | "TransformerEncoderLayer" | "TransformerDecoderLayer" => {
-            Some(LayerKind::ShapePreserving {
-                name: owner.to_string(),
-            })
-        }
+        name if SHAPE_PRESERVING_LAYERS.contains(&name) => Some(LayerKind::ShapePreserving {
+            name: owner.to_string(),
+        }),
         "Flatten" => {
             let start_dim = call
                 .bindings
@@ -399,7 +379,7 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
 /// Strip a `self.` prefix from a ctor-arg dim expression's identifier
 /// tokens (`"self.d_inner"` → `"d_inner"`, `"self.d_inner*2"` →
 /// `"d_inner*2"`). `"self.d_inner"` would never match a same-named `d_inner`
-/// jaxtyping annotation dim (a different vocabulary — see `dims_match`).
+/// jaxtyping annotation dim (a different vocabulary — see `dims_provably_mismatch`).
 /// The analysis keeps the prefix until `ShapeCtx::layer_at` knows the value of
 /// the attribute. This only strips the token-level prefix; it does not
 /// consult the `self.<attr> = <ident>` alias map (`extract_self_attr_aliases*`
@@ -446,44 +426,16 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             in_features: f(&in_features),
             out_features: f(&out_features),
         },
-        LayerKind::Conv1d {
+        LayerKind::Conv {
+            spatial_rank,
             in_channels,
             out_channels,
             kernel_size,
             stride,
             padding,
             dilation,
-        } => LayerKind::Conv1d {
-            in_channels: f(&in_channels),
-            out_channels: f(&out_channels),
-            kernel_size: f(&kernel_size),
-            stride: f(&stride),
-            padding: f(&padding),
-            dilation: f(&dilation),
-        },
-        LayerKind::Conv2d {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        } => LayerKind::Conv2d {
-            in_channels: f(&in_channels),
-            out_channels: f(&out_channels),
-            kernel_size: f(&kernel_size),
-            stride: f(&stride),
-            padding: f(&padding),
-            dilation: f(&dilation),
-        },
-        LayerKind::Conv3d {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        } => LayerKind::Conv3d {
+        } => LayerKind::Conv {
+            spatial_rank,
             in_channels: f(&in_channels),
             out_channels: f(&out_channels),
             kernel_size: f(&kernel_size),
@@ -647,7 +599,7 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
     }
 }
 
-/// Spatial rank from a pooling class name's `1d`/`2d`/`3d` suffix.
+/// Spatial rank from a layer class name's `1d`/`2d`/`3d` suffix.
 fn pool_spatial_rank(name: &str) -> Option<usize> {
     name.strip_suffix('d')?
         .chars()
@@ -731,11 +683,7 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
             "groups",
             "use_bias",
         ],
-        "Dropout" | "Dropout1d" | "Dropout2d" | "Dropout3d" | "BatchNorm" | "BatchNorm1d"
-        | "BatchNorm2d" | "BatchNorm3d" | "LayerNorm" | "GroupNorm" | "ReLU" | "GELU"
-        | "Sigmoid" | "Tanh" | "Softmax" | "PReLU" | "Identity" | "InstanceNorm1d"
-        | "InstanceNorm2d" | "InstanceNorm3d" | "RMSNorm" | "AlphaDropout" | "LocalResponseNorm"
-        | "TransformerEncoderLayer" | "TransformerDecoderLayer" => &["self"],
+        name if SHAPE_PRESERVING_LAYERS.contains(&name) => &["self"],
         "Flatten" => &["self", "start_dim", "end_dim"],
         "Unflatten" => &["self", "dim", "sizes"],
         "Upsample" => &["self", "size", "scale_factor", "mode", "align_corners"],
@@ -890,6 +838,7 @@ pub fn classify_inline_constructor(
     classify_layer_text(&resolved)
 }
 
+#[cfg(test)]
 pub fn extract_layer_assignments<F>(
     node: Node,
     text: &str,
@@ -1249,41 +1198,6 @@ where
     }
 
     Ok(layers)
-}
-
-pub fn extract_layer_applications(
-    node: Node,
-    text: &str,
-    layers: &HashMap<String, LayerKind>,
-) -> Result<Vec<LayerApplication>, String> {
-    let calls = extract_calls(node, text)?;
-    let mut applications = Vec::new();
-
-    for call in calls {
-        let Some(kind) = layers.get(&call.target) else {
-            continue;
-        };
-        let Some(args_node) = node.descendant_for_byte_range(
-            call.args_node_range.start_byte,
-            call.args_node_range.end_byte,
-        ) else {
-            continue;
-        };
-        let args = extract_call_arguments(args_node, text)?;
-        let Some(CallArgument::Positional { value }) = args.first() else {
-            continue;
-        };
-        applications.push(LayerApplication {
-            variable: call.variable,
-            layer: call.target,
-            input: value.clone(),
-            kind: kind.clone(),
-            range: call.args_node_range,
-            extra_inputs: Vec::new(),
-        });
-    }
-
-    Ok(applications)
 }
 
 /// Apply a signed integer offset to a symbolic expression, constant-folding
@@ -1671,22 +1585,51 @@ fn check_min_rank(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_conv_layer(
-    layer_name: &str,
-    spatial_rank: usize,
+/// Replace the last dim with `output`. An `expected` last dim that provably
+/// differs is an error.
+fn replace_last_dim(
+    name: &str,
     layer: &str,
     input: &str,
     input_shape: &[String],
-    in_channels: &str,
-    out_channels: &str,
-    kernel_size: &str,
-    stride: &str,
-    padding: &str,
-    dilation: &str,
+    expected: Option<&String>,
+    output: &str,
 ) -> Result<Option<Vec<String>>, String> {
-    let min_rank = spatial_rank + 1;
-    check_min_rank(layer_name, layer, input, input_shape.len(), min_rank)?;
+    let Some(last_dim) = input_shape.last() else {
+        let name = if name == "Linear" { "linear" } else { name };
+        return Err(format!("Cannot apply {} layer '{}' to scalar input '{}'", name, layer, input));
+    };
+    if let Some(expected) = expected
+        && dims_provably_mismatch(expected, last_dim)
+    {
+        return Err(format!(
+            "{} layer '{}' expected input last dim {}, got {} for '{}'",
+            name, layer, expected, last_dim, input
+        ));
+    }
+    let mut output_shape = input_shape.to_vec();
+    *output_shape.last_mut().unwrap() = output.to_string();
+    Ok(Some(output_shape))
+}
+
+/// Conv and ConvTranspose, channels-first: `[..., C, *spatial]`.
+fn apply_conv_layer(
+    kind: &LayerKind,
+    layer: &str,
+    input: &str,
+    input_shape: &[String],
+) -> Result<Option<Vec<String>>, String> {
+    let (name, spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation) = match kind {
+        LayerKind::Conv { spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation } => {
+            ("Conv", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, Some(dilation))
+        }
+        LayerKind::ConvTranspose { spatial_rank, in_channels, out_channels, kernel_size, stride, padding } => {
+            ("ConvTranspose", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, None)
+        }
+        _ => unreachable!("apply_conv_layer takes only Conv and ConvTranspose"),
+    };
+    let layer_name = format!("{name}{spatial_rank}d");
+    check_min_rank(&layer_name, layer, input, input_shape.len(), spatial_rank + 1)?;
 
     let channels_idx = input_shape.len() - spatial_rank - 1;
     let channels_dim = &input_shape[channels_idx];
@@ -1698,23 +1641,28 @@ fn apply_conv_layer(
     }
 
     let mut output_shape = input_shape.to_vec();
-    output_shape[channels_idx] = out_channels.to_string();
-    match conv_padding(padding, stride) {
-        ConvPadding::KeepsSize => {}
+    output_shape[channels_idx] = out_channels.clone();
+    let padding = match conv_padding(padding, stride) {
+        ConvPadding::KeepsSize => return Ok(Some(output_shape)),
         ConvPadding::Unknown => return Ok(None),
-        ConvPadding::Amount(padding) => {
-            let Some(dilations) = conv_dilations(dilation, spatial_rank) else {
-                return Ok(None);
-            };
-            for (dim, dilation) in output_shape[channels_idx + 1..].iter_mut().zip(&dilations) {
-                let kernel = without_literal_mark(kernel_size);
-                let Some(kernel) = effective_kernel_size(kernel, dilation) else {
-                    return Ok(None);
-                };
-                let kernel = if dilation == "1" { kernel_size } else { kernel.as_str() };
-                *dim = conv_spatial_dim(dim, kernel, stride, padding);
-            }
+        ConvPadding::Amount(padding) => padding,
+    };
+    let spatial = &mut output_shape[channels_idx + 1..];
+    let Some(dilation) = dilation else {
+        for dim in spatial {
+            *dim = conv_transpose_spatial_dim(dim, kernel_size, stride, padding);
         }
+        return Ok(Some(output_shape));
+    };
+    let Some(dilations) = conv_dilations(dilation, spatial_rank) else {
+        return Ok(None);
+    };
+    for (dim, dilation) in spatial.iter_mut().zip(&dilations) {
+        let Some(kernel) = effective_kernel_size(without_literal_mark(kernel_size), dilation) else {
+            return Ok(None);
+        };
+        let kernel = if dilation == "1" { kernel_size } else { &kernel };
+        *dim = conv_spatial_dim(dim, kernel, stride, padding);
     }
     Ok(Some(output_shape))
 }
@@ -1760,23 +1708,12 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
     }
 }
 
-/// Canonicalize a dim expression for comparison: strip whitespace and sort
-/// commutative `+` terms / `*` factors so `a + b` matches `b+a`. Expressions
-/// with parens or non-commutative operators are only whitespace-stripped.
-// `dims_match` used to duplicate a sort-only canonicalization in-place; it
-// now delegates to the shared `canonicalize_dim` (which also folds literal
-// arithmetic, e.g. `2*3*d` → `6*d`) so every dim-equality boundary in the
-// crate agrees on one canonical form.
-fn dims_match(a: &str, b: &str) -> bool {
-    crate::types::dims_canonically_equal(a, b)
-}
-
 /// A layer's expected dim comes from constructor-argument text, a different
 /// vocabulary than jaxtyping annotation dims (issue #47). A mismatch is only
 /// an error when both sides are concrete integers; otherwise it's unprovable
 /// and the layer's output shape is trusted.
 fn dims_provably_mismatch(expected: &str, actual: &str) -> bool {
-    !dims_match(expected, actual)
+    !dims_canonically_equal(expected, actual)
         && without_literal_mark(expected).trim().parse::<u64>().is_ok()
         && without_literal_mark(actual).trim().parse::<u64>().is_ok()
 }
@@ -1828,107 +1765,15 @@ fn apply_layer_rule(
         LayerKind::Linear {
             in_features,
             out_features,
-        } => {
-            let Some(last_dim) = input_shape.last() else {
-                return Err(format!(
-                    "Cannot apply linear layer '{}' to scalar input '{}'",
-                    layer, input
-                ));
-            };
-
-            if dims_provably_mismatch(in_features, last_dim) {
-                return Err(format!(
-                    "Linear layer '{}' expected input last dim {}, got {} for '{}'",
-                    layer, in_features, last_dim, input
-                ));
-            }
-
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = out_features.clone();
-            Ok(Some(output_shape))
-        }
-        // Channels-first layout: Conv1d expects [..., C, L]
-        LayerKind::Conv1d {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        } => apply_conv_layer(
-            "Conv1d",
-            1,
-            layer,
-            input,
-            input_shape,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        ),
-        // Channels-first layout: Conv2d expects [..., C, H, W]
-        LayerKind::Conv2d {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        } => apply_conv_layer(
-            "Conv2d",
-            2,
-            layer,
-            input,
-            input_shape,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        ),
-        // Channels-first layout: Conv3d expects [..., C, D, H, W]
-        LayerKind::Conv3d {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        } => apply_conv_layer(
-            "Conv3d",
-            3,
-            layer,
-            input,
-            input_shape,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-        ),
+        } => replace_last_dim("Linear", layer, input, input_shape, Some(in_features), out_features),
+        LayerKind::Conv { .. } | LayerKind::ConvTranspose { .. } => apply_conv_layer(kind, layer, input, input_shape),
         // Returns an (output, weights) tuple — a single shape can't express
         // it, so direct application skips; tuple unpacking is handled in
         // analysis::tuple_rhs_shapes.
         LayerKind::MultiheadAttention { .. } => Ok(None),
         // flax channels-last: last dim becomes `features`, nothing to check
         // (flax infers the input width at runtime).
-        LayerKind::Dense { features } => {
-            if input_shape.is_empty() {
-                return Err(format!(
-                    "Cannot apply Dense layer '{}' to scalar input '{}'",
-                    layer, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = features.clone();
-            Ok(Some(output_shape))
-        }
+        LayerKind::Dense { features } => replace_last_dim("Dense", layer, input, input_shape, None, features),
         LayerKind::FlaxConv {
             features,
             spatial_rank,
@@ -2009,39 +1854,6 @@ fn apply_layer_rule(
             output_shape.push(embedding_size.clone());
             Ok(Some(output_shape))
         }
-        // ConvTranspose1d/2d/3d: same channels-first layout as Conv, inverse
-        // spatial formula.
-        LayerKind::ConvTranspose {
-            spatial_rank,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-        } => {
-            let layer_name = format!("ConvTranspose{}d", spatial_rank);
-            check_min_rank(&layer_name, layer, input, input_shape.len(), spatial_rank + 1)?;
-            let channels_idx = input_shape.len() - spatial_rank - 1;
-            let channels_dim = &input_shape[channels_idx];
-            if dims_provably_mismatch(in_channels, channels_dim) {
-                return Err(format!(
-                    "{} layer '{}' expected {} input channels, got {} for '{}'",
-                    layer_name, layer, in_channels, channels_dim, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            output_shape[channels_idx] = out_channels.clone();
-            match conv_padding(padding, stride) {
-                ConvPadding::KeepsSize => {}
-                ConvPadding::Unknown => return Ok(None),
-                ConvPadding::Amount(padding) => {
-                    for dim in &mut output_shape[channels_idx + 1..] {
-                        *dim = conv_transpose_spatial_dim(dim, kernel_size, stride, padding);
-                    }
-                }
-            }
-            Ok(Some(output_shape))
-        }
         // torch.nn.Flatten(start_dim, end_dim): collapse the resolved range
         // into one dim. Unresolvable (non-literal) indices are unknown.
         LayerKind::Flatten { start_dim, end_dim } => {
@@ -2113,44 +1925,21 @@ fn apply_layer_rule(
             Ok(Some(output_shape))
         }
         // torch.nn.RNN/LSTM/GRU: approximated as the primary output tensor
-        // only (see LayerKind::Rnn doc comment).
+        // only (see LayerKind::Rnn doc comment). RNNCell/GRUCell/LSTMCell:
+        // the same rule for a single step, optionally unbatched.
         LayerKind::Rnn {
             name,
             input_size,
             hidden_size,
-        } => {
-            check_min_rank(name, layer, input, input_shape.len(), 2)?;
-            let last_dim = input_shape.last().unwrap();
-            if dims_provably_mismatch(input_size, last_dim) {
-                return Err(format!(
-                    "{} layer '{}' expected input last dim {}, got {} for '{}'",
-                    name, layer, input_size, last_dim, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = hidden_size.clone();
-            Ok(Some(output_shape))
         }
-        // RNNCell/GRUCell/LSTMCell: same last-dim transform, min_rank 1
-        // (single step, optionally unbatched).
-        LayerKind::RnnCell {
+        | LayerKind::RnnCell {
             name,
             input_size,
             hidden_size,
         } => {
-            check_min_rank(name, layer, input, input_shape.len(), 1)?;
-            let last_dim = input_shape.last().unwrap();
-            if dims_provably_mismatch(input_size, last_dim) {
-                return Err(format!(
-                    "{} layer '{}' expected input last dim {}, got {} for '{}'",
-                    name, layer, input_size, last_dim, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = hidden_size.clone();
-            Ok(Some(output_shape))
+            let min_rank = if matches!(kind, LayerKind::Rnn { .. }) { 2 } else { 1 };
+            check_min_rank(name, layer, input, input_shape.len(), min_rank)?;
+            replace_last_dim(name, layer, input, input_shape, Some(input_size), hidden_size)
         }
         // torch.nn.PixelShuffle(r): (*, C*r^2, H, W) -> (*, C, H*r, W*r).
         LayerKind::PixelShuffle { upscale_factor } => {
@@ -2225,24 +2014,7 @@ fn apply_layer_rule(
             in1_features,
             out_features,
             ..
-        } => {
-            let Some(last_dim) = input_shape.last() else {
-                return Err(format!(
-                    "Cannot apply Bilinear layer '{}' to scalar input '{}'",
-                    layer, input
-                ));
-            };
-            if dims_provably_mismatch(in1_features, last_dim) {
-                return Err(format!(
-                    "Bilinear layer '{}' expected input last dim {}, got {} for '{}'",
-                    layer, in1_features, last_dim, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = out_features.clone();
-            Ok(Some(output_shape))
-        }
+        } => replace_last_dim("Bilinear", layer, input, input_shape, Some(in1_features), out_features),
         // torch.nn.CosineSimilarity(dim): drops the reduced axis from x1's
         // shape (same single-tracked-input limitation as Bilinear).
         LayerKind::CosineSimilarity { dim } => {
@@ -2256,22 +2028,7 @@ fn apply_layer_rule(
         }
         // equinox.nn.MLP: last-dim transform, same rule as Linear.
         LayerKind::Mlp { in_size, out_size } => {
-            let Some(last_dim) = input_shape.last() else {
-                return Err(format!(
-                    "Cannot apply MLP layer '{}' to scalar input '{}'",
-                    layer, input
-                ));
-            };
-            if dims_provably_mismatch(in_size, last_dim) {
-                return Err(format!(
-                    "MLP layer '{}' expected input last dim {}, got {} for '{}'",
-                    layer, in_size, last_dim, input
-                ));
-            }
-            let mut output_shape = input_shape.to_vec();
-            let last = output_shape.len() - 1;
-            output_shape[last] = out_size.clone();
-            Ok(Some(output_shape))
+            replace_last_dim("MLP", layer, input, input_shape, Some(in_size), out_size)
         }
         // torch.nn.Unfold: channels-first (C, H, W) / (N, C, H, W) ->
         // (C*kh*kw, L) / (N, C*kh*kw, L), L = num_blocks_h * num_blocks_w.
@@ -2399,3368 +2156,673 @@ impl ShapeLookup for SingleShapeLookup {
     }
 }
 
-pub fn apply_layer_applications(
-    apps: &[LayerApplication],
-    scopes: &mut [FunctionShapeScope],
-) -> Vec<ShapeError> {
-    let mut errors = Vec::new();
-
-    for app in apps {
-        let Some(scope_idx) = scope_index_for_byte(scopes, app.range.start_byte) else {
-            continue;
-        };
-        match apply_layer_application(app, &scopes[scope_idx].shapes) {
-            Ok(Some(output_shape)) => {
-                scopes[scope_idx]
-                    .shapes
-                    .insert(app.variable.clone(), output_shape);
-            }
-            Ok(None) => {}
-            Err(message) => errors.push(ShapeError::mismatch(app.variable.clone(), message, app.range)),
-        }
-    }
-
-    errors
-}
-
 #[cfg(test)]
-mod apply_layer_application_tests {
+mod table_tests {
     use super::*;
+    use std::fs;
+    use tree_sitter::Parser;
 
-    fn linear(in_features: &str, out_features: &str) -> LayerKind {
-        LayerKind::Linear {
-            in_features: in_features.to_string(),
-            out_features: out_features.to_string(),
-        }
-    }
-
-    fn dummy_range() -> Range {
-        Range {
-            start_byte: 0,
-            end_byte: 0,
-            start_point: tree_sitter::Point::new(0, 0),
-            end_point: tree_sitter::Point::new(0, 0),
-        }
-    }
-
-    fn app(input: &str, kind: LayerKind) -> LayerApplication {
-        LayerApplication {
-            variable: "y".to_string(),
-            layer: "layer".to_string(),
-            input: input.to_string(),
-            kind,
-            range: dummy_range(),
-            extra_inputs: Vec::new(),
-        }
+    fn s(text: &str) -> String {
+        text.to_string()
     }
 
     fn shape(dims: &[&str]) -> Vec<String> {
         dims.iter().map(|dim| dim.to_string()).collect()
     }
 
+    fn app(input: &str, kind: LayerKind) -> LayerApplication {
+        LayerApplication {
+            variable: s("y"),
+            layer: s("layer"),
+            input: s(input),
+            kind,
+            range: Range {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 0),
+            },
+            extra_inputs: Vec::new(),
+        }
+    }
+
+    fn linear(in_features: &str, out_features: &str) -> LayerKind {
+        LayerKind::Linear { in_features: s(in_features), out_features: s(out_features) }
+    }
+
+    fn kept(name: &str) -> LayerKind {
+        LayerKind::ShapePreserving { name: s(name) }
+    }
+
+    fn seq(children: Vec<LayerKind>) -> LayerKind {
+        LayerKind::Sequential { children }
+    }
+
+    fn conv(spatial_rank: usize, in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::Conv {
+            spatial_rank,
+            in_channels: s(in_channels),
+            out_channels: s(out_channels),
+            kernel_size: s(kernel_size),
+            stride: s(stride),
+            padding: s(padding),
+            dilation: s("1"),
+        }
+    }
+
+    fn conv_transpose(spatial_rank: usize, in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::ConvTranspose {
+            spatial_rank,
+            in_channels: s(in_channels),
+            out_channels: s(out_channels),
+            kernel_size: s(kernel_size),
+            stride: s(stride),
+            padding: s(padding),
+        }
+    }
+
+    fn pool(name: &str, spatial_rank: usize, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        LayerKind::Pool { name: s(name), spatial_rank, kernel_size: s(kernel_size), stride: s(stride), padding: s(padding) }
+    }
+
+    fn einops(name: &str, pattern: &str, kwargs: &[(&str, &str)]) -> LayerKind {
+        let kwargs = kwargs.iter().map(|(k, v)| (s(k), s(v))).collect();
+        LayerKind::EinopsPattern { name: s(name), pattern: s(pattern), kwargs }
+    }
+
+    fn unfold(kernel_size: &str, stride: &str, padding: &str, dilation: &str) -> LayerKind {
+        LayerKind::Unfold { kernel_size: s(kernel_size), stride: s(stride), padding: s(padding), dilation: s(dilation) }
+    }
+
+    fn fold(output_size: &str, kernel_size: &str) -> LayerKind {
+        LayerKind::Fold { output_size: s(output_size), kernel_size: s(kernel_size) }
+    }
+
+    fn mha(feature_dim: &str) -> LayerKind {
+        LayerKind::MultiheadAttention { feature_dim: s(feature_dim) }
+    }
+
+    fn embedding(embedding_size: &str) -> LayerKind {
+        LayerKind::Embedding { embedding_size: s(embedding_size) }
+    }
+
+    fn rnn(name: &str, input_size: &str, hidden_size: &str) -> LayerKind {
+        LayerKind::Rnn { name: s(name), input_size: s(input_size), hidden_size: s(hidden_size) }
+    }
+
+    fn pad(padding: &str) -> LayerKind {
+        LayerKind::Pad { name: s("ConstantPad2d"), spatial_rank: 2, padding: s(padding) }
+    }
+
+    fn bilinear(in1_features: &str) -> LayerKind {
+        LayerKind::Bilinear { in1_features: s(in1_features), in2_features: s("20"), out_features: s("30") }
+    }
+
+    fn mlp(in_size: &str, out_size: &str) -> LayerKind {
+        LayerKind::Mlp { in_size: s(in_size), out_size: s(out_size) }
+    }
+
+    enum Applied {
+        Gives(&'static [&'static str]),
+        Unknown,
+        Fails(&'static [&'static str]),
+    }
+    use Applied::*;
+
     #[test]
-    fn test_applies_linear_to_rank_2_shape() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "5"])));
+    fn apply_cases() {
+        let flatten = |start_dim: &str, end_dim: &str| LayerKind::Flatten { start_dim: s(start_dim), end_dim: s(end_dim) };
+        let unflatten = |dim: &str| LayerKind::Unflatten { dim: s(dim), sizes: s("(2, 3)") };
+        let upsample = |scale_factor: Option<&str>, size: Option<&str>| LayerKind::Upsample {
+            scale_factor: scale_factor.map(s),
+            size: size.map(s),
+        };
+        let cosine = |dim: &str| LayerKind::CosineSimilarity { dim: s(dim) };
+        let rows: &[(&str, LayerKind, &[&str], Applied)] = &[
+            ("linear rank 2", linear("3", "5"), &["batch", "3"], Gives(&["batch", "5"])),
+            ("linear rank 1", linear("3", "5"), &["3"], Gives(&["5"])),
+            ("linear symbolic", linear("features", "hidden"), &["batch", "features"], Gives(&["batch", "hidden"])),
+            ("linear keeps leading dims", linear("features", "hidden"), &["time", "batch", "features"], Gives(&["time", "batch", "hidden"])),
+            ("linear scalar input", linear("3", "5"), &[], Fails(&["scalar input"])),
+            ("linear last dim mismatch", linear("3", "5"), &["batch", "4"], Fails(&["expected input last dim 3", "got 4"])),
+            // Issue #47: ctor-argument text and annotation dims are different
+            // vocabularies, so a symbolic mismatch is unprovable and trusted.
+            ("linear symbolic mismatch", linear("features", "hidden"), &["batch", "other"], Gives(&["batch", "hidden"])),
+            ("linear numeric vs symbolic", linear("features", "hidden"), &["batch", "3"], Gives(&["batch", "hidden"])),
+            ("linear same in and out", linear("features", "features"), &["batch", "features"], Gives(&["batch", "features"])),
+            ("embedding appends dim", embedding("512"), &["batch", "seq"], Gives(&["batch", "seq", "512"])),
+            ("embedding scalar index", embedding("512"), &[], Gives(&["512"])),
+            ("maxpool2d halves spatial dims", pool("MaxPool2d", 2, "2", "2", "0"), &["16", "32", "32"], Gives(&["16", "16", "16"])),
+            ("maxpool1d symbolic", pool("MaxPool1d", 1, "2", "2", "0"), &["c", "L"], Gives(&["c", "(L-2)/2+1"])),
+            (
+                "adaptive pool sets spatial dims",
+                LayerKind::AdaptivePool { name: s("AdaptiveAvgPool2d"), spatial_rank: 2, output_size: s("1") },
+                &["32", "16", "16"],
+                Gives(&["32", "1", "1"]),
+            ),
+            ("pool rank too low", pool("MaxPool2d", 2, "2", "2", "0"), &["16"], Fails(&["requires input with at least 3 dims"])),
+            ("flatten middle dims", flatten("1", "2"), &["2", "3", "4", "5"], Gives(&["2", "12", "5"])),
+            ("flatten symbolic, negative end", flatten("1", "-1"), &["batch", "c", "d"], Gives(&["batch", "c*d"])),
+            ("flatten unresolvable start", flatten("axis", "-1"), &["2", "3", "4"], Unknown),
+            ("unflatten", unflatten("1"), &["batch", "6", "feat"], Gives(&["batch", "2", "3", "feat"])),
+            ("unflatten non-literal dim", unflatten("axis"), &["batch", "6", "feat"], Unknown),
+            ("upsample scalar scale", upsample(Some("2"), None), &["1", "3", "8", "8"], Gives(&["1", "3", "16", "16"])),
+            ("upsample size tuple", upsample(None, Some("(20, 20)")), &["1", "3", "8", "8"], Gives(&["1", "3", "20", "20"])),
+            ("upsample rank too low", upsample(Some("2"), None), &["3", "8"], Fails(&["requires input with at least 3 dims"])),
+            // conv_spatial_dim(8, k=4, s=2, p=1) == 4; the transpose inverts it.
+            ("conv transpose2d", conv_transpose(2, "3", "16", "4", "2", "1"), &["3", "4", "4"], Gives(&["16", "8", "8"])),
+            ("conv transpose2d channels", conv_transpose(2, "3", "16", "4", "2", "1"), &["5", "4", "4"], Fails(&["expected 3 input channels"])),
+            ("rnn hidden size", rnn("GRU", "10", "20"), &["seq", "10"], Gives(&["seq", "20"])),
+            ("rnn input size mismatch", rnn("GRU", "10", "20"), &["seq", "9"], Fails(&["expected input last dim 10"])),
+            (
+                "rnn cell unbatched",
+                LayerKind::RnnCell { name: s("LSTMCell"), input_size: s("10"), hidden_size: s("20") },
+                &["10"],
+                Gives(&["20"]),
+            ),
+            ("pixel shuffle", LayerKind::PixelShuffle { upscale_factor: s("2") }, &["8", "4", "4"], Gives(&["2", "8", "8"])),
+            ("pixel shuffle indivisible", LayerKind::PixelShuffle { upscale_factor: s("2") }, &["9", "4", "4"], Fails(&["not evenly divisible"])),
+            ("pixel unshuffle", LayerKind::PixelUnshuffle { downscale_factor: s("2") }, &["2", "8", "8"], Gives(&["8", "4", "4"])),
+            ("pad uniform int", pad("1"), &["3", "8", "8"], Gives(&["3", "10", "10"])),
+            // The first (left, right) pair pads the last spatial dim.
+            ("pad tuple reverse axes", pad("(1, 1, 2, 2)"), &["3", "8", "8"], Gives(&["3", "12", "10"])),
+            ("pad symbolic", pad("p"), &["3", "8", "8"], Unknown),
+            ("bilinear first input", bilinear("10"), &["batch", "10"], Gives(&["batch", "30"])),
+            ("bilinear in1 mismatch", bilinear("10"), &["batch", "9"], Fails(&["expected input last dim 10"])),
+            ("cosine similarity", cosine("1"), &["batch", "10"], Gives(&["batch"])),
+            ("cosine similarity non-literal dim", cosine("axis"), &["batch", "10"], Unknown),
+            ("mlp", mlp("10", "5"), &["10"], Gives(&["5"])),
+            ("mlp in size mismatch", mlp("10", "5"), &["9"], Fails(&["expected input last dim 10"])),
+            ("instance norm2d min rank", kept("InstanceNorm2d"), &["8"], Fails(&["requires input with at least 3 dims"])),
+            ("identity any rank", kept("Identity"), &[], Gives(&[])),
+            ("alpha dropout any rank", kept("AlphaDropout"), &[], Gives(&[])),
+            ("transformer encoder any rank", kept("TransformerEncoderLayer"), &[], Gives(&[])),
+            ("transformer decoder any rank", kept("TransformerDecoderLayer"), &[], Gives(&[])),
+            ("rms norm min rank", kept("RMSNorm"), &[], Fails(&["requires input with at least 1 dims"])),
+            (
+                "sequential linear relu linear",
+                seq(vec![linear("784", "256"), kept("ReLU"), linear("256", "10")]),
+                &["batch", "784"],
+                Gives(&["batch", "10"]),
+            ),
+            (
+                "sequential reports the failing child",
+                seq(vec![linear("784", "256"), linear("999", "10")]),
+                &["batch", "784"],
+                Fails(&["layer[1]", "expected input last dim 999", "got 256"]),
+            ),
+            ("sequential scalar input", seq(vec![linear("784", "256")]), &[], Fails(&["layer[0]"])),
+            // MultiheadAttention applied directly is unknown, so the chain is too.
+            ("sequential unknown child", seq(vec![mha("512"), linear("512", "10")]), &["batch", "seq", "512"], Unknown),
+            (
+                "nested sequential",
+                seq(vec![seq(vec![linear("4", "8"), kept("ReLU")]), linear("8", "2")]),
+                &["batch", "4"],
+                Gives(&["batch", "2"]),
+            ),
+            ("empty sequential", seq(Vec::new()), &["batch", "4"], Gives(&["batch", "4"])),
+            ("einops rearrange", einops("Rearrange", "\"b c h w -> b (c h w)\"", &[]), &["2", "3", "4", "5"], Gives(&["2", "60"])),
+            (
+                "einops reduce axis kwargs",
+                einops("Reduce", "\"b (h w) c -> b h w c\"", &[("h", "14")]),
+                &["2", "196", "8"],
+                Gives(&["2", "14", "14", "8"]),
+            ),
+            ("einops rank mismatch", einops("Rearrange", "\"b c h w -> b (c h w)\"", &[]), &["2", "3", "4"], Fails(&["expects rank 4"])),
+            (
+                "sequential rearrange then linear",
+                seq(vec![einops("Rearrange", "\"b c h w -> b (c h w)\"", &[]), linear("60", "10")]),
+                &["2", "3", "4", "5"],
+                Gives(&["2", "10"]),
+            ),
+            // 6 blocks per axis: L = 36, channels = 3*3*3 = 27.
+            ("unfold scalar args", unfold("3", "1", "0", "1"), &["3", "8", "8"], Gives(&["27", "36"])),
+            ("unfold batched", unfold("3", "1", "0", "1"), &["2", "3", "8", "8"], Gives(&["2", "27", "36"])),
+            // blocks_h = 5, blocks_w = 4, L = 20, channels = 3*2*3 = 18.
+            ("unfold per-axis tuples", unfold("(2, 3)", "(2, 3)", "0", "1"), &["3", "10", "12"], Gives(&["18", "20"])),
+            // Effective kernel 5 gives 3 blocks per axis. Channels use the raw kernel.
+            ("unfold dilation", unfold("3", "1", "0", "2"), &["3", "7", "7"], Gives(&["27", "9"])),
+            ("unfold symbolic spatial dims", unfold("3", "1", "0", "1"), &["c", "H", "W"], Gives(&["c*3*3", "(H-2)*(W-2)"])),
+            ("unfold dilation with symbolic kernel", unfold("k", "1", "0", "2"), &["3", "8", "8"], Unknown),
+            ("unfold rank too low", unfold("2", "1", "0", "1"), &["8"], Fails(&["requires input with at least 3 dims"])),
+            ("unfold bad tuple arity", unfold("(1, 2, 3)", "1", "0", "1"), &["3", "8", "8"], Unknown),
+            ("fold divisible channels", fold("(6, 6)", "2"), &["12", "20"], Gives(&["3", "6", "6"])),
+            ("fold batched", fold("(6, 6)", "2"), &["8", "12", "20"], Gives(&["8", "3", "6", "6"])),
+            ("fold per-axis kernel", fold("(5, 7)", "(2, 3)"), &["18", "35"], Gives(&["3", "5", "7"])),
+            ("fold not divisible", fold("(4, 4)", "3"), &["10", "20"], Fails(&["not evenly divisible by 9"])),
+            ("fold symbolic", fold("(H, W)", "k"), &["c", "L"], Gives(&["c/(k*k)", "H", "W"])),
+            ("fold rank too low", fold("(4, 4)", "2"), &[], Fails(&["requires input with at least 2 dims"])),
+            ("fold bad output size arity", fold("(4, 5, 6)", "2"), &["12", "20"], Unknown),
+        ];
+        for (case, kind, input, expected) in rows {
+            let shapes = HashMap::from([(s("x"), shape(input))]);
+            let result = apply_layer_application(&app("x", kind.clone()), &shapes);
+            match expected {
+                Gives(dims) => assert_eq!(result, Ok(Some(shape(dims))), "case: {case}"),
+                Unknown => assert_eq!(result, Ok(None), "case: {case}"),
+                Fails(parts) => {
+                    let error = result.expect_err(case);
+                    for part in *parts {
+                        assert!(error.contains(part), "case: {case}: error was: {error}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_applies_linear_to_rank_1_shape() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["3"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["5"])));
-    }
-
-    #[test]
-    fn test_applies_linear_to_symbolic_shape() {
-        let app = app("x", linear("features", "hidden"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "hidden"])));
-    }
-
-    #[test]
-    fn test_preserves_leading_dimensions() {
-        let app = app("x", linear("features", "hidden"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["time", "batch", "features"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["time", "batch", "hidden"])));
-    }
-
-    #[test]
-    fn test_missing_input_shape_returns_none() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::new();
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
+    fn apply_without_input_shape_is_unknown() {
+        let output = apply_layer_application(&app("x", linear("3", "5")), &HashMap::new()).unwrap();
         assert_eq!(output, None);
     }
 
     #[test]
-    fn test_empty_input_shape_returns_error() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::from([("x".to_string(), Vec::new())]);
-
-        let error = apply_layer_application(&app, &shapes).unwrap_err();
-
-        assert!(error.contains("scalar input"));
-    }
-
-    #[test]
-    fn test_last_dim_mismatch_returns_error() {
-        let app = app("x", linear("3", "5"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "4"]))]);
-
-        let error = apply_layer_application(&app, &shapes).unwrap_err();
-
-        assert!(error.contains("expected input last dim 3"));
-        assert!(error.contains("got 4"));
-    }
-
-    #[test]
-    fn test_symbolic_mismatch_propagates() {
-        // Issue #47: "features" comes from ctor-argument text, "other" from a
-        // jaxtyping annotation — different vocabularies, unprovable mismatch.
-        // The layer output is trusted instead of erroring.
-        let app = app("x", linear("features", "hidden"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "other"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "hidden"])));
-    }
-
-    #[test]
-    fn test_numeric_and_symbolic_dims_propagate() {
-        // Issue #47: one symbolic side means the mismatch is unprovable.
-        let app = app("x", linear("features", "hidden"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "3"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "hidden"])));
-    }
-
-    #[test]
-    fn test_same_in_and_out_features_is_allowed() {
-        let app = app("x", linear("features", "features"));
-        let shapes = HashMap::from([("x".to_string(), shape(&["batch", "features"]))]);
-
-        let output = apply_layer_application(&app, &shapes).unwrap();
-
-        assert_eq!(output, Some(shape(&["batch", "features"])));
-    }
-
-    #[test]
-    fn test_error_mentions_layer_and_input_names() {
+    fn apply_error_mentions_layer_and_input_names() {
         let mut app = app("input", linear("3", "5"));
-        app.layer = "projection".to_string();
-        let shapes = HashMap::from([("input".to_string(), shape(&["batch", "4"]))]);
+        app.layer = s("projection");
+        let shapes = HashMap::from([(s("input"), shape(&["batch", "4"]))]);
 
         let error = apply_layer_application(&app, &shapes).unwrap_err();
 
         assert!(error.contains("projection"));
         assert!(error.contains("input"));
     }
-}
 
-#[cfg(test)]
-mod apply_layer_applications_tests {
-    use super::*;
-
-    fn linear(in_features: &str, out_features: &str) -> LayerKind {
-        LayerKind::Linear {
-            in_features: in_features.to_string(),
-            out_features: out_features.to_string(),
-        }
-    }
-
-    fn dummy_range() -> Range {
-        Range {
-            start_byte: 0,
-            end_byte: 0,
-            start_point: tree_sitter::Point::new(0, 0),
-            end_point: tree_sitter::Point::new(0, 0),
-        }
-    }
-
-    fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
-        LayerApplication {
-            variable: variable.to_string(),
-            layer: layer.to_string(),
-            input: input.to_string(),
-            kind,
-            range: dummy_range(),
-            extra_inputs: Vec::new(),
-        }
-    }
-
-    fn shape(dims: &[&str]) -> Vec<String> {
-        dims.iter().map(|dim| dim.to_string()).collect()
-    }
-
-    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
-        vec![FunctionShapeScope {
-            function_name: None,
-            start_byte: 0,
-            end_byte: usize::MAX,
-            shapes,
-            return_shape: None,
-            param_order: Vec::new(),
-        all_params: Vec::new(),
-            dimension_sites: Vec::new(),
-        }]
-    }
-
-    #[test]
-    fn test_applies_single_application_into_shape_map() {
-        let apps = vec![app("y", "layer", "x", linear("3", "5"))];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "3"])));
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-    }
-
-    #[test]
-    fn test_applies_chained_applications_in_order() {
-        let apps = vec![
-            app("y", "l1", "x", linear("3", "5")),
-            app("z", "l2", "y", linear("5", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert_eq!(scopes[0].shapes.get("z"), Some(&shape(&["batch", "7"])));
-    }
-
-    #[test]
-    fn test_missing_input_is_skipped_without_error() {
-        let apps = vec![app("y", "layer", "missing", linear("3", "5"))];
-        let mut scopes = scopes_from(HashMap::new());
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert!(!scopes[0].shapes.contains_key("y"));
-    }
-
-    #[test]
-    fn test_mismatch_records_error_and_continues() {
-        let apps = vec![
-            app("bad", "bad_layer", "x", linear("4", "5")),
-            app("good", "good_layer", "x", linear("3", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "bad");
-        assert!(errors[0].message.contains("bad_layer"));
-        assert!(!scopes[0].shapes.contains_key("bad"));
-        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
-    }
-
-    #[test]
-    fn test_order_matters_for_chains() {
-        let apps = vec![
-            app("z", "l2", "y", linear("5", "7")),
-            app("y", "l1", "x", linear("3", "5")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert!(!scopes[0].shapes.contains_key("z"));
-    }
-
-    #[test]
-    fn test_later_assignment_overwrites_existing_output_shape() {
-        let apps = vec![app("y", "layer", "x", linear("3", "5"))];
-        let mut scopes = scopes_from(HashMap::from([
-            ("x".to_string(), shape(&["batch", "3"])),
-            ("y".to_string(), shape(&["old"])),
-        ]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-    }
-
-    #[test]
-    fn test_collects_multiple_errors() {
-        let apps = vec![
-            app("a", "l1", "x", linear("4", "5")),
-            app("b", "l2", "x", linear("6", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].variable, "a");
-        assert!(errors[0].message.contains("l1"));
-        assert_eq!(errors[1].variable, "b");
-        assert!(errors[1].message.contains("l2"));
-        assert!(!scopes[0].shapes.contains_key("a"));
-        assert!(!scopes[0].shapes.contains_key("b"));
-    }
-
-    #[test]
-    fn test_scalar_error_does_not_stop_later_valid_application() {
-        let apps = vec![
-            app("bad", "l1", "scalar", linear("3", "5")),
-            app("good", "l2", "x", linear("3", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([
-            ("scalar".to_string(), Vec::new()),
-            ("x".to_string(), shape(&["batch", "3"])),
-        ]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "bad");
-        assert!(errors[0].message.contains("scalar input"));
-        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "7"])));
-    }
-
-    #[test]
-    fn test_shape_error_points_to_output_variable_not_input_variable() {
-        let apps = vec![app("projected", "projection", "x", linear("4", "5"))];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "projected");
-        assert!(errors[0].message.contains("projection"));
-        assert!(errors[0].message.contains("x"));
-    }
-
-    #[test]
-    fn test_empty_applications_preserve_existing_shapes() {
-        let apps = Vec::new();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "3"])));
-    }
-
-    #[test]
-    fn test_failed_application_does_not_overwrite_existing_output_shape() {
-        let apps = vec![app("y", "bad_layer", "x", linear("4", "5"))];
-        let mut scopes = scopes_from(HashMap::from([
-            ("x".to_string(), shape(&["batch", "3"])),
-            ("y".to_string(), shape(&["old", "shape"])),
-        ]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "y");
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["old", "shape"])));
-    }
-
-    #[test]
-    fn test_dependent_application_is_skipped_after_failed_producer() {
-        let apps = vec![
-            app("bad", "bad_layer", "x", linear("4", "5")),
-            app("z", "next_layer", "bad", linear("5", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "bad");
-        assert!(!scopes[0].shapes.contains_key("bad"));
-        assert!(!scopes[0].shapes.contains_key("z"));
-    }
-
-    #[test]
-    fn test_multiple_errors_for_same_output_variable_are_preserved() {
-        let apps = vec![
-            app("y", "l1", "x", linear("4", "5")),
-            app("y", "l2", "x", linear("6", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].variable, "y");
-        assert!(errors[0].message.contains("l1"));
-        assert_eq!(errors[1].variable, "y");
-        assert!(errors[1].message.contains("l2"));
-        assert!(!scopes[0].shapes.contains_key("y"));
-    }
-
-    #[test]
-    fn test_error_order_follows_application_order_with_successes_between() {
-        let apps = vec![
-            app("a", "l1", "x", linear("4", "5")),
-            app("good", "good_layer", "x", linear("3", "9")),
-            app("b", "l2", "x", linear("6", "7")),
-        ];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].variable, "a");
-        assert!(errors[0].message.contains("l1"));
-        assert_eq!(errors[1].variable, "b");
-        assert!(errors[1].message.contains("l2"));
-        assert_eq!(scopes[0].shapes.get("good"), Some(&shape(&["batch", "9"])));
-    }
-
-    #[test]
-    fn test_shape_error_preserves_application_range() {
-        let mut failed = app("y", "bad_layer", "x", linear("4", "5"));
-        failed.range = Range {
-            start_byte: 10,
-            end_byte: 13,
-            start_point: tree_sitter::Point::new(1, 2),
-            end_point: tree_sitter::Point::new(1, 5),
-        };
-        let apps = vec![failed];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].range.start_byte, 10);
-        assert_eq!(errors[0].range.end_byte, 13);
-        assert_eq!(errors[0].range.start_point, tree_sitter::Point::new(1, 2));
-        assert_eq!(errors[0].range.end_point, tree_sitter::Point::new(1, 5));
-    }
-
-    #[test]
-    fn test_multiple_shape_errors_preserve_their_own_ranges() {
-        let mut first = app("a", "l1", "x", linear("4", "5"));
-        first.range = Range {
-            start_byte: 1,
-            end_byte: 4,
-            start_point: tree_sitter::Point::new(0, 1),
-            end_point: tree_sitter::Point::new(0, 4),
-        };
-        let mut second = app("b", "l2", "x", linear("6", "7"));
-        second.range = Range {
-            start_byte: 10,
-            end_byte: 13,
-            start_point: tree_sitter::Point::new(1, 1),
-            end_point: tree_sitter::Point::new(1, 4),
-        };
-        let apps = vec![first, second];
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].range.start_byte, 1);
-        assert_eq!(errors[1].range.start_byte, 10);
-    }
-}
-
-#[cfg(test)]
-mod extract_layer_applications_tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    fn parse(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        let language = tree_sitter_python::LANGUAGE;
-        parser.set_language(&language.into()).unwrap();
-        parser.parse(code, None).unwrap()
-    }
-
-    fn linear(in_features: &str, out_features: &str) -> LayerKind {
-        LayerKind::Linear {
-            in_features: in_features.to_string(),
-            out_features: out_features.to_string(),
-        }
-    }
-
-    fn dummy_range() -> Range {
-        Range {
-            start_byte: 0,
-            end_byte: 0,
-            start_point: tree_sitter::Point::new(0, 0),
-            end_point: tree_sitter::Point::new(0, 0),
-        }
-    }
-
-    fn app(variable: &str, layer: &str, input: &str, kind: LayerKind) -> LayerApplication {
-        LayerApplication {
-            variable: variable.to_string(),
-            layer: layer.to_string(),
-            input: input.to_string(),
-            kind,
-            range: dummy_range(),
-            extra_inputs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_extracts_simple_layer_application() {
-        let code = "y = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
-    }
-
-    #[test]
-    fn test_extracts_multiple_layer_applications() {
-        let code = "y = l1(x)\nz = l2(y)";
-        let tree = parse(code);
-        let layers = HashMap::from([
-            ("l1".to_string(), linear("3", "5")),
-            ("l2".to_string(), linear("5", "7")),
-        ]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![
-                app("y", "l1", "x", linear("3", "5")),
-                app("z", "l2", "y", linear("5", "7")),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_skips_unknown_layer_call() {
-        let code = "y = layer(x)\nz = unknown(y)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
-    }
-
-    #[test]
-    fn test_skips_layer_call_without_arguments() {
-        let code = "y = layer()";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert!(applications.is_empty());
-    }
-
-    #[test]
-    fn test_skips_layer_call_with_keyword_only_input() {
-        let code = "y = layer(x=x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert!(applications.is_empty());
-    }
-
-    #[test]
-    fn test_keeps_expression_input_text() {
-        let code = "y = layer(x + residual)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![app("y", "layer", "x + residual", linear("3", "5"))]
-        );
-    }
-
-    #[test]
-    fn test_skips_attribute_layer_call_for_now() {
-        let code = "y = model.layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert!(applications.is_empty());
-    }
-
-    #[test]
-    fn test_uses_first_positional_arg_when_extra_args_are_present() {
-        let code = "y = layer(x, other, flag=True)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
-    }
-
-    #[test]
-    fn test_preserves_application_order_while_skipping_unknown_calls() {
-        let code = "a = l1(x)\nignored = unknown(a)\nb = l2(a)";
-        let tree = parse(code);
-        let layers = HashMap::from([
-            ("l1".to_string(), linear("3", "5")),
-            ("l2".to_string(), linear("5", "7")),
-        ]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![
-                app("a", "l1", "x", linear("3", "5")),
-                app("b", "l2", "a", linear("5", "7")),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_layer_name_match_is_exact() {
-        let code = "y = layer2(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert!(applications.is_empty());
-    }
-
-    #[test]
-    fn test_extracts_layer_application_inside_function() {
-        let code = "def f(x):\n    y = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(applications, vec![app("y", "layer", "x", linear("3", "5"))]);
-    }
-
-    #[test]
-    fn test_keeps_nested_call_input_text() {
-        let code = "y = layer(preprocess(x))";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![app("y", "layer", "preprocess(x)", linear("3", "5"))]
-        );
-    }
-
-    #[test]
-    fn test_keeps_subscript_input_text() {
-        let code = "y = layer(x[:, 0])";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![app("y", "layer", "x[:, 0]", linear("3", "5"))]
-        );
-    }
-
-    #[test]
-    fn test_keeps_parenthesized_input_text() {
-        let code = "y = layer((x))";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![app("y", "layer", "(x)", linear("3", "5"))]
-        );
-    }
-
-    #[test]
-    fn test_duplicate_output_applications_are_kept_in_order() {
-        let code = "y = l1(x)\ny = l2(y)";
-        let tree = parse(code);
-        let layers = HashMap::from([
-            ("l1".to_string(), linear("3", "5")),
-            ("l2".to_string(), linear("5", "7")),
-        ]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            applications,
-            vec![
-                app("y", "l1", "x", linear("3", "5")),
-                app("y", "l2", "y", linear("5", "7")),
-            ]
-        );
-    }
-
-    fn range_text<'a>(text: &'a str, range: &Range) -> &'a str {
-        &text[range.start_byte..range.end_byte]
-    }
-
-    #[test]
-    fn test_application_range_covers_arguments() {
-        let code = "y = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(x)");
-    }
-
-    #[test]
-    fn test_application_range_covers_expression_arguments() {
-        let code = "y = layer(x + residual)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(x + residual)");
-    }
-
-    #[test]
-    fn test_multiple_application_ranges_follow_each_call() {
-        let code = "a = l1(x)\nb = l2(a)";
-        let tree = parse(code);
-        let layers = HashMap::from([
-            ("l1".to_string(), linear("3", "5")),
-            ("l2".to_string(), linear("5", "7")),
-        ]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(x)");
-        assert_eq!(range_text(code, &applications[1].range), "(a)");
-    }
-
-    #[test]
-    fn test_application_range_covers_all_arguments() {
-        let code = "y = layer(x, other, flag=True)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(
-            range_text(code, &applications[0].range),
-            "(x, other, flag=True)"
-        );
-    }
-
-    #[test]
-    fn test_application_range_covers_nested_call_argument() {
-        let code = "y = layer(preprocess(x))";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(preprocess(x))");
-    }
-
-    #[test]
-    fn test_application_range_inside_function_includes_only_arguments() {
-        let code = "def f(x):\n    y = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(x)");
-        assert_eq!(applications[0].range.start_point.row, 1);
-    }
-
-    #[test]
-    fn test_application_range_covers_multiline_arguments() {
-        let code = "y = layer(\n    x\n)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(\n    x\n)");
-        assert_eq!(applications[0].range.start_point.row, 0);
-        assert_eq!(applications[0].range.end_point.row, 2);
-    }
-
-    #[test]
-    fn test_duplicate_output_application_ranges_are_distinct() {
-        let code = "y = l1(x)\ny = l2(y)";
-        let tree = parse(code);
-        let layers = HashMap::from([
-            ("l1".to_string(), linear("3", "5")),
-            ("l2".to_string(), linear("5", "7")),
-        ]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(range_text(code, &applications[0].range), "(x)");
-        assert_eq!(range_text(code, &applications[1].range), "(y)");
-        assert_ne!(
-            applications[0].range.start_byte,
-            applications[1].range.start_byte
-        );
-    }
-
-    #[test]
-    fn test_range_after_skipped_unknown_call_belongs_to_known_call() {
-        let code = "ignored = unknown(x)\ny = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::from([("layer".to_string(), linear("3", "5"))]);
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert_eq!(applications.len(), 1);
-        assert_eq!(range_text(code, &applications[0].range), "(x)");
-        assert_eq!(applications[0].range.start_point.row, 1);
-    }
-
-    #[test]
-    fn test_empty_layer_map_returns_empty_applications() {
-        let code = "y = layer(x)";
-        let tree = parse(code);
-        let layers = HashMap::new();
-
-        let applications = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-
-        assert!(applications.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod extract_layer_assignments_tests {
-    use super::*;
-    use std::fs;
-    use tree_sitter::Parser;
-
-    fn parse(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        let language = tree_sitter_python::LANGUAGE;
-        parser.set_language(&language.into()).unwrap();
-        parser.parse(code, None).unwrap()
-    }
-
-    fn read(path: &PathBuf) -> Option<String> {
-        fs::read_to_string(path).ok()
-    }
-
-    fn write_equinox_linear(tmp: &tempfile::TempDir) {
-        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
-        fs::write(
-            tmp.path().join("equinox/nn/__init__.py"),
-            "from ._linear import Linear",
-        )
-        .unwrap();
-        fs::write(
-            tmp.path().join("equinox/nn/_linear.py"),
-            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_extracts_single_linear_assignment() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_extracts_multiple_linear_assignments() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code =
-            "import equinox as eqx\na = eqx.nn.Linear(3, 5)\nb = eqx.nn.Linear(features, hidden)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(layers.len(), 2);
-        assert_eq!(
-            layers.get("a"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-        assert_eq!(
-            layers.get("b"),
-            Some(&LayerKind::Linear {
-                in_features: "features".to_string(),
-                out_features: "hidden".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_supports_from_import_alias_assignment() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code =
-            "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_skips_non_layer_calls() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        fs::write(tmp.path().join("helpers.py"), "def make_layer(): pass").unwrap();
-        let code = "import equinox as eqx\nimport helpers\nlayer = eqx.nn.Linear(3, 5)\nother = helpers.make_layer()";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(layers.len(), 1);
-        assert!(layers.contains_key("layer"));
-        assert!(!layers.contains_key("other"));
-    }
-
-    #[test]
-    fn test_skips_missing_implementation() {
-        // User-defined module not in the built-in catalog: must still fall
-        // through to disk resolution, which fails for missing impl.
-        let tmp = tempfile::tempdir().unwrap();
-        let code = "import my_layers\nlayer = my_layers.Linear(3, 5)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert!(layers.is_empty());
-    }
-
-    #[test]
-    fn test_supports_reversed_keyword_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(out_features=5, in_features=3)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_supports_extra_constructor_kwargs() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5, use_bias=False, key=key)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_keyword_overrides_positional_constructor_binding() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 4, out_features=5)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_extracts_layer_assignment_inside_function() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\ndef make():\n    layer = eqx.nn.Linear(3, 5)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_skips_layer_assignment_when_required_feature_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(in_features=3)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert!(layers.is_empty());
-    }
-
-    #[test]
-    fn test_duplicate_layer_assignment_last_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code =
-            "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\nlayer = eqx.nn.Linear(7, 11)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "7".to_string(),
-                out_features: "11".to_string()
-            })
-        );
-    }
-}
-
-#[cfg(test)]
-mod classify_layer_call_tests {
-    use super::*;
-
-    fn call(
-        module_parts: &[&str],
-        owner: Option<&str>,
-        name: &str,
-        bindings: &[(&str, &str)],
-    ) -> ResolvedCallSignature {
+    fn call(module_parts: &[&str], owner: Option<&str>, name: &str, bindings: &[(&str, &str)]) -> ResolvedCallSignature {
         ResolvedCallSignature {
             implementation: ResolvedImplementation {
                 target: ResolvedModuleTarget {
                     dots: 0,
                     module_parts: module_parts.iter().map(|p| p.to_string()).collect(),
                     file_path: PathBuf::from("unused.py"),
-                    symbol_parts: vec![owner.unwrap_or(name).to_string()],
+                    symbol_parts: vec![s(owner.unwrap_or(name))],
                 },
-                symbol: owner.map(|owner| PythonSymbol::Class {
-                    name: owner.to_string(),
-                }),
+                symbol: owner.map(|owner| PythonSymbol::Class { name: s(owner) }),
             },
             signature: PythonCallableSignature {
-                owner: owner.map(|owner| owner.to_string()),
-                name: name.to_string(),
+                owner: owner.map(s),
+                name: s(name),
                 params: Vec::new(),
             },
             arguments: Vec::new(),
-            bindings: bindings
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect(),
+            bindings: bindings.iter().map(|(name, value)| (s(name), s(value))).collect(),
         }
     }
 
-    #[test]
-    fn test_classifies_equinox_linear() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
+    /// Case, module, owner, method, bindings, expected layer.
+    type ClassifyRow<'a> = (&'a str, &'a [&'a str], Option<&'a str>, &'a str, &'a [(&'a str, &'a str)], Option<LayerKind>);
 
     #[test]
-    fn test_classifies_symbolic_equinox_linear() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "features"), ("out_features", "hidden")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Linear {
-                in_features: "features".to_string(),
-                out_features: "hidden".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_missing_in_features_returns_none() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("out_features", "5")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_missing_out_features_returns_none() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "3")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_non_equinox_linear_returns_none() {
-        let call = call(
-            &["my_project", "layers"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_non_constructor_returns_none() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "forward",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_nested_equinox_nn_module_is_accepted() {
-        let call = call(
-            &["equinox", "nn", "layers", "linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_equinox_not_nn_returns_none() {
-        let call = call(
-            &["equinox", "experimental"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_wrong_owner_returns_none() {
-        let call = call(
-            &["equinox", "nn"],
-            Some("Dense"),
-            "__init__",
-            &[("in_features", "3"), ("out_features", "5")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_function_call_returns_none() {
-        let call = call(&["jax", "numpy"], None, "concatenate", &[("arrays", "xs")]);
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    // --- MultiheadAttention bug fix: equinox and torch bind different ctor
-    // positions to the tracked feature dim. ---
-
-    #[test]
-    fn test_classifies_torch_multihead_attention_via_embed_dim() {
-        let call = call(
-            &["torch", "nn"],
-            Some("MultiheadAttention"),
-            "__init__",
-            &[("embed_dim", "512"), ("num_heads", "8")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::MultiheadAttention {
-                feature_dim: "512".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_classifies_equinox_multihead_attention_via_query_size() {
-        // equinox.nn.MultiheadAttention(num_heads, query_size, ...) — reversed
-        // order vs. torch. Before the fix, classify_layer_call always read
-        // the `embed_dim` binding key, which equinox ctors never populate, so
-        // this returned None.
-        let call = call(
-            &["equinox", "nn"],
-            Some("MultiheadAttention"),
-            "__init__",
-            &[("num_heads", "8"), ("query_size", "512")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::MultiheadAttention {
-                feature_dim: "512".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_equinox_multihead_attention_ignores_embed_dim_binding() {
-        // Even if an `embed_dim` binding happened to be present (e.g. stale
-        // data), the equinox path must read `query_size`, not `embed_dim`.
-        let call = call(
-            &["equinox", "nn"],
-            Some("MultiheadAttention"),
-            "__init__",
-            &[
-                ("embed_dim", "8"),
-                ("num_heads", "8"),
-                ("query_size", "512"),
-            ],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::MultiheadAttention {
-                feature_dim: "512".to_string()
-            })
-        );
-    }
-
-    // --- einops.layers.{torch,flax}.Rearrange / Reduce ---
-
-    #[test]
-    fn test_classifies_einops_torch_rearrange() {
-        let call = call(
-            &["einops", "layers", "torch"],
-            Some("Rearrange"),
-            "__init__",
-            &[("pattern", "\"b c h w -> b (c h w)\"")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::EinopsPattern {
-                name: "Rearrange".to_string(),
-                pattern: "\"b c h w -> b (c h w)\"".to_string(),
-                kwargs: HashMap::new(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_classifies_einops_flax_reduce_with_axis_kwargs() {
-        let call = call(
-            &["einops", "layers", "flax"],
-            Some("Reduce"),
-            "__init__",
-            &[
-                ("pattern", "\"b (h w) c -> b h w c\""),
-                ("reduction", "\"mean\""),
-                ("h", "14"),
-                ("w", "14"),
-            ],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::EinopsPattern {
-                name: "Reduce".to_string(),
-                pattern: "\"b (h w) c -> b h w c\"".to_string(),
-                kwargs: HashMap::from([
-                    ("h".to_string(), "14".to_string()),
-                    ("w".to_string(), "14".to_string()),
-                ]),
-            })
-        );
-    }
-
-    #[test]
-    fn test_einops_rearrange_missing_pattern_returns_none() {
-        let call = call(&["einops", "layers", "torch"], Some("Rearrange"), "__init__", &[]);
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_einops_rearrange_wrong_module_returns_none() {
-        let call = call(
-            &["einops", "layers", "chainer"],
-            Some("Rearrange"),
-            "__init__",
-            &[("pattern", "\"a b -> b a\"")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    // --- torch.nn.Unfold / torch.nn.Fold ---
-
-    #[test]
-    fn test_classifies_torch_unfold_scalar_args() {
-        let call = call(
-            &["torch", "nn", "fold"],
-            Some("Unfold"),
-            "__init__",
-            &[("kernel_size", "3")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Unfold {
-                kernel_size: "3".to_string(),
-                stride: "1".to_string(),
-                padding: "0".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_classifies_torch_unfold_tuple_args() {
-        let call = call(
-            &["torch", "nn", "fold"],
-            Some("Unfold"),
-            "__init__",
-            &[
-                ("kernel_size", "(2, 3)"),
-                ("stride", "(1, 2)"),
-                ("padding", "1"),
-            ],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Unfold {
-                kernel_size: "(2, 3)".to_string(),
-                stride: "(1, 2)".to_string(),
-                padding: "1".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_unfold_missing_kernel_size_returns_none() {
-        let call = call(&["torch", "nn", "fold"], Some("Unfold"), "__init__", &[]);
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    #[test]
-    fn test_classifies_torch_fold() {
-        let call = call(
-            &["torch", "nn", "fold"],
-            Some("Fold"),
-            "__init__",
-            &[("output_size", "(4, 5)"), ("kernel_size", "2")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Fold {
-                output_size: "(4, 5)".to_string(),
-                kernel_size: "2".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_fold_missing_output_size_returns_none() {
-        let call = call(
-            &["torch", "nn", "fold"],
-            Some("Fold"),
-            "__init__",
-            &[("kernel_size", "2")],
-        );
-
-        assert_eq!(classify_layer_call(&call), None);
-    }
-
-    // --- torch.nn.LocalResponseNorm ---
-
-    #[test]
-    fn test_classifies_local_response_norm_as_shape_preserving() {
-        let call = call(
-            &["torch", "nn", "normalization"],
-            Some("LocalResponseNorm"),
-            "__init__",
-            &[("size", "5")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::ShapePreserving {
-                name: "LocalResponseNorm".to_string()
-            })
-        );
-    }
-
-    // --- self.-prefixed ctor args (issue noted in llm.txt: `Linear(self.d_inner, ...)`) ---
-
-    #[test]
-    fn test_strips_self_prefix_from_ctor_arg() {
-        // Mirrors llm.txt's noted gap: `Linear(self.d_inner, out_features)`
-        // binds `in_features` as the literal text `"self.d_inner"`, which
-        // must normalize to `"d_inner"` to match a same-named jaxtyping
-        // annotation dim.
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "self.d_inner"), ("out_features", "10")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Linear {
-                in_features: "d_inner".to_string(),
-                out_features: "10".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_strips_self_prefix_from_compound_ctor_arg() {
-        let call = call(
-            &["equinox", "nn", "_linear"],
-            Some("Linear"),
-            "__init__",
-            &[("in_features", "self.d_inner*2"), ("out_features", "10")],
-        );
-
-        assert_eq!(
-            classify_layer_call(&call),
-            Some(LayerKind::Linear {
-                in_features: "d_inner*2".to_string(),
-                out_features: "10".to_string(),
-            })
-        );
-    }
-}
-
-#[cfg(test)]
-mod known_layer_signature_tests {
-    use super::*;
-
-    fn parts(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|p| p.to_string()).collect()
-    }
-
-    #[test]
-    fn test_equinox_linear_signature() {
-        let sig = known_layer_signature(&parts(&["equinox", "nn", "Linear"])).unwrap();
-        assert_eq!(sig.owner.as_deref(), Some("Linear"));
-        assert_eq!(sig.name, "__init__");
-        assert_eq!(&sig.params[..3], &["self", "in_features", "out_features"]);
-    }
-
-    #[test]
-    fn test_torch_linear_signature() {
-        let sig = known_layer_signature(&parts(&["torch", "nn", "Linear"])).unwrap();
-        assert_eq!(sig.owner.as_deref(), Some("Linear"));
-        assert_eq!(sig.name, "__init__");
-        assert_eq!(&sig.params[..3], &["self", "in_features", "out_features"]);
-    }
-
-    #[test]
-    fn test_equinox_conv_variants_signatures() {
-        for class in ["Conv1d", "Conv2d", "Conv3d"] {
-            let sig = known_layer_signature(&parts(&["equinox", "nn", class])).unwrap();
-            assert_eq!(sig.owner.as_deref(), Some(class));
-            assert_eq!(sig.name, "__init__");
-            assert_eq!(
-                &sig.params[..4],
-                &["self", "in_channels", "out_channels", "kernel_size"]
-            );
-            assert!(sig.params.iter().any(|p| p == "stride"));
-            assert!(sig.params.iter().any(|p| p == "padding"));
-        }
-    }
-
-    #[test]
-    fn test_torch_conv_variants_signatures() {
-        for class in ["Conv1d", "Conv2d", "Conv3d"] {
-            let sig = known_layer_signature(&parts(&["torch", "nn", class])).unwrap();
-            assert_eq!(sig.owner.as_deref(), Some(class));
-            assert_eq!(
-                &sig.params[..4],
-                &["self", "in_channels", "out_channels", "kernel_size"]
-            );
-        }
-    }
-
-    #[test]
-    fn test_shape_preserving_layer_signatures() {
-        let names = [
-            "Dropout",
-            "Dropout1d",
-            "Dropout2d",
-            "Dropout3d",
-            "BatchNorm",
-            "BatchNorm1d",
-            "BatchNorm2d",
-            "BatchNorm3d",
-            "LayerNorm",
-            "GroupNorm",
-            "ReLU",
-            "GELU",
-            "Sigmoid",
-            "Tanh",
-            "Softmax",
-            "PReLU",
+    fn classify_cases() {
+        const EQX_LINEAR: &[&str] = &["equinox", "nn", "_linear"];
+        const IN_OUT: &[(&str, &str)] = &[("in_features", "3"), ("out_features", "5")];
+        const REARRANGE: &str = "\"b c h w -> b (c h w)\"";
+        const REDUCE: &str = "\"b (h w) c -> b h w c\"";
+        let init = "__init__";
+        let rows: &[ClassifyRow] = &[
+            ("equinox linear", EQX_LINEAR, Some("Linear"), init, IN_OUT, Some(linear("3", "5"))),
+            (
+                "symbolic equinox linear",
+                EQX_LINEAR,
+                Some("Linear"),
+                init,
+                &[("in_features", "features"), ("out_features", "hidden")],
+                Some(linear("features", "hidden")),
+            ),
+            ("missing in_features", EQX_LINEAR, Some("Linear"), init, &[("out_features", "5")], None),
+            ("missing out_features", EQX_LINEAR, Some("Linear"), init, &[("in_features", "3")], None),
+            ("non-equinox linear", &["my_project", "layers"], Some("Linear"), init, IN_OUT, None),
+            ("non-constructor", EQX_LINEAR, Some("Linear"), "forward", IN_OUT, None),
+            ("nested equinox.nn module", &["equinox", "nn", "layers", "linear"], Some("Linear"), init, IN_OUT, Some(linear("3", "5"))),
+            ("equinox not nn", &["equinox", "experimental"], Some("Linear"), init, IN_OUT, None),
+            ("wrong owner", &["equinox", "nn"], Some("Dense"), init, IN_OUT, None),
+            ("function call", &["jax", "numpy"], None, "concatenate", &[("arrays", "xs")], None),
+            (
+                "torch multihead attention reads embed_dim",
+                &["torch", "nn"],
+                Some("MultiheadAttention"),
+                init,
+                &[("embed_dim", "512"), ("num_heads", "8")],
+                Some(mha("512")),
+            ),
+            // equinox orders (num_heads, query_size, ...), the reverse of torch.
+            (
+                "equinox multihead attention reads query_size",
+                &["equinox", "nn"],
+                Some("MultiheadAttention"),
+                init,
+                &[("num_heads", "8"), ("query_size", "512")],
+                Some(mha("512")),
+            ),
+            (
+                "equinox multihead attention ignores embed_dim",
+                &["equinox", "nn"],
+                Some("MultiheadAttention"),
+                init,
+                &[("embed_dim", "8"), ("num_heads", "8"), ("query_size", "512")],
+                Some(mha("512")),
+            ),
+            (
+                "einops torch rearrange",
+                &["einops", "layers", "torch"],
+                Some("Rearrange"),
+                init,
+                &[("pattern", REARRANGE)],
+                Some(einops("Rearrange", REARRANGE, &[])),
+            ),
+            (
+                "einops flax reduce with axis kwargs",
+                &["einops", "layers", "flax"],
+                Some("Reduce"),
+                init,
+                &[("pattern", REDUCE), ("reduction", "\"mean\""), ("h", "14"), ("w", "14")],
+                Some(einops("Reduce", REDUCE, &[("h", "14"), ("w", "14")])),
+            ),
+            ("einops rearrange without pattern", &["einops", "layers", "torch"], Some("Rearrange"), init, &[], None),
+            ("einops rearrange wrong module", &["einops", "layers", "chainer"], Some("Rearrange"), init, &[("pattern", "\"a b -> b a\"")], None),
+            ("torch unfold scalar args", &["torch", "nn", "fold"], Some("Unfold"), init, &[("kernel_size", "3")], Some(unfold("3", "1", "0", "1"))),
+            (
+                "torch unfold tuple args",
+                &["torch", "nn", "fold"],
+                Some("Unfold"),
+                init,
+                &[("kernel_size", "(2, 3)"), ("stride", "(1, 2)"), ("padding", "1")],
+                Some(unfold("(2, 3)", "(1, 2)", "1", "1")),
+            ),
+            ("unfold without kernel_size", &["torch", "nn", "fold"], Some("Unfold"), init, &[], None),
+            (
+                "torch fold",
+                &["torch", "nn", "fold"],
+                Some("Fold"),
+                init,
+                &[("output_size", "(4, 5)"), ("kernel_size", "2")],
+                Some(fold("(4, 5)", "2")),
+            ),
+            ("fold without output_size", &["torch", "nn", "fold"], Some("Fold"), init, &[("kernel_size", "2")], None),
+            (
+                "local response norm",
+                &["torch", "nn", "normalization"],
+                Some("LocalResponseNorm"),
+                init,
+                &[("size", "5")],
+                Some(kept("LocalResponseNorm")),
+            ),
+            // `Linear(self.d_inner, ...)` must match a `d_inner` annotation dim.
+            (
+                "strips self prefix",
+                EQX_LINEAR,
+                Some("Linear"),
+                init,
+                &[("in_features", "self.d_inner"), ("out_features", "10")],
+                Some(linear("d_inner", "10")),
+            ),
+            (
+                "strips self prefix in compound arg",
+                EQX_LINEAR,
+                Some("Linear"),
+                init,
+                &[("in_features", "self.d_inner*2"), ("out_features", "10")],
+                Some(linear("d_inner*2", "10")),
+            ),
         ];
-        for framework in ["equinox", "torch"] {
-            for name in names {
-                let sig = known_layer_signature(&parts(&[framework, "nn", name]))
-                    .unwrap_or_else(|| panic!("no signature for {}.nn.{}", framework, name));
-                assert_eq!(sig.owner.as_deref(), Some(name));
-                assert_eq!(sig.name, "__init__");
-            }
+        for (case, module_parts, owner, name, bindings, expected) in rows {
+            let call = call(module_parts, *owner, name, bindings);
+            assert_eq!(&classify_layer_call(&call), expected, "case: {case}");
         }
     }
 
-    #[test]
-    fn test_unknown_framework_returns_none() {
-        assert!(known_layer_signature(&parts(&["jax", "nn", "Linear"])).is_none());
-        assert!(known_layer_signature(&parts(&["flax", "nn", "Dense"])).is_none());
+    enum Sig {
+        /// The params start with the first list and contain the second.
+        Params(&'static [&'static str], &'static [&'static str]),
+        Exact(&'static [&'static str]),
+        Missing,
     }
 
     #[test]
-    fn test_flax_linen_dense_in_catalog() {
-        let sig = known_layer_signature(&parts(&["flax", "linen", "Dense"])).unwrap();
-        assert_eq!(sig.owner.as_deref(), Some("Dense"));
-        assert!(sig.params.contains(&"features".to_string()));
-    }
-
-    #[test]
-    fn test_unknown_class_returns_none() {
-        assert!(known_layer_signature(&parts(&["equinox", "nn", "Mystery"])).is_none());
-        assert!(known_layer_signature(&parts(&["torch", "nn", "Mystery"])).is_none());
-    }
-
-    #[test]
-    fn test_short_path_returns_none() {
-        assert!(known_layer_signature(&parts(&["Linear"])).is_none());
-        assert!(known_layer_signature(&parts(&["torch", "nn"])).is_none());
-    }
-
-    #[test]
-    fn test_wrong_subpackage_returns_none() {
-        // equinox.experimental.Linear should not match
-        assert!(known_layer_signature(&parts(&["equinox", "experimental", "Linear"])).is_none());
-        assert!(known_layer_signature(&parts(&["torch", "functional", "Linear"])).is_none());
-    }
-
-    #[test]
-    fn test_torch_multihead_attention_signature_order() {
-        let sig = known_layer_signature(&parts(&["torch", "nn", "MultiheadAttention"])).unwrap();
-        assert_eq!(&sig.params[..3], &["self", "embed_dim", "num_heads"]);
-    }
-
-    #[test]
-    fn test_equinox_multihead_attention_signature_order() {
-        // Reversed vs. torch: num_heads first, then query_size.
-        let sig = known_layer_signature(&parts(&["equinox", "nn", "MultiheadAttention"])).unwrap();
-        assert_eq!(&sig.params[..3], &["self", "num_heads", "query_size"]);
-    }
-
-    #[test]
-    fn test_flatten_unflatten_upsample_signatures() {
-        let flatten =
-            known_layer_signature(&parts(&["torch", "nn", "Flatten"])).unwrap();
-        assert_eq!(flatten.params, vec!["self", "start_dim", "end_dim"]);
-
-        let unflatten =
-            known_layer_signature(&parts(&["torch", "nn", "Unflatten"])).unwrap();
-        assert_eq!(unflatten.params, vec!["self", "dim", "sizes"]);
-
-        let upsample =
-            known_layer_signature(&parts(&["torch", "nn", "Upsample"])).unwrap();
-        assert!(upsample.params.contains(&"scale_factor".to_string()));
-        assert!(upsample.params.contains(&"size".to_string()));
-    }
-
-    #[test]
-    fn test_conv_transpose_variants_share_conv_prefix() {
-        for framework in ["equinox", "torch"] {
-            for class in ["ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d"] {
-                let sig = known_layer_signature(&parts(&[framework, "nn", class])).unwrap();
-                assert_eq!(
-                    &sig.params[..5],
-                    &["self", "in_channels", "out_channels", "kernel_size", "stride"]
-                );
-                assert!(sig.params.iter().any(|p| p == "padding"));
-            }
-        }
-    }
-
-    #[test]
-    fn test_rnn_family_signatures() {
-        for class in ["RNN", "LSTM", "GRU", "RNNCell", "LSTMCell", "GRUCell"] {
-            let sig = known_layer_signature(&parts(&["torch", "nn", class]))
-                .unwrap_or_else(|| panic!("no signature for torch.nn.{}", class));
-            assert_eq!(&sig.params[..3], &["self", "input_size", "hidden_size"]);
-        }
-        for class in ["LSTMCell", "GRUCell"] {
-            let sig = known_layer_signature(&parts(&["equinox", "nn", class]))
-                .unwrap_or_else(|| panic!("no signature for equinox.nn.{}", class));
-            assert_eq!(&sig.params[..3], &["self", "input_size", "hidden_size"]);
-        }
-    }
-
-    #[test]
-    fn test_pixel_shuffle_signatures() {
-        let shuffle = known_layer_signature(&parts(&["torch", "nn", "PixelShuffle"])).unwrap();
-        assert_eq!(shuffle.params, vec!["self", "upscale_factor"]);
-        let unshuffle =
-            known_layer_signature(&parts(&["torch", "nn", "PixelUnshuffle"])).unwrap();
-        assert_eq!(unshuffle.params, vec!["self", "downscale_factor"]);
-    }
-
-    #[test]
-    fn test_pad_family_signatures() {
-        let constant = known_layer_signature(&parts(&["torch", "nn", "ConstantPad2d"])).unwrap();
-        assert_eq!(constant.params, vec!["self", "padding", "value"]);
-
-        for class in ["ZeroPad2d", "ReflectionPad1d", "ReplicationPad3d"] {
-            let sig = known_layer_signature(&parts(&["torch", "nn", class]))
-                .unwrap_or_else(|| panic!("no signature for torch.nn.{}", class));
-            assert_eq!(sig.params, vec!["self", "padding"]);
-        }
-    }
-
-    #[test]
-    fn test_bilinear_cosine_similarity_signatures() {
-        let bilinear = known_layer_signature(&parts(&["torch", "nn", "Bilinear"])).unwrap();
-        assert_eq!(
-            &bilinear.params[..4],
-            &["self", "in1_features", "in2_features", "out_features"]
-        );
-
-        let cosine =
-            known_layer_signature(&parts(&["torch", "nn", "CosineSimilarity"])).unwrap();
-        assert_eq!(cosine.params, vec!["self", "dim", "eps"]);
-    }
-
-    #[test]
-    fn test_equinox_mlp_signature() {
-        let sig = known_layer_signature(&parts(&["equinox", "nn", "MLP"])).unwrap();
-        assert_eq!(&sig.params[..3], &["self", "in_size", "out_size"]);
-    }
-
-    #[test]
-    fn test_torch_mlp_is_not_in_catalog() {
-        // MLP is an equinox.nn concept; torch has no torch.nn.MLP.
-        assert!(known_layer_signature(&parts(&["torch", "nn", "MLP"])).is_none());
-    }
-
-    #[test]
-    fn test_new_shape_preserving_layer_signatures() {
-        let names = [
-            "Identity",
-            "InstanceNorm1d",
-            "InstanceNorm2d",
-            "InstanceNorm3d",
-            "RMSNorm",
-            "AlphaDropout",
-            "TransformerEncoderLayer",
-            "TransformerDecoderLayer",
+    fn signature_cases() {
+        const EQX: &[&str] = &["equinox", "nn"];
+        const TORCH: &[&str] = &["torch", "nn"];
+        const CONV_PREFIX: &[&str] = &["self", "in_channels", "out_channels", "kernel_size"];
+        const CONV_T: &[&str] = &["ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d"];
+        const CONV_T_PREFIX: &[&str] = &["self", "in_channels", "out_channels", "kernel_size", "stride"];
+        const RNN_PREFIX: &[&str] = &["self", "input_size", "hidden_size"];
+        const KEPT: &[&str] = &[
+            "Dropout", "Dropout1d", "Dropout2d", "Dropout3d", "BatchNorm", "BatchNorm1d", "BatchNorm2d",
+            "BatchNorm3d", "LayerNorm", "GroupNorm", "ReLU", "GELU", "Sigmoid", "Tanh", "Softmax", "PReLU",
+            "Identity", "InstanceNorm1d", "InstanceNorm2d", "InstanceNorm3d", "RMSNorm", "AlphaDropout",
+            "TransformerEncoderLayer", "TransformerDecoderLayer",
         ];
-        for framework in ["equinox", "torch"] {
-            for name in names {
-                let sig = known_layer_signature(&parts(&[framework, "nn", name]))
-                    .unwrap_or_else(|| panic!("no signature for {}.nn.{}", framework, name));
-                assert_eq!(sig.owner.as_deref(), Some(name));
+        let rows: &[(&[&str], &[&str], Sig)] = &[
+            (EQX, &["Linear"], Sig::Params(&["self", "in_features", "out_features"], &[])),
+            (TORCH, &["Linear"], Sig::Params(&["self", "in_features", "out_features"], &[])),
+            (EQX, &["Conv1d", "Conv2d", "Conv3d"], Sig::Params(CONV_PREFIX, &["stride", "padding"])),
+            (TORCH, &["Conv1d", "Conv2d", "Conv3d"], Sig::Params(CONV_PREFIX, &[])),
+            (EQX, KEPT, Sig::Params(&[], &[])),
+            (TORCH, KEPT, Sig::Params(&[], &[])),
+            (&["jax", "nn"], &["Linear"], Sig::Missing),
+            (&["flax", "nn"], &["Dense"], Sig::Missing),
+            (&["flax", "linen"], &["Dense"], Sig::Params(&[], &["features"])),
+            (EQX, &["Mystery"], Sig::Missing),
+            (TORCH, &["Mystery"], Sig::Missing),
+            (&[], &["Linear"], Sig::Missing),
+            (&["torch"], &["nn"], Sig::Missing),
+            (&["equinox", "experimental"], &["Linear"], Sig::Missing),
+            (&["torch", "functional"], &["Linear"], Sig::Missing),
+            (TORCH, &["MultiheadAttention"], Sig::Params(&["self", "embed_dim", "num_heads"], &[])),
+            // Reversed vs. torch: num_heads first, then query_size.
+            (EQX, &["MultiheadAttention"], Sig::Params(&["self", "num_heads", "query_size"], &[])),
+            (TORCH, &["Flatten"], Sig::Exact(&["self", "start_dim", "end_dim"])),
+            (TORCH, &["Unflatten"], Sig::Exact(&["self", "dim", "sizes"])),
+            (TORCH, &["Upsample"], Sig::Params(&[], &["scale_factor", "size"])),
+            (EQX, CONV_T, Sig::Params(CONV_T_PREFIX, &["padding"])),
+            (TORCH, CONV_T, Sig::Params(CONV_T_PREFIX, &["padding"])),
+            (TORCH, &["RNN", "LSTM", "GRU", "RNNCell", "LSTMCell", "GRUCell"], Sig::Params(RNN_PREFIX, &[])),
+            (EQX, &["LSTMCell", "GRUCell"], Sig::Params(RNN_PREFIX, &[])),
+            (TORCH, &["PixelShuffle"], Sig::Exact(&["self", "upscale_factor"])),
+            (TORCH, &["PixelUnshuffle"], Sig::Exact(&["self", "downscale_factor"])),
+            (TORCH, &["ConstantPad2d"], Sig::Exact(&["self", "padding", "value"])),
+            (TORCH, &["ZeroPad2d", "ReflectionPad1d", "ReplicationPad3d"], Sig::Exact(&["self", "padding"])),
+            (TORCH, &["Bilinear"], Sig::Params(&["self", "in1_features", "in2_features", "out_features"], &[])),
+            (TORCH, &["CosineSimilarity"], Sig::Exact(&["self", "dim", "eps"])),
+            (EQX, &["MLP"], Sig::Params(&["self", "in_size", "out_size"], &[])),
+            // MLP is an equinox.nn concept; torch has no torch.nn.MLP.
+            (TORCH, &["MLP"], Sig::Missing),
+            (&["einops", "layers", "torch"], &["Rearrange"], Sig::Params(&["self", "pattern"], &[])),
+            (&["einops", "layers", "torch"], &["Reduce"], Sig::Params(&["self", "pattern", "reduction"], &[])),
+            (&["einops", "layers", "flax"], &["Rearrange"], Sig::Params(&["self", "pattern"], &[])),
+            (&["einops", "layers", "flax"], &["Reduce"], Sig::Params(&["self", "pattern", "reduction"], &[])),
+            (&["einops", "layers", "chainer"], &["Rearrange"], Sig::Missing),
+        ];
+        for (module, classes, expected) in rows {
+            for class in *classes {
+                let parts: Vec<String> = module.iter().chain([class]).map(|p| p.to_string()).collect();
+                let signature = known_layer_signature(&parts);
+                if let Sig::Missing = expected {
+                    assert_eq!(signature, None, "{parts:?}");
+                    continue;
+                }
+                let signature = signature.unwrap_or_else(|| panic!("no signature for {parts:?}"));
+                assert_eq!(signature.owner.as_deref(), Some(*class), "{parts:?}");
+                assert_eq!(signature.name, "__init__", "{parts:?}");
+                match expected {
+                    Sig::Exact(params) => assert_eq!(signature.params, *params, "{parts:?}"),
+                    Sig::Params(prefix, contained) => {
+                        assert_eq!(&signature.params[..prefix.len()], *prefix, "{parts:?}");
+                        for param in *contained {
+                            assert!(signature.params.iter().any(|p| p == param), "{parts:?} has no {param}");
+                        }
+                    }
+                    Sig::Missing => unreachable!(),
+                }
             }
         }
     }
-
-    #[test]
-    fn test_einops_rearrange_reduce_signatures() {
-        for framework in ["torch", "flax"] {
-            let sig =
-                known_layer_signature(&parts(&["einops", "layers", framework, "Rearrange"]))
-                    .unwrap();
-            assert_eq!(sig.owner.as_deref(), Some("Rearrange"));
-            assert_eq!(&sig.params[..2], &["self", "pattern"]);
-
-            let sig = known_layer_signature(&parts(&["einops", "layers", framework, "Reduce"]))
-                .unwrap();
-            assert_eq!(sig.owner.as_deref(), Some("Reduce"));
-            assert_eq!(&sig.params[..3], &["self", "pattern", "reduction"]);
-        }
-    }
-
-    #[test]
-    fn test_einops_layers_chainer_not_in_catalog() {
-        assert!(
-            known_layer_signature(&parts(&["einops", "layers", "chainer", "Rearrange"]))
-                .is_none()
-        );
-    }
-}
-
-#[cfg(test)]
-mod catalog_first_extract_layer_assignments_tests {
-    use super::*;
-    use tree_sitter::Parser;
 
     fn parse(code: &str) -> tree_sitter::Tree {
         let mut parser = Parser::new();
-        let language = tree_sitter_python::LANGUAGE;
-        parser.set_language(&language.into()).unwrap();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
         parser.parse(code, None).unwrap()
     }
 
-    fn no_read(_: &PathBuf) -> Option<String> {
-        None
+    /// Case, source code, expected layers by name.
+    type ExtractRow<'a> = (&'a str, &'a str, &'a [(&'a str, LayerKind)]);
+
+    fn check_layers(case: &str, layers: HashMap<String, LayerKind>, expected: &[(&str, LayerKind)]) {
+        let expected: HashMap<String, LayerKind> = expected.iter().map(|(name, kind)| (s(name), kind.clone())).collect();
+        assert_eq!(layers, expected, "case: {case}");
     }
 
+    /// Layers resolved from source files on disk: a minimal `equinox.nn.Linear`
+    /// and an unrelated `helpers.make_layer`.
     #[test]
-    fn test_catalog_resolves_equinox_linear_without_disk() {
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(64, 128)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "64".to_string(),
-                out_features: "128".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_linear_without_disk() {
-        let code = "import torch\nlayer = torch.nn.Linear(128, 256)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "128".to_string(),
-                out_features: "256".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_equinox_embedding_without_disk() {
-        let code = "import equinox as eqx\nemb = eqx.nn.Embedding(10000, 512)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("emb"),
-            Some(&LayerKind::Embedding {
-                embedding_size: "512".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_embedding_kwarg_without_disk() {
-        let code = "import torch\nemb = torch.nn.Embedding(10000, embedding_dim=768)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("emb"),
-            Some(&LayerKind::Embedding {
-                embedding_size: "768".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_apply_embedding_appends_dim() {
-        let shapes = HashMap::from([
-            ("tokens".to_string(), vec!["batch".to_string(), "seq".to_string()]),
-            ("idx".to_string(), Vec::new()),
-        ]);
-        let kind = LayerKind::Embedding {
-            embedding_size: "512".to_string(),
-        };
-        let app = |input: &str| LayerApplication {
-            variable: "y".to_string(),
-            layer: "emb".to_string(),
-            input: input.to_string(),
-            kind: kind.clone(),
-            range: tree_sitter::Range {
-                start_byte: 0,
-                end_byte: 0,
-                start_point: tree_sitter::Point::new(0, 0),
-                end_point: tree_sitter::Point::new(0, 0),
-            },
-            extra_inputs: Vec::new(),
-        };
-
-        assert_eq!(
-            apply_layer_application(&app("tokens"), &shapes).unwrap(),
-            Some(vec![
-                "batch".to_string(),
-                "seq".to_string(),
-                "512".to_string()
-            ])
-        );
-        assert_eq!(
-            apply_layer_application(&app("idx"), &shapes).unwrap(),
-            Some(vec!["512".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_maxpool2d_without_disk() {
-        let code = "import torch\npool = torch.nn.MaxPool2d(2)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("pool"),
-            Some(&LayerKind::Pool {
-                name: "MaxPool2d".to_string(),
-                spatial_rank: 2,
-                kernel_size: "2".to_string(),
-                stride: "2".to_string(),
-                padding: "0".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_adaptive_avgpool_without_disk() {
-        let code = "import torch\npool = torch.nn.AdaptiveAvgPool2d(1)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("pool"),
-            Some(&LayerKind::AdaptivePool {
-                name: "AdaptiveAvgPool2d".to_string(),
-                spatial_rank: 2,
-                output_size: "1".to_string()
-            })
-        );
-    }
-
-    fn pool_app(input: &str, kind: LayerKind) -> LayerApplication {
-        LayerApplication {
-            variable: "y".to_string(),
-            layer: "pool".to_string(),
-            input: input.to_string(),
-            kind,
-            range: tree_sitter::Range {
-                start_byte: 0,
-                end_byte: 0,
-                start_point: tree_sitter::Point::new(0, 0),
-                end_point: tree_sitter::Point::new(0, 0),
-            },
-            extra_inputs: Vec::new(),
+    fn disk_extract_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
+        fs::write(tmp.path().join("equinox/nn/__init__.py"), "from ._linear import Linear").unwrap();
+        fs::write(
+            tmp.path().join("equinox/nn/_linear.py"),
+            "class Linear:\n    def __init__(self, in_features, out_features, use_bias=True): pass",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("helpers.py"), "def make_layer(): pass").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let rows: &[ExtractRow] = &[
+            ("single linear", "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)", &[("layer", linear("3", "5"))]),
+            (
+                "multiple linears",
+                "import equinox as eqx\na = eqx.nn.Linear(3, 5)\nb = eqx.nn.Linear(features, hidden)",
+                &[("a", linear("3", "5")), ("b", linear("features", "hidden"))],
+            ),
+            ("from-import alias", "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)", &[("layer", linear("3", "5"))]),
+            (
+                "skips non-layer calls",
+                "import equinox as eqx\nimport helpers\nlayer = eqx.nn.Linear(3, 5)\nother = helpers.make_layer()",
+                &[("layer", linear("3", "5"))],
+            ),
+            // Not in the built-in catalog, and not on disk.
+            ("skips missing implementation", "import my_layers\nlayer = my_layers.Linear(3, 5)", &[]),
+            ("reversed keyword order", "import equinox as eqx\nlayer = eqx.nn.Linear(out_features=5, in_features=3)", &[("layer", linear("3", "5"))]),
+            ("extra constructor kwargs", "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5, use_bias=False, key=key)", &[("layer", linear("3", "5"))]),
+            ("keyword overrides positional", "import equinox as eqx\nlayer = eqx.nn.Linear(3, 4, out_features=5)", &[("layer", linear("3", "5"))]),
+            ("inside a function", "import equinox as eqx\ndef make():\n    layer = eqx.nn.Linear(3, 5)", &[("layer", linear("3", "5"))]),
+            ("required feature missing", "import equinox as eqx\nlayer = eqx.nn.Linear(in_features=3)", &[]),
+            (
+                "last assignment wins",
+                "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\nlayer = eqx.nn.Linear(7, 11)",
+                &[("layer", linear("7", "11"))],
+            ),
+        ];
+        for (case, code, expected) in rows {
+            let read = |path: &PathBuf| fs::read_to_string(path).ok();
+            let layers = extract_layer_assignments(parse(code).root_node(), code, &roots, read, 5).unwrap();
+            check_layers(case, layers, expected);
         }
     }
 
+    /// Layers resolved from the built-in catalog, with no search roots and no
+    /// file reads.
     #[test]
-    fn test_apply_maxpool2d_halves_spatial_dims() {
-        let shapes = HashMap::from([(
-            "x".to_string(),
-            vec!["16".to_string(), "32".to_string(), "32".to_string()],
-        )]);
-        let kind = LayerKind::Pool {
-            name: "MaxPool2d".to_string(),
-            spatial_rank: 2,
-            kernel_size: "2".to_string(),
-            stride: "2".to_string(),
-            padding: "0".to_string(),
-        };
-
-        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
-
-        assert_eq!(
-            output,
-            Some(vec!["16".to_string(), "16".to_string(), "16".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_apply_maxpool1d_symbolic_spatial_dim() {
-        let shapes = HashMap::from([("x".to_string(), vec!["c".to_string(), "L".to_string()])]);
-        let kind = LayerKind::Pool {
-            name: "MaxPool1d".to_string(),
-            spatial_rank: 1,
-            kernel_size: "2".to_string(),
-            stride: "2".to_string(),
-            padding: "0".to_string(),
-        };
-
-        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
-
-        assert_eq!(
-            output,
-            Some(vec!["c".to_string(), "(L-2)/2+1".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_apply_adaptive_pool_sets_spatial_dims() {
-        let shapes = HashMap::from([(
-            "x".to_string(),
-            vec!["32".to_string(), "16".to_string(), "16".to_string()],
-        )]);
-        let kind = LayerKind::AdaptivePool {
-            name: "AdaptiveAvgPool2d".to_string(),
-            spatial_rank: 2,
-            output_size: "1".to_string(),
-        };
-
-        let output = apply_layer_application(&pool_app("x", kind), &shapes).unwrap();
-
-        assert_eq!(
-            output,
-            Some(vec!["32".to_string(), "1".to_string(), "1".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_apply_pool_rank_too_low_errors() {
-        let shapes = HashMap::from([("x".to_string(), vec!["16".to_string()])]);
-        let kind = LayerKind::Pool {
-            name: "MaxPool2d".to_string(),
-            spatial_rank: 2,
-            kernel_size: "2".to_string(),
-            stride: "2".to_string(),
-            padding: "0".to_string(),
-        };
-
-        let err = apply_layer_application(&pool_app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 3 dims"));
-    }
-
-    #[test]
-    fn test_catalog_resolves_equinox_conv2d_without_disk() {
-        let code = "import equinox as eqx\nlayer = eqx.nn.Conv2d(3, 16, 3)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Conv2d {
-                in_channels: "3".to_string(),
-                out_channels: "16".to_string(),
-                kernel_size: "3".to_string(),
-                stride: "1".to_string(),
-                padding: "0".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_conv2d_with_stride_padding_without_disk() {
-        let code = "import torch\nlayer = torch.nn.Conv2d(3, 16, 3, stride=2, padding=1)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Conv2d {
-                in_channels: "3".to_string(),
-                out_channels: "16".to_string(),
-                kernel_size: "3".to_string(),
-                stride: "2".to_string(),
-                padding: "1".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_dropout_shape_preserving() {
-        let code = "import torch\nlayer = torch.nn.Dropout()";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::ShapePreserving {
-                name: "Dropout".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_supports_from_import_alias_without_disk() {
-        let code =
-            "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "3".to_string(),
-                out_features: "5".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_non_layer_call_is_not_added_to_layer_map() {
-        let code = "import jax.numpy as jnp\ny = jnp.sum(x)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert!(layers.is_empty());
-    }
-
-    #[test]
-    fn test_user_layer_without_catalog_or_disk_is_skipped() {
-        // `my_module.Linear` is neither equinox.nn.Linear nor torch.nn.Linear,
-        // and there's no read_file backing — so it should be silently skipped.
-        let code = "import my_module\nlayer = my_module.Linear(3, 5)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert!(layers.is_empty());
-    }
-
-    // --- MultiheadAttention bug fix, exercised end-to-end through real
-    // parsed positional-arg constructor calls (not just direct
-    // ResolvedCallSignature construction). ---
-
-    #[test]
-    fn test_catalog_resolves_torch_multihead_attention_unchanged() {
-        // Matches corpus/torch_attention.py's `nn.MultiheadAttention(512, 8)`.
-        let code = "import torch.nn as nn\nattn = nn.MultiheadAttention(512, 8)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("attn"),
-            Some(&LayerKind::MultiheadAttention {
-                feature_dim: "512".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_equinox_multihead_attention_via_query_size() {
-        // Before the fix this returned None: classify_layer_call always
-        // looked up the `embed_dim` binding, which the equinox positional
-        // order (num_heads, query_size) never populates.
-        let code = "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(8, 512)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("attn"),
-            Some(&LayerKind::MultiheadAttention {
-                feature_dim: "512".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_equinox_multihead_attention_with_keywords() {
-        let code =
-            "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(num_heads=4, query_size=256)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("attn"),
-            Some(&LayerKind::MultiheadAttention {
-                feature_dim: "256".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_flatten_without_disk() {
-        let code = "import torch\nlayer = torch.nn.Flatten(1, 2)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Flatten {
-                start_dim: "1".to_string(),
-                end_dim: "2".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_conv_transpose2d_without_disk() {
-        let code = "import torch\nlayer = torch.nn.ConvTranspose2d(3, 16, 4, stride=2, padding=1)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::ConvTranspose {
-                spatial_rank: 2,
-                in_channels: "3".to_string(),
-                out_channels: "16".to_string(),
-                kernel_size: "4".to_string(),
-                stride: "2".to_string(),
-                padding: "1".to_string(),
-            })
-        );
-    }
-
-    // --- torch.nn.Sequential / equinox.nn.Sequential ---
-
-    #[test]
-    fn test_torch_sequential_of_linear_relu_linear() {
-        let code = "import torch.nn as nn\n\
-                     net = nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10))";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("net"),
-            Some(&LayerKind::Sequential {
-                children: vec![
-                    LayerKind::Linear {
-                        in_features: "784".to_string(),
-                        out_features: "256".to_string(),
-                    },
-                    LayerKind::ShapePreserving {
-                        name: "ReLU".to_string(),
-                    },
-                    LayerKind::Linear {
-                        in_features: "256".to_string(),
-                        out_features: "10".to_string(),
-                    },
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn test_equinox_sequential_takes_a_single_list_argument() {
-        let code = "import equinox as eqx\n\
-                     net = eqx.nn.Sequential([eqx.nn.Linear(4, 8), eqx.nn.Linear(8, 2)])";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("net"),
-            Some(&LayerKind::Sequential {
-                children: vec![
-                    LayerKind::Linear {
-                        in_features: "4".to_string(),
-                        out_features: "8".to_string(),
-                    },
-                    LayerKind::Linear {
-                        in_features: "8".to_string(),
-                        out_features: "2".to_string(),
-                    },
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn test_nested_sequential_classifies() {
-        let code = "import torch.nn as nn\n\
-                     net = nn.Sequential(nn.Sequential(nn.Linear(4, 8), nn.ReLU()), nn.Linear(8, 2))";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("net"),
-            Some(&LayerKind::Sequential {
-                children: vec![
-                    LayerKind::Sequential {
-                        children: vec![
-                            LayerKind::Linear {
-                                in_features: "4".to_string(),
-                                out_features: "8".to_string(),
-                            },
-                            LayerKind::ShapePreserving {
-                                name: "ReLU".to_string(),
-                            },
-                        ]
-                    },
-                    LayerKind::Linear {
-                        in_features: "8".to_string(),
-                        out_features: "2".to_string(),
-                    },
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn test_sequential_with_arbitrary_callable_child_is_unclassified() {
-        // `some_fn` isn't a resolvable layer constructor call (nor even a
-        // `call` node at all in this position) — the whole Sequential must
-        // stay honestly unclassified rather than guessing.
-        let code = "import torch.nn as nn\n\
-                     net = nn.Sequential(nn.Linear(4, 8), some_fn)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(layers.get("net"), None);
-    }
-
-    #[test]
-    fn test_sequential_with_unpacked_star_args_is_unclassified() {
-        let code = "import torch.nn as nn\n\
-                     net = nn.Sequential(*layer_list)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(layers.get("net"), None);
-    }
-
-    #[test]
-    fn test_sequential_with_unclassifiable_inner_child_is_unclassified() {
-        // The inner call resolves to a `call` node, but `mystery.Thing` isn't
-        // a recognised layer constructor, so classification of the middle
-        // child fails, and that must fail the whole Sequential.
-        let code = "import torch.nn as nn\nimport mystery\n\
-                     net = nn.Sequential(nn.Linear(4, 8), mystery.Thing(1, 2))";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(layers.get("net"), None);
-    }
-
-    // --- equinox.nn.SpectralNorm / equinox.nn.WeightNorm ---
-
-    #[test]
-    fn test_spectral_norm_delegates_to_inner_linear() {
-        let code = "import equinox as eqx\n\
-                     layer = eqx.nn.SpectralNorm(eqx.nn.Linear(4, 8), \"weight\", key=None)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "4".to_string(),
-                out_features: "8".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_weight_norm_delegates_to_inner_conv() {
-        let code = "import equinox as eqx\n\
-                     layer = eqx.nn.WeightNorm(eqx.nn.Conv2d(3, 16, 3))";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Conv2d {
-                in_channels: "3".to_string(),
-                out_channels: "16".to_string(),
-                kernel_size: "3".to_string(),
-                stride: "1".to_string(),
-                padding: "0".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_spectral_norm_with_unclassifiable_inner_layer_is_unclassified() {
-        let code = "import equinox as eqx\nimport mystery\n\
-                     layer = eqx.nn.SpectralNorm(mystery.Thing(1, 2), \"weight\")";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(layers.get("layer"), None);
-    }
-
-    // --- einops.layers.torch.Rearrange / Reduce, end-to-end ---
-
-    #[test]
-    fn test_einops_torch_rearrange_layer_classifies_via_from_import() {
-        let code = "from einops.layers.torch import Rearrange\n\
-                     layer = Rearrange(\"b c h w -> b (c h w)\")";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::EinopsPattern {
-                name: "Rearrange".to_string(),
-                pattern: "\"b c h w -> b (c h w)\"".to_string(),
-                kwargs: HashMap::new(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_einops_flax_reduce_layer_classifies_with_kwargs() {
-        let code = "from einops.layers.flax import Reduce\n\
-                     layer = Reduce(\"b (h w) c -> b h w c\", \"max\", h=14, w=14)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::EinopsPattern {
-                name: "Reduce".to_string(),
-                pattern: "\"b (h w) c -> b h w c\"".to_string(),
-                kwargs: HashMap::from([
-                    ("h".to_string(), "14".to_string()),
-                    ("w".to_string(), "14".to_string()),
-                ]),
-            })
-        );
-    }
-
-    // --- torch.nn.Unfold / Fold / LocalResponseNorm, end-to-end ---
-
-    #[test]
-    fn test_catalog_resolves_torch_unfold_without_disk() {
-        let code = "import torch\nlayer = torch.nn.Unfold(kernel_size=3, stride=1, padding=0)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Unfold {
-                kernel_size: "3".to_string(),
-                stride: "1".to_string(),
-                padding: "0".to_string(),
-                dilation: "1".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_torch_fold_without_disk() {
-        let code = "import torch\nlayer = torch.nn.Fold(output_size=(4, 4), kernel_size=2)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Fold {
-                output_size: "(4, 4)".to_string(),
-                kernel_size: "2".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_resolves_local_response_norm_without_disk() {
-        let code = "import torch\nlayer = torch.nn.LocalResponseNorm(5)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::ShapePreserving {
-                name: "LocalResponseNorm".to_string()
-            })
-        );
-    }
-
-    // --- self.-prefixed ctor args, end-to-end (recursion through Sequential too) ---
-
-    #[test]
-    fn test_catalog_self_prefixed_linear_ctor_arg_strips_prefix() {
-        let code = "import torch\nlayer = torch.nn.Linear(self.d_inner, 10)";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("layer"),
-            Some(&LayerKind::Linear {
-                in_features: "d_inner".to_string(),
-                out_features: "10".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_catalog_self_prefixed_ctor_arg_stripped_inside_sequential_child() {
-        let code = "import torch.nn as nn\n\
-                     net = nn.Sequential(nn.Linear(self.d_inner, 10), nn.ReLU())";
-        let tree = parse(code);
-        let roots: Vec<PathBuf> = Vec::new();
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, no_read, 5).unwrap();
-
-        assert_eq!(
-            layers.get("net"),
-            Some(&LayerKind::Sequential {
-                children: vec![
-                    LayerKind::Linear {
-                        in_features: "d_inner".to_string(),
-                        out_features: "10".to_string(),
-                    },
-                    LayerKind::ShapePreserving {
-                        name: "ReLU".to_string(),
-                    },
-                ]
-            })
-        );
-    }
-}
-
-#[cfg(test)]
-mod new_layer_kind_apply_tests {
-    use super::*;
-
-    fn shape(dims: &[&str]) -> Vec<String> {
-        dims.iter().map(|d| d.to_string()).collect()
-    }
-
-    fn app(input: &str, kind: LayerKind) -> LayerApplication {
-        LayerApplication {
-            variable: "y".to_string(),
-            layer: "layer".to_string(),
-            input: input.to_string(),
-            kind,
-            range: tree_sitter::Range {
-                start_byte: 0,
-                end_byte: 0,
-                start_point: tree_sitter::Point::new(0, 0),
-                end_point: tree_sitter::Point::new(0, 0),
-            },
-            extra_inputs: Vec::new(),
+    fn catalog_extract_cases() {
+        let conv2d_3_16_3 = || conv(2, "3", "16", "3", "1", "0");
+        let rows: &[ExtractRow] = &[
+            ("equinox linear", "import equinox as eqx\nlayer = eqx.nn.Linear(64, 128)", &[("layer", linear("64", "128"))]),
+            ("torch linear", "import torch\nlayer = torch.nn.Linear(128, 256)", &[("layer", linear("128", "256"))]),
+            ("equinox embedding", "import equinox as eqx\nemb = eqx.nn.Embedding(10000, 512)", &[("emb", embedding("512"))]),
+            ("torch embedding kwarg", "import torch\nemb = torch.nn.Embedding(10000, embedding_dim=768)", &[("emb", embedding("768"))]),
+            ("torch maxpool2d", "import torch\npool = torch.nn.MaxPool2d(2)", &[("pool", pool("MaxPool2d", 2, "2", "2", "0"))]),
+            (
+                "adaptive avgpool",
+                "import torch\npool = torch.nn.AdaptiveAvgPool2d(1)",
+                &[("pool", LayerKind::AdaptivePool { name: s("AdaptiveAvgPool2d"), spatial_rank: 2, output_size: s("1") })],
+            ),
+            ("equinox conv2d", "import equinox as eqx\nlayer = eqx.nn.Conv2d(3, 16, 3)", &[("layer", conv2d_3_16_3())]),
+            (
+                "torch conv2d stride padding",
+                "import torch\nlayer = torch.nn.Conv2d(3, 16, 3, stride=2, padding=1)",
+                &[("layer", conv(2, "3", "16", "3", "2", "1"))],
+            ),
+            ("torch dropout", "import torch\nlayer = torch.nn.Dropout()", &[("layer", kept("Dropout"))]),
+            ("from-import alias", "from equinox.nn import Linear as Lin\nlayer = Lin(in_features=3, out_features=5)", &[("layer", linear("3", "5"))]),
+            ("non-layer call", "import jax.numpy as jnp\ny = jnp.sum(x)", &[]),
+            // Neither equinox.nn.Linear nor torch.nn.Linear, and nothing on disk.
+            ("user layer", "import my_module\nlayer = my_module.Linear(3, 5)", &[]),
+            ("torch multihead attention", "import torch.nn as nn\nattn = nn.MultiheadAttention(512, 8)", &[("attn", mha("512"))]),
+            // equinox binds (num_heads, query_size) positionally.
+            ("equinox multihead attention", "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(8, 512)", &[("attn", mha("512"))]),
+            (
+                "equinox multihead attention keywords",
+                "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(num_heads=4, query_size=256)",
+                &[("attn", mha("256"))],
+            ),
+            (
+                "torch flatten",
+                "import torch\nlayer = torch.nn.Flatten(1, 2)",
+                &[("layer", LayerKind::Flatten { start_dim: s("1"), end_dim: s("2") })],
+            ),
+            (
+                "torch conv transpose2d",
+                "import torch\nlayer = torch.nn.ConvTranspose2d(3, 16, 4, stride=2, padding=1)",
+                &[("layer", conv_transpose(2, "3", "16", "4", "2", "1"))],
+            ),
+            (
+                "torch sequential",
+                "import torch.nn as nn\nnet = nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10))",
+                &[("net", seq(vec![linear("784", "256"), kept("ReLU"), linear("256", "10")]))],
+            ),
+            (
+                "equinox sequential list argument",
+                "import equinox as eqx\nnet = eqx.nn.Sequential([eqx.nn.Linear(4, 8), eqx.nn.Linear(8, 2)])",
+                &[("net", seq(vec![linear("4", "8"), linear("8", "2")]))],
+            ),
+            (
+                "nested sequential",
+                "import torch.nn as nn\nnet = nn.Sequential(nn.Sequential(nn.Linear(4, 8), nn.ReLU()), nn.Linear(8, 2))",
+                &[("net", seq(vec![seq(vec![linear("4", "8"), kept("ReLU")]), linear("8", "2")]))],
+            ),
+            // A child that is not a layer constructor call leaves the whole
+            // Sequential unclassified.
+            ("sequential with callable child", "import torch.nn as nn\nnet = nn.Sequential(nn.Linear(4, 8), some_fn)", &[]),
+            ("sequential with star args", "import torch.nn as nn\nnet = nn.Sequential(*layer_list)", &[]),
+            (
+                "sequential with unknown inner call",
+                "import torch.nn as nn\nimport mystery\nnet = nn.Sequential(nn.Linear(4, 8), mystery.Thing(1, 2))",
+                &[],
+            ),
+            (
+                "spectral norm",
+                "import equinox as eqx\nlayer = eqx.nn.SpectralNorm(eqx.nn.Linear(4, 8), \"weight\", key=None)",
+                &[("layer", linear("4", "8"))],
+            ),
+            ("weight norm", "import equinox as eqx\nlayer = eqx.nn.WeightNorm(eqx.nn.Conv2d(3, 16, 3))", &[("layer", conv2d_3_16_3())]),
+            (
+                "spectral norm of unknown layer",
+                "import equinox as eqx\nimport mystery\nlayer = eqx.nn.SpectralNorm(mystery.Thing(1, 2), \"weight\")",
+                &[],
+            ),
+            (
+                "einops torch rearrange",
+                "from einops.layers.torch import Rearrange\nlayer = Rearrange(\"b c h w -> b (c h w)\")",
+                &[("layer", einops("Rearrange", "\"b c h w -> b (c h w)\"", &[]))],
+            ),
+            (
+                "einops flax reduce kwargs",
+                "from einops.layers.flax import Reduce\nlayer = Reduce(\"b (h w) c -> b h w c\", \"max\", h=14, w=14)",
+                &[("layer", einops("Reduce", "\"b (h w) c -> b h w c\"", &[("h", "14"), ("w", "14")]))],
+            ),
+            ("torch unfold", "import torch\nlayer = torch.nn.Unfold(kernel_size=3, stride=1, padding=0)", &[("layer", unfold("3", "1", "0", "1"))]),
+            ("torch fold", "import torch\nlayer = torch.nn.Fold(output_size=(4, 4), kernel_size=2)", &[("layer", fold("(4, 4)", "2"))]),
+            ("local response norm", "import torch\nlayer = torch.nn.LocalResponseNorm(5)", &[("layer", kept("LocalResponseNorm"))]),
+            ("self prefix", "import torch\nlayer = torch.nn.Linear(self.d_inner, 10)", &[("layer", linear("d_inner", "10"))]),
+            (
+                "self prefix in sequential child",
+                "import torch.nn as nn\nnet = nn.Sequential(nn.Linear(self.d_inner, 10), nn.ReLU())",
+                &[("net", seq(vec![linear("d_inner", "10"), kept("ReLU")]))],
+            ),
+        ];
+        for (case, code, expected) in rows {
+            let layers = extract_layer_assignments(parse(code).root_node(), code, &[], |_| None, 5).unwrap();
+            check_layers(case, layers, expected);
         }
-    }
-
-    fn shapes_of(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
-        pairs
-            .iter()
-            .map(|(name, dims)| (name.to_string(), shape(dims)))
-            .collect()
-    }
-
-    // --- Flatten ---
-
-    #[test]
-    fn test_flatten_collapses_middle_dims() {
-        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
-        let kind = LayerKind::Flatten {
-            start_dim: "1".to_string(),
-            end_dim: "2".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "12", "5"])));
-    }
-
-    #[test]
-    fn test_flatten_symbolic_product_and_negative_end_dim() {
-        let shapes = shapes_of(&[("x", &["batch", "c", "d"])]);
-        let kind = LayerKind::Flatten {
-            start_dim: "1".to_string(),
-            end_dim: "-1".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "c*d"])));
-    }
-
-    #[test]
-    fn test_flatten_unresolvable_start_dim_is_unknown() {
-        let shapes = shapes_of(&[("x", &["2", "3", "4"])]);
-        let kind = LayerKind::Flatten {
-            start_dim: "axis".to_string(),
-            end_dim: "-1".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    // --- Unflatten ---
-
-    #[test]
-    fn test_unflatten_expands_dim_into_components() {
-        let shapes = shapes_of(&[("x", &["batch", "6", "feat"])]);
-        let kind = LayerKind::Unflatten {
-            dim: "1".to_string(),
-            sizes: "(2, 3)".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "2", "3", "feat"])));
-    }
-
-    #[test]
-    fn test_unflatten_non_literal_dim_is_unknown() {
-        let shapes = shapes_of(&[("x", &["batch", "6", "feat"])]);
-        let kind = LayerKind::Unflatten {
-            dim: "axis".to_string(),
-            sizes: "(2, 3)".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    // --- Upsample ---
-
-    #[test]
-    fn test_upsample_scalar_scale_factor_doubles_spatial_dims() {
-        let shapes = shapes_of(&[("x", &["1", "3", "8", "8"])]);
-        let kind = LayerKind::Upsample {
-            scale_factor: Some("2".to_string()),
-            size: None,
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["1", "3", "16", "16"])));
-    }
-
-    #[test]
-    fn test_upsample_explicit_size_tuple() {
-        let shapes = shapes_of(&[("x", &["1", "3", "8", "8"])]);
-        let kind = LayerKind::Upsample {
-            scale_factor: None,
-            size: Some("(20, 20)".to_string()),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["1", "3", "20", "20"])));
-    }
-
-    #[test]
-    fn test_upsample_rank_too_low_errors() {
-        let shapes = shapes_of(&[("x", &["3", "8"])]);
-        let kind = LayerKind::Upsample {
-            scale_factor: Some("2".to_string()),
-            size: None,
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 3 dims"));
-    }
-
-    // --- ConvTranspose ---
-
-    #[test]
-    fn test_conv_transpose2d_inverts_conv_output_formula() {
-        // conv_spatial_dim(8, k=4, s=2, p=1) == 4; the transpose must invert
-        // that back to 8.
-        let shapes = shapes_of(&[("x", &["3", "4", "4"])]);
-        let kind = LayerKind::ConvTranspose {
-            spatial_rank: 2,
-            in_channels: "3".to_string(),
-            out_channels: "16".to_string(),
-            kernel_size: "4".to_string(),
-            stride: "2".to_string(),
-            padding: "1".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["16", "8", "8"])));
-    }
-
-    #[test]
-    fn test_conv_transpose2d_channel_mismatch_errors() {
-        let shapes = shapes_of(&[("x", &["5", "4", "4"])]);
-        let kind = LayerKind::ConvTranspose {
-            spatial_rank: 2,
-            in_channels: "3".to_string(),
-            out_channels: "16".to_string(),
-            kernel_size: "4".to_string(),
-            stride: "2".to_string(),
-            padding: "1".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("expected 3 input channels"));
-    }
-
-    // --- Rnn / RnnCell ---
-
-    #[test]
-    fn test_rnn_replaces_last_dim_with_hidden_size() {
-        let shapes = shapes_of(&[("x", &["seq", "10"])]);
-        let kind = LayerKind::Rnn {
-            name: "GRU".to_string(),
-            input_size: "10".to_string(),
-            hidden_size: "20".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["seq", "20"])));
-    }
-
-    #[test]
-    fn test_rnn_input_size_mismatch_errors() {
-        let shapes = shapes_of(&[("x", &["seq", "9"])]);
-        let kind = LayerKind::Rnn {
-            name: "GRU".to_string(),
-            input_size: "10".to_string(),
-            hidden_size: "20".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("expected input last dim 10"));
-    }
-
-    #[test]
-    fn test_rnn_cell_applies_to_unbatched_input() {
-        let shapes = shapes_of(&[("x", &["10"])]);
-        let kind = LayerKind::RnnCell {
-            name: "LSTMCell".to_string(),
-            input_size: "10".to_string(),
-            hidden_size: "20".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["20"])));
-    }
-
-    // --- PixelShuffle / PixelUnshuffle ---
-
-    #[test]
-    fn test_pixel_shuffle_trades_channels_for_spatial_resolution() {
-        let shapes = shapes_of(&[("x", &["8", "4", "4"])]);
-        let kind = LayerKind::PixelShuffle {
-            upscale_factor: "2".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "8", "8"])));
-    }
-
-    #[test]
-    fn test_pixel_shuffle_indivisible_channels_errors() {
-        let shapes = shapes_of(&[("x", &["9", "4", "4"])]);
-        let kind = LayerKind::PixelShuffle {
-            upscale_factor: "2".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("not evenly divisible"));
-    }
-
-    #[test]
-    fn test_pixel_unshuffle_is_inverse_of_shuffle() {
-        let shapes = shapes_of(&[("x", &["2", "8", "8"])]);
-        let kind = LayerKind::PixelUnshuffle {
-            downscale_factor: "2".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["8", "4", "4"])));
-    }
-
-    // --- Pad family ---
-
-    #[test]
-    fn test_pad_uniform_int_pads_every_spatial_dim() {
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = LayerKind::Pad {
-            name: "ConstantPad2d".to_string(),
-            spatial_rank: 2,
-            padding: "1".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["3", "10", "10"])));
-    }
-
-    #[test]
-    fn test_pad_tuple_uses_reverse_axis_convention() {
-        // padding=(left, right, top, bottom): last spatial dim (W) gets the
-        // first pair, second-to-last (H) gets the second pair.
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = LayerKind::Pad {
-            name: "ConstantPad2d".to_string(),
-            spatial_rank: 2,
-            padding: "(1, 1, 2, 2)".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["3", "12", "10"])));
-    }
-
-    #[test]
-    fn test_pad_symbolic_padding_is_unknown() {
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = LayerKind::Pad {
-            name: "ConstantPad2d".to_string(),
-            spatial_rank: 2,
-            padding: "p".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    // --- Bilinear / CosineSimilarity ---
-
-    #[test]
-    fn test_bilinear_transforms_first_input_last_dim() {
-        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
-        let kind = LayerKind::Bilinear {
-            in1_features: "10".to_string(),
-            in2_features: "20".to_string(),
-            out_features: "30".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "30"])));
-    }
-
-    #[test]
-    fn test_bilinear_in1_features_mismatch_errors() {
-        let shapes = shapes_of(&[("x1", &["batch", "9"])]);
-        let kind = LayerKind::Bilinear {
-            in1_features: "10".to_string(),
-            in2_features: "20".to_string(),
-            out_features: "30".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x1", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("expected input last dim 10"));
-    }
-
-    #[test]
-    fn test_cosine_similarity_removes_reduced_axis() {
-        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
-        let kind = LayerKind::CosineSimilarity {
-            dim: "1".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch"])));
-    }
-
-    #[test]
-    fn test_cosine_similarity_non_literal_dim_is_unknown() {
-        let shapes = shapes_of(&[("x1", &["batch", "10"])]);
-        let kind = LayerKind::CosineSimilarity {
-            dim: "axis".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x1", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    // --- equinox MLP ---
-
-    #[test]
-    fn test_mlp_transforms_last_dim() {
-        let shapes = shapes_of(&[("x", &["10"])]);
-        let kind = LayerKind::Mlp {
-            in_size: "10".to_string(),
-            out_size: "5".to_string(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["5"])));
-    }
-
-    #[test]
-    fn test_mlp_in_size_mismatch_errors() {
-        let shapes = shapes_of(&[("x", &["9"])]);
-        let kind = LayerKind::Mlp {
-            in_size: "10".to_string(),
-            out_size: "5".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("expected input last dim 10"));
-    }
-
-    // --- New ShapePreserving names: min-rank vs. any-rank ---
-
-    #[test]
-    fn test_instance_norm2d_requires_min_rank() {
-        let shapes = shapes_of(&[("x", &["8"])]);
-        let kind = LayerKind::ShapePreserving {
-            name: "InstanceNorm2d".to_string(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 3 dims"));
-    }
-
-    #[test]
-    fn test_identity_alpha_dropout_and_transformer_layers_accept_any_rank() {
-        let shapes = shapes_of(&[("scalar", &[])]);
-        for name in [
-            "Identity",
-            "AlphaDropout",
-            "TransformerEncoderLayer",
-            "TransformerDecoderLayer",
-        ] {
-            let kind = LayerKind::ShapePreserving {
-                name: name.to_string(),
-            };
-            let out = apply_layer_application(&app("scalar", kind), &shapes).unwrap();
-            assert_eq!(out, Some(Vec::new()), "layer {} should accept rank 0", name);
-        }
-    }
-
-    #[test]
-    fn test_rms_norm_requires_at_least_rank_1() {
-        let shapes = shapes_of(&[("scalar", &[])]);
-        let kind = LayerKind::ShapePreserving {
-            name: "RMSNorm".to_string(),
-        };
-
-        let err = apply_layer_application(&app("scalar", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 1 dims"));
-    }
-
-    // --- Sequential ---
-
-    fn linear(in_features: &str, out_features: &str) -> LayerKind {
-        LayerKind::Linear {
-            in_features: in_features.to_string(),
-            out_features: out_features.to_string(),
-        }
-    }
-
-    fn relu() -> LayerKind {
-        LayerKind::ShapePreserving {
-            name: "ReLU".to_string(),
-        }
-    }
-
-    #[test]
-    fn test_sequential_threads_shape_through_linear_relu_linear() {
-        // The acceptance-bar case: nn.Sequential(Linear(784,256), ReLU(), Linear(256,10))
-        // applied to a (batch, 784) input ends at (batch, 10).
-        let shapes = shapes_of(&[("x", &["batch", "784"])]);
-        let kind = LayerKind::Sequential {
-            children: vec![linear("784", "256"), relu(), linear("256", "10")],
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "10"])));
-    }
-
-    #[test]
-    fn test_sequential_mid_chain_mismatch_reports_that_childs_error() {
-        // x is (batch, 784); the first Linear produces (batch, 256), which
-        // the second Linear (expecting 999) can't accept — the error must be
-        // that *second* layer's own mismatch message, index-qualified.
-        let shapes = shapes_of(&[("x", &["batch", "784"])]);
-        let kind = LayerKind::Sequential {
-            children: vec![linear("784", "256"), linear("999", "10")],
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("layer[1]"), "error was: {err}");
-        assert!(err.contains("expected input last dim 999"), "error was: {err}");
-        assert!(err.contains("got 256"), "error was: {err}");
-    }
-
-    #[test]
-    fn test_sequential_scalar_input_to_first_linear_errors_at_index_0() {
-        let shapes = shapes_of(&[("x", &[])]);
-        let kind = LayerKind::Sequential {
-            children: vec![linear("784", "256")],
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("layer[0]"), "error was: {err}");
-    }
-
-    #[test]
-    fn test_sequential_with_unknown_child_output_is_unknown() {
-        // MultiheadAttention's direct (non-tuple) application is always
-        // `Ok(None)` (see its apply arm) — a Sequential containing it can't
-        // know the downstream shape either, so the whole chain is unknown.
-        let shapes = shapes_of(&[("x", &["batch", "seq", "512"])]);
-        let kind = LayerKind::Sequential {
-            children: vec![
-                LayerKind::MultiheadAttention {
-                    feature_dim: "512".to_string(),
-                },
-                linear("512", "10"),
-            ],
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn test_nested_sequential_applies_end_to_end() {
-        let shapes = shapes_of(&[("x", &["batch", "4"])]);
-        let kind = LayerKind::Sequential {
-            children: vec![
-                LayerKind::Sequential {
-                    children: vec![linear("4", "8"), relu()],
-                },
-                linear("8", "2"),
-            ],
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "2"])));
-    }
-
-    #[test]
-    fn test_empty_sequential_is_identity() {
-        let shapes = shapes_of(&[("x", &["batch", "4"])]);
-        let kind = LayerKind::Sequential { children: Vec::new() };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["batch", "4"])));
-    }
-
-    // --- EinopsPattern (Rearrange / Reduce layers) ---
-
-    #[test]
-    fn test_einops_pattern_rearrange_layer_applies_like_free_function() {
-        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
-        let kind = LayerKind::EinopsPattern {
-            name: "Rearrange".to_string(),
-            pattern: "\"b c h w -> b (c h w)\"".to_string(),
-            kwargs: HashMap::new(),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "60"])));
-    }
-
-    #[test]
-    fn test_einops_pattern_reduce_layer_uses_axis_kwargs() {
-        let shapes = shapes_of(&[("x", &["2", "196", "8"])]);
-        let kind = LayerKind::EinopsPattern {
-            name: "Reduce".to_string(),
-            pattern: "\"b (h w) c -> b h w c\"".to_string(),
-            kwargs: HashMap::from([("h".to_string(), "14".to_string())]),
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "14", "14", "8"])));
-    }
-
-    #[test]
-    fn test_einops_pattern_rank_mismatch_errors() {
-        let shapes = shapes_of(&[("x", &["2", "3", "4"])]);
-        let kind = LayerKind::EinopsPattern {
-            name: "Rearrange".to_string(),
-            pattern: "\"b c h w -> b (c h w)\"".to_string(),
-            kwargs: HashMap::new(),
-        };
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("expects rank 4"));
-    }
-
-    #[test]
-    fn test_sequential_of_rearrange_then_linear() {
-        // Rearrange inside a Sequential, feeding a Linear — proves the
-        // EinopsPattern arm composes through the same chaining machinery as
-        // every other LayerKind.
-        let shapes = shapes_of(&[("x", &["2", "3", "4", "5"])]);
-        let kind = LayerKind::Sequential {
-            children: vec![
-                LayerKind::EinopsPattern {
-                    name: "Rearrange".to_string(),
-                    pattern: "\"b c h w -> b (c h w)\"".to_string(),
-                    kwargs: HashMap::new(),
-                },
-                linear("60", "10"),
-            ],
-        };
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "10"])));
-    }
-
-    // --- Unfold ---
-
-    fn unfold(kernel_size: &str, stride: &str, padding: &str, dilation: &str) -> LayerKind {
-        LayerKind::Unfold {
-            kernel_size: kernel_size.to_string(),
-            stride: stride.to_string(),
-            padding: padding.to_string(),
-            dilation: dilation.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_unfold_concrete_scalar_args() {
-        // floor((8+0-3)/1)+1 = 6 blocks per axis; L = 6*6 = 36; channels = 3*3*3 = 27.
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = unfold("3", "1", "0", "1");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["27", "36"])));
-    }
-
-    #[test]
-    fn test_unfold_batched_input_preserves_leading_batch_dim() {
-        let shapes = shapes_of(&[("x", &["2", "3", "8", "8"])]);
-        let kind = unfold("3", "1", "0", "1");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["2", "27", "36"])));
-    }
-
-    #[test]
-    fn test_unfold_per_axis_tuple_kernel_stride_padding() {
-        // blocks_h = floor((10-2)/2)+1 = 5; blocks_w = floor((12-3)/3)+1 = 4;
-        // L = 20; channels = 3*2*3 = 18.
-        let shapes = shapes_of(&[("x", &["3", "10", "12"])]);
-        let kind = unfold("(2, 3)", "(2, 3)", "0", "1");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["18", "20"])));
-    }
-
-    #[test]
-    fn test_unfold_dilation_extends_effective_kernel() {
-        // eff_k = 2*(3-1)+1 = 5; blocks = floor((7-5)/1)+1 = 3; L = 9;
-        // channels use the *raw* kernel_size (3), not the dilated one: 3*3*3 = 27.
-        let shapes = shapes_of(&[("x", &["3", "7", "7"])]);
-        let kind = unfold("3", "1", "0", "2");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["27", "9"])));
-    }
-
-    #[test]
-    fn test_unfold_symbolic_spatial_dims_with_literal_geometry() {
-        let shapes = shapes_of(&[("x", &["c", "H", "W"])]);
-        let kind = unfold("3", "1", "0", "1");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["c*3*3", "(H-2)*(W-2)"])));
-    }
-
-    #[test]
-    fn test_unfold_non_unit_dilation_with_symbolic_kernel_is_unknown() {
-        // dilation != 1 and kernel_size isn't a literal int: the effective
-        // (dilated) kernel size isn't foldable.
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = unfold("k", "1", "0", "2");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn test_unfold_rank_too_low_errors() {
-        let shapes = shapes_of(&[("x", &["8"])]);
-        let kind = unfold("2", "1", "0", "1");
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 3 dims"));
-    }
-
-    #[test]
-    fn test_unfold_bad_tuple_arity_is_unknown() {
-        let shapes = shapes_of(&[("x", &["3", "8", "8"])]);
-        let kind = unfold("(1, 2, 3)", "1", "0", "1");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
-    }
-
-    // --- Fold ---
-
-    fn fold(output_size: &str, kernel_size: &str) -> LayerKind {
-        LayerKind::Fold {
-            output_size: output_size.to_string(),
-            kernel_size: kernel_size.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_fold_concrete_divisible_channels() {
-        // 12 / (2*2) = 3.
-        let shapes = shapes_of(&[("x", &["12", "20"])]);
-        let kind = fold("(6, 6)", "2");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["3", "6", "6"])));
-    }
-
-    #[test]
-    fn test_fold_batched_input_preserves_leading_batch_dim() {
-        let shapes = shapes_of(&[("x", &["8", "12", "20"])]);
-        let kind = fold("(6, 6)", "2");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["8", "3", "6", "6"])));
-    }
-
-    #[test]
-    fn test_fold_per_axis_tuple_kernel_size() {
-        // 18 / (2*3) = 3.
-        let shapes = shapes_of(&[("x", &["18", "35"])]);
-        let kind = fold("(5, 7)", "(2, 3)");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["3", "5", "7"])));
-    }
-
-    #[test]
-    fn test_fold_not_evenly_divisible_errors() {
-        let shapes = shapes_of(&[("x", &["10", "20"])]);
-        let kind = fold("(4, 4)", "3");
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("not evenly divisible by 9"));
-    }
-
-    #[test]
-    fn test_fold_symbolic_channels_and_kernel_produce_symbolic_quotient() {
-        let shapes = shapes_of(&[("x", &["c", "L"])]);
-        let kind = fold("(H, W)", "k");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, Some(shape(&["c/(k*k)", "H", "W"])));
-    }
-
-    #[test]
-    fn test_fold_rank_too_low_errors() {
-        let shapes = shapes_of(&[("x", &[])]);
-        let kind = fold("(4, 4)", "2");
-
-        let err = apply_layer_application(&app("x", kind), &shapes).unwrap_err();
-
-        assert!(err.contains("requires input with at least 2 dims"));
-    }
-
-    #[test]
-    fn test_fold_bad_output_size_arity_is_unknown() {
-        let shapes = shapes_of(&[("x", &["12", "20"])]);
-        let kind = fold("(4, 5, 6)", "2");
-
-        let out = apply_layer_application(&app("x", kind), &shapes).unwrap();
-
-        assert_eq!(out, None);
     }
 }
 

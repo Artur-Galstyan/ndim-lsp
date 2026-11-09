@@ -187,41 +187,23 @@ where
         hierarchy,
         plan,
     } = pre;
-    let self_attr_aliases = self_attr_aliases_from_writes(&self_attr_writes, text);
-
+    let pass = PassInput {
+        node,
+        text,
+        imports: &imports,
+        layer_records: &layer_records,
+        self_attr_layers: &self_attr_layers,
+        aliases: &self_attr_aliases_from_writes(&self_attr_writes, text),
+        self_attr_writes: &self_attr_writes,
+        hierarchy: &hierarchy,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    };
     let (applications, errors, assignment_shapes) = match (plan, next) {
-        (Some(plan), Some(next)) => propagate_planned(
-            node,
-            text,
-            &imports,
-            &layer_records,
-            &self_attr_layers,
-            &self_attr_aliases,
-            &self_attr_writes,
-            &hierarchy,
-            search_roots,
-            read_file,
-            max_depth,
-            cache,
-            &mut scopes,
-            plan,
-            next,
-        )?,
-        _ => propagate_calls(
-            node,
-            text,
-            &imports,
-            &layer_records,
-            &self_attr_layers,
-            &self_attr_aliases,
-            &self_attr_writes,
-            &hierarchy,
-            search_roots,
-            read_file,
-            max_depth,
-            cache,
-            &mut scopes,
-        )?,
+        (Some(plan), Some(next)) => propagate_planned(&pass, &mut scopes, plan, next)?,
+        _ => propagate_calls(&pass, &mut scopes)?,
     };
 
     let mut layers = HashMap::new();
@@ -242,6 +224,7 @@ where
 /// `kind` buckets the cause (e.g. `"subscript"`, `"call:jnp.diff"`) so the
 /// coverage harness can rank gaps by how often they actually occur.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(test)]
 pub struct DarkSpot {
     pub line: u32,
     pub kind: String,
@@ -251,6 +234,7 @@ pub struct DarkSpot {
 /// vs. went dark, and what the dark ones were. Drives the corpus harness that
 /// prioritizes which structural gaps / functions to implement next.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(test)]
 pub struct CoverageReport {
     /// Non-annotated, non-`_` assignments considered.
     pub total: usize,
@@ -259,6 +243,7 @@ pub struct CoverageReport {
 }
 
 /// Run the analyzer over a file and report which assignments went dark.
+#[cfg(test)]
 pub fn analyze_coverage<F>(
     node: Node,
     text: &str,
@@ -321,6 +306,7 @@ where
 
 /// Bucket a dark assignment's RHS by cause. Calls are labelled with their
 /// (resolved) function name so missing functions surface by name.
+#[cfg(test)]
 fn dark_spot_kind(rhs: Node, text: &str, import_map: &HashMap<String, ImportPath>) -> String {
     match rhs.kind() {
         "subscript" => "subscript".to_string(),
@@ -761,6 +747,16 @@ impl<'a> ShapeCtx<'a> {
         } else {
             self.errors.push(error);
         }
+    }
+
+    /// The value of `result`. An error is reported as a mismatch of `variable`.
+    fn check<T>(
+        &mut self,
+        result: Result<T, String>,
+        variable: impl Into<String>,
+        range: tree_sitter::Range,
+    ) -> Option<T> {
+        result.map_err(|message| self.report(ShapeError::mismatch(variable, message, range))).ok()
     }
 
     fn reads_variadic_dim(&self, range: tree_sitter::Range) -> bool {
@@ -2627,6 +2623,26 @@ fn apply_max_min_method_for_backend(
     }
 }
 
+/// `receiver.<method>(args)` by the rule of `known`. An error names `variable`.
+fn shape_of_known_method(
+    known: KnownFunction,
+    receiver: &str,
+    variable: String,
+    args: Vec<CallArgument>,
+    args_node: Node,
+    scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
+    let args = if matches!(known, KnownFunction::Clamp) {
+        without_scalar_bounds(args, args_node, false, ctx)
+    } else {
+        args
+    };
+    let result = apply_method_call_for_backend(&known, receiver, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
+    let shape = ctx.check(result, variable, args_node.range())??;
+    Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
+}
+
 /// Resolve a `call` node's shape.
 ///
 /// This is the main dispatch point that handles:
@@ -2729,14 +2745,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 kind: layer,
                 range: args_node.range(),
             };
-            return match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
-                Ok(Some(output)) => Some(output),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            };
+            let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+            return ctx.check(result, "", args_node.range()).flatten();
         }
 
         // Direct call of a user module held in a field: `self.blk(x)`. A field
@@ -2812,25 +2822,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
-                if let Some(known) = classify_method_call(&method_name) {
-                    let args = if matches!(known, KnownFunction::Clamp) {
-                        without_scalar_bounds(args, args_node, false, ctx)
-                    } else {
-                        args
-                    };
-                    let result = apply_method_call_for_backend(&known, &receiver_name, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
-                    return match result {
-                        Ok(Some(shape)) => {
-                            Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
-                        }
-                        Ok(None) => None,
-                        Err(message) => {
-                            ctx.report(ShapeError::mismatch(method_name, message, args_node.range()));
-                            None
-                        }
-                    };
-                }
-                return None;
+                let known = classify_method_call(&method_name)?;
+                return shape_of_known_method(known, &receiver_name, method_name, args, args_node, scope_idx, ctx);
             }
             // Receiver has no shape. For a `call` receiver there's nothing
             // else to try. For an `attribute` (e.g. `jax.nn` in
@@ -2855,28 +2848,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
                 if let Some(known) = classify_method_call(&method_name) {
-                    let args = if matches!(known, KnownFunction::Clamp) {
-                        without_scalar_bounds(args, args_node, false, ctx)
-                    } else {
-                        args
-                    };
-                    let result = apply_method_call_for_backend(
-                        &known,
-                        &receiver_name,
-                        &args,
-                        ctx.imports.file(),
-                        &ctx.scope_shapes(scope_idx),
-                    );
-                    return match result {
-                        Ok(Some(shape)) => {
-                            Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
-                        }
-                        Ok(None) => None,
-                        Err(message) => {
-                            ctx.report(ShapeError::mismatch(receiver_name, message, args_node.range()));
-                            None
-                        }
-                    };
+                    let variable = receiver_name.clone();
+                    return shape_of_known_method(known, &receiver_name, variable, args, args_node, scope_idx, ctx);
                 }
 
                 // Check if receiver is a layer — layers are called like layer(x)
@@ -2962,14 +2935,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             ctx.links,
             ctx.scopes,
         );
-        return match result {
-            Ok(Some(shape)) => Some(shape),
-            Ok(None) => None,
-            Err(message) => {
-                ctx.report(ShapeError::mismatch(target, message, args_node.range()));
-                None
-            }
-        };
+        return ctx.check(result, target, args_node.range()).flatten();
     }
 
     // 2b. `jax.lax.map(f, xs)` — maps `f` over the leading axis of `xs`,
@@ -2978,16 +2944,12 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     // needs the callee's `FunctionShapeScope`/self-attr-layer machinery.
     {
         if matches!(known.as_ref(), Some(KnownFunction::LaxMap)) {
-            let mut positionals = args.iter().filter_map(|a| match a {
-                CallArgument::Positional { value } => Some(value.clone()),
-                _ => None,
-            });
             if let Some(lambda) = lambda_argument(args_node, 0)
                 && matches!(args.first(), Some(CallArgument::Positional { .. }))
             {
                 return map_lambda(lambda, args_node, &args[1..], scope_idx, ctx);
             }
-            let callable = positionals.next()?;
+            let callable = positional_values(&args).next()?.to_string();
             let rest: Vec<CallArgument> = args.iter().skip(1).cloned().collect();
             if let Some(attr) = callable.strip_prefix("self.")
                 && let Some(layer) = ctx.self_attr_layer_at(attr, call_byte)
@@ -3022,13 +2984,8 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     out_axes: 0,
                     site: call_byte,
                 };
-                return match apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes) {
-                    Ok(shape) => shape,
-                    Err(message) => {
-                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                        None
-                    }
-                };
+                let result = apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes);
+                return ctx.check(result, "", args_node.range()).flatten();
             }
             return None;
         }
@@ -3141,14 +3098,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         ctx.max_depth,
         ctx.cache,
     ) {
-        return match result {
-            Ok(Some(shape)) => Some(shape),
-            Ok(None) => None,
-            Err(message) => {
-                ctx.report(ShapeError::mismatch(target, message, args_node.range()));
-                None
-            }
-        };
+        return ctx.check(result, target, args_node.range()).flatten();
     }
 
     None
@@ -3735,10 +3685,7 @@ struct VmapInfo {
 ///   variable, `None`, etc.).
 fn parse_vmap_call(args: &[CallArgument], site: usize) -> Option<VmapInfo> {
     // First positional arg = wrapped function name.
-    let first_positional = args.iter().find_map(|arg| match arg {
-        CallArgument::Positional { value } => Some(value.clone()),
-        _ => None,
-    })?;
+    let first_positional = positional_values(args).next()?.to_string();
 
     // Must be a bare identifier — no dots (no qualified names like
     // `module.func`), and no expressions like `lambda x: x`.
@@ -4302,35 +4249,26 @@ fn extract_submodules(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn propagate_calls(
-    node: Node,
-    text: &str,
-    imports: &ImportScopes,
-    layer_records: &[LayerAssignment],
-    self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
-    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
-    self_attr_writes: &[SelfAttrWrite],
-    hierarchy: &ClassHierarchy,
-    search_roots: &[PathBuf],
-    read_file: &dyn Fn(&PathBuf) -> Option<String>,
+/// What a propagation pass over the tree of `node` reads.
+struct PassInput<'a> {
+    node: Node<'a>,
+    text: &'a str,
+    imports: &'a ImportScopes,
+    layer_records: &'a [LayerAssignment],
+    self_attr_layers: &'a HashMap<String, Vec<ScopedSelfAttrLayer>>,
+    aliases: &'a HashMap<String, Vec<ScopedSelfAttrAlias>>,
+    self_attr_writes: &'a [SelfAttrWrite<'a>],
+    hierarchy: &'a ClassHierarchy,
+    search_roots: &'a [PathBuf],
+    read_file: &'a dyn Fn(&PathBuf) -> Option<String>,
     max_depth: usize,
-    cache: Option<&ResolutionCache>,
-    scopes: &mut [FunctionShapeScope],
-) -> Result<PropagateOutput, String> {
+    cache: Option<&'a ResolutionCache>,
+}
+
+fn propagate_calls(pass: &PassInput, scopes: &mut [FunctionShapeScope]) -> Result<PropagateOutput, String> {
+    let (node, text) = (pass.node, pass.text);
     let (output, ()) = with_propagation(
-        node,
-        text,
-        imports,
-        layer_records,
-        self_attr_layers,
-        aliases,
-        self_attr_writes,
-        hierarchy,
-        search_roots,
-        read_file,
-        max_depth,
-        cache,
+        pass,
         scopes,
         |ctx| {
             // Collect all assignments (identifier and tuple-pattern LHS) in
@@ -4356,43 +4294,15 @@ fn propagate_calls(
 
 /// `propagate_calls` over the units the plan marks dirty. The records of the
 /// others stand in for them.
-#[allow(clippy::too_many_arguments)]
 fn propagate_planned(
-    node: Node,
-    text: &str,
-    imports: &ImportScopes,
-    layer_records: &[LayerAssignment],
-    self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
-    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
-    self_attr_writes: &[SelfAttrWrite],
-    hierarchy: &ClassHierarchy,
-    search_roots: &[PathBuf],
-    read_file: &dyn Fn(&PathBuf) -> Option<String>,
-    max_depth: usize,
-    cache: Option<&ResolutionCache>,
+    pass: &PassInput,
     scopes: &mut [FunctionShapeScope],
     plan: PropPlan,
     next: &mut UnitMemo,
 ) -> Result<PropagateOutput, String> {
-    let nodes = unit_nodes(node);
+    let nodes = unit_nodes(pass.node);
     let runs = if plan.dirty.iter().any(|&dirty| dirty) {
-        with_propagation(
-            node,
-            text,
-            imports,
-            layer_records,
-            self_attr_layers,
-            aliases,
-            self_attr_writes,
-            hierarchy,
-            search_roots,
-            read_file,
-            max_depth,
-            cache,
-            scopes,
-            |ctx| run_units(&nodes, &plan.dirty, ctx),
-        )?
-        .1
+        with_propagation(pass, scopes, |ctx| run_units(&nodes, &plan.dirty, ctx))?.1
     } else {
         nodes.iter().map(|_| None).collect()
     };
@@ -4501,23 +4411,25 @@ fn run_units(
 
 /// Build the context of a propagation pass over `node` and run `body` in it.
 /// Returns what the pass produced, and what `body` returned.
-#[allow(clippy::too_many_arguments)]
 fn with_propagation<T>(
-    node: Node,
-    text: &str,
-    imports: &ImportScopes,
-    layer_records: &[LayerAssignment],
-    self_attr_layers: &HashMap<String, Vec<ScopedSelfAttrLayer>>,
-    aliases: &HashMap<String, Vec<ScopedSelfAttrAlias>>,
-    self_attr_writes: &[SelfAttrWrite],
-    hierarchy: &ClassHierarchy,
-    search_roots: &[PathBuf],
-    read_file: &dyn Fn(&PathBuf) -> Option<String>,
-    max_depth: usize,
-    cache: Option<&ResolutionCache>,
+    pass: &PassInput,
     scopes: &mut [FunctionShapeScope],
     body: impl FnOnce(&mut ShapeCtx<'_>) -> Result<T, String>,
 ) -> Result<(PropagateOutput, T), String> {
+    let PassInput {
+        node,
+        text,
+        imports,
+        layer_records,
+        self_attr_layers,
+        aliases,
+        self_attr_writes,
+        hierarchy,
+        search_roots,
+        read_file,
+        max_depth,
+        cache,
+    } = *pass;
     let mut applications = Vec::new();
     let mut errors = Vec::new();
     let mut assignment_shapes = Vec::new();
@@ -5031,12 +4943,8 @@ fn handle_augmented_assignment(
         // elementwise-broadcasting for shape purposes.
         _ => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Add),
     };
-    match result {
-        Ok(Some(shape)) => {
-            ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
-        }
-        Ok(None) => {}
-        Err(message) => ctx.report(ShapeError::mismatch(name.to_string(), message, assignment_node.range())),
+    if let Some(Some(shape)) = ctx.check(result, name, assignment_node.range()) {
+        ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte());
     }
 }
 
@@ -5392,6 +5300,9 @@ fn tuple_rhs_shapes(
         "call" => {
             let func = rhs.child_by_field_name("function")?;
             let target = func.utf8_text(ctx.text.as_bytes()).ok()?;
+            let args_node = rhs.child_by_field_name("arguments")?;
+            let text = ctx.text;
+            let raw_args = || extract_call_arguments(args_node, text).ok();
 
             // Method-call tuple forms on a plain local receiver: `values,
             // indices = x.topk(k)`, `a, b, c = x.chunk(3)`, `a, b =
@@ -5420,8 +5331,7 @@ fn tuple_rhs_shapes(
                         | KnownFunction::MedianDim
                 )
             {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = raw_args()?;
                 let mut method_args = Vec::with_capacity(raw_args.len() + 1);
                 method_args.push(CallArgument::Positional {
                     value: receiver.to_string(),
@@ -5450,12 +5360,8 @@ fn tuple_rhs_shapes(
                 if n_targets != 2 {
                     return None;
                 }
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let mut positionals = args.iter().filter_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                });
+                let args = raw_args()?;
+                let mut positionals = positional_values(&args);
                 let query = positionals.next()?;
                 let key = positionals.next().unwrap_or(query);
                 let query_shape = ctx.resolve_shape(query, scope_idx)?;
@@ -5489,71 +5395,33 @@ fn tuple_rhs_shapes(
             // num_directions == 1` (also not tracked), so for a batched
             // input it is missing the real leading `num_layers*num_
             // directions` axis that torch's actual `h_n`/`c_n` carries.
-            // Documented as an approximation in TO_IMPLEMENT.md.
-            if let Some(attr) = target.strip_prefix("self.") {
-                let rnn_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
-                    Some(LayerKind::Rnn { hidden_size, .. }) => Some(hidden_size),
-                    _ => None,
-                };
-                if let Some(hidden_size) = rnn_hidden_size {
-                    if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
-                        return None;
-                    }
-                    let args_node = rhs.child_by_field_name("arguments")?;
-                    let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                    let input = args.iter().find_map(|a| match a {
-                        CallArgument::Positional { value } => Some(value.as_str()),
-                        _ => None,
-                    })?;
-                    let input_shape = ctx.resolve_shape(input, scope_idx)?;
-                    if input_shape.len() < 2 {
-                        return None;
-                    }
-
-                    let mut output = input_shape.clone();
-                    let last = output.len() - 1;
-                    output[last] = hidden_size.clone();
-
-                    let mut state = input_shape[1..].to_vec();
-                    if let Some(last_dim) = state.last_mut() {
-                        *last_dim = hidden_size;
-                    }
-
-                    return Some(vec![Some(output), Some(state)]);
+            // Documented as an approximation in TO_IMPLEMENT.md. A single-step
+            // cell (`LayerKind::RnnCell`, `h, c = self.cell(x, (h0, c0))`) binds
+            // both names to its output: last dim -> `hidden_size`, min rank 1.
+            if let Some(attr) = target.strip_prefix("self.")
+                && let Some(layer) = ctx.self_attr_layer_at(attr, rhs.start_byte())
+                && let LayerKind::Rnn { hidden_size, .. } | LayerKind::RnnCell { hidden_size, .. } = &layer
+            {
+                let cell = matches!(layer, LayerKind::RnnCell { .. });
+                if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
+                    return None;
                 }
-            }
-
-            // `h, c = self.lstm(x, (h0, c0))` — self.<attr> resolves to a
-            // single-step RNN cell (`LayerKind::RnnCell`: LSTMCell/GRUCell/
-            // RNNCell) built in `__init__`. Same "both share one shape"
-            // approximation as the `Rnn` arm's `(h, c)` state above, applied
-            // to the single-step rule (`apply_layer_kind`'s `RnnCell` arm:
-            // last dim -> `hidden_size`, rank preserved, min rank 1 for the
-            // unbatched convention).
-            if let Some(attr) = target.strip_prefix("self.") {
-                let cell_hidden_size = match ctx.self_attr_layer_at(attr, rhs.start_byte()) {
-                    Some(LayerKind::RnnCell { hidden_size, .. }) => Some(hidden_size),
-                    _ => None,
-                };
-                if let Some(hidden_size) = cell_hidden_size {
-                    if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
-                        return None;
-                    }
-                    let args_node = rhs.child_by_field_name("arguments")?;
-                    let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                    let input = args.iter().find_map(|a| match a {
-                        CallArgument::Positional { value } => Some(value.as_str()),
-                        _ => None,
-                    })?;
-                    let input_shape = ctx.resolve_shape(input, scope_idx)?;
-                    if input_shape.is_empty() {
-                        return None;
-                    }
-                    let mut output = input_shape.clone();
-                    let last = output.len() - 1;
-                    output[last] = hidden_size;
+                let args = raw_args()?;
+                let input = positional_values(&args).next()?;
+                let input_shape = ctx.resolve_shape(input, scope_idx)?;
+                if input_shape.len() < if cell { 1 } else { 2 } {
+                    return None;
+                }
+                let mut output = input_shape.clone();
+                *output.last_mut()? = hidden_size.clone();
+                if cell {
                     return Some(vec![Some(output.clone()), Some(output)]);
                 }
+                let mut state = input_shape[1..].to_vec();
+                if let Some(last_dim) = state.last_mut() {
+                    *last_dim = hidden_size.clone();
+                }
+                return Some(vec![Some(output), Some(state)]);
             }
 
             let resolved = resolve_call_target(target, ctx.imports.at(rhs.start_byte()));
@@ -5578,7 +5446,6 @@ fn tuple_rhs_shapes(
                 if n_targets != 2 {
                     return None;
                 }
-                let args_node = rhs.child_by_field_name("arguments")?;
                 let body_node = find_keyword_arg_node(args_node, "f", ctx.text.as_bytes())
                     .and_then(|kw| kw.child_by_field_name("value"))
                     .or_else(|| find_positional_arg_node(args_node, 0));
@@ -5609,8 +5476,7 @@ fn tuple_rhs_shapes(
             // JAX tuple returns use the same validation as single-name calls,
             // but keep each output distinct. Resolve inline array expressions.
             if matches!(known, Some(KnownFunction::LaxTopK | KnownFunction::QrMultiply)) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = raw_args()?;
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
                 let result = if matches!(known, Some(KnownFunction::LaxTopK)) {
                     crate::known_functions::compute_top_k_shape(&args, &ctx.scope_shapes(scope_idx))
@@ -5618,16 +5484,8 @@ fn tuple_rhs_shapes(
                 } else {
                     crate::known_functions::compute_qr_multiply_shapes(&args, &ctx.scope_shapes(scope_idx))
                 };
-                return match result {
-                    Ok(Some(outputs)) if outputs.len() == n_targets => {
-                        Some(outputs.into_iter().map(Some).collect())
-                    }
-                    Ok(_) => None,
-                    Err(message) => {
-                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                        None
-                    }
-                };
+                let outputs = ctx.check(result, "", args_node.range())??;
+                return (outputs.len() == n_targets).then(|| outputs.into_iter().map(Some).collect());
             }
 
             // `sorted_keys, sorted_values = jax.lax.sort_key_val(keys, values)`
@@ -5636,12 +5494,8 @@ fn tuple_rhs_shapes(
                 if n_targets != 2 {
                     return None;
                 }
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let mut positionals = args.iter().filter_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                });
+                let args = raw_args()?;
+                let mut positionals = positional_values(&args);
                 let keys = positionals.next()?;
                 let values = positionals.next()?;
                 let keys_shape = ctx.resolve_shape(keys, scope_idx)?;
@@ -5656,20 +5510,9 @@ fn tuple_rhs_shapes(
                 known,
                 Some(KnownFunction::HSplit | KnownFunction::VSplit | KnownFunction::DSplit)
             ) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                return match compute_fixed_axis_split_shapes(
-                    &known?,
-                    &args,
-                    &ctx.scope_shapes(scope_idx),
-                ) {
-                    Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
-                    Ok(None) => None,
-                    Err(message) => {
-                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                        None
-                    }
-                };
+                let args = raw_args()?;
+                let result = compute_fixed_axis_split_shapes(&known?, &args, &ctx.scope_shapes(scope_idx));
+                return Some(ctx.check(result, "", args_node.range())??.into_iter().map(Some).collect());
             }
 
             // `i0, i1, ... = jnp.nonzero(x)` — one 1D output per input
@@ -5678,12 +5521,8 @@ fn tuple_rhs_shapes(
                 if n_targets == 0 {
                     return None;
                 }
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let input_name = args.iter().find_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                })?;
+                let args = raw_args()?;
+                let input_name = positional_values(&args).next()?;
                 let input_shape = ctx.resolve_shape(input_name, scope_idx)?;
                 if input_shape.len() != n_targets {
                     return None;
@@ -5700,15 +5539,9 @@ fn tuple_rhs_shapes(
                 if n_targets != 2 {
                     return None;
                 }
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                return match compute_einops_pack_shape(&args, &ctx.scope_shapes(scope_idx)) {
-                    Ok(shape) => Some(vec![shape, None]),
-                    Err(message) => {
-                        ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                        None
-                    }
-                };
+                let args = raw_args()?;
+                let result = compute_einops_pack_shape(&args, &ctx.scope_shapes(scope_idx));
+                return Some(vec![ctx.check(result, "", args_node.range())?, None]);
             }
 
             // `a, b, ... = einops.unpack(packed, ps, pattern)` — genuinely
@@ -5725,12 +5558,8 @@ fn tuple_rhs_shapes(
             // any prefix of that tuple) — only `solution`'s shape is
             // derivable; the rest are algorithm/data-dependent.
             if matches!(known, Some(KnownFunction::LinalgLstsq)) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
-                let mut positionals = args.iter().filter_map(|a| match a {
-                    CallArgument::Positional { value } => Some(value.as_str()),
-                    _ => None,
-                });
+                let args = raw_args()?;
+                let mut positionals = positional_values(&args);
                 let a_name = positionals.next()?;
                 let b_name = positionals.next()?;
                 let a_shape = ctx.resolve_shape(a_name, scope_idx)?;
@@ -5750,8 +5579,7 @@ fn tuple_rhs_shapes(
                         | KnownFunction::BroadcastArrays
                 )
             ) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let raw_args = raw_args()?;
                 if raw_args.len() != n_targets
                     || raw_args
                         .iter()
@@ -5762,40 +5590,16 @@ fn tuple_rhs_shapes(
                 let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
                 let known = known.as_ref()?;
                 if matches!(known, KnownFunction::BroadcastArrays) {
-                    return match apply_known_function(known, &args, &ctx.scope_shapes(scope_idx)) {
-                        Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
-                        Ok(None) => None,
-                        Err(message) => {
-                            ctx.report(ShapeError::mismatch(
-                                String::new(),
-                                message,
-                                args_node.range(),
-                            ));
-                            None
-                        }
-                    };
+                    let result = apply_known_function(known, &args, &ctx.scope_shapes(scope_idx));
+                    return Some(vec![Some(ctx.check(result, "", args_node.range())??); n_targets]);
                 }
                 if n_targets < 2 {
                     return None;
                 }
                 let mut shapes = Vec::with_capacity(n_targets);
                 for arg in &args {
-                    match apply_known_function(
-                        known,
-                        std::slice::from_ref(arg),
-                        &ctx.scope_shapes(scope_idx),
-                    ) {
-                        Ok(Some(shape)) => shapes.push(Some(shape)),
-                        Ok(None) => return None,
-                        Err(message) => {
-                            ctx.report(ShapeError::mismatch(
-                                String::new(),
-                                message,
-                                args_node.range(),
-                            ));
-                            return None;
-                        }
-                    }
+                    let result = apply_known_function(known, std::slice::from_ref(arg), &ctx.scope_shapes(scope_idx));
+                    shapes.push(Some(ctx.check(result, "", args_node.range())??));
                 }
                 return Some(shapes);
             }
@@ -5811,8 +5615,7 @@ fn tuple_rhs_shapes(
                         | KnownFunction::Meshgrid
                 )
             ) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let args = raw_args()?;
                 if args
                     .iter()
                     .any(|a| matches!(a, CallArgument::Keyword { .. }))
@@ -5839,8 +5642,7 @@ fn tuple_rhs_shapes(
                         | KnownFunction::TorchSplit
                 )
             ) {
-                let args_node = rhs.child_by_field_name("arguments")?;
-                let mut args = extract_call_arguments(args_node, ctx.text).ok()?;
+                let mut args = raw_args()?;
                 if matches!(known, Some(KnownFunction::TopK | KnownFunction::MinMax)) {
                     if let Some((i, input)) = args.iter_mut().enumerate().find(|(_, arg)| {
                         matches!(arg, CallArgument::Positional { .. })
@@ -5858,24 +5660,24 @@ fn tuple_rhs_shapes(
             if !matches!(known, Some(KnownFunction::Split | KnownFunction::ArraySplit)) {
                 return None;
             }
-            let args_node = rhs.child_by_field_name("arguments")?;
-            let args = extract_call_arguments(args_node, ctx.text).ok()?;
+            let args = raw_args()?;
             let result = if matches!(known, Some(KnownFunction::ArraySplit)) {
                 compute_array_split_shapes(&args, &ctx.scope_shapes(scope_idx))
             } else {
                 compute_split_shapes(&args, &ctx.scope_shapes(scope_idx))
             };
-            match result {
-                Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
+            Some(ctx.check(result, "", args_node.range())??.into_iter().map(Some).collect())
         }
         _ => None,
     }
+}
+
+/// The values of the positional arguments, as written.
+fn positional_values(args: &[CallArgument]) -> impl Iterator<Item = &str> {
+    args.iter().filter_map(|a| match a {
+        CallArgument::Positional { value } => Some(value.as_str()),
+        _ => None,
+    })
 }
 
 /// Shared math for tuple-unpacked `topk`/`chunk`/`unbind`/`kthvalue`/
@@ -5890,34 +5692,9 @@ fn tuple_multi_output_shapes(
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<Option<Vec<String>>>> {
+    let range = args_node.range();
     match known {
-        KnownFunction::TopK => {
-            if n_targets != 2 {
-                return None;
-            }
-            match apply_known_topk_shape(args, &ctx.scope_shapes(scope_idx)) {
-                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
-        }
-        KnownFunction::KthValue => {
-            if n_targets != 2 {
-                return None;
-            }
-            match apply_known_kthvalue_shape(args, &ctx.scope_shapes(scope_idx)) {
-                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
-        }
-        KnownFunction::MinMax | KnownFunction::MedianDim => {
+        KnownFunction::TopK | KnownFunction::KthValue | KnownFunction::MinMax | KnownFunction::MedianDim => {
             if n_targets != 2 {
                 return None;
             }
@@ -5933,49 +5710,33 @@ fn tuple_multi_output_shapes(
                 // No-dim scalar form (`torch.median(x)`) isn't a 2-tuple.
                 return None;
             }
-            match apply_known_reduction(args, &ctx.scope_shapes(scope_idx)) {
-                Ok(Some(shape)) => Some(vec![Some(shape.clone()), Some(shape)]),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
+            let result = match known {
+                KnownFunction::TopK => apply_known_topk_shape(args, &ctx.scope_shapes(scope_idx)),
+                KnownFunction::KthValue => apply_known_kthvalue_shape(args, &ctx.scope_shapes(scope_idx)),
+                _ => apply_known_reduction(args, &ctx.scope_shapes(scope_idx)),
+            };
+            let shape = ctx.check(result, "", range)??;
+            Some(vec![Some(shape.clone()), Some(shape)])
         }
         KnownFunction::Unbind => {
             if n_targets == 0 {
                 return None;
             }
-            match compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets) {
-                Ok(Some(shape)) => Some(vec![Some(shape); n_targets]),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
+            let result = compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets);
+            Some(vec![Some(ctx.check(result, "", range)??); n_targets])
         }
-        KnownFunction::Chunk => match compute_chunk_shapes(args, &ctx.scope_shapes(scope_idx)) {
-            Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
-            Ok(None) => None,
-            Err(message) => {
-                ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                None
-            }
-        },
-        // Real torch semantics (chunk *size*, not section count) — covers
-        // both `torch.split(x, ...)` (free function) and `x.split(...)`
-        // (method, receiver prepended by the caller). `n_targets` lets the
-        // literal-size / symbolic-axis-dim case still bind a chunk list.
-        KnownFunction::TorchSplit => {
-            match compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), Some(n_targets)) {
-                Ok(Some(shapes)) => Some(shapes.into_iter().map(Some).collect()),
-                Ok(None) => None,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-                    None
-                }
-            }
+        // `TorchSplit` has real torch semantics (chunk *size*, not section
+        // count) — covers both `torch.split(x, ...)` (free function) and
+        // `x.split(...)` (method, receiver prepended by the caller).
+        // `n_targets` lets the literal-size / symbolic-axis-dim case still
+        // bind a chunk list.
+        KnownFunction::Chunk | KnownFunction::TorchSplit => {
+            let result = if matches!(known, KnownFunction::Chunk) {
+                compute_chunk_shapes(args, &ctx.scope_shapes(scope_idx))
+            } else {
+                compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), Some(n_targets))
+            };
+            Some(ctx.check(result, "", range)??.into_iter().map(Some).collect())
         }
         _ => None,
     }
@@ -6006,13 +5767,7 @@ fn linalg_tuple_shapes(
     scope_idx: usize,
     ctx: &ShapeCtx,
 ) -> Option<Vec<Option<Vec<String>>>> {
-    let positionals: Vec<&str> = args
-        .iter()
-        .filter_map(|a| match a {
-            CallArgument::Positional { value } => Some(value.as_str()),
-            _ => None,
-        })
-        .collect();
+    let positionals: Vec<&str> = positional_values(args).collect();
 
     match known {
         KnownFunction::Meshgrid => {
@@ -6365,7 +6120,7 @@ fn shape_of_inline_vmap(
             return None;
         }
         let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
-        return match apply_vmap_call_chain(
+        let result = apply_vmap_call_chain(
             &axes,
             &callable,
             inner_call.start_byte(),
@@ -6373,13 +6128,8 @@ fn shape_of_inline_vmap(
             &ctx.scope_shapes(scope_idx),
             ctx.links,
             ctx.scopes,
-        ) {
-            Ok(shape) => shape,
-            Err(message) => {
-                ctx.report(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
-                None
-            }
-        };
+        );
+        return ctx.check(result, "", outer_args_node.range()).flatten();
     }
 
     None
@@ -6439,14 +6189,7 @@ fn batched_lambda(
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
     let peeled = peel_vmap_args(axes, args, &ctx.scope_shapes(scope_idx));
-    let (examples, batch_dims) = match peeled {
-        Ok(Some((examples, batch_dims))) => (examples, batch_dims),
-        Ok(None) => return None,
-        Err(message) => {
-            ctx.report(ShapeError::mismatch(String::new(), message, args_node.range()));
-            return None;
-        }
-    };
+    let (examples, batch_dims) = ctx.check(peeled, "", args_node.range())??;
     let examples = examples.into_iter().map(|(_, shape)| shape).collect();
     let mut output = shape_of_batched_lambda(lambda, scope_idx, examples, ctx)?;
     for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
@@ -6631,14 +6374,8 @@ fn shape_of_inline_layer(
         kind,
         range: outer_args_node.range(),
     };
-    match apply_layer_application(&application, &ctx.scope_shapes(scope_idx)) {
-        Ok(Some(output)) => Some(output),
-        Ok(None) => None,
-        Err(message) => {
-            ctx.report(ShapeError::mismatch(String::new(), message, outer_args_node.range()));
-            None
-        }
-    }
+    let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+    ctx.check(result, "", outer_args_node.range()).flatten()
 }
 
 /// Apply a layer batched over its leading axis: peel the batch dim at
@@ -6671,11 +6408,8 @@ fn apply_inline_vmap_layer_chain(
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
     let (layer_name, layer) = layer;
-    let input_name = outer_args.iter().find_map(|a| match a {
-        CallArgument::Positional { value } => Some(value.clone()),
-        _ => None,
-    })?;
-    let mut shape = ctx.resolve_shape(&input_name, scope_idx)?;
+    let input_name = positional_values(outer_args).next()?;
+    let mut shape = ctx.resolve_shape(input_name, scope_idx)?;
 
     let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
     for &(in_axes, _) in axes {
@@ -6691,21 +6425,10 @@ fn apply_inline_vmap_layer_chain(
     // query's per-example shape is unchanged by attention (same rule as the
     // direct-call MHA special case in `shape_of_call`), so just re-prepend
     // the peeled batch dims onto it.
-    if matches!(layer, LayerKind::MultiheadAttention { .. }) {
-        let mut output = shape;
-        for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
-            output = prepend_batch_dim(output, out_axes, dim);
-        }
-        return Some(output);
-    }
-
-    let mut output = match apply_layer_kind(layer, &shape, layer_name, &input_name) {
-        Ok(Some(output)) => output,
-        Ok(None) => return None,
-        Err(message) => {
-            ctx.report(ShapeError::mismatch(String::new(), message, range));
-            return None;
-        }
+    let mut output = if matches!(layer, LayerKind::MultiheadAttention { .. }) {
+        shape
+    } else {
+        ctx.check(apply_layer_kind(layer, &shape, layer_name, input_name), "", range)??
     };
     for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
         output = prepend_batch_dim(output, out_axes, dim);
@@ -6859,15 +6582,12 @@ fn apply_user_function(
         &ctx.scope_shapes(scope_idx),
         ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
     ) {
-        match result {
-            Ok(Some(shape)) if !captures || ctx.scopes[callee_idx].return_shape.is_some() => {
+        match ctx.check(result, display, args_node.range()) {
+            None => return Some(None),
+            Some(Some(shape)) if !captures || ctx.scopes[callee_idx].return_shape.is_some() => {
                 return Some(Some(shape));
             }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(message) => {
-                ctx.report(ShapeError::mismatch(display, message, args_node.range()));
-                return Some(None);
-            }
+            Some(_) => {}
         }
     }
     if captures {
@@ -7509,13 +7229,7 @@ fn apply_submodule_call(
             None => return None,
         }
     }
-    let binding = match bind_module_dims(declared, display, &bound) {
-        Ok(binding) => binding,
-        Err(message) => {
-            ctx.report(ShapeError::mismatch(display.to_string(), message, range));
-            return None;
-        }
-    };
+    let binding = ctx.check(bind_module_dims(declared, display, &bound), display, range)?;
 
     let caller_names: HashSet<String> = seeded
         .values()
@@ -8002,16 +7716,10 @@ fn is_shape_preserving_call(resolved: &ResolvedTarget) -> bool {
             | "absolute" | "reciprocal"
             | "sin" | "cos" | "tan" | "arcsin" | "arccos" | "arctan"
             | "sinh" | "cosh" | "tanh" | "arcsinh" | "arccosh" | "arctanh"
-            | "deg2rad" | "rad2deg" | "degrees" | "radians"
-            | "add" | "subtract" | "multiply" | "divide" | "true_divide"
-            | "floor_divide" | "power" | "float_power" | "remainder" | "mod"
-            | "fmod" | "maximum" | "minimum" | "fmax" | "fmin" | "copysign"
-            | "heaviside" | "logical_not" | "logical_and" | "logical_or"
-            | "logical_xor" | "equal" | "not_equal" | "less" | "less_equal"
-            | "greater" | "greater_equal" | "isnan" | "isfinite" | "isinf"
-            | "isneginf" | "isposinf" | "signbit" | "nextafter" | "nan_to_num"
-            | "arctan2" | "hypot" | "logaddexp"
-        );
+            | "deg2rad" | "rad2deg" | "degrees" | "radians" | "logical_not"
+            | "isnan" | "isfinite" | "isinf" | "isneginf" | "isposinf" | "signbit"
+            | "nan_to_num"
+        ) || is_binary_elementwise_call(resolved);
     }
 
     // torch elementwise math + activations
@@ -8081,101 +7789,39 @@ mod shape_of_expression_tests {
     fn analyze_simple(code: &str) -> LayerShapeAnalysis {
         let tree = parse(code);
         let imports = ImportScopes::new(tree.root_node(), code).unwrap();
-        let layer_records = Vec::new();
         let mut scopes = extract_jaxtyping_shapes(tree.root_node(), code).unwrap();
-
-        let mut applications = Vec::new();
-        let mut errors = Vec::new();
-        let mut assignment_shapes = Vec::new();
-        let mut vmap_targets = HashMap::new();
-        let self_attr_layers = HashMap::new();
-        let aliases = HashMap::new();
-        let search_roots: Vec<PathBuf> = Vec::new();
-        let read_file: &dyn Fn(&PathBuf) -> Option<String> = &|_: &PathBuf| None;
-
-        let assignments = collect_assignment_items(tree.root_node(), code).unwrap();
-
-        let mut function_nodes = Vec::new();
-        let mut class_ranges = Vec::new();
-        collect_function_definition_nodes(tree.root_node(), &mut function_nodes, &mut class_ranges);
-        let mut scope_function_nodes: Vec<Option<Node>> = std::iter::once(None)
-            .chain(function_nodes.into_iter().map(Some))
-            .collect();
-        scope_function_nodes.resize(scopes.len(), None);
-        let original_shapes: Vec<HashMap<String, Vec<String>>> =
-            scopes.iter().map(|s| s.shapes.clone()).collect();
-
-        let links = build_scope_links(tree.root_node(), &scopes, &scope_function_nodes, &class_ranges, &imports, code);
-
-        let mut ctx = ShapeCtx {
+        let pass = PassInput {
+            node: tree.root_node(),
             text: code,
             imports: &imports,
-            layer_records: &layer_records,
-            self_attr_layers: &self_attr_layers,
-            aliases: &aliases,
-            attr_writes: &[],
-            layer_dims: Default::default(),
-            root: tree.root_node(),
+            layer_records: &[],
+            self_attr_layers: &HashMap::new(),
+            aliases: &HashMap::new(),
+            self_attr_writes: &[],
             hierarchy: &ClassHierarchy::default(),
-            search_roots: &search_roots,
-            read_file,
+            search_roots: &[],
+            read_file: &|_| None,
             max_depth: 5,
             cache: None,
-            scopes: &mut scopes,
-            vmap_targets: &mut vmap_targets,
-            applications: &mut applications,
-            errors: &mut errors,
-            assignment_shapes: &mut assignment_shapes,
-            synthetic_counter: 0,
-            synthetics: HashMap::new(),
-            synthetic_text: HashMap::new(),
-            scalar_dims: HashMap::new(),
-            tuple_carries: HashSet::new(),
-            scope_function_nodes: &scope_function_nodes,
-            active_specializations: Vec::new(),
-            expression_depth: 0,
-            steps_left: MAX_STATEMENT_STEPS,
-            name_checks: Default::default(),
-            name_cycle: Cell::new(false),
-            specialized_scopes: std::collections::HashSet::new(),
-            original_shapes: &original_shapes,
-            links: &links,
-            submodules: &Submodules::default(),
-            global_names: Default::default(),
-            classes: ScopeIndex::default(),
-            class_starts: Vec::new(),
-            module_writes: HashMap::new(),
-            class_body_names: Default::default(),
-            global_scopes: Default::default(),
-            module_values: Default::default(),
-            module_index: Default::default(),
-            annotation_symbols: Default::default(),
-            int_names: HashSet::new(),
-            int_consts: Default::default(),
-            call_time: Vec::new(),
-            inner_masked: Vec::new(),
-            inner_scalars: HashSet::new(),
-            inner_arrays: HashSet::new(),
         };
-
-        for (lhs, rhs_node, _assignment_node) in assignments {
-            let Lhs::Single(lhs_name) = lhs else {
-                continue;
-            };
-            let scope_idx = match ctx.links.scope_index.lookup(rhs_node.start_byte()) {
-                Some(idx) => idx,
-                None => continue,
-            };
-            let result = shape_of_expression(rhs_node, &mut ctx);
-            if let Some(shape) = result {
-                ctx.scopes[scope_idx].shapes.insert(lhs_name, shape);
+        let ((applications, errors, _), ()) = with_propagation(&pass, &mut scopes, |ctx| {
+            for (lhs, rhs_node, _) in collect_assignment_items(tree.root_node(), code)? {
+                let Lhs::Single(lhs_name) = lhs else {
+                    continue;
+                };
+                let Some(scope_idx) = ctx.links.scope_index.lookup(rhs_node.start_byte()) else {
+                    continue;
+                };
+                if let Some(shape) = shape_of_expression(rhs_node, ctx) {
+                    ctx.scopes[scope_idx].shapes.insert(lhs_name, shape);
+                }
             }
-        }
-
-        let layers = HashMap::new();
+            Ok(())
+        })
+        .unwrap();
         LayerShapeAnalysis {
             scopes,
-            layers,
+            layers: HashMap::new(),
             applications,
             errors,
             assignment_shapes: Vec::new(),

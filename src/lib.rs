@@ -16,11 +16,15 @@ mod integration_tests;
 #[cfg(test)]
 mod jax_compat_tests;
 
-pub use analysis::*;
-pub use imports::*;
-pub use incremental::*;
-pub use known_functions::*;
-pub use layers::*;
-pub use python_ast::*;
-pub use resolution::*;
-pub use types::*;
+pub use analysis::{analyze_layer_shapes, analyze_layer_shapes_with_memo};
+pub use incremental::{UnitMemo, first_analysis_difference, first_tree_difference, reparse};
+pub use resolution::{ResolutionCache, clear_resolution_cache, new_resolution_cache};
+pub use types::{
+    FunctionShapeScope, LayerShapeAnalysis, ShapeError, ShapeErrorKind, ShapeFix, scope_for_byte,
+};
+
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use {
+    analysis::*, imports::*, known_functions::*, layers::*, python_ast::*, resolution::*, types::*,
+};

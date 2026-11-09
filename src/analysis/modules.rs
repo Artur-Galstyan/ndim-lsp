@@ -931,13 +931,8 @@ fn apply_held(
                 kind,
                 range,
             };
-            match apply_layer_application(&application, &ctx.scope_shapes(scope)) {
-                Ok(shape) => shape,
-                Err(message) => {
-                    ctx.report(ShapeError::mismatch(String::new(), message, range));
-                    None
-                }
-            }
+            let result = apply_layer_application(&application, &ctx.scope_shapes(scope));
+            ctx.check(result, "", range).flatten()
         }
     }
 }

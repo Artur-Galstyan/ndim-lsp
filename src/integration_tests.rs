@@ -627,130 +627,6 @@ def g(x: Float[Array, \"batch 3 32 32\"]):
 }
 
 #[cfg(test)]
-mod end_to_end_layer_shape_tests {
-    use super::*;
-    use std::fs;
-    use tree_sitter::Parser;
-
-    fn parse(code: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        let language = tree_sitter_python::LANGUAGE;
-        parser.set_language(&language.into()).unwrap();
-        parser.parse(code, None).unwrap()
-    }
-
-    fn read(path: &PathBuf) -> Option<String> {
-        fs::read_to_string(path).ok()
-    }
-
-    fn shape(dims: &[&str]) -> Vec<String> {
-        dims.iter().map(|dim| dim.to_string()).collect()
-    }
-
-    fn write_equinox_linear(tmp: &tempfile::TempDir) {
-        fs::create_dir_all(tmp.path().join("equinox/nn")).unwrap();
-        fs::write(
-            tmp.path().join("equinox/nn/__init__.py"),
-            "from ._linear import Linear",
-        )
-        .unwrap();
-        fs::write(
-            tmp.path().join("equinox/nn/_linear.py"),
-            "class Linear:\n    def __init__(self, in_features, out_features): pass",
-        )
-        .unwrap();
-    }
-
-    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
-        vec![FunctionShapeScope {
-            function_name: None,
-            start_byte: 0,
-            end_byte: usize::MAX,
-            shapes,
-            return_shape: None,
-            param_order: Vec::new(),
-        all_params: Vec::new(),
-            dimension_sites: Vec::new(),
-        }]
-    }
-
-    #[test]
-    fn test_extracts_layers_and_propagates_chain() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nl1 = eqx.nn.Linear(3, 5)\nl2 = eqx.nn.Linear(5, 7)\ny = l1(x)\nz = l2(y)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("y"), Some(&shape(&["batch", "5"])));
-        assert_eq!(scopes[0].shapes.get("z"), Some(&shape(&["batch", "7"])));
-    }
-
-    #[test]
-    fn test_reports_mismatch_in_end_to_end_pipeline() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "4"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "y");
-        assert!(errors[0].message.contains("expected input last dim 3"));
-        assert!(!scopes[0].shapes.contains_key("y"));
-    }
-
-    #[test]
-    fn test_unknown_input_in_end_to_end_pipeline_is_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\ny = layer(x)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::new());
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert!(!scopes[0].shapes.contains_key("y"));
-    }
-
-    #[test]
-    fn test_in_place_layer_application_uses_old_input_shape_then_overwrites() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_equinox_linear(&tmp);
-        let code = "import equinox as eqx\nlayer = eqx.nn.Linear(3, 5)\nx = layer(x)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "3"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert!(errors.is_empty());
-        assert_eq!(scopes[0].shapes.get("x"), Some(&shape(&["batch", "5"])));
-    }
-}
-
-#[cfg(test)]
 mod resolve_call_signature_tests {
     use super::*;
     use std::fs;
@@ -2162,19 +2038,6 @@ mod torch_nn_linear_tests {
         .unwrap();
     }
 
-    fn scopes_from(shapes: HashMap<String, Vec<String>>) -> Vec<FunctionShapeScope> {
-        vec![FunctionShapeScope {
-            function_name: None,
-            start_byte: 0,
-            end_byte: usize::MAX,
-            shapes,
-            return_shape: None,
-            param_order: Vec::new(),
-        all_params: Vec::new(),
-            dimension_sites: Vec::new(),
-        }]
-    }
-
     #[test]
     fn test_single_torch_nn_linear_flow() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2205,26 +2068,6 @@ mod torch_nn_linear_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["batch", "5"])));
         assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["batch", "7"])));
-    }
-
-    #[test]
-    fn test_torch_nn_linear_mismatch_reports_shape_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_fake_torch_nn(&tmp);
-        let code = "import torch\nlayer = torch.nn.Linear(3, 5)\ny = layer(x)";
-        let tree = parse(code);
-        let roots = vec![tmp.path().to_path_buf()];
-
-        let layers = extract_layer_assignments(tree.root_node(), code, &roots, read, 5).unwrap();
-        let apps = extract_layer_applications(tree.root_node(), code, &layers).unwrap();
-        let mut scopes = scopes_from(HashMap::from([("x".to_string(), shape(&["batch", "4"]))]));
-
-        let errors = apply_layer_applications(&apps, &mut scopes);
-
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].variable, "y");
-        assert!(errors[0].message.contains("expected input last dim 3"));
-        assert!(!scopes[0].shapes.contains_key("y"));
     }
 
     #[test]
@@ -3092,7 +2935,8 @@ mod conv_layer_tests {
         stride: &str,
         padding: &str,
     ) -> LayerKind {
-        LayerKind::Conv1d {
+        LayerKind::Conv {
+            spatial_rank: 1,
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
             kernel_size: kernel_size.to_string(),
@@ -3109,7 +2953,8 @@ mod conv_layer_tests {
         stride: &str,
         padding: &str,
     ) -> LayerKind {
-        LayerKind::Conv2d {
+        LayerKind::Conv {
+            spatial_rank: 2,
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
             kernel_size: kernel_size.to_string(),
@@ -3126,7 +2971,8 @@ mod conv_layer_tests {
         stride: &str,
         padding: &str,
     ) -> LayerKind {
-        LayerKind::Conv3d {
+        LayerKind::Conv {
+            spatial_rank: 3,
             in_channels: in_channels.to_string(),
             out_channels: out_channels.to_string(),
             kernel_size: kernel_size.to_string(),
