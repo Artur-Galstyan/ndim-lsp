@@ -6214,6 +6214,7 @@ fn peel_vmap_args<'a>(
     }
 
     let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
+    let mut conflicts = Conflicts::default();
     for &(in_axes, _) in axes {
         let mut level_dim: Option<String> = None;
         let mut next = Vec::with_capacity(current.len());
@@ -6222,10 +6223,8 @@ fn peel_vmap_args<'a>(
                 Ok((peeled, dim)) => {
                     if let Some(ref existing) = level_dim {
                         if dims_conflict(existing, &dim) {
-                            return Err(format!(
-                                "vmap input batch dims disagree: '{}' vs '{}'",
-                                existing, dim
-                            ));
+                            let message = format!("vmap input batch dims disagree: '{}' vs '{}'", existing, dim);
+                            conflicts.add(existing, &dim, message)?;
                         }
                     } else {
                         level_dim = Some(dim);
@@ -6245,6 +6244,7 @@ fn peel_vmap_args<'a>(
         // `level_dim` is always `Some` here.
         batch_dims.push(level_dim.unwrap());
     }
+    conflicts.finish()?;
     Ok(Some((current, batch_dims)))
 }
 
@@ -6979,6 +6979,7 @@ fn build_dim_binding(
     positional_arg_shapes: &[(&str, Vec<String>)],
 ) -> Result<HashMap<String, String>, String> {
     let mut binding: HashMap<String, String> = HashMap::new();
+    let mut conflicts = Conflicts::default();
     for (param_name, arg_shape) in positional_arg_shapes {
         let Some(param_shape) = param_shapes.get(*param_name) else {
             continue;
@@ -7015,16 +7016,18 @@ fn build_dim_binding(
                 }
             } else if let Some(existing) = binding.get(param_dim) {
                 if dims_conflict(existing, arg_dim) {
-                    return Err(format!(
+                    let message = format!(
                         "call to {}: dim '{}' cannot be both '{}' and '{}'",
                         target_name, param_dim, existing, arg_dim
-                    ));
+                    );
+                    conflicts.add(existing, arg_dim, message)?;
                 }
             } else {
                 binding.insert(param_dim.clone(), arg_dim.clone());
             }
         }
     }
+    conflicts.finish()?;
     Ok(binding)
 }
 
@@ -8011,6 +8014,7 @@ fn apply_matmul_shape(
     let right_batch = &right[..right.len() - 2];
     let batch_rank = left_batch.len().max(right_batch.len());
     let mut batch = Vec::with_capacity(batch_rank);
+    let mut conflicts = Conflicts::default();
     for k in (1..=batch_rank).rev() {
         let l = left_batch.len().checked_sub(k).map(|i| &left_batch[i]);
         let r = right_batch.len().checked_sub(k).map(|i| &right_batch[i]);
@@ -8024,10 +8028,11 @@ fn apply_matmul_shape(
                 return Ok(None);
             }
             (Some(l), Some(r)) => {
-                return Err(format!(
+                let message = format!(
                     "matmul batch dimension mismatch: {} has {}, {} has {} (align from the right)",
                     left_name, l, right_name, r
-                ));
+                );
+                conflicts.add(l, r, message)?;
             }
             (Some(d), None) | (None, Some(d)) => batch.push(d.clone()),
             (None, None) => unreachable!(),
@@ -8042,11 +8047,13 @@ fn apply_matmul_shape(
     let rhs_second_last = &right[right.len() - 2];
 
     if dims_conflict(lhs_last, rhs_second_last) {
-        return Err(format!(
+        let message = format!(
             "matmul dimension mismatch: {} last dim {} != {} second-to-last dim {}",
             left_name, lhs_last, right_name, rhs_second_last
-        ));
+        );
+        conflicts.add(lhs_last, rhs_second_last, message)?;
     }
+    conflicts.finish()?;
 
     let mut output = batch;
     output.push(left[left.len() - 2].clone());
@@ -8088,6 +8095,7 @@ fn apply_elementwise_shape(
 
     let rank = left.len().max(right.len());
     let mut result = Vec::with_capacity(rank);
+    let mut conflicts = Conflicts::default();
     for i in 0..rank {
         // right-align: None = leading pad of the shorter operand
         let a = (i + left.len()).checked_sub(rank).map(|j| &left[j]);
@@ -8110,15 +8118,16 @@ fn apply_elementwise_shape(
                     // A variadic dim on the right of this pair moves the axes.
                     return Ok(None);
                 } else {
-                    // ponytail: unequal non-"1" dims are incompatible, including
-                    // distinct annotation symbols ("batch" vs "seq"). Strict in v1;
-                    // upgrade to a unification step if it proves too strict.
-                    return Err(format!(
+                    // Two different names can be equal at run time: such a
+                    // conflict gives an `Approximation` and no shape.
+                    let message = format!(
                         "elementwise {} incompatible shapes, got [{}] and [{}]",
                         op_symbol,
                         left.join(", "),
                         right.join(", ")
-                    ));
+                    );
+                    conflicts.add(a, b, message)?;
+                    a.clone()
                 }
             }
             (None, None) => unreachable!("i < max(left.len(), right.len())"),
@@ -8126,6 +8135,7 @@ fn apply_elementwise_shape(
         result.push(dim);
     }
 
+    conflicts.finish()?;
     Ok(Some(result))
 }
 
@@ -8573,6 +8583,37 @@ class E(eqx.Module):
             ("e5", &["16"]),
         ] {
             assert_eq!(find_shape(&analysis, name), Some(&shape(dims)), "{name}");
+        }
+    }
+
+    /// A conflict that rests only on two different names is an
+    /// `Approximation` with no shape: the names can be equal at run time. An
+    /// integer on a side keeps a `Mismatch`.
+    #[test]
+    fn test_a_conflict_of_two_names_is_an_approximation() {
+        use ShapeErrorKind::{Approximation, Mismatch};
+        let cases = [
+            ("x + z", Approximation),
+            ("x @ z.T @ w", Approximation),
+            ("jnp.concatenate([x, z], axis=1)", Approximation),
+            ("jnp.stack([x, z])", Approximation),
+            ("jnp.einsum(\"ij,ij->i\", x, z)", Approximation),
+            ("same(x, z)", Approximation),
+            ("jax.vmap(row)(x, z)", Approximation),
+            ("x + four", Mismatch),
+            ("three + four", Mismatch),
+            ("y + z", Mismatch),
+            ("jnp.concatenate([x, four], axis=1)", Mismatch),
+        ];
+        for (expression, kind) in cases {
+            let code = format!(
+                "import jax\nimport jax.numpy as jnp\ndef same(a: Float[Array, \"p d\"], b: Float[Array, \"p d\"]) -> Float[Array, \"p d\"]:\n    return a\ndef row(a: Float[Array, \"d\"], b: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return a\ndef f(x: Float[Array, \"n d\"], z: Float[Array, \"m d\"], w: Float[Array, \"n d\"], y: Float[Array, \"m 3\"], four: Float[Array, \"4 d\"], three: Float[Array, \"3 d\"]):\n    r = {expression}\n"
+            );
+            let analysis = analyze(&code);
+            let kinds: Vec<ShapeErrorKind> = analysis.errors.iter().map(|e| e.kind).collect();
+            assert_eq!(kinds, [kind], "{expression}: {:?}", analysis.errors);
+            assert!(analysis.errors.iter().all(|e| !e.message.contains(NAMES_ONLY)), "{expression}");
+            assert_eq!(find_shape(&analysis, "r"), None, "{expression}");
         }
     }
 

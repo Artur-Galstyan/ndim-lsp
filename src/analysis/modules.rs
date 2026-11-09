@@ -1537,11 +1537,16 @@ fn run_probe(
     let mut messages: Vec<String> = Vec::new();
     for error in errors {
         let foreign = error.reads.iter().any(|name| constants.contains(name));
+        // The mark keeps the kind of the error for the call.
+        let message = match error.kind {
+            ShapeErrorKind::Approximation => format!("{NAMES_ONLY}{}", error.message),
+            ShapeErrorKind::Mismatch => error.message.clone(),
+        };
         if (!has_probe_name(&error.message) || error.message.contains("__ndim_a"))
             && !foreign
-            && !messages.contains(&error.message)
+            && !messages.contains(&message)
         {
-            messages.push(error.message.clone());
+            messages.push(message);
         }
     }
     std::sync::Arc::new(ModuleProbe {

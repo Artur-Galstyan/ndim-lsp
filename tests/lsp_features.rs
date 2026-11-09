@@ -158,11 +158,16 @@ fn diagnostics_have_a_code_per_kind() {
     let (_dir, root) = project(&[]);
     let uri = file_uri(&root.join("main.py"));
     let mut c = Client::start(&root, json!({}));
-    let text = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    return a @ b\n";
+    let text = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m 3\"], b: Float[Array, \"4 k\"]):\n    return a @ b\n";
     let diags = c.open(&uri, text);
     assert_eq!(diags.len(), 1);
     assert_eq!(diags[0]["code"], "shape-mismatch");
     assert_eq!(diags[0]["source"], "ndim-lsp");
+    // Two different names can be equal at run time.
+    let names = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    return a @ b\n";
+    let diags = c.open(&file_uri(&root.join("names.py")), names);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["code"], "shape-approximation");
 }
 
 #[test]
@@ -279,7 +284,7 @@ fn check_mode_prints_diagnostics_like_a_compiler() {
     assert_eq!(code, 0, "{out}");
     assert!(!out.contains(": error: "), "{out}");
 
-    let bad = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    y = a @ b\n    z = a\n";
+    let bad = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m 3\"], b: Float[Array, \"4 k\"]):\n    y = a @ b\n    z = a\n";
     let (_dir, root) = project(&[("bad.py", bad)]);
     let (code, out) = check(&root, &["--shapes", "bad.py"]);
     assert_eq!(code, 1, "{out}");
@@ -287,9 +292,18 @@ fn check_mode_prints_diagnostics_like_a_compiler() {
     assert_eq!(
         lines,
         [
-            "bad.py:3:26: error: y: matmul dimension mismatch: a last dim k != b second-to-last dim n",
-            "bad.py:5: z: [m, k]",
+            "bad.py:3:26: error: y: matmul dimension mismatch: a last dim 3 != b second-to-last dim 4",
+            "bad.py:5: z: [m, 3]",
         ]
+    );
+    // A conflict of two different names is a warning, which does not fail the check.
+    let names = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    y = a @ b\n";
+    let (_dir, root) = project(&[("names.py", names)]);
+    let (code, out) = check(&root, &["names.py"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out.trim(),
+        "names.py:3:26: warning: y: matmul dimension mismatch: a last dim k != b second-to-last dim n"
     );
     let (code, _) = check(&root, &[]);
     assert_eq!(code, 2);

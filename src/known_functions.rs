@@ -714,6 +714,7 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
     let rank = left.len().max(right.len());
     let mut result = Vec::new();
     let mut aligned = true;
+    let mut conflicts = Conflicts::default();
 
     for i in 0..rank {
         let left_dim = left
@@ -735,17 +736,20 @@ fn broadcast_two_shapes(left: &[String], right: &[String]) -> Result<Vec<String>
         } else if !aligned || !dims_conflict(left_dim, right_dim) {
             unified_dim(left_dim, right_dim)
         } else {
-            return Err(format!(
+            let message = format!(
                 "cannot broadcast dim {} with {} (shapes [{}] and [{}])",
                 left_dim,
                 right_dim,
                 left.join(", "),
                 right.join(", ")
-            ));
+            );
+            conflicts.add(left_dim, right_dim, message)?;
+            left_dim.to_string()
         };
         result.push(dim);
     }
 
+    conflicts.finish()?;
     result.reverse();
     Ok(result)
 }
@@ -828,6 +832,7 @@ fn variadic_join_conflict(rule: &str, shapes: &[Vec<String>], join_axis: Option<
 
     let first_rank = shapes.first().map_or(0, Vec::len);
     let (mut from_start, mut from_end) = (Vec::new(), Vec::new());
+    let mut conflicts = Conflicts::default();
     for shape in shapes {
         let variadic = shape.iter().position(|dim| is_variadic_dim(dim));
         let mismatch = |axis: usize, expected: &str, got: &str| {
@@ -836,17 +841,18 @@ fn variadic_join_conflict(rule: &str, shapes: &[Vec<String>], join_axis: Option<
         let joined = |at: usize| join_axis.is_some_and(|axis| can_be_axis(shape, at, axis));
         for at in (0..variadic.unwrap_or(shape.len())).filter(|at| !joined(*at)) {
             if let Some(expected) = merge_aligned_dim(&mut from_start, at, &shape[at]) {
-                return Err(mismatch(at, &expected, &shape[at]));
+                conflicts.add(&expected, &shape[at], mismatch(at, &expected, &shape[at]))?;
             }
         }
         for at in (variadic.map_or(0, |at| at + 1)..shape.len()).rev().filter(|at| !joined(*at)) {
             let back = shape.len() - 1 - at;
             if let Some(expected) = merge_aligned_dim(&mut from_end, back, &shape[at]) {
-                return Err(mismatch(first_rank.saturating_sub(back + 1), &expected, &shape[at]));
+                let message = mismatch(first_rank.saturating_sub(back + 1), &expected, &shape[at]);
+                conflicts.add(&expected, &shape[at], message)?;
             }
         }
     }
-    Ok(())
+    conflicts.finish()
 }
 
 /// Whether a `Concatenate` or a `Stack` call reads a shape with a variadic dim.
@@ -1784,6 +1790,7 @@ fn apply_known_concatenate(
     let axis = normalize_axis(axis, rank, "concatenate")?;
 
     let mut output = first_shape.clone();
+    let mut conflicts = Conflicts::default();
     for shape in &input_shapes {
         if shape.len() != rank {
             return Err(format!(
@@ -1797,14 +1804,17 @@ fn apply_known_concatenate(
                 continue;
             }
             if dims_conflict(&shape[dim_idx], &output[dim_idx]) {
-                return Err(format!(
+                let message = format!(
                     "concatenate dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, output[dim_idx], shape[dim_idx]
-                ));
+                );
+                conflicts.add(&output[dim_idx], &shape[dim_idx], message)?;
+                continue;
             }
             output[dim_idx] = unified_dim(&output[dim_idx], &shape[dim_idx]);
         }
     }
+    conflicts.finish()?;
 
     let concat_dims = input_shapes
         .iter()
@@ -1850,6 +1860,7 @@ fn apply_known_stack(
     }
 
     let mut stacked = first_shape.clone();
+    let mut conflicts = Conflicts::default();
     for shape in &input_shapes {
         if shape.len() != first_shape.len() {
             return Err(format!(
@@ -1860,14 +1871,17 @@ fn apply_known_stack(
         }
         for (dim_idx, got) in shape.iter().enumerate() {
             if dims_conflict(&stacked[dim_idx], got) {
-                return Err(format!(
+                let message = format!(
                     "stack dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, stacked[dim_idx], got
-                ));
+                );
+                conflicts.add(&stacked[dim_idx], got, message)?;
+                continue;
             }
             stacked[dim_idx] = unified_dim(&stacked[dim_idx], got);
         }
     }
+    conflicts.finish()?;
 
     let output_rank = first_shape.len() + 1;
     let Some(axis) = parse_axis(
@@ -2367,23 +2381,25 @@ fn require_square_matrix(shape: &[String], context: &str) -> Result<(), String> 
     let last = &shape[shape.len() - 1];
     let second_last = &shape[shape.len() - 2];
     if dims_conflict(last, second_last) {
-        return Err(format!(
+        let message = format!(
             "{} requires last two dimensions to match, got {} and {}",
             context, second_last, last
-        ));
+        );
+        let mut conflicts = Conflicts::default();
+        conflicts.add(second_last, last, message)?;
+        return conflicts.finish();
     }
     Ok(())
 }
 
 fn check_dim_match(left: &str, right: &str, context: &str) -> Result<(), String> {
     if !dims_conflict(left, right) {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} dimension mismatch: expected {}, got {}",
-            context, left, right
-        ))
+        return Ok(());
     }
+    let message = format!("{} dimension mismatch: expected {}, got {}", context, left, right);
+    let mut conflicts = Conflicts::default();
+    conflicts.add(left, right, message)?;
+    conflicts.finish()
 }
 
 fn broadcast_prefix_shapes(
@@ -3498,6 +3514,7 @@ fn concat_shapes_along_axis(
     }
 
     let mut output = first_shape.clone();
+    let mut conflicts = Conflicts::default();
     for shape in input_shapes {
         if shape.len() != rank {
             return Err(format!(
@@ -3511,14 +3528,17 @@ fn concat_shapes_along_axis(
                 continue;
             }
             if dims_conflict(&shape[dim_idx], &output[dim_idx]) {
-                return Err(format!(
+                let message = format!(
                     "concat dimension mismatch at axis {}: expected {}, got {}",
                     dim_idx, output[dim_idx], shape[dim_idx]
-                ));
+                );
+                conflicts.add(&output[dim_idx], &shape[dim_idx], message)?;
+                continue;
             }
             output[dim_idx] = unified_dim(&output[dim_idx], &shape[dim_idx]);
         }
     }
+    conflicts.finish()?;
 
     output[axis] = concat_dim(
         &input_shapes

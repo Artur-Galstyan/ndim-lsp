@@ -359,6 +359,41 @@ pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
     }
 }
 
+/// Starts the message of a conflict that rests only on two different names
+/// (`names_conflict`). Different names can be equal at run time, so a
+/// `ShapeError` with the mark is an `Approximation`. The constructors of
+/// `ShapeError` take the mark off.
+pub(crate) const NAMES_ONLY: &str = "\u{1}";
+
+/// Whether `a` and `b` conflict only because they are two different names,
+/// with no integer on either side.
+pub(crate) fn names_conflict(a: &str, b: &str) -> bool {
+    let is_name = |dim: &str| is_plain_dim(dim) && dim.parse::<i64>().is_err();
+    dims_conflict(a, b) && is_name(a) && is_name(b)
+}
+
+/// The conflicts that one check finds. A conflict of two different names
+/// (`names_conflict`) waits, so that a proven conflict after it still gives
+/// a `Mismatch`.
+#[derive(Default)]
+pub(crate) struct Conflicts(Option<String>);
+
+impl Conflicts {
+    /// The conflict of `a` and `b`: `Err` when it is proven.
+    pub(crate) fn add(&mut self, a: &str, b: &str, message: String) -> Result<(), String> {
+        if !names_conflict(a, b) {
+            return Err(message);
+        }
+        self.0.get_or_insert_with(|| format!("{NAMES_ONLY}{message}"));
+        Ok(())
+    }
+
+    /// `Err` with the `NAMES_ONLY` mark when a conflict of names waits.
+    pub(crate) fn finish(self) -> Result<(), String> {
+        self.0.map_or(Ok(()), Err)
+    }
+}
+
 /// Whether two flat sums have the same terms apart from their integers.
 fn same_names(a: &str, b: &str) -> bool {
     let names = |dim: &str| {
@@ -1497,11 +1532,16 @@ impl PartialEq for ShapeError {
 }
 
 impl ShapeError {
-    /// A genuine shape contradiction under the rule's modeled semantics.
+    /// A genuine shape contradiction under the rule's modeled semantics. A
+    /// message with the `NAMES_ONLY` mark gives an `Approximation`.
     pub fn mismatch(variable: impl Into<String>, message: impl Into<String>, range: Range) -> Self {
+        let message: String = message.into();
+        if message.contains(NAMES_ONLY) {
+            return Self::approximation(variable, message, range);
+        }
         ShapeError {
             variable: variable.into(),
-            message: message.into(),
+            message,
             range,
             kind: ShapeErrorKind::Mismatch,
             related: None,
@@ -1521,7 +1561,7 @@ impl ShapeError {
     ) -> Self {
         ShapeError {
             variable: variable.into(),
-            message: message.into(),
+            message: message.into().replace(NAMES_ONLY, ""),
             range,
             kind: ShapeErrorKind::Approximation,
             related: None,
