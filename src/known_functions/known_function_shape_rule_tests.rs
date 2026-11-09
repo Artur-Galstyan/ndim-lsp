@@ -197,7 +197,16 @@ fn test_squeeze_cases() {
     check(KnownFunction::Squeeze, None, &[
         ("squeeze_all_unit_dims", vec![pos("x")], &[("x", &["1", "batch", "1", "features"])], Ok(Some(&["batch", "features"]))),
         ("squeeze_specific_axis", vec![pos("x"), kw("axis", "0")], &[("x", &["1", "batch", "1"])], Ok(Some(&["batch", "1"]))),
-        ("squeeze_non_unit_axis_errors", vec![pos("x"), kw("axis", "1")], &[("x", &["1", "batch", "1"])], Err(&["cannot squeeze"])),
+        ("squeeze_symbolic_axis_unknown", vec![pos("x"), kw("axis", "1")], &[("x", &["1", "batch", "1"])], Ok(None)),
+        ("squeeze_non_unit_axis_errors", vec![pos("x"), kw("axis", "1")], &[("x", &["1", "3", "1"])], Err(&["cannot squeeze"])),
+        ("squeeze_literal_mark_axis_errors", vec![pos("x"), pos("0")], &[("x", &["__free_D__is_4", "1"])], Err(&["cannot squeeze"])),
+        ("squeeze_axis_not_literal", vec![pos("x"), pos("d")], &[("x", &["1", "3", "1"])], Ok(None)),
+    ]);
+    check(KnownFunction::TorchSqueeze, None, &[
+        ("torch_squeeze_unit_dim", vec![pos("x"), pos("0")], &[("x", &["1", "3"])], Ok(Some(&["3"]))),
+        ("torch_squeeze_non_unit_dim_keeps_shape", vec![pos("x"), pos("1")], &[("x", &["1", "3"])], Ok(Some(&["1", "3"]))),
+        ("torch_squeeze_symbolic_dim_unknown", vec![pos("x"), kw("dim", "1")], &[("x", &["1", "n"])], Ok(None)),
+        ("torch_squeeze_tuple_dims", vec![pos("x"), pos("(0, 1)")], &[("x", &["1", "3"])], Ok(Some(&["3"]))),
     ]);
 }
 
@@ -515,6 +524,22 @@ fn test_empty_like_cases() {
 
 #[test]
 #[rustfmt::skip]
+fn test_dot_general_cases() {
+    check(KnownFunction::DotGeneral, None, &[
+        ("dot_general_matmul", vec![pos("a"), pos("b"), pos("(((1,), (0,)), ((), ()))")], &[("a", &["m", "k"]), ("b", &["k", "n"])], Ok(Some(&["m", "n"]))),
+        ("dot_general_batch_first", vec![pos("a"), pos("b"), pos("(((2,), (1,)), ((0,), (0,)))")], &[("a", &["b", "m", "k"]), ("b", &["b", "k", "n"])], Ok(Some(&["b", "m", "n"]))),
+        ("dot_general_batch_last", vec![pos("a"), pos("b"), pos("(((0,), (0,)), ((1,), (1,)))")], &[("a", &["k", "b"]), ("b", &["k", "b", "n"])], Ok(Some(&["b", "n"]))),
+        ("dot_general_list_spec", vec![pos("a"), pos("b"), kw("dimension_numbers", "[[[1], [0]], [[], []]]")], &[("a", &["m", "k"]), ("b", &["k", "n"])], Ok(Some(&["m", "n"]))),
+        ("dot_general_name_spec", vec![pos("a"), pos("b"), pos("dims")], &[("a", &["m", "k"]), ("b", &["k", "n"])], Ok(None)),
+        ("dot_general_negative_axis", vec![pos("a"), pos("b"), pos("(((-1,), (0,)), ((), ()))")], &[("a", &["m", "k"]), ("b", &["k", "n"])], Ok(None)),
+        ("dot_general_axis_out_of_range", vec![pos("a"), pos("b"), pos("(((2,), (0,)), ((), ()))")], &[("a", &["m", "k"]), ("b", &["k", "n"])], Ok(None)),
+        ("dot_general_contracting_mismatch", vec![pos("a"), pos("b"), pos("(((1,), (0,)), ((), ()))")], &[("a", &["2", "3"]), ("b", &["4", "5"])], Err(&["dot_general", "3", "4"])),
+        ("dot_general_batch_mismatch", vec![pos("a"), pos("b"), pos("(((2,), (1,)), ((0,), (0,)))")], &[("a", &["2", "3", "4"]), ("b", &["5", "4", "6"])], Err(&["dot_general", "2", "5"])),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
 fn test_where_cases() {
     check(KnownFunction::Where, None, &[
         ("where_broadcasts_three_inputs", vec![pos("cond"), pos("x"), pos("y")], &[("cond", &["batch", "1"]), ("x", &["batch", "features"]), ("y", &["1", "features"])], Ok(Some(&["batch", "features"]))),
@@ -535,8 +560,21 @@ fn test_sum_cases() {
         ("reduction_invalid_dynamic_axis_returns_none", vec![pos("x"), kw("axis", "axis")], &[("x", &["batch", "features"])], Ok(None)),
         ("reduction_empty_axis_tuple_preserves_shape", vec![pos("x"), kw("axis", "()")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
         ("reduction_axis_none_keepdims_all_ones", vec![pos("x"), kw("axis", "None"), kw("keepdims", "True")], &[("x", &["batch", "features"])], Ok(Some(&["1", "1"]))),
-        // linalg.norm dispatches through KnownFunction::Sum's reduction rule.
-        ("norm_reduction_axis_semantics", vec![pos("x"), kw("axis", "1")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
+        ("reduction_positional_dtype_is_not_keepdims", vec![pos("x"), pos("1"), pos("True")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
+        ("reduction_positional_keepdims", vec![pos("x"), pos("1"), pos("None"), pos("None"), pos("True")], &[("x", &["b", "d"])], Ok(Some(&["b", "1"]))),
+        ("reduction_keepdims_not_literal", vec![pos("x"), pos("1"), kw("keepdims", "k")], &[("x", &["b", "d"])], Ok(None)),
+    ]);
+    check(KnownFunction::Reduction { axis: 2, keepdims: Some(3), q: None }, None, &[
+        ("norm_ord_is_not_axis", vec![pos("x"), pos("1")], &[("x", &["b", "d"])], Ok(Some(&[]))),
+        ("norm_axis_keyword", vec![pos("x"), kw("axis", "1")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
+        ("norm_positional_axis_keepdims", vec![pos("x"), pos("2"), pos("0"), pos("True")], &[("x", &["b", "d"])], Ok(Some(&["1", "d"]))),
+    ]);
+    check(KnownFunction::Reduction { axis: 2, keepdims: Some(6), q: Some(1) }, None, &[
+        ("quantile_scalar_q", vec![pos("x"), pos("50")], &[("x", &["b", "d"])], Ok(Some(&[]))),
+        ("quantile_list_q_leads", vec![pos("x"), pos("[0.25, 0.75]"), pos("1")], &[("x", &["b", "d"])], Ok(Some(&["2", "b"]))),
+        ("quantile_array_q_leads", vec![pos("x"), pos("q"), kw("axis", "0")], &[("x", &["b", "d"]), ("q", &["k"])], Ok(Some(&["k", "d"]))),
+        ("quantile_q_not_proven", vec![pos("x"), pos("q")], &[("x", &["b", "d"])], Ok(None)),
+        ("quantile_axis_out_of_bounds", vec![pos("x"), pos("0.5"), pos("2")], &[("x", &["b", "d"])], Err(&["out of bounds"])),
     ]);
 }
 
@@ -1083,7 +1121,7 @@ fn test_histogram_cases() {
 #[rustfmt::skip]
 fn test_bin_count_cases() {
     check(KnownFunction::BinCount, None, &[
-        ("bincount_conservatively_unknown", vec![pos("x")], &[("x", &["100"])], Ok(None)),
+        ("bincount_one_axis_of_unknown_size", vec![pos("x")], &[("x", &["100"])], Ok(Some(&["__free_?"]))),
     ]);
 }
 
@@ -1091,7 +1129,7 @@ fn test_bin_count_cases() {
 #[rustfmt::skip]
 fn test_unique_cases() {
     check(KnownFunction::Unique, None, &[
-        ("unique_conservatively_unknown", vec![pos("x")], &[("x", &["100"])], Ok(None)),
+        ("unique_one_axis_of_unknown_size", vec![pos("x")], &[("x", &["100"])], Ok(Some(&["__free_?"]))),
     ]);
 }
 

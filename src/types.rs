@@ -1001,8 +1001,18 @@ pub enum KnownFunction {
     Transpose,
     ExpandDims,
     Squeeze,
+    /// torch `squeeze`: a dim whose size is not 1 stays in the shape.
+    TorchSqueeze,
     Sum,
     Mean,
+    /// A reduction by the slots of one library signature. Each field is a
+    /// positional index, the input is 0. `keepdims: None` is keyword only.
+    /// The shape of the quantile argument `q` leads the result.
+    Reduction {
+        axis: usize,
+        keepdims: Option<usize>,
+        q: Option<usize>,
+    },
     Max,
     Min,
     /// `torch.max`/`torch.min`: two tensors broadcast elementwise, a `dim`
@@ -1013,8 +1023,37 @@ pub enum KnownFunction {
     Std,
     Var,
     Matmul,
+    /// `jax.lax.dot_general(lhs, rhs, ((lc, rc), (lb, rb)))`.
+    DotGeneral,
     /// `torch.bmm` / `Tensor.bmm`: rank-3 operands, equal batch (no broadcast).
     Bmm,
+    /// `torch.mm` / `Tensor.mm`: two rank-2 operands.
+    Mm,
+    /// `torch.mv` / `Tensor.mv`: a rank-2 and a rank-1 operand.
+    Mv,
+    /// `torch.addmm(input, mat1, mat2)`: `mm`, and `input` broadcasts to it.
+    Addmm,
+    /// `torch.baddbmm(input, batch1, batch2)`: `bmm`, and `input` broadcasts to it.
+    Baddbmm,
+    /// `Tensor.t()`: the transpose of a tensor of rank 2 or less.
+    TorchT,
+    /// `torch.nn.functional.linear(input, weight, bias)`, `weight` is `[out, in]`.
+    Linear,
+    /// `torch.nn.functional.scaled_dot_product_attention(query, key, value)`.
+    ScaledDotProductAttention,
+    /// A `torch.nn.functional` loss with the rule of the loss module `layer`.
+    /// `reduction` is the positional index of the `reduction` argument, and
+    /// `deprecated` the indices of `size_average` and `reduce`.
+    FunctionalLoss {
+        layer: &'static str,
+        reduction: usize,
+        deprecated: Option<(usize, usize)>,
+    },
+    LinalgEigvals,
+    LinalgMatrixPower,
+    LinalgMultiDot,
+    /// `linalg.slogdet`: a `(sign, logabsdet)` tuple.
+    LinalgSlogdet,
     Dot,
     Einsum,
     Split,
@@ -1024,7 +1063,12 @@ pub enum KnownFunction {
     /// `jnp.split`/`np.split` or `torch.tensor_split`.
     TorchSplit,
     Tile,
+    /// numpy `repeat(a, repeats, axis)`, torch `repeat_interleave`.
     Repeat,
+    /// The method `repeat_interleave`: `Repeat` in every library.
+    RepeatInterleave,
+    /// torch `Tensor.repeat(*sizes)`: a tile with at least one size per dim.
+    TorchRepeat,
     Flatten,
     /// `torch.flatten(x, start_dim, end_dim)` / `Tensor.flatten(start_dim, end_dim)`.
     TorchFlatten,

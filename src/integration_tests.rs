@@ -8402,7 +8402,7 @@ mod jax_numpy_new_builtin_tests {
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), None);
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["?"])));
     }
 }
 
@@ -8881,7 +8881,7 @@ mod torch_new_builtin_tests {
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty());
-        assert!(!has_shape(&analysis, "y"));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["?"])));
     }
 
     #[test]
@@ -8977,7 +8977,7 @@ mod torch_new_builtin_tests {
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty());
-        assert!(!has_shape(&analysis, "y"));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["?"])));
     }
 
     #[test]

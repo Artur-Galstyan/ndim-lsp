@@ -13,7 +13,7 @@ use crate::known_functions::{
     classify_method_call, compute_array_split_shapes, compute_chunk_shapes,
     compute_einops_pack_shape, compute_fixed_axis_split_shapes, compute_split_shapes,
     compute_torch_split_shapes,
-    compute_unbind_shape, multiply_dim,
+    compute_unbind_shape, multiply_dim, torch_method_reading,
 };
 use crate::incremental::{
     NodeRef, PrePass, PropPlan, PropagateOutput, Segment, UnitMemo, UnitRun, unit_nodes,
@@ -2570,8 +2570,8 @@ fn apply_method_call_for_backend(
     import_map: &HashMap<String, ImportPath>,
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    if matches!(known, KnownFunction::Max | KnownFunction::Min) {
-        return apply_max_min_method_for_backend(known, receiver, args, import_map, shapes);
+    if let Some(torch) = torch_method_reading(known) {
+        return apply_method_readings(&torch, known, receiver, args, import_map, shapes);
     }
     if !matches!(known, KnownFunction::Transpose) {
         return apply_method_call(known, receiver, args, shapes);
@@ -2603,10 +2603,11 @@ fn apply_method_call_for_backend(
     }
 }
 
-/// `x.max(y)` broadcasts and `x.max(dim)` returns a `(values, indices)`
-/// namedtuple in torch, while numpy/jax `x.max(axis)` reduces to an array.
-/// With no known backend, the result is kept only when both readings agree.
-fn apply_max_min_method_for_backend(
+/// A method that torch reads in another way than numpy/jax, such as `x.max(y)`
+/// or `x.sum(1, True)`. With no known backend, the result is kept only when
+/// both readings agree, and an error only when both readings fail.
+fn apply_method_readings(
+    torch: &KnownFunction,
     known: &KnownFunction,
     receiver: &str,
     args: &[CallArgument],
@@ -2614,13 +2615,14 @@ fn apply_max_min_method_for_backend(
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
     match file_backend(import_map) {
-        FileBackend::Torch => apply_method_call(&KnownFunction::TorchMaxMin, receiver, args, shapes),
+        FileBackend::Torch => apply_method_call(torch, receiver, args, shapes),
         FileBackend::NumpyLike => apply_method_call(known, receiver, args, shapes),
         FileBackend::Unknown => {
-            let torch = apply_method_call(&KnownFunction::TorchMaxMin, receiver, args, shapes);
+            let torch = apply_method_call(torch, receiver, args, shapes);
             let numpy = apply_method_call(known, receiver, args, shapes);
             match (torch, numpy) {
                 (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
+                (Err(error), Err(_)) => Err(error),
                 _ => Ok(None),
             }
         }
@@ -5618,6 +5620,7 @@ fn tuple_rhs_shapes(
                     KnownFunction::LinalgSvd
                         | KnownFunction::LinalgQr
                         | KnownFunction::LinalgEig
+                        | KnownFunction::LinalgSlogdet
                         | KnownFunction::Meshgrid
                 )
             ) {
@@ -5830,6 +5833,9 @@ fn linalg_tuple_shapes(
                         Some(vec![n.clone()]),
                         Some(vec![n.clone(), n.clone()]),
                     ])
+                }
+                KnownFunction::LinalgSlogdet if n_targets == 2 && !dims_conflict(m, n) => {
+                    Some(vec![Some(Vec::new()), Some(Vec::new())])
                 }
                 _ => None,
             }
