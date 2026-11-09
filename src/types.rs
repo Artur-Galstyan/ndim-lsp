@@ -365,11 +365,11 @@ pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
 /// `ShapeError` take the mark off.
 pub(crate) const NAMES_ONLY: &str = "\u{1}";
 
-/// Whether `a` and `b` conflict only because they are two different names,
-/// with no integer on either side.
+/// Whether the conflict of `a` and `b` rests on a name: two different names,
+/// or a name against an integer. Only two different integers are proven.
 pub(crate) fn names_conflict(a: &str, b: &str) -> bool {
-    let is_name = |dim: &str| is_plain_dim(dim) && dim.parse::<i64>().is_err();
-    dims_conflict(a, b) && is_name(a) && is_name(b)
+    let is_int = |dim: &str| dim.parse::<i64>().is_ok();
+    dims_conflict(a, b) && is_plain_dim(a) && is_plain_dim(b) && !(is_int(a) && is_int(b))
 }
 
 /// The conflicts that one check finds. A conflict of two different names

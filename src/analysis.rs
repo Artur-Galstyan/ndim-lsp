@@ -8573,10 +8573,10 @@ class E(eqx.Module):
             ("jnp.einsum(\"ij,ij->i\", x, z)", Approximation),
             ("same(x, z)", Approximation),
             ("jax.vmap(row)(x, z)", Approximation),
-            ("x + four", Mismatch),
+            ("x + four", Approximation),
             ("three + four", Mismatch),
-            ("y + z", Mismatch),
-            ("jnp.concatenate([x, four], axis=1)", Mismatch),
+            ("y + z", Approximation),
+            ("jnp.concatenate([x, four], axis=1)", Approximation),
         ];
         for (expression, kind) in cases {
             let code = format!(
