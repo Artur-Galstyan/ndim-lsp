@@ -8832,6 +8832,38 @@ mod torch_new_builtin_tests {
         assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["1"])));
     }
 
+    /// The pieces of a split must match the targets in number, else Python
+    /// raises. A star target takes the pieces between. A symbolic `chunk`
+    /// keeps the rank, but not the size of a piece.
+    #[test]
+    fn test_split_pieces_against_the_unpacked_names() {
+        let unknown = "?";
+        let cases: &[(&str, &str, &[Option<&[&str]>])] = &[
+            ("6 4", "a, b = x.split(1)", &[None, None]),
+            ("6 4", "a, b = torch.split(x, 2)", &[None, None]),
+            ("6 4", "a, b = jnp.split(x, 3)", &[None, None]),
+            ("6 4", "a, b, c, d = x.chunk(3)", &[None, None, None, None]),
+            ("7", "a, b = torch.chunk(x, 3)", &[None, None]),
+            ("6 4", "a, *r, b = jnp.split(x, 3)", &[Some(&["2", "4"]), None, Some(&["2", "4"])]),
+            ("6 4", "*r, b = x.split(4)", &[None, Some(&["2", "4"])]),
+            ("6 4", "a, *r, b, c = jnp.split(x, 2)", &[None, None, None, None]),
+            ("n 4", "a, b = x.chunk(2)", &[Some(&[unknown, "4"]), Some(&[unknown, "4"])]),
+            ("n 4", "a, b = x.chunk(3)", &[None, None]),
+            ("2*n 4", "a, b = x.chunk(2)", &[Some(&["n", "4"]), Some(&["n", "4"])]),
+            ("6 4", "(a, b), c = jnp.split(x, 2)", &[None, None, Some(&["3", "4"])]),
+            ("3 4", "a, *r = x.unbind(0)", &[Some(&["4"]), None]),
+        ];
+        for (dims, line, expected) in cases {
+            let code = format!("import torch\nimport jax.numpy as jnp\ndef f(x: Float[Array, \"{dims}\"]):\n    a = b = c = d = x\n    {line}\n");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{line}: {:?}", analysis.errors);
+            let names = ["a", "r", "b", "c", "d"].into_iter().filter(|n| line.split('=').next().unwrap().contains(n));
+            for (name, want) in names.zip(expected.iter()) {
+                assert_eq!(find_shape(&analysis, name), want.map(shape).as_ref(), "{line}: {name}");
+            }
+        }
+    }
+
     #[test]
     fn test_method_unbind_tuple_unpacking() {
         let code = "def f(x: Float[Array, \"3 4 5\"]):\n    a, b, c = x.unbind(0)";

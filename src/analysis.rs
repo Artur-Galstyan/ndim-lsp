@@ -5570,7 +5570,7 @@ fn tuple_rhs_shapes(
                     &known,
                     &method_args,
                     args_node,
-                    n_targets,
+                    targets,
                     scope_idx,
                     ctx,
                 );
@@ -5893,7 +5893,7 @@ fn tuple_rhs_shapes(
                 } else {
                     args = resolve_call_args(args, args_node, scope_idx, ctx)?;
                 }
-                return tuple_multi_output_shapes(&known?, &args, args_node, n_targets, scope_idx, ctx);
+                return tuple_multi_output_shapes(&known?, &args, args_node, targets, scope_idx, ctx);
             }
 
             if !matches!(known, Some(KnownFunction::Split | KnownFunction::ArraySplit)) {
@@ -5905,10 +5905,40 @@ fn tuple_rhs_shapes(
             } else {
                 compute_split_shapes(&args, &ctx.scope_shapes(scope_idx))
             };
-            Some(ctx.check(result, "", args_node.range())??.into_iter().map(Some).collect())
+            fit_pieces(ctx.check(result, "", args_node.range())??, targets)
         }
         _ => None,
     }
+}
+
+/// The shape of each target of `a, *r, b = <pieces>`. Python raises when
+/// the count does not fit, so then no target has a shape. A star or a
+/// nested target gets no shape: a list, or a piece unpacked again.
+fn fit_pieces(pieces: Vec<Vec<String>>, targets: &[TupleTarget]) -> Option<Vec<Option<Vec<String>>>> {
+    let star = targets.iter().position(|t| matches!(t, TupleTarget::Star(_)));
+    let fits = match star {
+        None => pieces.len() == targets.len(),
+        Some(_) => pieces.len() + 1 >= targets.len(),
+    };
+    if !fits {
+        return None;
+    }
+    let after = star.map_or(0, |k| targets.len() - k - 1);
+    let front = star.unwrap_or(targets.len());
+    let mut pieces = pieces.into_iter().map(Some).collect::<Vec<_>>();
+    let back = pieces.split_off(pieces.len() - after);
+    pieces.truncate(front);
+    let mut out: Vec<Option<Vec<String>>> = pieces;
+    if star.is_some() {
+        out.push(None);
+    }
+    out.extend(back);
+    for (shape, target) in out.iter_mut().zip(targets) {
+        if matches!(target, TupleTarget::Nested(_)) {
+            *shape = None;
+        }
+    }
+    Some(out)
 }
 
 /// The values of the positional arguments, as written.
@@ -5927,10 +5957,11 @@ fn tuple_multi_output_shapes(
     known: &KnownFunction,
     args: &[CallArgument],
     args_node: Node,
-    n_targets: usize,
+    targets: &[TupleTarget],
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<Option<Vec<String>>>> {
+    let n_targets = targets.len();
     let range = args_node.range();
     match known {
         KnownFunction::TopK | KnownFunction::KthValue | KnownFunction::MinMax | KnownFunction::MedianDim => {
@@ -5961,8 +5992,10 @@ fn tuple_multi_output_shapes(
             if n_targets == 0 {
                 return None;
             }
-            let result = compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets);
-            Some(vec![Some(ctx.check(result, "", range)??); n_targets])
+            let star = targets.iter().any(|t| matches!(t, TupleTarget::Star(_)));
+            let result = compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets, star);
+            let shape = ctx.check(result, "", range)??;
+            Some(targets.iter().map(|t| matches!(t, TupleTarget::Name(_)).then(|| shape.clone())).collect())
         }
         // `TorchSplit` has real torch semantics (chunk *size*, not section
         // count) — covers both `torch.split(x, ...)` (free function) and
@@ -5970,12 +6003,13 @@ fn tuple_multi_output_shapes(
         // `n_targets` lets the literal-size / symbolic-axis-dim case still
         // bind a chunk list.
         KnownFunction::Chunk | KnownFunction::TorchSplit => {
+            let star = targets.iter().any(|t| matches!(t, TupleTarget::Star(_)));
             let result = if matches!(known, KnownFunction::Chunk) {
                 compute_chunk_shapes(args, &ctx.scope_shapes(scope_idx))
             } else {
-                compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), Some(n_targets))
+                compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), (!star).then_some(n_targets))
             };
-            Some(ctx.check(result, "", range)??.into_iter().map(Some).collect())
+            fit_pieces(ctx.check(result, "", range)??, targets)
         }
         _ => None,
     }

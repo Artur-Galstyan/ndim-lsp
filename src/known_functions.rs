@@ -5931,6 +5931,7 @@ pub fn compute_unbind_shape(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
     n_targets: usize,
+    star: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
@@ -5945,7 +5946,13 @@ pub fn compute_unbind_shape(
     let Ok(size) = input_shape[dim].parse::<usize>() else {
         return Ok(None);
     };
-    if size != n_targets {
+    if star && size + 1 < n_targets {
+        return Err(format!(
+            "unbind along dim {} produces {} outputs, but at least {} were unpacked",
+            dim, size, n_targets - 1
+        ));
+    }
+    if !star && size != n_targets {
         return Err(format!(
             "unbind along dim {} produces {} outputs, but {} were unpacked",
             dim, size, n_targets
@@ -5987,12 +5994,14 @@ pub fn compute_chunk_shapes(
     };
     let axis_dim = &input_shape[dim];
 
+    // A symbolic size gives `n` equal pieces only when `n` divides it as a
+    // factor. Else torch may give fewer pieces, and a smaller last piece.
     let Ok(axis_size) = axis_dim.parse::<usize>() else {
         if n > MAX_PIECES {
             return Ok(None);
         }
         let mut out = input_shape.clone();
-        out[dim] = format!("chunk({}, {})", axis_dim, n);
+        out[dim] = cancel_product_factor(axis_dim, n).unwrap_or_else(|| UNKNOWN_DIM.to_string());
         return Ok(Some(vec![out; n]));
     };
 
