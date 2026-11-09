@@ -167,14 +167,14 @@ known_cases! {
     torch_transpose, ["torch", "transpose"], Some(KnownFunction::SwapAxes);
     torch_swapdims, ["torch", "swapdims"], Some(KnownFunction::SwapAxes);
     torch_unsqueeze, ["torch", "unsqueeze"], Some(KnownFunction::ExpandDims);
-    torch_squeeze, ["torch", "squeeze"], Some(KnownFunction::Squeeze);
-    torch_sum, ["torch", "sum"], Some(KnownFunction::Sum);
-    torch_mean, ["torch", "mean"], Some(KnownFunction::Mean);
+    torch_squeeze, ["torch", "squeeze"], Some(KnownFunction::TorchSqueeze);
+    torch_sum, ["torch", "sum"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
+    torch_mean, ["torch", "mean"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
     torch_max, ["torch", "max"], Some(KnownFunction::TorchMaxMin);
     torch_min, ["torch", "min"], Some(KnownFunction::TorchMaxMin);
-    torch_prod, ["torch", "prod"], Some(KnownFunction::Prod);
-    torch_std, ["torch", "std"], Some(KnownFunction::Std);
-    torch_var, ["torch", "var"], Some(KnownFunction::Var);
+    torch_prod, ["torch", "prod"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
+    torch_std, ["torch", "std"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None });
+    torch_var, ["torch", "var"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None });
     torch_matmul, ["torch", "matmul"], Some(KnownFunction::Matmul);
     torch_dot, ["torch", "dot"], Some(KnownFunction::Dot);
     torch_einsum, ["torch", "einsum"], Some(KnownFunction::Einsum);
@@ -260,7 +260,7 @@ known_cases! {
     // equinox.nn.filter_vmap is NOT a known function — wrong module path
     equinox_nn_filter_vmap_rejected, ["equinox", "nn", "filter_vmap"], None;
     jax_lax_dot, ["jax", "lax", "dot"], Some(KnownFunction::Dot);
-    jax_lax_dot_general, ["jax", "lax", "dot_general"], Some(KnownFunction::Matmul);
+    jax_lax_dot_general, ["jax", "lax", "dot_general"], Some(KnownFunction::DotGeneral);
 
     unknown_module_rejected, ["foo", "concatenate"], None;
     deep_unknown_module_rejected, ["jax", "random", "split"], None;
@@ -273,19 +273,19 @@ known_cases! {
 
     jnp_all, ["jax", "numpy", "all"], Some(KnownFunction::All);
     np_all, ["numpy", "all"], Some(KnownFunction::All);
-    torch_all, ["torch", "all"], Some(KnownFunction::All);
+    torch_all, ["torch", "all"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
 
     jnp_any, ["jax", "numpy", "any"], Some(KnownFunction::Any);
     np_any, ["numpy", "any"], Some(KnownFunction::Any);
-    torch_any, ["torch", "any"], Some(KnownFunction::Any);
+    torch_any, ["torch", "any"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
 
     jnp_argmax, ["jax", "numpy", "argmax"], Some(KnownFunction::ArgMax);
     np_argmax, ["numpy", "argmax"], Some(KnownFunction::ArgMax);
-    torch_argmax, ["torch", "argmax"], Some(KnownFunction::ArgMax);
+    torch_argmax, ["torch", "argmax"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
 
     jnp_argmin, ["jax", "numpy", "argmin"], Some(KnownFunction::ArgMin);
     np_argmin, ["numpy", "argmin"], Some(KnownFunction::ArgMin);
-    torch_argmin, ["torch", "argmin"], Some(KnownFunction::ArgMin);
+    torch_argmin, ["torch", "argmin"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None });
 
     jnp_argsort, ["jax", "numpy", "argsort"], Some(KnownFunction::Argsort);
     np_argsort, ["numpy", "argsort"], Some(KnownFunction::Argsort);
@@ -309,8 +309,8 @@ known_cases! {
     torch_nn_function_rejected, ["torch", "nn", "Linear"], None;
     numpy_linalg_dot_rejected_for_now, ["numpy", "linalg", "dot"], None;
     // `linalg.norm` reuses the plain-reduction shape rule (axis/keepdims
-    // mechanics are identical); see `linalg_norm_reduction_tests` below.
-    jax_numpy_linalg_norm_classified, ["jax", "numpy", "linalg", "norm"], Some(KnownFunction::Sum);
+    // mechanics are identical); `ord` is the second argument.
+    jax_numpy_linalg_norm_classified, ["jax", "numpy", "linalg", "norm"], Some(KnownFunction::Reduction { axis: 2, keepdims: Some(3), q: None });
 
     // ── linalg.inv classification tests ──
 
@@ -444,9 +444,9 @@ known_cases! {
 
     // ── jax.numpy / numpy reduction-alias classification ──
 
-    jnp_median_reuses_mean, ["jax", "numpy", "median"], Some(KnownFunction::Mean);
-    jnp_quantile_reuses_mean, ["jax", "numpy", "quantile"], Some(KnownFunction::Mean);
-    jnp_count_nonzero_reuses_sum, ["jax", "numpy", "count_nonzero"], Some(KnownFunction::Sum);
+    jnp_median, ["jax", "numpy", "median"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(4), q: None });
+    jnp_quantile, ["jax", "numpy", "quantile"], Some(KnownFunction::Reduction { axis: 2, keepdims: Some(6), q: Some(1) });
+    jnp_count_nonzero, ["jax", "numpy", "count_nonzero"], Some(KnownFunction::Reduction { axis: 1, keepdims: None, q: None });
     jnp_ptp_reuses_max, ["jax", "numpy", "ptp"], Some(KnownFunction::Max);
     jax_numpy_fft_fft_classified, ["jax", "numpy", "fft", "fft"], Some(KnownFunction::Copy);
     torch_fft_rfft_not_classified, ["torch", "fft", "rfft"], None;
@@ -472,7 +472,7 @@ known_cases! {
 
     jax_nn_one_hot, ["jax", "nn", "one_hot"], Some(KnownFunction::OneHot);
     jax_nn_dot_product_attention, ["jax", "nn", "dot_product_attention"], Some(KnownFunction::DotProductAttention);
-    jax_nn_logsumexp_reuses_sum, ["jax", "nn", "logsumexp"], Some(KnownFunction::Sum);
+    jax_nn_logsumexp, ["jax", "nn", "logsumexp"], Some(KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None });
     jax_nn_relu_not_classified, ["jax", "nn", "relu"], None;
 
     torch_gather, ["torch", "gather"], Some(KnownFunction::Gather);

@@ -986,8 +986,18 @@ pub enum KnownFunction {
     Transpose,
     ExpandDims,
     Squeeze,
+    /// torch `squeeze`: a dim whose size is not 1 stays in the shape.
+    TorchSqueeze,
     Sum,
     Mean,
+    /// A reduction by the slots of one library signature. Each field is a
+    /// positional index, the input is 0. `keepdims: None` is keyword only.
+    /// The shape of the quantile argument `q` leads the result.
+    Reduction {
+        axis: usize,
+        keepdims: Option<usize>,
+        q: Option<usize>,
+    },
     Max,
     Min,
     /// `torch.max`/`torch.min`: two tensors broadcast elementwise, a `dim`
@@ -998,6 +1008,8 @@ pub enum KnownFunction {
     Std,
     Var,
     Matmul,
+    /// `jax.lax.dot_general(lhs, rhs, ((lc, rc), (lb, rb)))`.
+    DotGeneral,
     /// `torch.bmm` / `Tensor.bmm`: rank-3 operands, equal batch (no broadcast).
     Bmm,
     Dot,
@@ -1009,7 +1021,12 @@ pub enum KnownFunction {
     /// `jnp.split`/`np.split` or `torch.tensor_split`.
     TorchSplit,
     Tile,
+    /// numpy `repeat(a, repeats, axis)`, torch `repeat_interleave`.
     Repeat,
+    /// The method `repeat_interleave`: `Repeat` in every library.
+    RepeatInterleave,
+    /// torch `Tensor.repeat(*sizes)`: a tile with at least one size per dim.
+    TorchRepeat,
     Flatten,
     /// `torch.flatten(x, start_dim, end_dim)` / `Tensor.flatten(start_dim, end_dim)`.
     TorchFlatten,

@@ -79,10 +79,11 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "extract" => Some(KnownFunction::Extract),
             "compress" => Some(KnownFunction::Compress),
             "histogram" => Some(KnownFunction::Histogram),
-            // Same axis/keepdims mechanics as the reduction they alias to —
-            // reused directly rather than adding near-duplicate variants.
-            "median" | "quantile" | "percentile" => Some(KnownFunction::Mean),
-            "count_nonzero" => Some(KnownFunction::Sum),
+            "median" => Some(KnownFunction::Reduction { axis: 1, keepdims: Some(4), q: None }),
+            "quantile" | "percentile" => {
+                Some(KnownFunction::Reduction { axis: 2, keepdims: Some(6), q: Some(1) })
+            }
+            "count_nonzero" => Some(KnownFunction::Reduction { axis: 1, keepdims: None, q: None }),
             "ptp" => Some(KnownFunction::Max),
             "cross" => Some(KnownFunction::Cross),
             _ => classify_array_function(name),
@@ -95,6 +96,12 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "transpose" | "swapdims" => Some(KnownFunction::SwapAxes),
             "unsqueeze" => Some(KnownFunction::ExpandDims),
             "max" | "min" => Some(KnownFunction::TorchMaxMin),
+            "sum" | "mean" | "prod" | "all" | "any" | "argmax" | "argmin" => Some(TORCH_REDUCTION),
+            "std" | "var" => Some(TORCH_STD_VAR),
+            "quantile" => Some(KnownFunction::Reduction { axis: 2, keepdims: Some(3), q: Some(1) }),
+            "norm" => Some(NORM),
+            "squeeze" => Some(KnownFunction::TorchSqueeze),
+            "repeat_interleave" => Some(KnownFunction::Repeat),
             "bmm" => Some(KnownFunction::Bmm),
             // Real torch `split` semantics: 2nd arg is a chunk *size*, not a
             // section count. `tensor_split` keeps numpy/jnp `array_split`
@@ -177,8 +184,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "svd" => Some(KnownFunction::LinalgSvd),
             "qr" => Some(KnownFunction::LinalgQr),
             "eig" | "eigh" => Some(KnownFunction::LinalgEig),
-            // Axis/keepdims mechanics identical to a plain reduction.
-            "norm" => Some(KnownFunction::Sum),
+            "norm" => Some(NORM),
             "solve" => Some(KnownFunction::LinalgSolve),
             // Shape-preserving on a square matrix — same rule as `inv`.
             "cholesky" => Some(KnownFunction::LinalgInv),
@@ -203,7 +209,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     if is_jax_lax {
         return match name.as_str() {
             "dot" => Some(KnownFunction::Dot),
-            "dot_general" => Some(KnownFunction::Matmul),
+            "dot_general" => Some(KnownFunction::DotGeneral),
             "scan" => Some(KnownFunction::Scan),
             "map" => Some(KnownFunction::LaxMap),
             "cond" => Some(KnownFunction::LaxCond),
@@ -255,8 +261,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
         return match name.as_str() {
             "one_hot" => Some(KnownFunction::OneHot),
             "dot_product_attention" => Some(KnownFunction::DotProductAttention),
-            // Same axis/keepdims mechanics as a plain sum reduction.
-            "logsumexp" => Some(KnownFunction::Sum),
+            "logsumexp" => Some(KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None }),
             _ => None,
         };
     }
@@ -647,7 +652,10 @@ fn add_to_dim(dim: &str, amount: isize) -> String {
     if let Ok(dim) = dim.parse::<isize>() {
         return dim.checked_add(amount).map_or(UNKNOWN_DIM.to_string(), |dim| dim.to_string());
     }
-    offset_dim(dim, -(amount as i64)).unwrap_or_else(|| format!("{dim}{amount:+}"))
+    let Some(negated) = (amount as i64).checked_neg() else {
+        return UNKNOWN_DIM.to_string();
+    };
+    offset_dim(dim, negated).unwrap_or_else(|| format!("{dim}{amount:+}"))
 }
 
 /// The integers of a literal. A value with a name has none: `min(1, 2)` is
@@ -871,7 +879,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "cumsum" => Some(KnownFunction::Cumsum),
         "cumprod" => Some(KnownFunction::Cumprod),
         "tile" => Some(KnownFunction::Tile),
-        "repeat" | "repeat_interleave" => Some(KnownFunction::Repeat),
+        "repeat" => Some(KnownFunction::Repeat),
+        "repeat_interleave" => Some(KnownFunction::RepeatInterleave),
         "expand" | "broadcast_to" => Some(KnownFunction::BroadcastTo),
         "astype" => Some(KnownFunction::Astype),
         "copy" | "byteswap" | "clone" | "cpu" | "cuda" | "float" | "long" | "int" | "bool"
@@ -895,7 +904,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "new_zeros" | "new_ones" | "new_empty" => Some(KnownFunction::NewSizeConstructor),
         "new_full" => Some(KnownFunction::NewConstructor),
         "clamp" | "clip" => Some(KnownFunction::Clamp),
-        "norm" => Some(KnownFunction::Sum),
+        "norm" => Some(NORM),
         "diagonal" => Some(KnownFunction::Diagonal),
         "tril" => Some(KnownFunction::Tril),
         "triu" => Some(KnownFunction::Triu),
@@ -911,21 +920,32 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
     }
 }
 
+/// The torch rule of a method whose numpy rule is `method`, when the two
+/// libraries read the arguments in different ways.
+pub fn torch_method_reading(method: &KnownFunction) -> Option<KnownFunction> {
+    match method {
+        KnownFunction::Sum
+        | KnownFunction::Mean
+        | KnownFunction::Prod
+        | KnownFunction::All
+        | KnownFunction::Any
+        | KnownFunction::ArgMax
+        | KnownFunction::ArgMin => Some(TORCH_REDUCTION),
+        KnownFunction::Std | KnownFunction::Var => Some(TORCH_STD_VAR),
+        KnownFunction::Max | KnownFunction::Min => Some(KnownFunction::TorchMaxMin),
+        KnownFunction::Repeat => Some(KnownFunction::TorchRepeat),
+        KnownFunction::Squeeze => Some(KnownFunction::TorchSqueeze),
+        _ => None,
+    }
+}
+
 pub fn apply_method_call(
     method: &KnownFunction,
     receiver: &str,
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    // torch `x.repeat(2, 3)` tiles per-dim; numpy `a.repeat(n[, axis])`
-    // repeats elements. ≥2 positional args → torch tile semantics.
-    let positional_count = args
-        .iter()
-        .filter(|arg| matches!(arg, CallArgument::Positional { .. }))
-        .count();
-    let method = if matches!(method, KnownFunction::Repeat) && positional_count >= 2 {
-        &KnownFunction::Tile
-    } else if matches!(method, KnownFunction::Flatten) && is_torch_flatten_call(args) {
+    let method = if matches!(method, KnownFunction::Flatten) && is_torch_flatten_call(args) {
         &KnownFunction::TorchFlatten
     } else {
         method
@@ -959,6 +979,7 @@ fn synthesize_method_args(
             | KnownFunction::Permute
             | KnownFunction::Transpose
             | KnownFunction::Tile
+            | KnownFunction::TorchRepeat
             | KnownFunction::BroadcastTo
     ) && positional_count >= 2;
 
@@ -1016,7 +1037,8 @@ fn apply_known_rule(
         KnownFunction::SwapAxes => apply_known_swapaxes(args, shapes),
         KnownFunction::MoveAxis => apply_known_moveaxis(args, shapes),
         KnownFunction::ExpandDims => apply_known_expand_dims(args, shapes),
-        KnownFunction::Squeeze => apply_known_squeeze(args, shapes),
+        KnownFunction::Squeeze => apply_known_squeeze(args, shapes, false),
+        KnownFunction::TorchSqueeze => apply_known_squeeze(args, shapes, true),
         KnownFunction::AtLeast1D => apply_known_atleast(args, shapes, 1),
         KnownFunction::AtLeast2D => apply_known_atleast(args, shapes, 2),
         KnownFunction::AtLeast3D => apply_known_atleast(args, shapes, 3),
@@ -1052,6 +1074,7 @@ fn apply_known_rule(
         KnownFunction::Linspace | KnownFunction::Logspace => apply_known_linspace(args),
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
+        KnownFunction::DotGeneral => apply_known_dot_general(args, shapes),
         KnownFunction::Bmm => apply_known_bmm(args, shapes),
         KnownFunction::Dot => apply_known_dot(args, shapes),
         KnownFunction::TensorDot => apply_known_tensordot(args, shapes),
@@ -1064,8 +1087,9 @@ fn apply_known_rule(
         KnownFunction::Take => apply_known_take(args, shapes),
         KnownFunction::BroadcastTo => apply_known_broadcast_to(args, shapes),
         KnownFunction::BroadcastArrays => apply_known_broadcast_arrays(args, shapes),
-        KnownFunction::Tile => apply_known_tile(args, shapes),
-        KnownFunction::Repeat => apply_known_repeat(args, shapes),
+        KnownFunction::Tile => apply_known_tile(args, shapes, false),
+        KnownFunction::TorchRepeat => apply_known_tile(args, shapes, true),
+        KnownFunction::Repeat | KnownFunction::RepeatInterleave => apply_known_repeat(args, shapes),
         KnownFunction::Clamp => apply_known_clamp(args, shapes),
         KnownFunction::Pad => apply_known_pad(args, shapes),
         KnownFunction::NumpyPad => apply_known_numpy_pad(args, shapes),
@@ -1085,7 +1109,11 @@ fn apply_known_rule(
         | KnownFunction::All
         | KnownFunction::Any
         | KnownFunction::ArgMax
-        | KnownFunction::ArgMin => apply_known_reduction(args, shapes),
+        | KnownFunction::ArgMin => {
+            let (axis, keepdims, q) = numpy_reduction(function);
+            apply_reduction(args, shapes, axis, keepdims, q)
+        }
+        KnownFunction::Reduction { axis, keepdims, q } => apply_reduction(args, shapes, *axis, *keepdims, *q),
         KnownFunction::TorchMaxMin => apply_known_torch_max_min(args, shapes),
         KnownFunction::LinalgInv => apply_known_linalg_inv(args, shapes),
         KnownFunction::LinalgMatrixSqrth => {
@@ -1486,7 +1514,10 @@ fn apply_known_flax_pool(
         if s <= 0 {
             return Ok(None);
         }
-        let count = if same { (d + s - 1) / s } else { window_count(d, w, s).unwrap_or(0) };
+        let count = if same { same_size(d, s) } else { Some(window_count(d, w, s).unwrap_or(0)) };
+        let Some(count) = count else {
+            return Ok(None);
+        };
         output[start + i] = count.to_string();
     }
     Ok(Some(output))
@@ -1495,7 +1526,25 @@ fn apply_known_flax_pool(
 /// The count of windows of size `window` at steps of `stride` in `padded`
 /// elements, or `None` when one window is larger than `padded`.
 fn window_count(padded: isize, window: isize, stride: isize) -> Option<isize> {
-    (padded >= window).then(|| (padded - window) / stride + 1)
+    if padded < window {
+        return None;
+    }
+    padded.checked_sub(window)?.checked_div(stride)?.checked_add(1)
+}
+
+/// `(kernel - 1) * dilation + 1`, the extent of a dilated window.
+fn dilated_window(kernel: isize, dilation: isize) -> Option<isize> {
+    kernel.checked_sub(1)?.checked_mul(dilation)?.checked_add(1)
+}
+
+/// `size + low + high`, the size of a padded axis.
+fn padded_size(size: isize, low: isize, high: isize) -> Option<isize> {
+    size.checked_add(low)?.checked_add(high)
+}
+
+/// `ceil(size / stride)`, the size of a `SAME` window axis.
+fn same_size(size: isize, stride: isize) -> Option<isize> {
+    size.checked_add(stride)?.checked_sub(1)?.checked_div(stride)
 }
 
 fn sequence_arg_value(args: &[CallArgument]) -> Option<&str> {
@@ -2114,15 +2163,28 @@ fn apply_known_expand_dims(
     Ok(Some(output))
 }
 
+/// The integer that `dim` is proven to be.
+fn proven_size(dim: &str) -> Option<i64> {
+    dim.parse().ok().or_else(|| literal_dim(dim)?.parse().ok())
+}
+
+/// numpy and jax refuse to squeeze an axis whose size is not 1. torch keeps
+/// such an axis. An axis of a size that is not proven gives no shape.
 fn apply_known_squeeze(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
+    torch: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-    let axes =
-        nth_positional_or_keyword(args, 1, &["axis", "dim", "dimensions"]).and_then(parse_axis_list);
+    let axes_raw = nth_positional_or_keyword(args, 1, &["axis", "dim", "dimensions"]);
+    let axes = match axes_raw.map(parse_axis_list) {
+        Some(None) => return Ok(None),
+        Some(Some(axes)) if axes.contains(&isize::MIN) => None,
+        Some(axes) => axes,
+        None => None,
+    };
 
     let rank = input_shape.len();
     let axes = if let Some(axes) = axes {
@@ -2135,14 +2197,21 @@ fn apply_known_squeeze(
             .collect::<Vec<_>>()
     };
 
-    for axis in &axes {
-        if input_shape[*axis] != "1" {
-            return Err(format!(
-                "cannot squeeze axis {} with dimension {}",
-                axis, input_shape[*axis]
-            ));
+    let mut removed = Vec::new();
+    for axis in axes {
+        match proven_size(&input_shape[axis]) {
+            Some(1) => removed.push(axis),
+            Some(_) if torch => {}
+            Some(_) => {
+                return Err(format!(
+                    "cannot squeeze axis {} with dimension {}",
+                    axis, input_shape[axis]
+                ));
+            }
+            None => return Ok(None),
         }
     }
+    let axes = removed;
 
     let output = input_shape
         .iter()
@@ -2338,7 +2407,7 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
         return Ok(Some(vec![values[0].clone()]));
     }
     if let (Ok(start), Ok(stop)) = (values[0].parse::<isize>(), values[1].parse::<isize>()) {
-        return Ok(Some(vec![(stop - start).max(0).to_string()]));
+        return Ok(stop.checked_sub(start).map(|size| vec![size.max(0).to_string()]));
     }
     Ok(Some(vec![format!("{}-{}", values[1], values[0])]))
 }
@@ -2430,6 +2499,67 @@ fn apply_known_matmul(
             Ok(Some(output))
         }
     }
+}
+
+/// The two items of a literal pair `(a, b)`.
+fn literal_pair(text: &str) -> Option<(&str, &str)> {
+    match split_top_level(sequence_inner(text.trim())?).as_slice() {
+        [a, b] => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// The axes of a literal tuple of non-negative integers.
+fn literal_axes(text: &str) -> Option<Vec<usize>> {
+    split_top_level(sequence_inner(text.trim())?)
+        .into_iter()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.parse().ok())
+        .collect()
+}
+
+/// `jax.lax.dot_general(lhs, rhs, ((lc, rc), (lb, rb)))`: the batch dims, the
+/// free dims of `lhs`, then the free dims of `rhs`. Only literal axes give a
+/// shape.
+fn apply_known_dot_general(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(lhs), Some(rhs)) = (shape_arg(args, 0, &["lhs"], shapes), shape_arg(args, 1, &["rhs"], shapes)) else {
+        return Ok(None);
+    };
+    let numbers = nth_positional_or_keyword(args, 2, &["dimension_numbers"]).and_then(|numbers| {
+        let (contracting, batch) = literal_pair(numbers)?;
+        let (lc, rc) = literal_pair(contracting)?;
+        let (lb, rb) = literal_pair(batch)?;
+        Some([literal_axes(lc)?, literal_axes(rc)?, literal_axes(lb)?, literal_axes(rb)?])
+    });
+    let Some([lc, rc, lb, rb]) = numbers else {
+        return Ok(None);
+    };
+    let valid = |shape: &[String], contracting: &[usize], batch: &[usize]| {
+        let mut axes = [contracting, batch].concat();
+        axes.sort_unstable();
+        axes.dedup();
+        !has_variadic_dim(shape)
+            && axes.len() == contracting.len() + batch.len()
+            && axes.iter().all(|axis| *axis < shape.len())
+    };
+    if lc.len() != rc.len() || lb.len() != rb.len() || !valid(lhs, &lc, &lb) || !valid(rhs, &rc, &rb) {
+        return Ok(None);
+    }
+    for (l, r) in lb.iter().zip(&rb).chain(lc.iter().zip(&rc)) {
+        check_dim_match(&lhs[*l], &rhs[*r], "dot_general")?;
+    }
+    let free = |shape: &[String], contracting: &[usize], batch: &[usize]| {
+        (0..shape.len())
+            .filter(|axis| !contracting.contains(axis) && !batch.contains(axis))
+            .map(|axis| shape[axis].clone())
+            .collect::<Vec<_>>()
+    };
+    let batch = lb.iter().zip(&rb).map(|(l, r)| unified_dim(&lhs[*l], &rhs[*r]));
+    Ok(Some(batch.chain(free(lhs, &lc, &lb)).chain(free(rhs, &rc, &rb)).collect()))
 }
 
 /// `torch.bmm(input, mat2)`: both operands rank 3, equal batch dim (unlike
@@ -2961,19 +3091,25 @@ fn apply_known_broadcast_arrays(
     Ok(Some(output))
 }
 
+/// `np.tile` pads `reps` with ones. torch `x.repeat(*sizes)` refuses fewer
+/// sizes than dims, and one size can be a sequence, so it gives no shape then.
 fn apply_known_tile(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
+    torch: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
     let Some(reps) =
-        nth_positional_or_keyword(args, 1, &["reps", "dims"]).and_then(parse_shape_value)
+        nth_positional_or_keyword(args, 1, &["reps", "dims", "repeats"]).and_then(parse_shape_value)
     else {
         return Ok(None);
     };
+    if torch && reps.len() < input_shape.len() {
+        return Ok(None);
+    }
 
     let rank = input_shape.len().max(reps.len());
     let mut shape = vec!["1".to_string(); rank - input_shape.len()];
@@ -2999,9 +3135,20 @@ fn apply_known_repeat(
     };
 
     let (repeats, axis) = nth_two_positional_or_keywords(args, 1, &["repeats"], &["axis", "dim"]);
-    let axis = axis.and_then(parse_axis);
     let Some(repeats) = repeats else {
         return Ok(None);
+    };
+    // An array of counts gives a size the file does not prove.
+    let array_repeats = shapes.shape(repeats).is_some_and(|shape| !shape.is_empty());
+    if array_repeats || !is_one_size(repeats) {
+        return Ok(None);
+    }
+    let axis = match axis.map(str::trim) {
+        None | Some("None") => None,
+        Some(axis) => match parse_axis(axis) {
+            Some(axis) => Some(axis),
+            None => return Ok(None),
+        },
     };
 
     if let Some(axis) = axis {
@@ -3228,17 +3375,20 @@ fn apply_known_pad(
     }
 
     let additions = if values.len() == 1 {
-        vec![values[0] * 2; input_shape.len()]
+        values[0].checked_mul(2).map(|addition| vec![addition; input_shape.len()])
     } else if values.len() == 2 {
-        vec![values[0] + values[1]; input_shape.len()]
+        values[0].checked_add(values[1]).map(|addition| vec![addition; input_shape.len()])
     } else if values.len() == input_shape.len() * 2 {
         values
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|pair| pair[0] + pair[1])
-            .collect::<Vec<_>>()
+            .map(|pair| pair[0].checked_add(pair[1]))
+            .collect::<Option<Vec<_>>>()
     } else {
+        return Ok(None);
+    };
+    let Some(additions) = additions else {
         return Ok(None);
     };
 
@@ -3388,25 +3538,79 @@ fn apply_known_torch_max_min(
     }
 }
 
+/// The signature of torch `sum`, `mean`, `prod`, `all`, `any`, `argmax`, `argmin`.
+const TORCH_REDUCTION: KnownFunction = KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None };
+/// torch `std` and `var`: `(input, dim, unbiased, keepdim)`.
+const TORCH_STD_VAR: KnownFunction = KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None };
+/// `norm(x, ord, axis, keepdims)` in numpy, jax, and torch.
+const NORM: KnownFunction = KnownFunction::Reduction { axis: 2, keepdims: Some(3), q: None };
+
+/// A torch reduction: `(input, dim, keepdim)`.
 pub fn apply_known_reduction(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    apply_known_rule(&TORCH_REDUCTION, args, shapes)
+}
+
+/// The numpy signature of a reduction: `(a, axis, dtype, out, keepdims)` for
+/// `sum`, `std` with `ddof` before `keepdims`, and `(a, axis, out, keepdims)`.
+fn numpy_reduction(function: &KnownFunction) -> (usize, Option<usize>, Option<usize>) {
+    match function {
+        KnownFunction::Sum | KnownFunction::Mean | KnownFunction::Prod => (1, Some(4), None),
+        KnownFunction::Std | KnownFunction::Var => (1, Some(5), None),
+        _ => (1, Some(3), None),
+    }
+}
+
+/// The shape of a `q` argument: a number is a scalar, a list of numbers has
+/// one axis, and a name has its shape.
+fn quantile_shape(q: &str, shapes: &dyn ShapeLookup) -> Option<Vec<String>> {
+    let q = q.trim();
+    if q.parse::<f64>().is_ok() {
+        return Some(Vec::new());
+    }
+    if let Some(inner) = sequence_inner(q) {
+        let items = split_top_level(inner).into_iter().map(str::trim).filter(|item| !item.is_empty()).collect::<Vec<_>>();
+        return items.iter().all(|item| item.parse::<f64>().is_ok()).then(|| vec![items.len().to_string()]);
+    }
+    shapes.shape(q).cloned()
+}
+
+fn apply_reduction(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    axis_at: usize,
+    keepdims_at: Option<usize>,
+    q_at: Option<usize>,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
 
-    let axis_raw = nth_positional_or_keyword(args, 1, &["axis", "dim"]);
-    let mut keepdims = false;
-    for arg in args {
-        if let CallArgument::Keyword { name, value } = arg
-            && (name == "keepdims" || name == "keepdim")
-            && let Some(parsed) = parse_bool(value)
-        {
-            keepdims = parsed;
-        }
-    }
+    let leading = match q_at {
+        Some(at) => match nth_positional_or_keyword(args, at, &["q"]).and_then(|q| quantile_shape(q, shapes)) {
+            Some(leading) => leading,
+            None => return Ok(None),
+        },
+        None => Vec::new(),
+    };
+    let axis_raw = nth_positional_or_keyword(args, axis_at, &["axis", "dim"]);
+    let keepdims_raw = match keepdims_at {
+        Some(at) => nth_positional_or_keyword(args, at, &["keepdims", "keepdim"]),
+        None => args.iter().rev().find_map(|arg| match arg {
+            CallArgument::Keyword { name, value } if name == "keepdims" || name == "keepdim" => Some(value.as_str()),
+            _ => None,
+        }),
+    };
+    let Some(keepdims) = keepdims_raw.map_or(Some(false), parse_bool) else {
+        return Ok(None);
+    };
+    let reduced = reduced_shape(input_shape, axis_raw, keepdims)?;
+    Ok(reduced.map(|reduced| [leading, reduced].concat()))
+}
 
+fn reduced_shape(input_shape: &[String], axis_raw: Option<&str>, keepdims: bool) -> Result<Option<Vec<String>>, String> {
     let axes = match axis_raw {
         None => None,
         Some(raw) => match parse_axis_list(raw) {
@@ -3424,7 +3628,7 @@ pub fn apply_known_reduction(
     };
 
     if axes.is_empty() {
-        return Ok(Some(input_shape.clone()));
+        return Ok(Some(input_shape.to_vec()));
     }
 
     let axes = if axes.contains(&isize::MIN) {
@@ -3444,7 +3648,7 @@ pub fn apply_known_reduction(
     normalized.sort_unstable();
 
     if keepdims {
-        let mut output = input_shape.clone();
+        let mut output = input_shape.to_vec();
         for axis in normalized {
             output[axis] = "1".to_string();
         }
@@ -3891,7 +4095,9 @@ pub fn compute_torch_split_shapes(
         let mut out = input_shape.clone();
         out[axis] = size.to_string();
         let mut output_shapes = vec![out; k - 1];
-        let consumed = size * (k - 1);
+        let Some(consumed) = size.checked_mul(k - 1) else {
+            return Ok(None);
+        };
         let mut last = input_shape.clone();
         last[axis] = if consumed == 0 {
             axis_dim.clone()
@@ -3932,7 +4138,7 @@ pub fn compute_torch_split_shapes(
                 .iter()
                 .filter(|v| **v != Some(-1))
                 .try_fold(0usize, |acc, v| -> Option<usize> {
-                    Some(acc + usize::try_from((*v)?).ok()?)
+                    acc.checked_add(usize::try_from((*v)?).ok()?)
                 })
         } else {
             None
@@ -4094,7 +4300,9 @@ fn apply_known_lax_slice(
     };
     let mut output = Vec::with_capacity(input_shape.len());
     for i in 0..input_shape.len() {
-        let size = limit[i] - start[i];
+        let Some(size) = limit[i].checked_sub(start[i]) else {
+            return Ok(None);
+        };
         if size < 0 {
             return Err(format!(
                 "lax.slice: limit_indices[{}]={} < start_indices[{}]={}",
@@ -4102,7 +4310,8 @@ fn apply_known_lax_slice(
             ));
         }
         let stride = strides[i].max(1);
-        output.push((((size - 1) / stride) + 1).to_string());
+        let count = if size == 0 { 0 } else { (size - 1) / stride + 1 };
+        output.push(count.to_string());
     }
     Ok(Some(output))
 }
@@ -4163,10 +4372,19 @@ fn apply_known_lax_pad(
             return Ok(None);
         };
         if let Ok(d) = dim.parse::<isize>() {
-            let total = d + lo + hi + interior * (d - 1).max(0);
+            let total = padded_size(d, *lo, *hi)
+                .zip(interior.checked_mul((d - 1).max(0)))
+                .and_then(|(padded, inserted)| padded.checked_add(inserted))
+                .filter(|total| *total >= 0);
+            let Some(total) = total else {
+                return Ok(None);
+            };
             output.push(total.to_string());
         } else if *interior == 0 {
-            output.push(add_to_dim(dim, lo + hi));
+            let Some(added) = lo.checked_add(*hi) else {
+                return Ok(None);
+            };
+            output.push(add_to_dim(dim, added));
         } else {
             return Ok(None);
         }
@@ -4215,12 +4433,17 @@ fn apply_known_lax_reduce_window(
         let (lo, hi) = padding[i];
         let w = window[i];
         let s = strides[i].max(1);
-        let padded = d + lo + hi;
-        let Some(count) = window_count(padded, w, s) else {
+        let Some(padded) = padded_size(d, lo, hi) else {
+            return Ok(None);
+        };
+        if padded < w {
             return Err(format!(
                 "reduce_window: padded dim {} smaller than window {}",
                 padded, w
             ));
+        }
+        let Some(count) = window_count(padded, w, s) else {
+            return Ok(None);
         };
         output.push(count.to_string());
     }
@@ -4238,10 +4461,7 @@ fn apply_known_lax_conv_general_dilated(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    if args
-        .iter()
-        .any(|a| matches!(a, CallArgument::Keyword { name, .. } if name == "dimension_numbers"))
-    {
+    if nth_positional_or_keyword(args, 6, &["dimension_numbers"]).is_some_and(|numbers| numbers.trim() != "None") {
         return Ok(None);
     }
     let Some((_, lhs_shape)) = first_array_arg_shape(args, shapes) else {
@@ -4300,17 +4520,18 @@ fn apply_known_lax_conv_general_dilated(
         let Ok(k) = rhs_shape[2 + i].parse::<isize>() else {
             return Ok(None);
         };
-        let eff_k = (k - 1) * dilation[i] + 1;
         let s = strides[i].max(1);
         let out = match &padding {
             Some(pads) => {
                 let (lo, hi) = pads[i];
-                let Some(count) = window_count(d + lo + hi, eff_k, s) else {
-                    return Ok(None);
-                };
-                count
+                dilated_window(k, dilation[i])
+                    .zip(padded_size(d, lo, hi))
+                    .and_then(|(eff_k, padded)| window_count(padded, eff_k, s))
             }
-            None => (d + s - 1) / s, // 'SAME': ceil(d / s)
+            None => same_size(d, s),
+        };
+        let Some(out) = out else {
+            return Ok(None);
         };
         output.push(out.to_string());
     }
@@ -5419,16 +5640,16 @@ pub fn compute_chunk_shapes(
 
 // ── torch combinatorics ──────────────────────────────────────────────────
 
-fn n_choose_r(n: u64, r: u64) -> u64 {
+fn n_choose_r(n: u64, r: u64) -> Option<u64> {
     if r > n {
-        return 0;
+        return Some(0);
     }
     let r = r.min(n - r);
     let mut result: u64 = 1;
     for i in 0..r {
-        result = result * (n - i) / (i + 1);
+        result = result.checked_mul(n - i)? / (i + 1);
     }
-    result
+    Some(result)
 }
 
 /// `torch.combinations(input, r=2, with_replacement=False)` — `input` is
@@ -5450,7 +5671,7 @@ fn apply_known_combinations(
     let r = nth_positional_or_keyword(args, 1, &["r"])
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(2);
-    Ok(Some(vec![n_choose_r(n, r).to_string(), r.to_string()]))
+    Ok(n_choose_r(n, r).map(|count| vec![count.to_string(), r.to_string()]))
 }
 
 /// `torch.cartesian_prod(*tensors)` — each tensor is 1D; output is
@@ -5600,8 +5821,10 @@ fn apply_known_functional_conv(
             return Ok(None);
         };
         let s = stride[i].max(1);
-        let eff_k = (k - 1) * dilation[i] + 1;
-        let Some(count) = window_count(d + 2 * padding[i], eff_k, s) else {
+        let count = dilated_window(k, dilation[i])
+            .zip(padded_size(d, padding[i], padding[i]))
+            .and_then(|(eff_k, padded)| window_count(padded, eff_k, s));
+        let Some(count) = count else {
             return Ok(None);
         };
         output[idx] = count.to_string();
@@ -5653,7 +5876,8 @@ fn apply_known_functional_pool(
             return Ok(None);
         };
         let s = stride[i].max(1);
-        let Some(count) = window_count(d + 2 * padding[i], kernel[i], s) else {
+        let count = padded_size(d, padding[i], padding[i]).and_then(|padded| window_count(padded, kernel[i], s));
+        let Some(count) = count else {
             return Ok(None);
         };
         output[idx] = count.to_string();
@@ -5840,3 +6064,6 @@ mod known_function_tests;
 
 #[cfg(test)]
 mod method_call_tests;
+
+#[cfg(test)]
+mod signature_tests;

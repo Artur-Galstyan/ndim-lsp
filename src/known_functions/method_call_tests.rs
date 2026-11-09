@@ -72,7 +72,7 @@ fn test_classify_expand_repeat_tile() {
     assert_eq!(classify_method_call("repeat"), Some(KnownFunction::Repeat));
     assert_eq!(
         classify_method_call("repeat_interleave"),
-        Some(KnownFunction::Repeat)
+        Some(KnownFunction::RepeatInterleave)
     );
     assert_eq!(classify_method_call("tile"), Some(KnownFunction::Tile));
 }
@@ -81,8 +81,18 @@ fn test_classify_expand_repeat_tile() {
 #[rustfmt::skip]
 fn test_repeat_method_cases() {
     check(KnownFunction::Repeat, Some("x"), &[
-        ("apply_torch_repeat_multi_positional_tiles", vec![pos("4"), pos("5")], &[("x", &["2", "3"])], Ok(Some(&["8", "15"]))),
         ("apply_numpy_repeat_single_arg_with_axis", vec![pos("4"), kw("axis", "0")], &[("x", &["2", "3"])], Ok(Some(&["8", "3"]))),
+        ("apply_numpy_repeat_positional_axis", vec![pos("4"), pos("0")], &[("x", &["2", "3"])], Ok(Some(&["8", "3"]))),
+        ("apply_numpy_repeat_axis_not_literal", vec![pos("4"), pos("ax")], &[("x", &["2", "3"])], Ok(None)),
+        ("apply_numpy_repeat_array_counts", vec![pos("r"), pos("0")], &[("x", &["2", "3"]), ("r", &["2"])], Ok(None)),
+    ]);
+    check(KnownFunction::TorchRepeat, Some("x"), &[
+        ("apply_torch_repeat_multi_positional_tiles", vec![pos("4"), pos("5")], &[("x", &["2", "3"])], Ok(Some(&["8", "15"]))),
+        ("apply_torch_repeat_adds_leading_dim", vec![pos("2"), pos("4"), pos("5")], &[("x", &["2", "3"])], Ok(Some(&["2", "8", "15"]))),
+        ("apply_torch_repeat_fewer_sizes_than_dims", vec![pos("4")], &[("x", &["2", "3"])], Ok(None)),
+    ]);
+    check(KnownFunction::RepeatInterleave, Some("x"), &[
+        ("apply_repeat_interleave_dim", vec![pos("2"), pos("1")], &[("x", &["2", "3"])], Ok(Some(&["2", "6"]))),
     ]);
 }
 
@@ -912,7 +922,7 @@ fn test_classify_new_misc_methods() {
     assert_eq!(classify_method_call("clamp"), Some(KnownFunction::Clamp));
     assert_eq!(classify_method_call("clip"), Some(KnownFunction::Clamp));
     assert_eq!(classify_method_call("softmax"), Some(KnownFunction::Copy));
-    assert_eq!(classify_method_call("norm"), Some(KnownFunction::Sum));
+    assert_eq!(classify_method_call("norm"), Some(KnownFunction::Reduction { axis: 2, keepdims: Some(3), q: None }));
     assert_eq!(
         classify_method_call("diagonal"),
         Some(KnownFunction::Diagonal)
