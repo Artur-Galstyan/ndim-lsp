@@ -4746,7 +4746,7 @@ mod torch_varargs_size_tests {
         assert_eq!(numeric("jnp.ones((2, 3), jnp.float32)"), dims(&["2", "3"]));
         assert_eq!(numeric("np.empty((3, 4), float)"), dims(&["3", "4"]));
         assert_eq!(numeric("np.zeros(4, float)"), dims(&["4"]));
-        assert_eq!(numeric("jnp.zeros(B)"), dims(&["B"]));
+        assert_eq!(numeric("jnp.zeros(B)"), None);
         assert_eq!(numeric("np.full((2, 3), 1.5)"), dims(&["2", "3"]));
     }
 }
@@ -7926,13 +7926,26 @@ mod multihead_attention_tests {
     }
 
     #[test]
-    fn test_lstm_single_lhs_is_a_tuple() {
-        // `out = self.lstm(x)` binds the `(output, (h_n, c_n))` tuple: no shape.
-        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)";
+    fn test_multihead_attention_first_element_cross_attention_uses_query_shape() {
+        // Query and key/value have different sequence lengths — the primary
+        // output (`[0]`) still follows the query's shape, not the key/value's.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out = self.attn(q, kv, kv)[0]";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
+    }
+
+    #[test]
+    fn test_lstm_single_lhs_is_a_tuple() {
+        // `out = self.lstm(x)` binds the `(output, (h_n, c_n))` tuple: no shape.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)\n        first = self.lstm(x)[0]";
+        let analysis = analyze(code);
+
+        // torch gives a tuple `(output, (h_n, c_n))`: `out` is no array.
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "out"), None);
+        assert_eq!(find_shape(&analysis, "first"), Some(&shape(&["seq", "20"])));
     }
 
     #[test]
@@ -7940,6 +7953,7 @@ mod multihead_attention_tests {
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.gru(x)";
         let analysis = analyze(code);
 
+        // torch gives a tuple `(output, h_n)`: `out` is no array.
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "out"), None);
     }
@@ -16123,7 +16137,8 @@ mod symbolic_slice_tests {
 
     #[test]
     fn a_plain_size_argument_keeps_its_rank() {
-        y_is("jnp.zeros(k)", &["k"]);
+        // `k` is a parameter without an annotation: it may hold a tuple.
+        assert_eq!(y("jnp.zeros(k)"), None);
         y_is("jnp.zeros(5)", &["5"]);
         y_is("jnp.zeros((min(k, 2), 2))", &["min(k, 2)", "2"]);
         y_is("jnp.zeros((k, 2))", &["k", "2"]);

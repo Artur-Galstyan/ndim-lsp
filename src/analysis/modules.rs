@@ -27,11 +27,11 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Range};
 
 use super::{
-    ShapeCtx, Submodule, apply_submodule_call, constructed_module, extra_layer_inputs,
-    insert_identifiers, normalize_dim, resolve_call_args,
+    ShapeCtx, Submodule, apply_layer_value, apply_submodule_call, constructed_module,
+    extra_layer_inputs, insert_identifiers, normalize_dim, resolve_call_args,
 };
 use crate::imports::is_imported;
-use crate::layers::{apply_layer_application, classify_inline_constructor};
+use crate::layers::classify_inline_constructor;
 use crate::python_ast::{ClassHierarchy, dim_symbols, dynamic_attribute, extract_call_arguments};
 use crate::resolution::{
     ModuleProbe, resolve_call_target, resolve_implementation, search_roots_fingerprint,
@@ -931,7 +931,7 @@ fn apply_held(
                 kind,
                 range,
             };
-            let result = apply_layer_application(&application, &ctx.scope_shapes(scope));
+            let result = apply_layer_value(&application, &ctx.scope_shapes(scope));
             ctx.check(result, "", range).flatten()
         }
     }
@@ -1537,11 +1537,16 @@ fn run_probe(
     let mut messages: Vec<String> = Vec::new();
     for error in errors {
         let foreign = error.reads.iter().any(|name| constants.contains(name));
+        // The mark keeps the kind of the error for the call.
+        let message = match error.kind {
+            ShapeErrorKind::Approximation => format!("{NAMES_ONLY}{}", error.message),
+            ShapeErrorKind::Mismatch => error.message.clone(),
+        };
         if (!has_probe_name(&error.message) || error.message.contains("__ndim_a"))
             && !foreign
-            && !messages.contains(&error.message)
+            && !messages.contains(&message)
         {
-            messages.push(error.message.clone());
+            messages.push(message);
         }
     }
     std::sync::Arc::new(ModuleProbe {

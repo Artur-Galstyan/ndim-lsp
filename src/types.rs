@@ -306,9 +306,41 @@ fn fold_atom(tokens: &[u8], at: &mut usize) -> Option<i64> {
     }
 }
 
+/// Whether `dim` is one integer or one name. The analysis cannot relate any
+/// other form, such as `split(n, 4)`, `min(4, n)`, `n/2`, or `2*n`, to a
+/// different dim.
+fn is_plain_dim(dim: &str) -> bool {
+    dim.parse::<i64>().is_ok()
+        || (dim.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && dim.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'))
+}
+
+/// `dim` without the brackets around all of it: `(n+1)` is `n+1`. Only a
+/// comparison reads it, so the text of a dim stays as written.
+fn without_outer_brackets(dim: &str) -> &str {
+    let mut dim = dim.trim();
+    while let Some(inner) = dim.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            depth += match c {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            depth >= 0
+        });
+        if !balanced || depth != 0 {
+            break;
+        }
+        dim = inner.trim();
+    }
+    dim
+}
+
 /// Whether the two dims are different at run time, as far as the file proves.
-/// A free dim conflicts with nothing. A difference conflicts only with a dim of
-/// the same name and another integer: `n-1` with `n`, but not with `m` or `4`.
+/// A free dim conflicts with nothing. Two integers or names conflict when they
+/// differ. Any other form conflicts only with a sum of the same names and
+/// another integer: `n-1` with `n`, but not with `m` or `4`.
 pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
     let other_integer = |value: &str, dim: &str| dim.parse::<i64>().is_ok() && dim != value;
     match (literal_dim(a), literal_dim(b)) {
@@ -322,32 +354,69 @@ pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
                 && is_named_size(a)
                 && is_named_size(b)
                 && !dims_canonically_equal(a, b)
-                && (!(is_difference(a) || is_difference(b)) || same_names(a, b))
+                && ((is_plain_dim(a) && is_plain_dim(b)) || same_names(a, b))
         }
+    }
+}
+
+/// Starts the message of a conflict that rests only on two different names
+/// (`names_conflict`). Different names can be equal at run time, so a
+/// `ShapeError` with the mark is an `Approximation`. The constructors of
+/// `ShapeError` take the mark off.
+pub(crate) const NAMES_ONLY: &str = "\u{1}";
+
+/// Whether `a` and `b` conflict only because they are two different names,
+/// with no integer on either side.
+pub(crate) fn names_conflict(a: &str, b: &str) -> bool {
+    let is_name = |dim: &str| is_plain_dim(dim) && dim.parse::<i64>().is_err();
+    dims_conflict(a, b) && is_name(a) && is_name(b)
+}
+
+/// The conflicts that one check finds. A conflict of two different names
+/// (`names_conflict`) waits, so that a proven conflict after it still gives
+/// a `Mismatch`.
+#[derive(Default)]
+pub(crate) struct Conflicts(Option<String>);
+
+impl Conflicts {
+    /// The conflict of `a` and `b`: `Err` when it is proven.
+    pub(crate) fn add(&mut self, a: &str, b: &str, message: String) -> Result<(), String> {
+        if !names_conflict(a, b) {
+            return Err(message);
+        }
+        self.0.get_or_insert_with(|| format!("{NAMES_ONLY}{message}"));
+        Ok(())
+    }
+
+    /// `Err` with the `NAMES_ONLY` mark when a conflict of names waits.
+    pub(crate) fn finish(self) -> Result<(), String> {
+        self.0.map_or(Ok(()), Err)
     }
 }
 
 /// Whether two flat sums have the same terms apart from their integers.
 fn same_names(a: &str, b: &str) -> bool {
     let names = |dim: &str| {
-        let stripped: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+        let stripped: String = without_outer_brackets(dim).chars().filter(|c| !c.is_whitespace()).collect();
         flat_sum(&stripped).map(|(terms, _)| terms)
     };
     names(a).is_some_and(|terms| !terms.is_empty() && names(b).as_ref() == Some(&terms))
 }
 
 /// The dim that two dims without a conflict give together. A free dim takes
-/// the value of the other side, and a difference takes an exact dim. Two
-/// different free dims give `UNPROVEN_DIM`, except that `UNKNOWN_DIM` says
+/// the value of the other side, a difference takes an exact dim, and another
+/// form takes an integer or a name. Two different dims of one kind other than
+/// integers and names give `UNPROVEN_DIM`, except that `UNKNOWN_DIM` says
 /// nothing and so takes any other side.
 pub(crate) fn unified_dim(a: &str, b: &str) -> String {
     if b == UNKNOWN_DIM {
         return a.to_string();
     }
-    let rank = |dim: &str| match (is_free_dim(dim), is_difference(dim)) {
-        (true, _) => 2,
-        (false, true) => 1,
-        (false, false) => 0,
+    let rank = |dim: &str| match (is_free_dim(dim), is_difference(dim), is_plain_dim(dim)) {
+        (true, _, _) => 3,
+        (false, true, _) => 2,
+        (false, false, false) => 1,
+        (false, false, true) => 0,
     };
     match rank(a).cmp(&rank(b)) {
         std::cmp::Ordering::Greater => b.to_string(),
@@ -534,7 +603,7 @@ fn canonicalize_product_term(term: &str) -> String {
 /// Dim equality under [`canonicalize_dim`], with or without the `FREE_DIM`
 /// mark. A check that reports a mismatch uses [`dims_conflict`].
 pub fn dims_canonically_equal(a: &str, b: &str) -> bool {
-    canonicalize_dim(a) == canonicalize_dim(b)
+    canonicalize_dim(without_outer_brackets(a)) == canonicalize_dim(without_outer_brackets(b))
 }
 
 #[cfg(test)]
@@ -647,6 +716,43 @@ mod canonicalize_dim_tests {
             assert!(!dims_conflict(other, "__free_min(4, n)"), "{other}");
             assert!(!dims_conflict(UNKNOWN_DIM, other), "{other}");
         }
+    }
+
+    /// noxton `nn/xlstm.py`: `split(hidden_dim_x4, 4)` may equal `hidden_dim`.
+    #[test]
+    fn test_a_form_conflicts_only_by_arithmetic() {
+        for (a, b, conflict, unified) in [
+            ("hidden_dim", "split(hidden_dim_x4, 4)", false, "hidden_dim"),
+            ("split(hidden_dim_x4, 4)", "hidden_dim", false, "hidden_dim"),
+            ("4", "split(n, 2)", false, "4"),
+            ("m", "n/2", false, "m"),
+            ("m", "2*n", false, "m"),
+            ("m", "ceil(n/2)", false, "m"),
+            ("2*n", "3*n", false, crate::layers::UNPROVEN_DIM),
+            ("n+1", "m+1", false, crate::layers::UNPROVEN_DIM),
+            ("n+1", "n", true, ""),
+            ("(n+1)", "n", true, ""),
+            ("2*n+1", "n*2", true, ""),
+            ("n", "m", true, ""),
+            ("n", "4", true, ""),
+            ("3", "4", true, ""),
+        ] {
+            assert_eq!(dims_conflict(a, b), conflict, "{a} {b}");
+            if !conflict {
+                assert_eq!(unified_dim(a, b), unified, "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_outer_brackets_do_not_change_a_comparison() {
+        assert!(dims_canonically_equal("(n+1)", "n+1"));
+        assert!(dims_canonically_equal("((n))", "n"));
+        assert!(dims_canonically_equal(" (2*d) ", "d*2"));
+        assert!(!dims_canonically_equal("(n+1)*(m)", "n+1*m"));
+        assert!(!dims_conflict("(n+1)", "n+1"));
+        assert!(!dims_conflict("n+1", "(1+n)"));
+        assert_eq!(canonicalize_dim("(d)"), "(d)");
     }
 
     #[test]
@@ -1430,11 +1536,16 @@ impl PartialEq for ShapeError {
 }
 
 impl ShapeError {
-    /// A genuine shape contradiction under the rule's modeled semantics.
+    /// A genuine shape contradiction under the rule's modeled semantics. A
+    /// message with the `NAMES_ONLY` mark gives an `Approximation`.
     pub fn mismatch(variable: impl Into<String>, message: impl Into<String>, range: Range) -> Self {
+        let message: String = message.into();
+        if message.contains(NAMES_ONLY) {
+            return Self::approximation(variable, message, range);
+        }
         ShapeError {
             variable: variable.into(),
-            message: message.into(),
+            message,
             range,
             kind: ShapeErrorKind::Mismatch,
             related: None,
@@ -1454,7 +1565,7 @@ impl ShapeError {
     ) -> Self {
         ShapeError {
             variable: variable.into(),
-            message: message.into(),
+            message: message.into().replace(NAMES_ONLY, ""),
             range,
             kind: ShapeErrorKind::Approximation,
             related: None,
