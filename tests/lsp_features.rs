@@ -198,3 +198,66 @@ fn utf8_positions_when_the_client_offers_them() {
         assert_eq!(c.wait_diagnostics(&uri, from), Vec::<Value>::new(), "{enc}");
     }
 }
+
+const HELPER_OK: &str = "from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"b d\"], w: Float[Array, \"d k\"]) -> Float[Array, \"b k\"]:\n    return x @ w\n";
+const HELPER_BAD: &str = "from jaxtyping import Float, Array\n\ndef proj(x: Float[Array, \"b d\"], w: Float[Array, \"k d\"]) -> Float[Array, \"b k\"]:\n    return x @ w\n";
+const MAIN: &str = "from jaxtyping import Float, Array\nfrom helper import proj\n\ndef f(x: Float[Array, \"b d\"], w: Float[Array, \"d k\"]):\n    y = proj(x, w)\n    return y\n";
+
+fn messages(diags: &[Value]) -> Vec<String> {
+    diags.iter().map(|d| d["message"].as_str().unwrap().to_string()).collect()
+}
+
+/// The diagnostics of MAIN on a fresh server with `helper` on disk.
+fn fresh_main(helper: &str) -> Vec<String> {
+    let (_dir, root) = project(&[("helper.py", helper)]);
+    let mut c = Client::start(&root, json!({}));
+    messages(&c.open(&file_uri(&root.join("main.py")), MAIN))
+}
+
+#[test]
+fn an_unsaved_helper_buffer_is_what_imports_read() {
+    let (_dir, root) = project(&[("helper.py", HELPER_OK), ("main.py", MAIN)]);
+    let (main, helper) = (file_uri(&root.join("main.py")), file_uri(&root.join("helper.py")));
+    let (ok, bad) = (fresh_main(HELPER_OK), fresh_main(HELPER_BAD));
+    assert!(ok.is_empty() && !bad.is_empty());
+    let mut c = Client::start(&root, json!({}));
+    assert_eq!(messages(&c.open(&main, MAIN)), ok);
+    c.open(&helper, HELPER_OK);
+
+    // Each edit counts, not only the first one after the disk state.
+    for (version, text, want) in [(2, HELPER_BAD, &bad), (3, HELPER_OK, &ok), (4, HELPER_BAD, &bad)] {
+        let from = c.published();
+        c.change(&helper, version, text);
+        assert_eq!(&messages(&c.wait_diagnostics(&main, from)), want, "version {version}");
+    }
+
+    // The closed buffer leaves the disk text.
+    let from = c.published();
+    c.notify("textDocument/didClose", json!({"textDocument": {"uri": helper}}));
+    assert_eq!(messages(&c.wait_diagnostics(&main, from)), ok);
+}
+
+#[test]
+fn a_helper_opened_with_unsaved_text_is_read_at_once() {
+    let (_dir, root) = project(&[("helper.py", HELPER_OK), ("main.py", MAIN)]);
+    let (main, helper) = (file_uri(&root.join("main.py")), file_uri(&root.join("helper.py")));
+    let mut c = Client::start(&root, json!({}));
+    assert!(c.open(&main, MAIN).is_empty());
+    let from = c.published();
+    c.open(&helper, HELPER_BAD);
+    assert_eq!(messages(&c.wait_diagnostics(&main, from)), fresh_main(HELPER_BAD));
+}
+
+#[test]
+fn a_helper_buffer_equal_to_the_disk_does_not_republish() {
+    let (_dir, root) = project(&[("helper.py", HELPER_OK), ("main.py", MAIN)]);
+    let (main, helper) = (file_uri(&root.join("main.py")), file_uri(&root.join("helper.py")));
+    let mut c = Client::start(&root, json!({}));
+    c.open(&main, MAIN);
+    c.open(&helper, HELPER_OK);
+    c.notify("textDocument/didClose", json!({"textDocument": {"uri": helper}}));
+    let from = c.published();
+    c.settle(500);
+    let republished = c.notes.iter().filter(|n| n["method"] == "textDocument/publishDiagnostics").skip(from).any(|n| n["params"]["uri"] == main.as_str());
+    assert!(!republished);
+}

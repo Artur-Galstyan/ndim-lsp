@@ -146,6 +146,8 @@ pub struct CachedAnalysis {
     pub lines: Arc<LineIndex>,
     /// The top-level statements this analysis left to the next one to reuse.
     pub memo: Arc<UnitMemo>,
+    /// The file texts that imports read, per path.
+    pub reads: Arc<Reads>,
     pub version: i32,
     pub rev: u64,
 }
@@ -176,6 +178,13 @@ impl Lines<'_> {
         self.index.offset(self.text, *position, self.enc)
     }
 }
+
+/// The texts of the open documents that an analysis reads imports from.
+pub type Buffers = HashMap<PathBuf, Arc<str>>;
+
+/// Each file an analysis read, with the editor text it got. `None`: it read
+/// the disk.
+pub type Reads = HashMap<PathBuf, Option<Arc<str>>>;
 
 /// One text snapshot of an open document. `rev` is unique per text write, so
 /// results keyed on it can never belong to a closed or replaced text.
@@ -367,8 +376,12 @@ impl LanguageServer for Backend {
         if let Some(state) = self.documents.write().unwrap().get_mut(&doc.uri) {
             state.pace = Pace::default();
         }
+        let differs = differs_from_disk(&doc.uri, &doc.text);
         if let Some(rev) = self.set_document(&doc.uri, doc.text, doc.version, Duration::ZERO, false)
         {
+            if differs {
+                self.buffer_changed(&doc.uri);
+            }
             self.spawn_publish(doc.uri, rev);
         }
         self.client
@@ -382,9 +395,13 @@ impl LanguageServer for Backend {
         // newest text always wins. The analysis runs in its own task after
         // the debounce, so this handler does not hold a concurrency slot.
         match self.change_document(&uri, params.text_document.version, &params.content_changes) {
-            Change::Stored(rev) => self.spawn_publish(uri, rev),
+            Change::Stored(rev) => {
+                self.buffer_changed(&uri);
+                self.spawn_publish(uri, rev);
+            }
             Change::Stale => {}
             Change::Unusable(rev) => {
+                self.buffer_changed(&uri);
                 self.spawn_publish(uri, rev);
                 self.client
                     .log_message(
@@ -415,7 +432,10 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         // Evict all per-document state so long-lived sessions don't leak.
         // An analysis still running finds no matching text and drops itself.
-        self.documents.write().unwrap().remove(uri);
+        let closed = self.documents.write().unwrap().remove(uri);
+        if closed.is_some_and(|s| s.doc.in_sync && differs_from_disk(uri, &s.doc.text)) {
+            self.buffer_changed(uri);
+        }
         // Clear any diagnostics the client may still be showing.
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
@@ -612,6 +632,52 @@ impl Backend {
         if dropped || running {
             self.reanalyze_open_documents();
         }
+    }
+
+    /// The text that imports of `uri` read changed: its editor buffer was
+    /// opened, changed, or closed. The cache entries that read the file are
+    /// dropped, and the documents that may depend on it are analyzed again
+    /// after their debounce: all of them if the cache dropped an entry (the
+    /// cache does not record which document used which file), else the ones
+    /// whose last analysis read the file. Their cost is kept: the run costs
+    /// what an edit of the helper costs them, and sets their debounce.
+    fn buffer_changed(&self, uri: &Url) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let all = self.resolution_cache.buffer_changed(&path);
+        let mut revs = Vec::new();
+        let mut docs = self.documents.write().unwrap();
+        for (other, state) in docs.iter_mut() {
+            let reads = state.committed.as_ref().is_some_and(|c| c.reads.contains_key(&path));
+            if other == uri || !(all || reads) {
+                continue;
+            }
+            let debounce = state.pace.debounce();
+            state.doc.rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+            state.doc.ready_at = Instant::now() + debounce;
+            state.doc.debounce = debounce;
+            revs.push((other.clone(), state.doc.rev));
+        }
+        drop(docs);
+        if revs.is_empty() {
+            return;
+        }
+        for (other, rev) in revs {
+            self.spawn_publish(other, rev);
+        }
+        self.refresh_inlay_hints();
+    }
+
+    /// The texts of the open documents, for the imports of one analysis.
+    fn buffers(&self) -> Buffers {
+        self.documents
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.doc.in_sync)
+            .filter_map(|(uri, s)| Some((uri.to_file_path().ok()?, s.doc.text.clone())))
+            .collect()
     }
 
     /// Ask the client for the settings. The reply is dropped if a notification
@@ -861,8 +927,9 @@ impl Backend {
         let text = doc.text.clone();
         let base = self.documents.read().unwrap().get(&uri).and_then(|s| s.committed.clone());
         let had_base = base.is_some();
+        let buffers = self.buffers();
         let run = tokio::task::spawn_blocking(move || {
-            compute_analysis(&text, base.as_ref(), &roots, &resolution_cache)
+            compute_analysis(&text, base.as_ref(), &roots, &resolution_cache, &buffers)
         })
         .await;
 
@@ -915,6 +982,7 @@ impl Backend {
                     tree: Arc::new(run.tree),
                     lines: Arc::new(run.lines),
                     memo: Arc::new(run.memo),
+                    reads: Arc::new(run.reads),
                     version: doc.version,
                     rev: doc.rev,
                 })
@@ -935,8 +1003,10 @@ impl Backend {
 
         // Cache only if this is still the newest text; a stale entry would
         // never be read and a closed document must not be re-populated.
-        if let Some(cached) = &result {
-            self.commit(&uri, cached);
+        if let Some(cached) = &result
+            && let Some(rev) = self.commit(&uri, cached)
+        {
+            self.spawn_publish(uri.clone(), rev);
         }
         if let Some(state) = self.documents.write().unwrap().get_mut(&uri) {
             match sample {
@@ -951,12 +1021,22 @@ impl Backend {
 
     /// Keep `cached` as the newest result for `uri`, and as the base of the
     /// next incremental parse, if its text is still the newest. A result for
-    /// old text, or for a closed document, changes no state.
-    fn commit(&self, uri: &Url, cached: &CachedAnalysis) {
+    /// old text, or for a closed document, changes no state. A result that
+    /// read a file whose editor text changed since is not kept: the document
+    /// gets a new rev after its debounce, which is returned.
+    fn commit(&self, uri: &Url, cached: &CachedAnalysis) -> Option<u64> {
         let mut docs = self.documents.write().unwrap();
-        if let Some(state) = docs.get_mut(uri).filter(|s| s.doc.rev == cached.rev) {
+        let current = reads_current(&docs, &cached.reads);
+        let state = docs.get_mut(uri).filter(|s| s.doc.rev == cached.rev)?;
+        if current {
             state.committed = Some(cached.clone());
+            return None;
         }
+        let debounce = state.pace.debounce();
+        state.doc.rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+        state.doc.ready_at = Instant::now() + debounce;
+        state.doc.debounce = debounce;
+        Some(state.doc.rev)
     }
 
     /// Publish diagnostics for `rev` in a task of its own, after the debounce.
@@ -1324,6 +1404,31 @@ fn shape_at(
         return scope.shapes.get(name).cloned();
     }
     None
+}
+
+/// Whether the text of the file of `uri` on disk is not `text`.
+fn differs_from_disk(uri: &Url, text: &str) -> bool {
+    uri.to_file_path()
+        .is_ok_and(|path| std::fs::read_to_string(path).ok().as_deref() != Some(text))
+}
+
+/// Whether each file in `reads` still gives the text that the analysis read:
+/// the same editor text, or the disk while no editor text differs from it.
+fn reads_current(docs: &HashMap<Url, DocState>, reads: &Reads) -> bool {
+    if reads.is_empty() {
+        return true;
+    }
+    let buffers: HashMap<PathBuf, &Arc<str>> = docs
+        .iter()
+        .filter(|(_, s)| s.doc.in_sync)
+        .filter_map(|(uri, s)| Some((uri.to_file_path().ok()?, &s.doc.text)))
+        .collect();
+    reads.iter().all(|(path, read)| match (read, buffers.get(path)) {
+        (Some(read), Some(now)) => Arc::ptr_eq(read, now) || read == *now,
+        (None, None) => true,
+        (Some(read), None) => std::fs::read_to_string(path).ok().as_deref() == Some(&**read),
+        (None, Some(now)) => std::fs::read_to_string(path).ok().as_deref() == Some(&***now),
+    })
 }
 
 /// Walk from the innermost scope containing `cursor_byte` outward until a
@@ -1716,6 +1821,7 @@ struct AnalysisRun {
     search_roots: usize,
     read_count: usize,
     read_bytes: usize,
+    reads: Reads,
 }
 
 /// Parse and analyze `text`. Pure CPU and file reads: call from a blocking
@@ -1725,12 +1831,13 @@ fn compute_analysis(
     base: Option<&CachedAnalysis>,
     workspace_roots: &[PathBuf],
     resolution_cache: &ResolutionCache,
+    buffers: &Buffers,
 ) -> std::result::Result<AnalysisRun, String> {
     let t_roots = Instant::now();
     let mut search_roots = workspace_roots.to_vec();
     search_roots.extend(python_site_packages_roots(workspace_roots));
     let roots_ms = t_roots.elapsed().as_millis();
-    let mut run = analyze_text(text, base, &search_roots, resolution_cache, *VERIFY)?;
+    let mut run = analyze_text(text, base, &search_roots, resolution_cache, buffers, *VERIFY)?;
     run.roots_ms = roots_ms;
     Ok(run)
 }
@@ -1743,6 +1850,7 @@ fn analyze_text(
     base: Option<&CachedAnalysis>,
     search_roots: &[PathBuf],
     resolution_cache: &ResolutionCache,
+    buffers: &Buffers,
     verify: bool,
 ) -> std::result::Result<AnalysisRun, String> {
     let verify = verify && base.is_some();
@@ -1770,8 +1878,15 @@ fn analyze_text(
 
     let read_count = AtomicUsize::new(0);
     let read_bytes = AtomicUsize::new(0);
+    let reads = Mutex::new(Reads::new());
+    // An open document gives its editor text, any other file its disk text.
     let read_file = |path: &PathBuf| {
-        let result = std::fs::read_to_string(path).ok();
+        let buffer = buffers.get(path);
+        reads.lock().unwrap().insert(path.clone(), buffer.cloned());
+        let result = match buffer {
+            Some(text) => Some(text.to_string()),
+            None => std::fs::read_to_string(path).ok(),
+        };
         if let Some(ref s) = result {
             read_count.fetch_add(1, Ordering::Relaxed);
             read_bytes.fetch_add(s.len(), Ordering::Relaxed);
@@ -1839,6 +1954,7 @@ fn analyze_text(
         search_roots: search_roots.len(),
         read_count,
         read_bytes,
+        reads: reads.into_inner().unwrap(),
     })
 }
 
@@ -2569,6 +2685,7 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
             tree: Arc::new(parser.parse(text, None).unwrap()),
             lines: Arc::new(LineIndex::new(text)),
             memo: Arc::default(),
+            reads: Arc::default(),
             version: 1,
             rev,
         }
@@ -2580,8 +2697,8 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         let old = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 4))\n    return y\n";
         let new = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 5))\n    z = y.T\n    return z\n";
         let base = cached(old, 0);
-        let inc = compute_analysis(new, Some(&base), &[], &cache).unwrap();
-        let fresh = compute_analysis(new, None, &[], &cache).unwrap();
+        let inc = compute_analysis(new, Some(&base), &[], &cache, &Buffers::new()).unwrap();
+        let fresh = compute_analysis(new, None, &[], &cache, &Buffers::new()).unwrap();
         assert_eq!(inc.analysis, fresh.analysis);
         assert!(first_tree_difference(&inc.tree, &fresh.tree).is_none());
         assert!(inc.mismatch.is_none());
@@ -2599,8 +2716,8 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         let mut hits = Vec::new();
         for text in texts {
             // Verified: a difference from the fresh analysis panics.
-            let run = analyze_text(text, base.as_ref(), &[], &cache, true).unwrap();
-            let fresh = compute_analysis(text, None, &[], &cache).unwrap();
+            let run = analyze_text(text, base.as_ref(), &[], &cache, &Buffers::new(), true).unwrap();
+            let fresh = compute_analysis(text, None, &[], &cache, &Buffers::new()).unwrap();
             assert_eq!(run.analysis, fresh.analysis);
             assert!(run.mismatch.is_none());
             hits.push(run.memo.stats().syntax_hits);
@@ -2610,6 +2727,7 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
                 tree: Arc::new(run.tree),
                 lines: Arc::new(run.lines),
                 memo: Arc::new(run.memo),
+                reads: Arc::new(run.reads),
                 version: 1,
                 rev: 0,
             });
