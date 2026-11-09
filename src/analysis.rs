@@ -3136,7 +3136,10 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         let args = match known {
             KnownFunction::Clamp => without_scalar_bounds(args, args_node, true, ctx),
             KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
-                with_scalar_endpoints(args, args_node, ctx)
+                with_scalar_operands(args, args_node, 2, &["start", "stop", "end"], ctx)
+            }
+            KnownFunction::Where => {
+                with_scalar_operands(args, args_node, 3, &["condition", "x", "y", "input", "other"], ctx)
             }
             _ => args,
         };
@@ -3238,9 +3241,15 @@ fn binary_call_shape(
     }
 }
 
-/// The `start` and `stop` of a `linspace` call, as `0` when they are
-/// provable scalars.
-fn with_scalar_endpoints(args: Vec<CallArgument>, args_node: Node, ctx: &ShapeCtx) -> Vec<CallArgument> {
+/// The first `positions` positional arguments and the `keywords` arguments
+/// of a call, as `0` when they are provable scalars.
+fn with_scalar_operands(
+    args: Vec<CallArgument>,
+    args_node: Node,
+    positions: usize,
+    keywords: &[&str],
+    ctx: &ShapeCtx,
+) -> Vec<CallArgument> {
     let mut positional = 0usize;
     args.into_iter()
         .enumerate()
@@ -3248,12 +3257,12 @@ fn with_scalar_endpoints(args: Vec<CallArgument>, args_node: Node, ctx: &ShapeCt
             let value_node = match &arg {
                 CallArgument::Positional { .. } => {
                     positional += 1;
-                    if positional > 2 {
+                    if positional > positions {
                         return arg;
                     }
                     args_node.named_child(i as u32)
                 }
-                CallArgument::Keyword { name, .. } if matches!(name.as_str(), "start" | "stop" | "end") => {
+                CallArgument::Keyword { name, .. } if keywords.contains(&name.as_str()) => {
                     args_node.named_child(i as u32).and_then(|n| n.child_by_field_name("value"))
                 }
                 CallArgument::Keyword { .. } => return arg,

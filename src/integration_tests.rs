@@ -4636,6 +4636,30 @@ mod constructor_coverage_integration_tests {
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
     }
 
+    /// `where` reports two operands that do not broadcast, with the kind of
+    /// a binary operator, also when the condition has no shape.
+    #[test]
+    fn test_where_operands_must_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("jnp.where(c > 0, a, b)", None, Some(ShapeErrorKind::Mismatch)),
+            ("jnp.where(c > 0, a, n)", None, Some(ShapeErrorKind::Approximation)),
+            ("torch.where(c, a, a)", Some(vec!["3"]), None),
+            ("np.where(c, a, -np.inf)", Some(vec!["3"]), None),
+            ("np.where(c)", None, None),
+        ];
+        for (call, expected, kind) in cases {
+            let code = format!(
+                "import numpy as np\nimport torch\nimport jax.numpy as jnp\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"5\"], n: Float[Array, \"n\"], c: Bool[Array, \"3\"]):\n    y = {call}\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(analysis.errors.iter().map(|e| e.kind).collect::<Vec<_>>(), kind.into_iter().collect::<Vec<_>>(), "{call}");
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
+
     /// Array endpoints add their broadcast shape after `num`; a provable
     /// scalar expression adds nothing; an unknown endpoint gives no shape.
     #[test]

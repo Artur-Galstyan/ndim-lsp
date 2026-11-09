@@ -3926,22 +3926,36 @@ fn apply_known_numpy_pad(
     ))
 }
 
+/// `where(condition, x, y)` broadcasts its three operands. Two operands with
+/// shapes that do not broadcast are a conflict even when the third has no
+/// shape. One argument gives a tuple of index arrays.
 fn apply_known_where(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let values = positional_arg_values(args);
-    if values.len() < 3 {
+    let operands = [
+        nth_positional_or_keyword(args, 0, &["condition"]),
+        nth_positional_or_keyword(args, 1, &["x", "input"]),
+        nth_positional_or_keyword(args, 2, &["y", "other"]),
+    ];
+    if operands[1].is_none() || operands[2].is_none() {
         return Ok(None);
     }
+    let known: Vec<Option<Vec<String>>> = operands
+        .into_iter()
+        .map(|value| {
+            let value = value?.trim();
+            if value.parse::<f64>().is_ok() {
+                return Some(Vec::new());
+            }
+            shapes.shape(value).cloned()
+        })
+        .collect();
     let mut output = Vec::new();
-    for value in values.iter().take(3) {
-        let Some(shape) = shapes.shape(value) else {
-            return Ok(None);
-        };
+    for shape in known.iter().flatten() {
         output = broadcast_two_shapes(&output, shape)?;
     }
-    Ok(Some(output))
+    Ok(known.iter().all(Option::is_some).then_some(output))
 }
 
 /// `torch.max(a, b)` broadcasts elementwise. A `dim` returns a

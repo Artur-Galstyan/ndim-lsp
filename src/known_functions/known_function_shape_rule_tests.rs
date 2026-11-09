@@ -570,6 +570,12 @@ fn test_where_cases() {
     check(KnownFunction::Where, None, &[
         ("where_broadcasts_three_inputs", vec![pos("cond"), pos("x"), pos("y")], &[("cond", &["batch", "1"]), ("x", &["batch", "features"]), ("y", &["1", "features"])], Ok(Some(&["batch", "features"]))),
         ("where_broadcast_mismatch_errors", vec![pos("cond"), pos("x"), pos("y")], &[("cond", &["batch", "1"]), ("x", &["batch", "x"]), ("y", &["batch", "y"])], Err(&["cannot broadcast"])),
+        ("where_mismatch_with_unknown_condition", vec![pos("cond"), pos("x"), pos("y")], &[("x", &["3"]), ("y", &["5"])], Err(&["cannot broadcast"])),
+        ("where_condition_against_one_operand", vec![pos("cond"), pos("x"), pos("y")], &[("cond", &["4"]), ("x", &["3"])], Err(&["cannot broadcast"])),
+        ("where_unknown_operand_gives_none", vec![pos("cond"), pos("x"), pos("y")], &[("cond", &["3"]), ("x", &["3"])], Ok(None)),
+        ("where_scalar_operand", vec![pos("cond"), pos("x"), pos("0.0")], &[("cond", &["n", "1"]), ("x", &["d"])], Ok(Some(&["n", "d"]))),
+        ("where_keywords", vec![kw("condition", "cond"), kw("input", "x"), kw("other", "y")], &[("cond", &["3"]), ("x", &["3"]), ("y", &["5"])], Err(&["cannot broadcast"])),
+        ("where_one_argument_is_a_tuple", vec![pos("cond")], &[("cond", &["3"])], Ok(None)),
     ]);
 }
 
