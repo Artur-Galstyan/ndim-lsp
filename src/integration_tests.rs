@@ -198,6 +198,25 @@ mod analyze_layer_shapes_tests {
         assert!(analysis.layers.contains_key("layer"));
     }
 
+    /// `import a.b` binds `a`, and a splat argument can fill any parameter.
+    #[test]
+    fn test_dotted_imports_and_splat_constructor_arguments() {
+        let cases: &[(&str, &str, Option<&[&str]>)] = &[
+            ("import torch.nn\ndef f():\n    x = torch.zeros(3, 8)\n    y = torch.nn.Linear(8, 4)(x)", "y", Some(&["3", "4"])),
+            ("import torch.nn\ndef f():\n    y = torch.zeros(3, 8)", "y", Some(&["3", "8"])),
+            ("import jax.numpy\ndef f():\n    y = jax.numpy.zeros((3, 4))", "y", Some(&["3", "4"])),
+            ("import jax.numpy\ndef f():\n    a = jax.numpy.zeros((3, 4))\n    y = jax.nn.relu(a)", "y", Some(&["3", "4"])),
+            ("import jax.numpy\nimport jax.random\ndef f():\n    y = jax.numpy.zeros((3, 4))", "y", Some(&["3", "4"])),
+            ("import torch\nimport torch.nn as nn\ndef f(a):\n    x = torch.zeros(3, 8)\n    y = nn.Linear(8, *a)(x)", "y", None),
+            ("import torch\nimport torch.nn as nn\ndef f(cfg):\n    y = nn.Flatten(**cfg)(torch.zeros(2, 3, 4))", "y", None),
+        ];
+        for (code, name, expected) in cases {
+            let tree = parse(code);
+            let analysis = analyze_layer_shapes(tree.root_node(), code, &[], read, 5, None).unwrap();
+            assert_eq!(find_shape(&analysis, name), expected.map(shape).as_ref(), "{code}");
+        }
+    }
+
     #[test]
     fn test_non_layer_calls_are_ignored_in_analysis() {
         let tmp = tempfile::tempdir().unwrap();
@@ -833,7 +852,7 @@ mod resolve_call_signature_tests {
     }
 
     #[test]
-    fn edit_without_revalidate_is_not_stale() {
+    fn edit_with_an_editor_event_is_not_stale() {
         let tmp = tempfile::tempdir().unwrap();
         write_equinox_linear(&tmp, "class Linear:\n    def __init__(self, ab): pass\n");
         let roots = vec![tmp.path().to_path_buf()];
@@ -853,6 +872,8 @@ mod resolve_call_signature_tests {
             "class Linear:\n    def __init__(self, cd): pass\n",
         )
         .unwrap();
+        // Same size, maybe the same modification time: only the event tells.
+        cache.revalidate(&[tmp.path().join("equinox/nn/_linear.py")]);
         assert_eq!(resolve().signature.params, ["self", "cd"]);
     }
 
@@ -986,7 +1007,7 @@ mod resolve_target_on_disk_tests {
     }
 
     #[test]
-    fn test_module_file_wins_over_package_init_for_same_prefix() {
+    fn test_package_init_wins_over_module_file_for_same_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
         fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
@@ -1000,7 +1021,7 @@ mod resolve_target_on_disk_tests {
             Some(expected(
                 0,
                 &["foo", "bar"],
-                tmp.path().join("foo/bar.py"),
+                tmp.path().join("foo/bar/__init__.py"),
                 &["Baz"]
             ))
         );
@@ -1288,7 +1309,13 @@ mod additional_edge_case_tests {
             fn $name() {
                 let bindings = bind_call_arguments(&$sig, &[$($arg),*]);
                 let expected = HashMap::from([$(($param.to_string(), $value.to_string()),)*]);
-                assert_eq!(bindings, expected);
+                assert_eq!(bindings, Some(expected));
+            }
+        };
+        ($name:ident, $sig:expr, [$($arg:expr),*], None) => {
+            #[test]
+            fn $name() {
+                assert_eq!(bind_call_arguments(&$sig, &[$($arg),*]), None);
             }
         };
     }
@@ -1348,6 +1375,26 @@ mod additional_edge_case_tests {
         [kw("x", "1"), pos("2")],
         [("x", "2")]
     );
+    bind_case!(
+        bind_star_args_takes_extra_positionals,
+        sig(None, &["x", "*args", "y"]),
+        [pos("1"), pos("2"), pos("3")],
+        [("x", "1")]
+    );
+    bind_case!(
+        bind_bare_star_makes_keyword_only,
+        sig(None, &["x", "*", "y", "**kw"]),
+        [pos("1"), pos("2"), kw("y", "3")],
+        [("x", "1"), ("y", "3")]
+    );
+    bind_case!(
+        bind_positional_only_ignores_keyword,
+        sig(None, &["x", "/", "y"]),
+        [pos("1"), pos("2"), kw("x", "3")],
+        [("x", "1"), ("y", "2")]
+    );
+    bind_case!(bind_list_splat_gives_none, sig(None, &["x", "y"]), [pos("1"), pos("*rest")], None);
+    bind_case!(bind_dict_splat_gives_none, sig(None, &["x", "y"]), [pos("**cfg")], None);
 
     macro_rules! apply_ok_case {
         ($name:ident, $input:expr, $layer:expr, $expected:expr) => {
@@ -5209,6 +5256,37 @@ def f(x: Float[Array, "batch 4"]) -> None:
             find_shape_in_scope(&analysis, "f", "y"),
             Some(&shape(&["batch", "d_out"]))
         );
+    }
+
+    /// A relative import resolves next to the document, and only with its
+    /// path. A decorated helper is found.
+    #[test]
+    fn test_cross_file_return_shape_relative_import_of_the_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = "import jax\n@jax.jit\ndef project(x: Float[Array, \"batch d_in\"]) -> Float[Array, \"batch d_out\"]:\n    pass";
+        fs::create_dir_all(tmp.path().join("pkg/sub")).unwrap();
+        fs::write(tmp.path().join("pkg/helpers.py"), helper).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cases = [
+            ("from .helpers import project", "pkg/main.py", true),
+            ("from . import helpers as h", "pkg/main.py", true),
+            ("from ..helpers import project", "pkg/sub/main.py", true),
+            ("from .helpers import project", "pkg/sub/main.py", false),
+            ("from .helpers import project", "main.py", false),
+        ];
+        for (import, document, found) in cases {
+            let call = if import.contains(" as h") { "h.project(x)" } else { "project(x)" };
+            let code = format!("{import}\n\ndef f(x: Float[Array, \"batch 4\"]) -> None:\n    y = {call}\n");
+            let tree = parse(&code);
+            let path = tmp.path().join(document);
+            let analysis = with_document(Some(&path), || {
+                analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap()
+            });
+            let expected = found.then(|| shape(&["batch", "d_out"]));
+            assert_eq!(find_shape_in_scope(&analysis, "f", "y"), expected.as_ref(), "{code} in {document}");
+            let without = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(find_shape_in_scope(&without, "f", "y"), None, "{code} without a document");
+        }
     }
 
     /// `import mylib.helpers as h` then `y = h.project(x)` — the qualified

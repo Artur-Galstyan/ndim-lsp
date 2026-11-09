@@ -52,14 +52,25 @@ pub fn extract_callable_signature(
             return Ok(None);
         };
 
+        // A bare `*` and `/` stay in the list, and a splat keeps its stars,
+        // for `bind_call_arguments`.
         let mut params = Vec::new();
         for i in 0..params_node.named_child_count() {
             let Some(child) = params_node.named_child(i as u32) else {
                 continue;
             };
-            if let Some(name) = parameter_name(child, text)? {
-                params.push(name);
-            }
+            let inner = match child.kind() {
+                "typed_parameter" => child.named_child(0).unwrap_or(child),
+                _ => child,
+            };
+            let name = match inner.kind() {
+                "keyword_separator" => Some("*".to_string()),
+                "positional_separator" => Some("/".to_string()),
+                "list_splat_pattern" => parameter_name(inner, text)?.map(|name| format!("*{name}")),
+                "dictionary_splat_pattern" => parameter_name(inner, text)?.map(|name| format!("**{name}")),
+                _ => parameter_name(child, text)?,
+            };
+            params.extend(name);
         }
 
         Ok(Some(params))
@@ -71,7 +82,7 @@ pub fn extract_callable_signature(
         name: &str,
     ) -> Result<Option<PythonCallableSignature>, String> {
         for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i as u32) else {
+            let Some(child) = node.named_child(i as u32).map(undecorated) else {
                 continue;
             };
             if child.kind() != "function_definition" {
@@ -99,7 +110,7 @@ pub fn extract_callable_signature(
         class_name: &str,
     ) -> Result<Option<PythonCallableSignature>, String> {
         for i in 0..node.named_child_count() {
-            let Some(class_node) = node.named_child(i as u32) else {
+            let Some(class_node) = node.named_child(i as u32).map(undecorated) else {
                 continue;
             };
             if class_node.kind() != "class_definition" {
@@ -141,6 +152,14 @@ pub fn extract_callable_signature(
         PythonSymbol::Class { name } => class_init_signature(node, text, name),
         PythonSymbol::Function { name } => top_level_function_signature(node, text, name),
         PythonSymbol::Import { .. } => Ok(None),
+    }
+}
+
+/// The class or function of a decorated definition, or `node` itself.
+pub(crate) fn undecorated(node: Node) -> Node {
+    match node.kind() {
+        "decorated_definition" => node.child_by_field_name("definition").unwrap_or(node),
+        _ => node,
     }
 }
 
@@ -565,11 +584,12 @@ fn global_statements<'t>(node: Node<'t>, text: &str) -> Vec<Node<'t>> {
         .collect()
 }
 
-/// Whether the module binds `name` in one place only, with no `global`
-/// statement for it and no wildcard import after the binding. A class or a
-/// function body binds names of its own. With `wraps`, a rebinding that
-/// keeps the signature (`keeps_signature`) is not a second place.
-fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, String> {
+/// The places where module code binds `name`, the wildcard imports, and with
+/// `wraps` the rebindings `name = T(name)` apart from the places. A class or a
+/// function body binds names of its own.
+type Bindings = (Vec<usize>, Vec<usize>, Vec<(usize, SelfWrap)>);
+
+fn module_bindings(root: Node, text: &str, name: &str, wraps: bool) -> Result<Bindings, String> {
     let mentions = |node: Node| {
         let mut names = HashSet::new();
         insert_identifiers(node, text, &mut names);
@@ -578,6 +598,8 @@ fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, S
     let mut bindings = Vec::new();
     let mut wildcards = Vec::new();
     let mut self_wraps = Vec::new();
+    // `import a.b` and `import a.c` both bind `a` to the package `a`.
+    let mut package_at = None;
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         let bound = match n.kind() {
@@ -593,9 +615,13 @@ fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, S
                 if n.named_children(&mut cursor).any(|c| c.kind() == "wildcard_import") {
                     wildcards.push(n.start_byte());
                 } else if text[n.byte_range()].contains(name)
-                    && build_import_map(n, text)?.contains_key(name)
+                    && let Some(path) = build_import_map(n, text)?.remove(name)
                 {
-                    bindings.push(n.start_byte());
+                    if path.dots == 0 && path.module.is_empty() && path.name == name {
+                        package_at = package_at.max(Some(n.start_byte()));
+                    } else {
+                        bindings.push(n.start_byte());
+                    }
                 }
                 continue;
             }
@@ -626,6 +652,29 @@ fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, S
         let mut cursor = n.walk();
         stack.extend(n.named_children(&mut cursor));
     }
+    bindings.extend(package_at);
+    Ok((bindings, wildcards, self_wraps))
+}
+
+/// Whether the module binds `name` anywhere, or names it in a `global`
+/// statement. Wildcard imports are not read.
+pub(crate) fn binds_name(root: Node, text: &str, name: &str) -> Result<bool, String> {
+    if !module_bindings(root, text, name, false)?.0.is_empty() {
+        return Ok(true);
+    }
+    let mut globals = HashSet::new();
+    if text.contains("global") {
+        collect_global_names(root, text, &mut globals);
+    }
+    Ok(globals.contains(name))
+}
+
+/// Whether the module binds `name` in one place only, with no `global`
+/// statement for it and no wildcard import after the binding. With `wraps`,
+/// a rebinding that keeps the signature (`keeps_signature`) is not a second
+/// place.
+fn bound_once(root: Node, text: &str, name: &str, wraps: bool) -> Result<bool, String> {
+    let (bindings, wildcards, self_wraps) = module_bindings(root, text, name, wraps)?;
     let [binding] = bindings[..] else {
         return Ok(false);
     };
@@ -654,7 +703,9 @@ pub fn find_top_level_symbol(
 ) -> Result<Option<PythonSymbol>, String> {
     const QUERY_STRING: &str = r#"
         (module (class_definition name: (_) @cls_def))
+        (module (decorated_definition definition: (class_definition name: (_) @cls_def)))
         (module (function_definition name: (_) @fn_def))
+        (module (decorated_definition definition: (function_definition name: (_) @fn_def)))
         (module (import_statement) @import)
         (module (import_from_statement) @import)
     "#;
@@ -678,48 +729,25 @@ pub fn find_top_level_symbol(
     let mut matches = cursor.matches(query, node, text.as_bytes());
     let mut found = None;
 
+    // Decorators are ignored, the same as for a function of the open file.
     while let Some(match_) = matches.next() {
-        match match_.pattern_index {
-            0 => {
-                for capture in match_.captures {
-                    if capture.index == class_idx {
-                        let class_name = node_text(capture.node, text)?;
-
-                        if class_name == name {
-                            found = Some(PythonSymbol::Class {
-                                name: class_name.to_string(),
-                            });
-                        }
-                    }
+        for capture in match_.captures {
+            if capture.index == class_idx || capture.index == fn_idx {
+                if node_text(capture.node, text)? == name {
+                    found = Some(if capture.index == class_idx {
+                        PythonSymbol::Class { name: name.to_string() }
+                    } else {
+                        PythonSymbol::Function { name: name.to_string() }
+                    });
                 }
+            } else if capture.index == import_idx
+                && let Some(path) = build_import_map(capture.node, text)?.remove(name)
+            {
+                found = Some(PythonSymbol::Import {
+                    name: name.to_string(),
+                    path,
+                });
             }
-            1 => {
-                for capture in match_.captures {
-                    if capture.index == fn_idx {
-                        let fn_name = node_text(capture.node, text)?;
-
-                        if fn_name == name {
-                            found = Some(PythonSymbol::Function {
-                                name: fn_name.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            2 | 3 => {
-                for capture in match_.captures {
-                    if capture.index == import_idx {
-                        let import_map = build_import_map(capture.node, text)?;
-                        if let Some(path) = import_map.get(name) {
-                            found = Some(PythonSymbol::Import {
-                                name: name.to_string(),
-                                path: path.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -791,18 +819,17 @@ pub(crate) fn visit_imports<'t>(
             for capture in match_.captures {
                 if capture.index == import_statement_idx {
                     match capture.node.kind() {
+                        // `import a.b.c` binds `a` to the top package.
                         "dotted_name" => {
                             let dotted_name = node_text(capture.node, text)?;
-                            let (module, name, first) =
-                                plain_import_dotted_name_to_vec(&dotted_name)
-                                    .map_err(|e| e.to_string())?;
+                            let (_, _, first) = plain_import_dotted_name_to_vec(&dotted_name)?;
                             found(
                                 capture.node,
-                                first.to_string(),
+                                first.clone(),
                                 ImportPath {
                                     dots: 0,
-                                    module,
-                                    name: name.to_string(),
+                                    module: Vec::new(),
+                                    name: first,
                                 },
                             );
                         }
@@ -1961,7 +1988,7 @@ mod call_argument_tests {
             },
         ];
 
-        let bindings = bind_call_arguments(&signature, &args);
+        let bindings = bind_call_arguments(&signature, &args).unwrap();
 
         assert_eq!(bindings.get("x"), Some(&"arr".to_string()));
         assert_eq!(bindings.get("keepdims"), Some(&"True".to_string()));
@@ -1981,7 +2008,7 @@ mod call_argument_tests {
             },
         ];
 
-        let bindings = bind_call_arguments(&signature, &args);
+        let bindings = bind_call_arguments(&signature, &args).unwrap();
 
         assert_eq!(bindings.get("in_features"), Some(&"3".to_string()));
         assert_eq!(bindings.get("out_features"), Some(&"5".to_string()));
@@ -2004,7 +2031,7 @@ mod call_argument_tests {
             },
         ];
 
-        let bindings = bind_call_arguments(&signature, &args);
+        let bindings = bind_call_arguments(&signature, &args).unwrap();
 
         assert_eq!(bindings.get("axis"), Some(&"1".to_string()));
     }
@@ -2021,7 +2048,7 @@ mod call_argument_tests {
             },
         ];
 
-        let bindings = bind_call_arguments(&signature, &args);
+        let bindings = bind_call_arguments(&signature, &args).unwrap();
 
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings.get("x"), Some(&"arr".to_string()));
@@ -2099,7 +2126,22 @@ mod extract_callable_signature_tests {
         )
         .unwrap();
 
-        assert_eq!(found, Some(signature(None, "f", &["x", "args", "kwargs"])));
+        assert_eq!(found, Some(signature(None, "f", &["x", "*args", "**kwargs"])));
+    }
+
+    #[test]
+    fn test_extracts_parameter_kinds() {
+        let cases = [
+            ("def f(a, /, b, *, c, d: int = 1): pass", vec!["a", "/", "b", "*", "c", "d"]),
+            ("def f(*args: int, k, **kw: str): pass", vec!["*args", "k", "**kw"]),
+            ("@jax.jit\ndef f(x): pass", vec!["x"]),
+        ];
+        for (code, params) in cases {
+            let tree = parse(code);
+            let function = PythonSymbol::Function { name: "f".to_string() };
+            let found = extract_callable_signature(tree.root_node(), code, &function).unwrap();
+            assert_eq!(found, Some(signature(None, "f", &params)), "{code}");
+        }
     }
 
     #[test]
@@ -2160,7 +2202,7 @@ mod extract_callable_signature_tests {
 
         assert_eq!(
             found,
-            Some(signature(None, "f", &["x", "axis", "keepdims"]))
+            Some(signature(None, "f", &["x", "*", "axis", "keepdims"]))
         );
     }
 
@@ -3156,6 +3198,24 @@ mod find_top_level_symbol_tests {
     }
 
     #[test]
+    fn test_finds_decorated_and_package_bindings() {
+        let cases = [
+            ("@jax.jit\ndef f(x): pass", "f", Some(function("f"))),
+            ("@a\n@b(1)\nclass C: pass", "C", Some(class("C"))),
+            ("@jax.jit\ndef f(x): pass\ndef f(x): pass", "f", None),
+            ("import a.b\nimport a.c", "a", Some(import("a", ip(0, &[], "a")))),
+            ("import a\nimport a.b", "a", Some(import("a", ip(0, &[], "a")))),
+            ("import a.b\nfrom x import a", "a", None),
+            ("import a.b\na = 1", "a", None),
+        ];
+        for (code, name, expected) in cases {
+            let tree = parse(code);
+            let found = find_top_level_symbol(tree.root_node(), code, name).unwrap();
+            assert_eq!(found, expected, "{code}");
+        }
+    }
+
+    #[test]
     fn test_import_after_a_definition_of_the_name_gives_no_symbol() {
         let code = "class Linear: pass\nfrom foo import Linear";
         let tree = parse(code);
@@ -3199,7 +3259,7 @@ mod import_map_tests {
         let code = "import jax.numpy";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("jax"), Some(&ip(0, &["jax"], "numpy")));
+        assert_eq!(map.get("jax"), Some(&ip(0, &[], "jax")));
     }
 
     #[test]
@@ -3395,7 +3455,7 @@ from ..core import Base
         let code = "import a.b.c.d";
         let tree = parse(code);
         let map = build_import_map(tree.root_node(), code).unwrap();
-        assert_eq!(map.get("a"), Some(&ip(0, &["a", "b", "c"], "d")));
+        assert_eq!(map.get("a"), Some(&ip(0, &[], "a")));
     }
 
     #[test]

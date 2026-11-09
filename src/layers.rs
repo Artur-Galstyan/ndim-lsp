@@ -922,7 +922,9 @@ fn try_catalog_signature(
         return Ok(None);
     };
     let arguments = extract_call_arguments(args_node, text)?;
-    let bindings = bind_call_arguments(&signature, &arguments);
+    let Some(bindings) = bind_call_arguments(&signature, &arguments) else {
+        return Ok(None);
+    };
 
     let class_name = signature.owner.clone().unwrap_or_default();
     let module_parts: Vec<String> = target.parts[..target.parts.len() - 1].to_vec();

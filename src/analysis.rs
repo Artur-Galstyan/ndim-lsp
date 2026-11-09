@@ -65,7 +65,8 @@ where
     if let Some(cache) = cache {
         cache.revalidate(&[]);
     }
-    analyze_tree(node, text, search_roots, &read_file, max_depth, cache)
+    let pre = PrePass::whole_tree(node, text, search_roots, &read_file, max_depth, cache)?;
+    finish_analysis(node, text, search_roots, &read_file, max_depth, cache, pre, None)
         .map(LayerShapeAnalysis::without_free_marks)
 }
 
@@ -99,7 +100,8 @@ pub(crate) fn too_deep(node: Node) -> bool {
 }
 
 /// `analyze_layer_shapes` without the check of the cache against the disk,
-/// for a nested analysis that runs inside one (see `modules`).
+/// for a nested analysis of another file that runs inside one (see
+/// `modules`). The relative imports of the document do not apply to it.
 fn analyze_tree<F>(
     node: Node,
     text: &str,
@@ -111,8 +113,10 @@ fn analyze_tree<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
-    let pre = PrePass::whole_tree(node, text, search_roots, read_file, max_depth, cache)?;
-    finish_analysis(node, text, search_roots, read_file, max_depth, cache, pre, None)
+    crate::resolution::with_document(None, || {
+        let pre = PrePass::whole_tree(node, text, search_roots, read_file, max_depth, cache)?;
+        finish_analysis(node, text, search_roots, read_file, max_depth, cache, pre, None)
+    })
 }
 
 /// Same result as `analyze_layer_shapes`, with the pre-passes taken from

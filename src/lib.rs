@@ -18,7 +18,7 @@ mod jax_compat_tests;
 
 pub use analysis::{analyze_layer_shapes, analyze_layer_shapes_with_memo};
 pub use incremental::{UnitMemo, first_analysis_difference, first_tree_difference, reparse};
-pub use resolution::{ResolutionCache, clear_resolution_cache, new_resolution_cache};
+pub use resolution::{ResolutionCache, clear_resolution_cache, new_resolution_cache, with_document};
 pub use types::{
     FunctionShapeScope, LayerShapeAnalysis, ShapeError, ShapeErrorKind, ShapeFix, scope_for_byte,
 };
