@@ -2043,7 +2043,7 @@ fn resolve_shape_index(dim: &str, shapes: &dyn ShapeLookup) -> Option<String> {
     let resolved = if idx >= 0 {
         shape.get(idx as usize)?
     } else {
-        let from_end = (-idx) as usize;
+        let from_end = idx.unsigned_abs();
         shape.get(shape.len().checked_sub(from_end)?)?
     };
     Some(resolved.clone())
