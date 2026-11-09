@@ -4748,7 +4748,7 @@ mod torch_varargs_size_tests {
         assert_eq!(numeric("jnp.ones((2, 3), jnp.float32)"), dims(&["2", "3"]));
         assert_eq!(numeric("np.empty((3, 4), float)"), dims(&["3", "4"]));
         assert_eq!(numeric("np.zeros(4, float)"), dims(&["4"]));
-        assert_eq!(numeric("jnp.zeros(B)"), dims(&["B"]));
+        assert_eq!(numeric("jnp.zeros(B)"), None);
         assert_eq!(numeric("np.full((2, 3), 1.5)"), dims(&["2", "3"]));
     }
 }
@@ -6951,13 +6951,14 @@ class LSTMEncoder(eqx.Module):
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "step_h"), Some(&shape(&["hidden"])));
+        // `eqx.nn.LSTMCell` gives the tuple `(h, c)`, so `step_h`, `h_new`,
+        // and `hs`, which the scan builds from `h_new`, are no arrays. The
+        // final carry keeps the shape of the init carry.
+        assert_eq!(find_shape(&analysis, "step_h"), None);
         assert_eq!(find_shape(&analysis, "carry_final"), None);
         assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "c_final"), Some(&shape(&["hidden"])));
-        // `hs`: encoded's leading "seq" axis prepended to the body's
-        // per-step `h_new` output.
-        assert_eq!(find_shape(&analysis, "hs"), Some(&shape(&["seq", "hidden"])));
+        assert_eq!(find_shape(&analysis, "hs"), None);
         // Seeded carry destructuring inside the nested `body` now resolves.
         assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["hidden"])));
     }
@@ -7900,24 +7901,22 @@ mod multihead_attention_tests {
     }
 
     #[test]
-    fn test_multihead_attention_single_lhs_binds_primary_output() {
-        // `out = self.attn(x, x, x)` (no tuple unpacking) previously bound
-        // nothing (`apply_layer_application`'s `MultiheadAttention` arm
-        // always returns `Ok(None)`, since the real return is a 2-tuple).
-        // Single-assignment call sites now bind the primary output — the
-        // query's shape, same rule as `attn_out` in the tuple-LHS case.
+    fn test_multihead_attention_single_lhs_binds_nothing() {
+        // `out = self.attn(x, x, x)` (no tuple unpacking) binds the 2-tuple
+        // `(output, weights)` of torch, so `out` has no shape.
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, x: Float[Array, \"seq 512\"]):\n        out = self.attn(x, x, x)";
         let analysis = analyze(code);
 
+        // torch gives a tuple `(output, weights)`: `out` is no array.
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "512"])));
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 
     #[test]
-    fn test_multihead_attention_single_lhs_cross_attention_uses_query_shape() {
+    fn test_multihead_attention_first_element_cross_attention_uses_query_shape() {
         // Query and key/value have different sequence lengths — the primary
-        // output still follows the query's shape, not the key/value's.
-        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out = self.attn(q, kv, kv)";
+        // output (`[0]`) still follows the query's shape, not the key/value's.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out = self.attn(q, kv, kv)[0]";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
@@ -7925,44 +7924,38 @@ mod multihead_attention_tests {
     }
 
     #[test]
-    fn test_multihead_attention_vmap_single_lhs_binds_primary_output() {
-        // `out = jax.vmap(self.attn)(q, k, v)` — batched MHA applied via
-        // inline vmap with a single (non-tuple) LHS. Previously bound
-        // nothing: `apply_inline_vmap_layer`'s layer-application path
-        // returned `Ok(None)` for MultiheadAttention, same underlying cause
-        // as the direct-call case fixed above. The batch axis peeled by
-        // vmap must be restored on the query's shape.
+    fn test_multihead_attention_vmap_single_lhs_binds_nothing() {
+        // `out = jax.vmap(self.attn)(q, k, v)` — a torch MHA gives a tuple,
+        // so `out` has no shape.
         let code = "import torch.nn as nn\nimport jax\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"batch seq 512\"], k: Float[Array, \"batch seq 512\"], v: Float[Array, \"batch seq 512\"]):\n        out = jax.vmap(self.attn)(q, k, v)";
         let analysis = analyze(code);
 
+        // torch gives a tuple `(output, weights)`: `out` is no array.
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(
-            find_shape(&analysis, "out"),
-            Some(&shape(&["batch", "seq", "512"]))
-        );
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 
     #[test]
-    fn test_lstm_single_lhs_binds_primary_output() {
-        // `out = self.lstm(x)` (no tuple unpacking): `apply_layer_application`'s
-        // `LayerKind::Rnn` arm already approximates the real `(output,
-        // final_state)` tuple return as just the primary output tensor
-        // (last dim replaced by `hidden_size`) — regression-covered here
-        // alongside the MultiheadAttention fix above.
-        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)";
+    fn test_lstm_single_lhs_binds_nothing() {
+        // `out = self.lstm(x)` (no tuple unpacking) binds the tuple
+        // `(output, final_state)`; `self.lstm(x)[0]` is the output.
+        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)\n        first = self.lstm(x)[0]";
         let analysis = analyze(code);
 
+        // torch gives a tuple `(output, (h_n, c_n))`: `out` is no array.
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "out"), None);
+        assert_eq!(find_shape(&analysis, "first"), Some(&shape(&["seq", "20"])));
     }
 
     #[test]
-    fn test_gru_single_lhs_binds_primary_output() {
+    fn test_gru_single_lhs_binds_nothing() {
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.gru(x)";
         let analysis = analyze(code);
 
+        // torch gives a tuple `(output, h_n)`: `out` is no array.
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 }
 
@@ -16126,7 +16119,8 @@ mod symbolic_slice_tests {
 
     #[test]
     fn a_plain_size_argument_keeps_its_rank() {
-        y_is("jnp.zeros(k)", &["k"]);
+        // `k` is a parameter without an annotation: it may hold a tuple.
+        assert_eq!(y("jnp.zeros(k)"), None);
         y_is("jnp.zeros(5)", &["5"]);
         y_is("jnp.zeros((min(k, 2), 2))", &["min(k, 2)", "2"]);
         y_is("jnp.zeros((k, 2))", &["k", "2"]);

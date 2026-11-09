@@ -1587,7 +1587,11 @@ fn shape_of_unary(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 /// negative step on a torch tensor, which torch refuses.
 fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let value_node = node.child_by_field_name("value")?;
-    let input_shape = shape_of_expression(value_node, ctx)?;
+    let input_shape = shape_of_expression(value_node, ctx);
+    if let Some(element) = tuple_layer_element(node, value_node, ctx) {
+        return element;
+    }
+    let input_shape = input_shape?;
     let rank = input_shape.len();
 
     // Index nodes are every named child except the value.
@@ -2717,6 +2721,7 @@ fn shape_of_known_method(
     } else {
         args
     };
+    let args = with_size_names(&known, true, args, args_node, scope_idx, ctx)?;
     let result = apply_method_call_for_backend(&known, receiver, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
     let shape = ctx.check(result, variable, args_node.range())??;
     Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
@@ -2810,6 +2815,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let CallArgument::Positional { value: query } = args.first()?.clone() else {
                     return None;
                 };
+                if layer_returns_tuple(&layer) {
+                    return None;
+                }
                 return ctx.resolve_shape(&query, scope_idx);
             }
 
@@ -2824,7 +2832,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 kind: layer,
                 range: args_node.range(),
             };
-            let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+            let result = apply_layer_value(&application, &ctx.scope_shapes(scope_idx));
             return ctx.check(result, "", args_node.range()).flatten();
         }
 
@@ -2991,7 +2999,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             kind,
             range: args_node.range(),
         };
-        let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+        let result = apply_layer_value(&application, &ctx.scope_shapes(scope_idx));
         ctx.applications.push(application.clone());
         match result {
             Ok(Some(output)) => return Some(output),
@@ -3089,7 +3097,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
     // 4. vmap *recording* (e.g. `vf = jax.vmap(f)`)
     if matches!(known.as_ref(), Some(KnownFunction::Vmap))
-        && let Some(_info) = parse_vmap_call(&args, call_byte) {
+        && let Some(_info) = parse_vmap_call(&args, call_byte, is_filter_vmap(&resolved)) {
             // propagate_calls records the vmap binding, so there is no shape here.
             return None;
         }
@@ -3116,6 +3124,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         } else {
             args
         };
+        let args = with_size_names(&known, false, args, args_node, scope_idx, ctx)?;
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
             Ok(Some(shape)) => Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte())),
@@ -3493,6 +3502,66 @@ fn sequence_sum(node: Node, scope_idx: usize, ctx: &mut ShapeCtx) -> Option<(boo
     }
 }
 
+/// `args` of a call of `known` (a method call when `method`) in which the one
+/// argument that gives the whole size, such as `s` in `jnp.zeros(s)`,
+/// `x.reshape(s)`, or `torch.zeros(s)`, is written as a size when it is a
+/// plain name: `(n,)` for a name that the scope proves an integer, and the
+/// tuple or list that is the one binding of the name. `None` for any other
+/// name, whose rank is not known.
+fn with_size_names(
+    known: &KnownFunction,
+    method: bool,
+    mut args: Vec<CallArgument>,
+    at: Node,
+    scope_idx: usize,
+    ctx: &ShapeCtx,
+) -> Option<Vec<CallArgument>> {
+    let positional: Vec<usize> = (0..args.len())
+        .filter(|&i| matches!(args[i], CallArgument::Positional { .. }))
+        .collect();
+    let only = |skip: usize| (positional.len() == skip + 1).then(|| positional[skip]);
+    let positional_size = match (known, method) {
+        (KnownFunction::Zeros | KnownFunction::Ones | KnownFunction::Full | KnownFunction::Empty, false) => {
+            positional.first().copied().filter(|&i| i == 0)
+        }
+        (KnownFunction::TorchSizeConstructor, false) | (KnownFunction::NewSizeConstructor, true) => only(0),
+        (KnownFunction::Reshape | KnownFunction::BroadcastTo, false) => only(1),
+        (KnownFunction::Reshape | KnownFunction::BroadcastTo, true) => only(0),
+        _ => return Some(args),
+    };
+    let keyword = args.iter().position(|arg| {
+        matches!(arg, CallArgument::Keyword { name, .. } if matches!(name.as_str(), "shape" | "size" | "newshape"))
+    });
+    let Some(index) = keyword.or(positional_size) else {
+        return Some(args);
+    };
+    let (CallArgument::Positional { value } | CallArgument::Keyword { value, .. }) = &mut args[index];
+    let is_name = value.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && value.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !has_mark(value);
+    if !is_name {
+        return Some(args);
+    }
+    if name_is_integer(at, value, ctx, &mut Vec::new()) {
+        *value = format!("({value},)");
+        return Some(args);
+    }
+    let NameBinding::Values(values) = nearest_binding(at, value, ctx).1 else {
+        return None;
+    };
+    let [literal] = values[..] else {
+        return None;
+    };
+    let scope = ctx.links.scope_index.lookup(literal.start_byte());
+    let is_param = scope.is_some_and(|scope| ctx.scopes[scope].all_params.contains(value));
+    if is_param || !matches!(literal.kind(), "tuple" | "list") {
+        return None;
+    }
+    let source = ctx.text.get(literal.byte_range())?;
+    *value = dim_list_text(literal, scope_idx, ctx).unwrap_or_else(|| source.to_string());
+    Some(args)
+}
+
 /// Resolve one argument from its matching AST node. Expressions without a
 /// known shape pass through unchanged.
 fn resolve_call_arg(
@@ -3779,9 +3848,8 @@ struct VmapInfo {
 /// Returns `None` if:
 /// - The first positional arg is not a bare identifier (contains `.` or is
 ///   not simple).
-/// - `in_axes` or `out_axes` is present but not a literal integer (tuple,
-///   variable, `None`, etc.).
-fn parse_vmap_call(args: &[CallArgument], site: usize) -> Option<VmapInfo> {
+/// - The options are not ones that `vmap_axes` models.
+fn parse_vmap_call(args: &[CallArgument], site: usize, filter: bool) -> Option<VmapInfo> {
     // First positional arg = wrapped function name.
     let first_positional = positional_values(args).next()?.to_string();
 
@@ -3791,10 +3859,7 @@ fn parse_vmap_call(args: &[CallArgument], site: usize) -> Option<VmapInfo> {
         return None;
     }
 
-    // Read in_axes (default 0). Only scalar literal ints are honoured.
-    let in_axes = parse_int_keyword(args, "in_axes", 0)?;
-    // Read out_axes (default 0). Same rule.
-    let out_axes = parse_int_keyword(args, "out_axes", 0)?;
+    let (in_axes, out_axes) = vmap_axes(args, filter)?;
 
     Some(VmapInfo {
         wrapped: first_positional,
@@ -3804,21 +3869,41 @@ fn parse_vmap_call(args: &[CallArgument], site: usize) -> Option<VmapInfo> {
     })
 }
 
-/// Extract a keyword argument as `isize`, falling back to `default`.
-/// Returns `None` if the keyword is present but its value is not a
-/// parseable integer (e.g. tuple, variable, None).
-fn parse_int_keyword(args: &[CallArgument], name: &str, default: isize) -> Option<isize> {
-    for arg in args {
-        if let CallArgument::Keyword {
-            name: kw_name,
-            value,
-        } = arg
-            && kw_name == name
-        {
-            return value.parse::<isize>().ok();
-        }
+fn is_filter_vmap(resolved: &ResolvedTarget) -> bool {
+    resolved.parts.last().is_some_and(|name| name == "filter_vmap")
+}
+
+/// The `in_axes` and `out_axes` of the arguments of a `jax.vmap` call, or of
+/// an `equinox.filter_vmap` call (`filter`), which takes its options by
+/// keyword only. Each is one integer, 0 by default. `None` for any other
+/// value, a splat, or an option that the rule does not model (`axis_size`).
+/// `axis_name` and `spmd_axis_name` do not change a shape.
+fn vmap_axes(args: &[CallArgument], filter: bool) -> Option<(isize, isize)> {
+    let options: &[&str] = if filter {
+        &["in_axes", "out_axes", "axis_name"]
+    } else {
+        &["in_axes", "out_axes", "axis_name", "spmd_axis_name"]
+    };
+    let positional: Vec<&str> = positional_values(args).collect();
+    let modeled = args.iter().all(|arg| match arg {
+        CallArgument::Positional { value } => !value.starts_with('*'),
+        CallArgument::Keyword { name, .. } => options.contains(&name.as_str()),
+    });
+    if !modeled || (filter && positional.len() > 1) {
+        return None;
     }
-    Some(default) // keyword not present → use default
+    let axis = |at: usize, name: &str| {
+        let keyword = args.iter().find_map(|arg| match arg {
+            CallArgument::Keyword { name: given, value } if given == name => Some(value.as_str()),
+            _ => None,
+        });
+        match (positional.get(at).copied(), keyword) {
+            (Some(_), Some(_)) => None,
+            (Some(value), None) | (None, Some(value)) => value.parse::<isize>().ok(),
+            (None, None) => Some(0),
+        }
+    };
+    Some((axis(1, "in_axes")?, axis(2, "out_axes")?))
 }
 
 /// Peel the batch dim from a shape at position `axis`.
@@ -4629,7 +4714,22 @@ fn process_value_statements(statements: Vec<Node>, ctx: &mut ShapeCtx) {
         // Fix up error variable names: for return/yield/assert contexts,
         // there is no LHS variable, so set the variable name to empty.
         name_errors(ctx, errors_before, "");
+        // A call of the function may already have evaluated this statement
+        // with the same shapes (`specialize_callee_call`).
+        drop_repeated_errors(ctx.errors, errors_before);
     }
+}
+
+/// Remove each error from `from` on that equals an error before `from`.
+fn drop_repeated_errors(errors: &mut Vec<ShapeError>, from: usize) {
+    let mut kept = from;
+    for i in from..errors.len() {
+        if !errors[..from].contains(&errors[i]) {
+            errors.swap(kept, i);
+            kept += 1;
+        }
+    }
+    errors.truncate(kept);
 }
 
 /// Replay the assignments under `root` in source order. `only_scope` keeps
@@ -4751,7 +4851,7 @@ fn process_assignment_item_inner(
                 let args_node = rhs_node.child_by_field_name("arguments");
                 if let Some(an) = args_node
                     && let Ok(args) = extract_call_arguments(an, ctx.text)
-                        && let Some(info) = parse_vmap_call(&args, rhs_node.start_byte()) {
+                        && let Some(info) = parse_vmap_call(&args, rhs_node.start_byte(), is_filter_vmap(&resolved)) {
                             let recorded = ctx.vmap_targets.entry(lhs_name.clone()).or_default();
                             if !recorded.iter().any(|known| known.site == info.site) {
                                 recorded.push(info);
@@ -4799,7 +4899,7 @@ fn process_assignment_item_inner(
                                 kind,
                                 range: an.range(),
                             };
-                            let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+                            let result = apply_layer_value(&application, &ctx.scope_shapes(scope_idx));
                             match result {
                                 Ok(Some(output)) => {
                                     ctx.record_binding(
@@ -6169,24 +6269,32 @@ fn apply_vmap_call_chain(
     };
 
     // Find the wrapped function's FunctionShapeScope.
-    let callee = match find_callee_scope(wrapped, site, links, scopes) {
-        Some(idx) => &scopes[idx],
-        None => return Ok(None), // wrapped function not found — skip silently
+    let Some(callee_idx) = find_callee_scope(wrapped, site, links, scopes) else {
+        return Ok(None); // wrapped function not found — skip silently
     };
+    let callee = &scopes[callee_idx];
 
     // If the callee has no jaxtyping annotations at all, skip.
     if callee.shapes.is_empty() && callee.return_shape.is_none() {
         return Ok(None);
     }
 
-    // Map positional arg shapes to param names (using param_order),
-    // then bind and substitute.
-    let param_names = &callee.param_order;
-    let arg_shapes: Vec<(&str, Vec<String>)> = current
+    // Map the peeled positional args to the parameters they bind, then bind
+    // and substitute.
+    let Some(function) = links.function_nodes.get(callee_idx).copied().flatten() else {
+        return Ok(None);
+    };
+    let peeled: Vec<CallArgument> = current
         .iter()
-        .enumerate()
-        .filter_map(|(idx, (_, shape))| param_names.get(idx).map(|p| (p.as_str(), shape.clone())))
+        .map(|(value, _)| CallArgument::Positional { value: value.to_string() })
         .collect();
+    let arg_shapes: Vec<(String, Vec<String>)> = bound_parameters(function, links.text, &peeled)
+        .into_iter()
+        .zip(&current)
+        .map(|((param, _), (_, shape))| (param, shape.clone()))
+        .collect();
+    let arg_shapes: Vec<(&str, Vec<String>)> =
+        arg_shapes.iter().map(|(param, shape)| (param.as_str(), shape.clone())).collect();
 
     let result = bind_and_substitute(callee, wrapped, &arg_shapes)?;
 
@@ -6432,6 +6540,38 @@ fn shape_of_inline_module(
     )
 }
 
+/// `self.lstm(x)[0]`: an element of the tuple that a call of a layer field
+/// gives (`layer_returns_tuple`), from `tuple_rhs_shapes`. `Some(None)` for an
+/// element without a shape, `None` when `value` is no such call.
+fn tuple_layer_element(node: Node, value: Node, ctx: &mut ShapeCtx) -> Option<Option<Vec<String>>> {
+    if value.kind() != "call" {
+        return None;
+    }
+    let function = value.child_by_field_name("function")?;
+    let attr = ctx.text.get(function.byte_range())?.strip_prefix("self.")?;
+    if !layer_returns_tuple(&ctx.self_attr_layer_at(attr, value.start_byte())?) {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let indices: Vec<Node> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.id() != value.id() && child.kind() != "comment")
+        .collect();
+    let at = match indices[..] {
+        [index] => match ctx.text.get(index.byte_range()) {
+            Some("0" | "-2") => 0,
+            Some("1" | "-1") => 1,
+            _ => return Some(None),
+        },
+        _ => return Some(None),
+    };
+    let Some(scope_idx) = ctx.links.scope_index.lookup(value.start_byte()) else {
+        return Some(None);
+    };
+    let targets = [TupleTarget::Name(None), TupleTarget::Name(None)];
+    Some(tuple_rhs_shapes(value, &targets, scope_idx, ctx).and_then(|mut elements| elements.get_mut(at)?.take()))
+}
+
 /// Unwind a (possibly nested) `vmap(vmap(...(callable)))` call chain.
 ///
 /// `node` must be a `call` node whose function resolves to `vmap`
@@ -6456,8 +6596,7 @@ fn collect_vmap_axes<'t>(
 
     let args_node = node.child_by_field_name("arguments")?;
     let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
-    let in_axes = parse_int_keyword(&raw_args, "in_axes", 0)?;
-    let out_axes = parse_int_keyword(&raw_args, "out_axes", 0)?;
+    let (in_axes, out_axes) = vmap_axes(&raw_args, is_filter_vmap(&resolved))?;
     let callable_node = find_positional_arg_node(args_node, 0)?;
 
     if callable_node.kind() == "call" {
@@ -6472,6 +6611,29 @@ fn collect_vmap_axes<'t>(
 /// Resolve `Layer(...)(x)` — a catalogued layer constructed and applied in
 /// one expression, e.g. flax's `nn.Dense(features=64)(x)` or
 /// `eqx.nn.Linear(3, 5)(x)`.
+/// Whether a call of the layer gives a tuple: torch `RNN`, `LSTM`, and `GRU`
+/// give `(output, h_n)`, an `LSTMCell` of torch or equinox gives `(h, c)`, and
+/// torch `MultiheadAttention` gives `(output, weights)`. Equinox
+/// `MultiheadAttention` and the other cells give one array.
+fn layer_returns_tuple(kind: &LayerKind) -> bool {
+    match kind {
+        LayerKind::Rnn { .. } => true,
+        LayerKind::RnnCell { name, .. } => name == "LSTMCell",
+        LayerKind::MultiheadAttention { returns_weights, .. } => *returns_weights,
+        _ => false,
+    }
+}
+
+/// The value of a layer call that one name binds: the rule of the layer, which
+/// checks the input, or no shape for a layer that gives a tuple.
+pub(super) fn apply_layer_value(
+    application: &LayerApplication,
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let output = apply_layer_application(application, shapes)?;
+    Ok(output.filter(|_| !layer_returns_tuple(&application.kind)))
+}
+
 /// The inputs of a layer call after the first. Only a loss reads one: its
 /// target, which is the second positional argument or `target=`.
 fn extra_layer_inputs(args: &[CallArgument], kind: &LayerKind) -> Vec<String> {
@@ -6514,7 +6676,7 @@ fn shape_of_inline_layer(
         kind,
         range: outer_args_node.range(),
     };
-    let result = apply_layer_application(&application, &ctx.scope_shapes(scope_idx));
+    let result = apply_layer_value(&application, &ctx.scope_shapes(scope_idx));
     ctx.check(result, "", outer_args_node.range()).flatten()
 }
 
@@ -6566,9 +6728,16 @@ fn apply_inline_vmap_layer_chain(
     // direct-call MHA special case in `shape_of_call`), so just re-prepend
     // the peeled batch dims onto it.
     let mut output = if matches!(layer, LayerKind::MultiheadAttention { .. }) {
+        if layer_returns_tuple(layer) {
+            return None;
+        }
         shape
     } else {
-        ctx.check(apply_layer_kind(layer, &shape, layer_name, input_name), "", range)??
+        let output = ctx.check(apply_layer_kind(layer, &shape, layer_name, input_name), "", range)??;
+        if layer_returns_tuple(layer) {
+            return None;
+        }
+        output
     };
     for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
         output = prepend_batch_dim(output, out_axes, dim);
@@ -6759,14 +6928,44 @@ fn bind_and_substitute(
         return Ok(None);
     }
 
-    let binding = build_dim_binding(callee, target_name, positional_arg_shapes)?;
+    let binding = build_dim_binding(&callee.shapes, target_name, positional_arg_shapes)?;
 
     // Substitute into return_shape.
     let Some(ref return_shape) = callee.return_shape else {
         return Ok(None);
     };
 
-    Ok(Some(substitute_dims(return_shape, &binding)))
+    Ok(Some(callee_dims_in_caller(return_shape, &binding, &|_| true)))
+}
+
+/// `shape`, a result of a callee, in the dims of the caller: a name that
+/// `binding` holds takes its value, and any other name that `of_callee` accepts
+/// is free. Only an argument ties a name of the callee to the caller, so an
+/// unbound name of the callee claims nothing in the caller.
+fn callee_dims_in_caller(
+    shape: &[String],
+    binding: &HashMap<String, String>,
+    of_callee: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut binding = binding.clone();
+    for dim in shape {
+        for word in dim_words(dim) {
+            if word.starts_with(char::is_alphabetic)
+                && !has_mark(word)
+                && !binding.contains_key(word)
+                && of_callee(word)
+            {
+                binding.insert(word.to_string(), format!("{FREE_DIM}{word}"));
+            }
+        }
+    }
+    substitute_dims(shape, &binding)
+}
+
+/// The names of `dim` as `substitute_dim` reads them, without the free mark.
+fn dim_words(dim: &str) -> impl Iterator<Item = &str> {
+    dim.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .map(|word| word.strip_prefix(FREE_DIM).unwrap_or(word))
 }
 
 /// Build a binding of declared param-dim-name → resolved arg dim from the
@@ -6775,13 +6974,13 @@ fn bind_and_substitute(
 /// `trace_user_function_return`) can reuse the same binding without also
 /// requiring a `-> ReturnType` annotation.
 fn build_dim_binding(
-    callee: &FunctionShapeScope,
+    param_shapes: &HashMap<String, Vec<String>>,
     target_name: &str,
     positional_arg_shapes: &[(&str, Vec<String>)],
 ) -> Result<HashMap<String, String>, String> {
     let mut binding: HashMap<String, String> = HashMap::new();
     for (param_name, arg_shape) in positional_arg_shapes {
-        let Some(param_shape) = callee.shapes.get(*param_name) else {
+        let Some(param_shape) = param_shapes.get(*param_name) else {
             continue;
         };
 
@@ -6922,7 +7121,7 @@ fn trace_user_function_return(
     positional_arg_shapes: &[(&str, Vec<String>)],
     (func_node, text): (Node, &str),
 ) -> Result<Option<Vec<String>>, String> {
-    let binding = build_dim_binding(callee, target_name, positional_arg_shapes)?;
+    let binding = build_dim_binding(&callee.shapes, target_name, positional_arg_shapes)?;
     let Some(body) = func_node.child_by_field_name("body") else {
         return Ok(None);
     };
@@ -6936,7 +7135,7 @@ fn trace_user_function_return(
     let Some(return_shape) = callee.shapes.get(&return_name) else {
         return Ok(None);
     };
-    Ok(Some(substitute_dims(return_shape, &binding)))
+    Ok(Some(callee_dims_in_caller(return_shape, &binding, &|_| true)))
 }
 
 /// Walk a function body collecting `return <identifier>` targets. Returns
@@ -7205,14 +7404,7 @@ fn specialize_callee_call(
         ctx.specialized_scopes.insert(callee_idx);
         // The whole-file pass may already have reported an error inside this
         // body; replaying it must not report it a second time.
-        let mut kept = errors_before;
-        for i in errors_before..ctx.errors.len() {
-            if !ctx.errors[..errors_before].contains(&ctx.errors[i]) {
-                ctx.errors.swap(kept, i);
-                kept += 1;
-            }
-        }
-        ctx.errors.truncate(kept);
+        drop_repeated_errors(ctx.errors, errors_before);
     } else {
         ctx.scopes[callee_idx].shapes = saved_shapes;
         ctx.tuple_carries.retain(|(scope, _)| *scope != callee_idx);
@@ -7238,48 +7430,93 @@ fn callee_all_params_annotated(callee_idx: usize, ctx: &ShapeCtx) -> bool {
     params.iter().all(|p| original.contains_key(p))
 }
 
-/// Map a call's resolved arguments onto the callee's FULL declared
-/// parameter list (`all_params` — annotated and un-annotated, in
-/// declaration order), skipping a leading `self`/`cls` (same convention as
-/// `resolution::bind_call_arguments`). Returns `(param_name, shape)` for
-/// every param whose incoming argument shape is resolvable in the caller's
-/// scope; an unresolvable argument just means that param goes unseeded (not
-/// a hard bail) — any body expression that actually depends on it stays
-/// dark, same as any other unresolvable lookup elsewhere in this evaluator.
+/// Map a call's resolved arguments onto the callee's declared parameters
+/// (`bound_parameters`). Returns `(param_name, shape)` for every param whose
+/// incoming argument shape is resolvable in the caller's scope; an
+/// unresolvable argument just means that param goes unseeded (not a hard
+/// bail) — any body expression that actually depends on it stays dark, same
+/// as any other unresolvable lookup elsewhere in this evaluator.
 fn seed_params_from_call(
-    all_params: &[String],
+    callee_idx: usize,
     args: &[CallArgument],
     caller_scope_idx: usize,
     ctx: &ShapeCtx,
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
-    let params = without_receiver(all_params);
     let mut seeded = HashMap::new();
     let mut carries = Vec::new();
-    let mut seed = |param: &String, value: &str| {
+    let Some(function) = ctx.scope_function_nodes.get(callee_idx).copied().flatten() else {
+        return (seeded, carries);
+    };
+    for (param, value) in bound_parameters(function, ctx.text, args) {
         if let Some(shape) = ctx.carry_element(value, caller_scope_idx) {
             seeded.insert(param.clone(), shape);
-            carries.push(param.clone());
+            carries.push(param);
         } else if let Some(shape) = ctx.resolve_shape(value, caller_scope_idx) {
-            seeded.insert(param.clone(), shape);
+            seeded.insert(param, shape);
         }
-    };
-    let mut positional_idx = 0usize;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                if let Some(param) = params.get(positional_idx) {
-                    seed(param, value);
-                }
-                positional_idx += 1;
-            }
-            CallArgument::Keyword { name, value } => {
-                if params.iter().any(|p| p == name) {
-                    seed(name, value);
+    }
+    (seeded, carries)
+}
+
+/// The parameter of `function` that each argument of a call binds, by the
+/// rules of Python, without a first parameter `self` or `cls`. A parameter
+/// after `*` or `*args` takes only a keyword, and one before `/` only a
+/// position. A splat in the call (`*xs`, `**kw`) may fill any parameter, so
+/// no argument from it on binds.
+fn bound_parameters<'a>(function: Node, text: &str, args: &'a [CallArgument]) -> Vec<(String, &'a str)> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut keyword: Vec<String> = Vec::new();
+    let mut keyword_only = false;
+    if let Some(parameters) = function.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let inner = match parameter.kind() {
+                "typed_parameter" => parameter.named_child(0).unwrap_or(parameter),
+                _ => parameter,
+            };
+            match inner.kind() {
+                "positional_separator" => keyword.clear(),
+                "keyword_separator" | "list_splat_pattern" => keyword_only = true,
+                "dictionary_splat_pattern" | "comment" => {}
+                _ => {
+                    let name = match inner.kind() {
+                        "identifier" => Some(inner),
+                        _ => inner.child_by_field_name("name"),
+                    };
+                    let Some(name) = name.and_then(|name| text.get(name.byte_range())) else {
+                        continue;
+                    };
+                    if !keyword_only {
+                        positional.push(name.to_string());
+                    }
+                    keyword.push(name.to_string());
                 }
             }
         }
     }
-    (seeded, carries)
+    if positional.first().is_some_and(|first| first == "self" || first == "cls") {
+        let receiver = positional.remove(0);
+        keyword.retain(|name| *name != receiver);
+    }
+    let mut bound = Vec::new();
+    let mut at = 0usize;
+    for arg in args {
+        match arg {
+            CallArgument::Positional { value } if value.starts_with('*') => break,
+            CallArgument::Positional { value } => {
+                if let Some(param) = positional.get(at) {
+                    bound.push((param.clone(), value.as_str()));
+                }
+                at += 1;
+            }
+            CallArgument::Keyword { name, value } => {
+                if keyword.contains(name) {
+                    bound.push((name.clone(), value.as_str()));
+                }
+            }
+        }
+    }
+    bound
 }
 
 /// Fallback for a same-file call whose callee (a top-level function, a
@@ -7295,10 +7532,55 @@ fn apply_seeded_user_function(
     caller_scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
-    let all_params = ctx.scopes[callee_idx].all_params.clone();
-    let (seeded, carries) = seed_params_from_call(&all_params, args, caller_scope_idx, ctx);
+    let (seeded, carries) = seed_params_from_call(callee_idx, args, caller_scope_idx, ctx);
+    let dims = CalleeDims::new(callee_idx, &seeded, ctx)?;
     let result = specialize_callee_call(callee_idx, seeded, carries, call_byte, false, ctx)?;
-    specialized_single(result)
+    Some(dims.apply(&specialized_single(result)?))
+}
+
+/// How the dims of a specialized callee, which keeps the annotations of its
+/// parameters, read in the caller (`callee_dims_in_caller`).
+struct CalleeDims {
+    /// The names of the annotations of the callee, bound to the arguments.
+    binding: HashMap<String, String>,
+    /// The names that the annotations of the callee use.
+    names: HashSet<String>,
+}
+
+impl CalleeDims {
+    /// `None` when an argument contradicts the annotation of its parameter.
+    /// A name of an annotation that an unannotated argument also brings into
+    /// the body has two meanings there, so its axis is unknown.
+    fn new(callee_idx: usize, seeded: &HashMap<String, Vec<String>>, ctx: &ShapeCtx) -> Option<Self> {
+        let declared = ctx.original_shapes.get(callee_idx)?;
+        let annotated: Vec<(&str, Vec<String>)> = seeded
+            .iter()
+            .filter(|(param, _)| declared.contains_key(*param))
+            .map(|(param, shape)| (param.as_str(), shape.clone()))
+            .collect();
+        let mut binding = build_dim_binding(declared, "", &annotated).ok()?;
+        let words = |dims: &mut dyn Iterator<Item = &String>| -> HashSet<String> {
+            dims.flat_map(|dim| dim_words(dim)).map(str::to_string).collect()
+        };
+        let brought = words(
+            &mut seeded
+                .iter()
+                .filter(|(param, _)| !declared.contains_key(*param))
+                .flat_map(|(_, shape)| shape),
+        );
+        for (name, value) in &mut binding {
+            if brought.contains(name) && !dims_canonically_equal(name, value) {
+                *value = UNKNOWN_DIM.to_string();
+            }
+        }
+        let return_shape = ctx.scopes[callee_idx].return_shape.iter().flatten();
+        let names = words(&mut declared.values().flatten().chain(return_shape));
+        Some(CalleeDims { binding, names })
+    }
+
+    fn apply(&self, shape: &[String]) -> Vec<String> {
+        callee_dims_in_caller(shape, &self.binding, &|word| self.names.contains(word))
+    }
 }
 
 /// The one array shape a specialized return stands for.
@@ -7354,8 +7636,7 @@ fn apply_submodule_call(
         return None;
     }
     let callee_idx = ctx.module_callee(module)?;
-    let (seeded, carries) =
-        seed_params_from_call(&ctx.scopes[callee_idx].all_params, args, caller_scope, ctx);
+    let (seeded, carries) = seed_params_from_call(callee_idx, args, caller_scope, ctx);
 
     // An annotated parameter that this call does not bind would leave the
     // callee's own dim names in the body.
@@ -7379,7 +7660,7 @@ fn apply_submodule_call(
         .flat_map(|dim| dim.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')))
         .map(|word| word.trim_start_matches(FREE_DIM).to_string())
         .collect();
-    let result = match ctx.scopes[callee_idx].return_shape.clone() {
+    let (result, binding, in_caller_dims) = match ctx.scopes[callee_idx].return_shape.clone() {
         Some(annotation) => {
             let binding = binding?;
             // A dim named like a constructor argument that holds a different
@@ -7392,15 +7673,30 @@ fn apply_submodule_call(
             if binding.iter().any(conflicts) {
                 return None;
             }
-            substitute_dims(&annotation, &binding)
+            (annotation, binding, false)
         }
+        // The body runs in the dims of the caller.
         None => {
             let ret = specialize_callee_call(callee_idx, seeded, carries, call_byte, true, ctx)?;
-            specialized_single(ret)?
+            (specialized_single(ret)?, HashMap::new(), true)
         }
     };
 
     let names = ctx.callee_names(module);
+    // A name of an annotation of the callee that no argument binds, and that is
+    // no field of the instance, is free. A body that runs in the dims of the
+    // caller also holds the names of the arguments.
+    let declared = &ctx.original_shapes[callee_idx];
+    let return_shape = ctx.scopes[callee_idx].return_shape.iter().flatten();
+    let annotation_names: HashSet<&str> =
+        declared.values().flatten().chain(return_shape).flat_map(|dim| dim_words(dim)).collect();
+    let of_callee = |word: &str| {
+        annotation_names.contains(word)
+            && !(in_caller_dims && caller_names.contains(word))
+            && !word.starts_with("self.")
+            && names(word).is_none()
+    };
+    let result = callee_dims_in_caller(&result, &binding, &of_callee);
     result
         .iter()
         .map(|dim| rebind_callee_dim(dim, &names, &caller_names))
@@ -7561,6 +7857,7 @@ fn scan_body_ys_shape(
         seeded.insert(elem_param.clone(), rest);
     }
 
+    let dims = CalleeDims::new(callee_idx, &seeded, ctx)?;
     let result = specialize_callee_call(callee_idx, seeded, carries, scan_call_byte, false, ctx)?;
     let mut elems = result.tuple?;
     if elems.len() != 2 {
@@ -7568,7 +7865,7 @@ fn scan_body_ys_shape(
     }
     let y_shape = elems.remove(1)?;
     let mut out = vec![leading];
-    out.extend(y_shape);
+    out.extend(dims.apply(&y_shape));
     Some(out)
 }
 
@@ -7602,6 +7899,29 @@ fn bind_user_function_args(
     // the known-function branch.
     if callee.shapes.is_empty() && callee.return_shape.is_none() {
         return None;
+    }
+
+    // A function of this file binds its arguments by the rules of Python.
+    // An argument without a shape for an array parameter skips the call.
+    if let Some((function, text)) = source {
+        let mut arg_shapes: Vec<(String, Vec<String>)> = Vec::new();
+        for (param, value) in bound_parameters(function, text, args) {
+            let Some(declared) = callee.shapes.get(&param) else {
+                continue;
+            };
+            match caller_shapes.shape(value) {
+                Some(shape) => arg_shapes.push((param, shape.clone())),
+                None if declared.is_empty() => {}
+                None => return Some(Ok(None)),
+            }
+        }
+        let arg_shapes: Vec<(&str, Vec<String>)> =
+            arg_shapes.iter().map(|(param, shape)| (param.as_str(), shape.clone())).collect();
+        return Some(if callee.return_shape.is_some() {
+            bind_and_substitute(callee, target, &arg_shapes)
+        } else {
+            trace_user_function_return(callee, target, &arg_shapes, (function, text))
+        });
     }
 
     // Resolve each positional arg to a shape from the caller's scope.
@@ -7639,14 +7959,9 @@ fn bind_user_function_args(
         }
     }
 
-    // Delegate to the shared bind_and_substitute helper — or, when the
-    // callee has no `-> ReturnType` annotation and its source node is available
-    // (same-file path), the body-tracing fallback (see
-    // `trace_user_function_return`).
+    // Delegate to the shared bind_and_substitute helper.
     if callee.return_shape.is_some() {
         Some(bind_and_substitute(callee, target, &arg_shapes))
-    } else if let Some(source) = source {
-        Some(trace_user_function_return(callee, target, &arg_shapes, source))
     } else {
         Some(Ok(None))
     }
@@ -7972,6 +8287,293 @@ mod shape_of_expression_tests {
 
     fn find_shape<'a>(analysis: &'a LayerShapeAnalysis, var: &str) -> Option<&'a Vec<String>> {
         analysis.scopes.iter().find_map(|s| s.shapes.get(var))
+    }
+
+    /// noxton `nn/transformer.py`: a name of a callee annotation that no
+    /// argument binds is no name of the caller.
+    #[test]
+    fn test_an_unbound_callee_name_is_free_in_the_caller() {
+        let code = r#"
+import equinox as eqx
+from jaxtyping import Float, Array
+
+def blk(x: Float[Array, "n d"]) -> Float[Array, "n e"]:
+    return x
+
+def blk2(x: Float[Array, "seq_len d"], flag) -> Float[Array, "seq_len d"]:
+    return x
+
+def f(tgt: Float[Array, "tgt_len d"], u: Float[Array, "e d"], v: Float[Array, "tgt_len k"]):
+    a = v + blk(tgt)
+    b = tgt + blk2(g(tgt), 1)
+    c = tgt + blk2(tgt, 1)
+    h = u + blk2(g(tgt), 1)
+
+class Inner(eqx.Module):
+    def __call__(self, x: Float[Array, "n d"]) -> Float[Array, "n e"]:
+        return x
+
+class L(eqx.Module):
+    inner: Inner
+
+    def __init__(self):
+        self.inner = Inner()
+
+    def _sa_block(self, x: Float[Array, "seq_len d"], mask, key=None) -> Float[Array, "seq_len d"]:
+        return x
+
+    def __call__(self, tgt: Float[Array, "tgt_len d"], m, w: Float[Array, "tgt_len k"]):
+        y = tgt + self._sa_block(g(tgt), m)
+        z = tgt + self._sa_block(tgt, m)
+        s = w + self.inner(tgt)
+"#;
+        let analysis = analyze(code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for (name, dims) in [
+            ("a", ["tgt_len", "k"]),
+            ("b", ["tgt_len", "d"]),
+            ("c", ["tgt_len", "d"]),
+            ("h", ["e", "d"]),
+            ("y", ["tgt_len", "d"]),
+            ("z", ["tgt_len", "d"]),
+            ("s", ["tgt_len", "k"]),
+        ] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&dims)), "{name}");
+        }
+    }
+
+    /// `equinox.filter_vmap` maps like `jax.vmap`, but takes its options by
+    /// keyword only. An option that the rule does not model gives unknown.
+    #[test]
+    fn test_filter_vmap_options_are_the_options_of_vmap() {
+        let cases: &[(&str, Option<&[&str]>)] = &[
+            ("jax.vmap(f)(x)", Some(&["t", "d", "2"])),
+            ("eqx.filter_vmap(f)(x)", Some(&["t", "d", "2"])),
+            ("eqx.filter_vmap(f, in_axes=1)(x)", Some(&["d", "t", "2"])),
+            ("eqx.filter_vmap(f, out_axes=1)(x)", Some(&["d", "t", "2"])),
+            ("eqx.filter_vmap(f, axis_name=\"i\")(x)", Some(&["t", "d", "2"])),
+            ("jax.vmap(f, 1)(x)", Some(&["d", "t", "2"])),
+            ("jax.vmap(f, 0, 1)(x)", Some(&["d", "t", "2"])),
+            ("jax.vmap(f, spmd_axis_name=\"i\")(x)", Some(&["t", "d", "2"])),
+            ("eqx.filter_vmap(f, 1)(x)", None),
+            ("eqx.filter_vmap(f, axis_size=3)(x)", None),
+            ("eqx.filter_vmap(f, spmd_axis_name=\"i\")(x)", None),
+            ("jax.vmap(f, axis_size=3)(x)", None),
+            ("jax.vmap(f, 1, in_axes=1)(x)", None),
+            ("eqx.filter_vmap(f, foo=3)(x)", None),
+            ("jax.vmap(f, *a)(x)", None),
+        ];
+        for (call, want) in cases {
+            for code in [
+                format!("import jax\nimport equinox as eqx\ndef f(x: Float[Array, \"d\"]) -> Float[Array, \"d 2\"]:\n    return x\ndef g(x: Float[Array, \"t d\"]):\n    y = {call}\n"),
+                format!("import jax\nimport equinox as eqx\ndef f(x: Float[Array, \"d\"]) -> Float[Array, \"d 2\"]:\n    return x\ndef g(x: Float[Array, \"t d\"]):\n    vf = {}\n    y = vf(x)\n", call.trim_end_matches("(x)")),
+            ] {
+                let analysis = analyze(&code);
+                assert_eq!(find_shape(&analysis, "y"), want.map(shape).as_ref(), "{code}");
+            }
+        }
+    }
+
+    /// noxton `nn/xlstm.py`: a chunk of `split` may equal any name, and the
+    /// broadcast keeps the name. `(n+1)` is `n+1`.
+    #[test]
+    fn test_a_split_chunk_and_a_bracketed_dim_are_no_conflict() {
+        let code = r#"
+import jax
+import jax.numpy as jnp
+
+def f(raw: Float[Array, "hidden_dim_x4"], m: Float[Array, "hidden_dim"], p: Float[Array, "(n+1) d"], q: Float[Array, "n+1 d"]):
+    iraw, fraw, zraw, oraw = jnp.split(raw, 4)
+    logfplusm = m + jax.nn.log_sigmoid(fraw)
+    s = p + q
+"#;
+        let analysis = analyze(code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "logfplusm"), Some(&shape(&["hidden_dim"])));
+        assert_eq!(find_shape(&analysis, "s"), Some(&shape(&["(n+1)", "d"])));
+    }
+
+    /// noxton `functions/attention.py`: a size argument that is a name gives
+    /// `[n]` only for a proven integer, and the dims of the tuple or list that
+    /// is its one binding.
+    #[test]
+    fn test_a_size_name_gives_its_integer_or_its_tuple() {
+        let three: &[&str] = &["1", "h", "e"];
+        let cases: &[(&str, Option<&[&str]>)] = &[
+            ("jnp.zeros(s)", Some(three)),
+            ("jnp.ones(s)", Some(three)),
+            ("jnp.empty(s)", Some(three)),
+            ("jnp.full(s, 0.0)", Some(three)),
+            ("jnp.zeros(shape=s)", Some(three)),
+            ("torch.zeros(s)", Some(three)),
+            ("torch.randn(s)", Some(three)),
+            ("torch.zeros(size=s)", Some(three)),
+            ("x.new_zeros(s)", Some(three)),
+            ("x.reshape(s)", Some(three)),
+            ("x.view(s)", Some(three)),
+            ("jnp.reshape(x, s)", Some(three)),
+            ("jnp.broadcast_to(x, s)", Some(three)),
+            ("jnp.zeros(lst)", Some(&["2", "3"])),
+            ("jnp.zeros(n)", Some(&["n"])),
+            ("torch.zeros(n)", Some(&["n"])),
+            ("jnp.zeros(m)", Some(&["4"])),
+            ("jnp.zeros(t)", None),
+            ("jnp.zeros(u)", None),
+            ("jnp.zeros(w)", None),
+            ("jnp.zeros(e)", None),
+            ("jnp.zeros(x)", None),
+            ("x.reshape(t)", None),
+            ("torch.zeros(t)", None),
+        ];
+        for (call, want) in cases {
+            let code = format!(
+                "import jax.numpy as jnp\nimport torch\ndef f(x: Float[Array, \"a b\"], h: int, e, n: int, c):\n    s = (1, h, e)\n    lst = [2, 3]\n    m = 4\n    t = load()\n    u = (1, 2) if c else (3,)\n    if c:\n        w = (1, 2)\n    else:\n        w = (3,)\n    y = {call}\n"
+            );
+            let analysis = analyze(&code);
+            assert_eq!(find_shape(&analysis, "y"), want.map(shape).as_ref(), "{call}");
+        }
+        let code = "import jax.numpy as jnp\ndef f(k: Float[Array, \"s h d\"], num_heads: int, head_dim):\n    zero_attn_shape = (1, num_heads, head_dim)\n    k_zeros = jnp.zeros(zero_attn_shape)\n    k = jnp.concatenate([k, k_zeros], axis=0)\n";
+        let analysis = analyze(code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(find_shape(&analysis, "k"), Some(&shape(&["s+1", "h", "d"])));
+    }
+
+    /// A call binds the parameters of a function of the file by the rules of
+    /// Python: `*args` takes no named parameter, a parameter after it takes a
+    /// keyword only, one before `/` a position only, and a splat in the call
+    /// binds nothing after it.
+    #[test]
+    fn test_a_call_binds_parameters_like_python() {
+        let code = r#"
+import jax
+from jaxtyping import Float, Array
+
+def star(first, *rest, b=None):
+    return rest
+
+def after_star(*xs, b=None):
+    return b
+
+def two(a, b):
+    return b
+
+def slash(a, /, **kw):
+    return a
+
+def scalar_first(n: int, x: Float[Array, "q"]) -> Float[Array, "q"]:
+    return x
+
+def mapped(scale, x: Float[Array, "e"]) -> Float[Array, "e 2"]:
+    return x
+
+def f(x: Float[Array, "a"], y: Float[Array, "b c"], xs, s: Float[Array, "t"], ys: Float[Array, "t e"]):
+    k = y.shape[0]
+    r1 = star(x, y)
+    r2 = after_star(x, y)
+    r3 = two(*xs, y)
+    r4 = slash(x, a=y)
+    r5 = scalar_first(k, x)
+    r6 = jax.vmap(mapped)(s, ys)
+"#;
+        let analysis = analyze(code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["r1", "r2", "r3"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        assert_eq!(find_shape(&analysis, "r4"), Some(&shape(&["a"])));
+        assert_eq!(find_shape(&analysis, "r5"), Some(&shape(&["a"])));
+        assert_eq!(find_shape(&analysis, "r6"), Some(&shape(&["t", "e", "2"])));
+    }
+
+    /// An error in the `return` of a callee that a call specializes is one
+    /// error, not one of the call and one of the statement.
+    #[test]
+    fn test_an_error_in_a_callee_return_is_reported_once() {
+        let code = r#"
+import jax.numpy as jnp
+from jaxtyping import Float, Array
+
+def g(x: Float[Array, "n 4"], y):
+    return x + jnp.zeros((3, 5))
+
+def g3(x, y):
+    return x + y
+
+def h(a: Float[Array, "k 4"], b: Float[Array, "k 2"]):
+    r = g(a, 1)
+    r3 = g3(a, b)
+"#;
+        let analysis = analyze(code);
+        let rows: Vec<usize> = analysis.errors.iter().map(|e| e.range.start_point.row).collect();
+        assert_eq!(rows, [5, 8], "{:?}", analysis.errors);
+    }
+
+    /// A layer call that gives a tuple binds no shape to one name: torch
+    /// `LSTM`, `GRU`, `RNN`, `MultiheadAttention`, and an `LSTMCell`. Equinox
+    /// `MultiheadAttention` and `GRUCell` give one array. `[0]` and `[1]`
+    /// pick an element.
+    #[test]
+    fn test_a_tuple_of_a_layer_is_no_array() {
+        let code = r#"import torch
+import torch.nn as nn
+import equinox as eqx
+from jaxtyping import Float, Array
+
+
+class T(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(8, 16, batch_first=True)
+        self.gru = nn.GRU(8, 16)
+        self.rnn = nn.RNN(8, 16)
+        self.attn = nn.MultiheadAttention(8, 2)
+        self.cell = nn.LSTMCell(8, 16)
+        self.gcell = nn.GRUCell(8, 16)
+
+    def forward(self, x: Float[Array, "b t 8"], q: Float[Array, "l b 8"], c: Float[Array, "b 8"]):
+        o1 = self.lstm(x)
+        o2, _ = self.lstm(x)
+        o3 = self.lstm(x)[0]
+        o4 = self.gru(x)
+        o5 = self.rnn(x)
+        o6 = self.attn(q, q, q)
+        o7, w7 = self.attn(q, q, q)
+        o8 = self.attn(q, q, q)[0]
+        o9 = self.cell(c)
+        o10 = self.gcell(c)
+        o11 = self.gru(x)[1]
+
+
+class E(eqx.Module):
+    def __init__(self, key):
+        self.mha = eqx.nn.MultiheadAttention(2, 8, key=key)
+        self.cell = eqx.nn.LSTMCell(8, 16, key=key)
+        self.gcell = eqx.nn.GRUCell(8, 16, key=key)
+
+    def __call__(self, q: Float[Array, "l 8"], h: Float[Array, "8"], s: Float[Array, "16"]):
+        e1 = self.mha(q, q, q)
+        e2 = self.cell(h, (s, s))
+        e3, e4 = self.cell(h, (s, s))
+        e5 = self.gcell(h, s)
+"#;
+        let analysis = analyze(code);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        for name in ["o1", "o4", "o5", "o6", "o9", "e2"] {
+            assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        for (name, dims) in [
+            ("o2", &["b", "t", "16"][..]),
+            ("o3", &["b", "t", "16"]),
+            ("o7", &["l", "b", "8"]),
+            ("o8", &["l", "b", "8"]),
+            ("o10", &["b", "16"]),
+            ("o11", &["1", "t", "16"]),
+            ("e1", &["l", "8"]),
+            ("e3", &["16"]),
+            ("e5", &["16"]),
+        ] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(dims)), "{name}");
+        }
     }
 
     #[test]

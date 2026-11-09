@@ -2378,6 +2378,31 @@ fn a_free_dim_follows_the_statements_that_name_it() {
     assert!(replayed > 0, "no step replayed a unit");
 }
 
+/// A size argument that is a name takes its dims from the one binding of the
+/// name in another unit: a tuple, an integer, or neither.
+#[test]
+fn a_size_name_follows_its_binding_in_other_units() {
+    let base = format!(
+        "import jax.numpy as jnp\nfrom jaxtyping import Float, Array\n\n\nS = (3, 4)\n\n\ndef mid():\n    return 1\n\n\ndef reader(v: Float[Array, \"3 4\"]):\n    r = jnp.zeros(S) + v\n{}",
+        independent_functions()
+    );
+    let steps = [
+        ("S = (3, 4)\n", "S = load()\n"),
+        ("S = load()\n", "S = [3, 4]\n"),
+        ("def mid():", "S = (5, 4)\n\n\ndef mid():"),
+        ("S = (5, 4)\n\n\n", ""),
+        ("S = [3, 4]\n", "S = 4\n"),
+        ("S = 4\n", "S = (3, 4)\n"),
+    ];
+    let four = dims(&["3", "4"]);
+    let want = [&four, &None, &four, &None, &four, &four, &four];
+    let replayed = walk_edits(&base, &steps, |step, analysis, text| {
+        assert_eq!(&shape_named(analysis, "r"), want[step], "step {step}\n{text}");
+        assert!(analysis.errors.is_empty(), "step {step}\n{text}");
+    });
+    assert!(replayed > 0, "no step replayed a unit");
+}
+
 /// A slice bound, a name that an annotation also uses, and a name around a
 /// class take their meaning from statements of other units.
 #[test]
