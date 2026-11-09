@@ -4635,6 +4635,32 @@ mod constructor_coverage_integration_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
     }
+
+    /// Array endpoints add their broadcast shape after `num`; a provable
+    /// scalar expression adds nothing; an unknown endpoint gives no shape.
+    #[test]
+    fn test_linspace_endpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("np.linspace(a, b, 10)", Some(vec!["10", "2", "3"])),
+            ("np.linspace(0, 2 * np.pi, 10)", Some(vec!["10"])),
+            ("np.geomspace(1.0, a, 4)", Some(vec!["4", "3"])),
+            ("np.logspace(-1.0, a * 2)", Some(vec!["50", "3"])),
+            ("np.linspace(lo, 1, 10)", None),
+            ("torch.linspace(0, math.pi, 7)", Some(vec!["7"])),
+            ("torch.linspace(a, 1, 7)", None),
+        ];
+        for (call, expected) in cases {
+            let code = format!(
+                "import math\nimport numpy as np\nimport torch\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"2 3\"]):\n    y = {call}\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{call}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
 }
 
 mod torch_varargs_size_tests {

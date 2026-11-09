@@ -3114,10 +3114,12 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Some(SequenceArg::Opaque) if first_arg_is_tuple(args_node) => return None,
             _ => args,
         };
-        let args = if matches!(known, KnownFunction::Clamp) {
-            without_scalar_bounds(args, args_node, true, ctx)
-        } else {
-            args
+        let args = match known {
+            KnownFunction::Clamp => without_scalar_bounds(args, args_node, true, ctx),
+            KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
+                with_scalar_endpoints(args, args_node, ctx)
+            }
+            _ => args,
         };
         let args = with_size_names(&known, false, args, args_node, scope_idx, ctx)?;
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
@@ -3215,6 +3217,37 @@ fn binary_call_shape(
         (Some(shape), None) | (None, Some(shape)) => Some(shape),
         (None, None) => is_scalar_expr(node, ctx, &mut Vec::new()).then(Vec::new),
     }
+}
+
+/// The `start` and `stop` of a `linspace` call, as `0` when they are
+/// provable scalars.
+fn with_scalar_endpoints(args: Vec<CallArgument>, args_node: Node, ctx: &ShapeCtx) -> Vec<CallArgument> {
+    let mut positional = 0usize;
+    args.into_iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let value_node = match &arg {
+                CallArgument::Positional { .. } => {
+                    positional += 1;
+                    if positional > 2 {
+                        return arg;
+                    }
+                    args_node.named_child(i as u32)
+                }
+                CallArgument::Keyword { name, .. } if matches!(name.as_str(), "start" | "stop" | "end") => {
+                    args_node.named_child(i as u32).and_then(|n| n.child_by_field_name("value"))
+                }
+                CallArgument::Keyword { .. } => return arg,
+            };
+            if !value_node.is_some_and(|n| is_scalar_expr(n, ctx, &mut Vec::new())) {
+                return arg;
+            }
+            match arg {
+                CallArgument::Positional { .. } => CallArgument::Positional { value: "0".to_string() },
+                CallArgument::Keyword { name, .. } => CallArgument::Keyword { name, value: "0".to_string() },
+            }
+        })
+        .collect()
 }
 
 /// Removes the `clip` / `clamp` bounds that are `None` or provable scalars,
@@ -5367,7 +5400,7 @@ fn is_array_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>
                         name.as_str(),
                         "zeros" | "ones" | "empty" | "full" | "zeros_like" | "ones_like"
                             | "empty_like" | "full_like" | "rand" | "randn" | "randint"
-                            | "rand_like" | "randn_like" | "arange" | "linspace" | "eye"
+                            | "rand_like" | "randn_like" | "arange" | "linspace" | "logspace" | "geomspace" | "eye"
                             | "identity" | "array" | "asarray" | "tensor" | "reshape"
                             | "transpose" | "matmul" | "einsum" | "concatenate" | "concat"
                             | "cat" | "stack" | "squeeze" | "unsqueeze" | "expand_dims"

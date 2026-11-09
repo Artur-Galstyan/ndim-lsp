@@ -191,7 +191,9 @@ known_cases! {
     torch_randn, ["torch", "randn"], Some(KnownFunction::TorchSizeConstructor);
     torch_full, ["torch", "full"], Some(KnownFunction::Full);
     torch_empty, ["torch", "empty"], Some(KnownFunction::TorchSizeConstructor);
-    torch_linspace, ["torch", "linspace"], Some(KnownFunction::Linspace);
+    torch_linspace, ["torch", "linspace"], Some(KnownFunction::TorchLinspace);
+    torch_logspace, ["torch", "logspace"], Some(KnownFunction::TorchLinspace);
+    np_geomspace, ["numpy", "geomspace"], Some(KnownFunction::Logspace);
     torch_zeros_like, ["torch", "zeros_like"], Some(KnownFunction::ZerosLike);
     torch_ones_like, ["torch", "ones_like"], Some(KnownFunction::OnesLike);
     torch_full_like, ["torch", "full_like"], Some(KnownFunction::FullLike);

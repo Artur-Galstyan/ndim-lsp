@@ -797,11 +797,29 @@ fn test_linspace_cases() {
         ("linspace_positional_num", vec![pos("0"), pos("1"), pos("100")], &[], Ok(Some(&["100"]))),
         ("linspace_keyword_num", vec![pos("0"), pos("1"), kw("num", "steps")], &[], Ok(Some(&["steps"]))),
         ("linspace_default_num_is_50", vec![pos("0"), pos("1")], &[], Ok(Some(&["50"]))),
-        ("torch_linspace_keyword_steps", vec![pos("0"), pos("1"), kw("steps", "steps")], &[], Ok(Some(&["steps"]))),
-        ("torch_linspace_positional_steps", vec![pos("0"), pos("1"), pos("200")], &[], Ok(Some(&["200"]))),
         ("linspace_retstep_is_a_tuple", vec![pos("0"), pos("1"), pos("5"), kw("retstep", "True")], &[], Ok(None)),
         ("linspace_positional_retstep", vec![pos("0"), pos("1"), pos("5"), pos("True"), pos("True")], &[], Ok(None)),
         ("linspace_retstep_false", vec![pos("0"), pos("1"), pos("5"), kw("retstep", "False")], &[], Ok(Some(&["5"]))),
+        ("linspace_array_endpoints_broadcast", vec![pos("a"), pos("b"), pos("10")], &[("a", &["3"]), ("b", &["2", "3"])], Ok(Some(&["10", "2", "3"]))),
+        ("linspace_array_and_scalar", vec![pos("a"), pos("1.5")], &[("a", &["3"])], Ok(Some(&["50", "3"]))),
+        ("linspace_keyword_endpoints", vec![kw("start", "0"), kw("stop", "b"), kw("num", "4")], &[("b", &["2"])], Ok(Some(&["4", "2"]))),
+        ("linspace_zero_dim_endpoint", vec![pos("a"), pos("1")], &[("a", &[])], Ok(Some(&["50"]))),
+        ("linspace_unknown_endpoint", vec![pos("lo"), pos("1"), pos("5")], &[], Ok(None)),
+        ("linspace_array_endpoints_axis", vec![pos("a"), pos("1"), pos("5"), kw("axis", "-1")], &[("a", &["3"])], Ok(None)),
+        ("linspace_scalar_endpoints_axis", vec![pos("0"), pos("1"), pos("5"), kw("axis", "-1")], &[], Ok(Some(&["5"]))),
+        ("linspace_endpoints_do_not_broadcast", vec![pos("a"), pos("b")], &[("a", &["3"]), ("b", &["4"])], Err(&["broadcast"])),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn test_torch_linspace_cases() {
+    check(KnownFunction::TorchLinspace, None, &[
+        ("torch_linspace_keyword_steps", vec![pos("0"), pos("1"), kw("steps", "steps")], &[], Ok(Some(&["steps"]))),
+        ("torch_linspace_positional_steps", vec![pos("0"), pos("1"), pos("200")], &[], Ok(Some(&["200"]))),
+        ("torch_linspace_zero_dim_endpoint", vec![pos("a"), pos("1"), pos("7")], &[("a", &[])], Ok(Some(&["7"]))),
+        ("torch_linspace_array_endpoint", vec![pos("a"), pos("1"), pos("7")], &[("a", &["3"])], Ok(None)),
+        ("torch_linspace_needs_steps", vec![pos("0"), pos("1")], &[], Ok(None)),
     ]);
 }
 

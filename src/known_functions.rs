@@ -49,7 +49,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "zeros" => Some(KnownFunction::Zeros),
             "ones" => Some(KnownFunction::Ones),
             "empty" => Some(KnownFunction::Empty),
-            "logspace" => Some(KnownFunction::Logspace),
+            "logspace" | "geomspace" => Some(KnownFunction::Logspace),
             "identity" => Some(KnownFunction::Identity),
             "broadcast_arrays" => Some(KnownFunction::BroadcastArrays),
             "pad" if is_numpy => Some(KnownFunction::NumpyPad),
@@ -139,6 +139,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "combinations" => Some(KnownFunction::Combinations),
             "cartesian_prod" => Some(KnownFunction::CartesianProd),
             "block_diag" => Some(KnownFunction::BlockDiag),
+            "linspace" | "logspace" => Some(KnownFunction::TorchLinspace),
             _ => classify_array_function(name),
         };
     }
@@ -1117,7 +1118,9 @@ fn apply_known_rule(
         | KnownFunction::Scatter
         | KnownFunction::MaskedFill => apply_known_shape_preserving(args, shapes),
         KnownFunction::Arange => apply_known_arange(args),
-        KnownFunction::Linspace | KnownFunction::Logspace => apply_known_linspace(args),
+        KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
+            apply_known_linspace(function, args, shapes)
+        }
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
         KnownFunction::DotGeneral => apply_known_dot_general(args, shapes),
@@ -2547,23 +2550,49 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
     Ok(Some(vec![format!("{}-{}", values[1], values[0])]))
 }
 
-fn apply_known_linspace(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+/// `linspace(start, stop, num)`: numpy and jax give `[num, *broadcast(start,
+/// stop)]` for array endpoints. A number is a scalar endpoint (the analysis
+/// writes `0` for a provable scalar). torch needs scalar endpoints and `steps`.
+fn apply_known_linspace(
+    function: &KnownFunction,
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let torch = matches!(function, KnownFunction::TorchLinspace);
     // `retstep=True` gives a `(samples, step)` tuple.
-    if !flag_unset(args, 4, "retstep") {
+    if matches!(function, KnownFunction::Linspace) && !flag_unset(args, 4, "retstep") {
         return Ok(None);
     }
-    for arg in args {
-        if let CallArgument::Keyword { name, value } = arg
-            && (name == "num" || name == "steps")
-        {
-            return Ok(Some(vec![value.clone()]));
+    let endpoint = |value: Option<&str>| -> Option<Vec<String>> {
+        let value = value?.trim();
+        if value.parse::<f64>().is_ok() {
+            return Some(Vec::new());
         }
+        shapes.shape(value).cloned()
+    };
+    let start = endpoint(nth_positional_or_keyword(args, 0, &["start"]));
+    let stop = endpoint(nth_positional_or_keyword(args, 1, &["stop", "end"]));
+    let (Some(start), Some(stop)) = (start, stop) else {
+        return Ok(None);
+    };
+    let keywords: &[&str] = if torch { &["steps"] } else { &["num"] };
+    let num = match nth_positional_or_keyword(args, 2, keywords) {
+        Some(num) => num.to_string(),
+        None if torch => return Ok(None),
+        None => "50".to_string(),
+    };
+    if torch {
+        return Ok((start.is_empty() && stop.is_empty()).then(|| vec![num]));
     }
-    let values = positional_arg_values(args);
-    if let Some(num) = values.get(2) {
-        return Ok(Some(vec![num.clone()]));
+    let tail = broadcast_two_shapes(&start, &stop)?;
+    let axis_set = positional_arg_values(args).len() > 5
+        || args.iter().any(|arg| matches!(arg, CallArgument::Keyword { name, value } if name == "axis" && value.trim() != "0"));
+    if !tail.is_empty() && axis_set {
+        return Ok(None);
     }
-    Ok(Some(vec!["50".to_string()]))
+    let mut output = vec![num];
+    output.extend(tail);
+    Ok(Some(output))
 }
 
 fn apply_known_eye(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
