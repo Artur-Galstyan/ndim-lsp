@@ -7761,6 +7761,27 @@ mod multihead_attention_tests {
         assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["tgt", "src"])));
     }
 
+    /// Case, constructor, call arguments, query, key, expected weights.
+    type AttentionRow<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str, Option<&'a [&'a str]>);
+
+    #[test]
+    fn test_multihead_attention_batched_weights() {
+        let rows: &[AttentionRow] = &[
+            ("sequence first", "nn.MultiheadAttention(16, 4)", "q, k, k", "7 2 16", "9 2 16", Some(&["2", "7", "9"])),
+            ("batch first", "nn.MultiheadAttention(16, 4, batch_first=True)", "q, k, k", "2 7 16", "2 9 16", Some(&["2", "7", "9"])),
+            ("per head", "nn.MultiheadAttention(16, 4)", "q, k, k, average_attn_weights=False", "7 2 16", "9 2 16", Some(&["2", "4", "7", "9"])),
+            ("no weights", "nn.MultiheadAttention(16, 4)", "q, k, k, need_weights=False", "7 2 16", "9 2 16", None),
+            ("zero attention key", "nn.MultiheadAttention(16, 4, add_zero_attn=True)", "q, k, k", "7 2 16", "9 2 16", Some(&["2", "7", "10"])),
+        ];
+        for (case, ctor, call, query, key, expected) in rows {
+            let code = format!("import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = {ctor}\n\n    def forward(self, q: Float[Array, \"{query}\"], k: Float[Array, \"{key}\"]):\n        out, w = self.attn({call})");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "case: {case}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "out"), Some(&shape(&query.split(' ').collect::<Vec<_>>())), "case: {case}");
+            assert_eq!(find_shape(&analysis, "w"), expected.map(shape).as_ref(), "case: {case}");
+        }
+    }
+
     #[test]
     fn test_multihead_attention_single_lhs_binds_primary_output() {
         // `out = self.attn(x, x, x)` (no tuple unpacking) previously bound
@@ -9146,9 +9167,8 @@ mod shape_error_kind_tests {
 
 /// RNN `(output, state)` tuple-LHS binding (`out, h = self.gru(x)`, `out,
 /// (h, c) = self.lstm(x)`) — extends `tuple_rhs_shapes` for `self.<attr>`
-/// calls resolving to `LayerKind::Rnn`. See the doc comment on that arm in
-/// `analysis.rs` for the exact approximation (batch_first=False,
-/// num_layers*num_directions == 1, seq axis dropped for the state).
+/// calls resolving to `LayerKind::Rnn`. The state is `[D*num_layers, N,
+/// H_out]` (`layers::rnn_outputs`).
 #[cfg(test)]
 mod rnn_tuple_unpacking_tests {
     use super::*;
@@ -9178,15 +9198,13 @@ mod rnn_tuple_unpacking_tests {
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
-        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["20"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["1", "20"])));
     }
 
     #[test]
     fn test_gru_tuple_unpacking_batched_state_keeps_batch_axis() {
-        // Batched input (seq, batch, features): the sequence-invariant
-        // output keeps all dims (last -> hidden); the state drops only the
-        // leading seq axis (approximation — real torch's h_n also carries a
-        // leading num_layers*num_directions axis, not modelled here).
+        // Batched input (seq, batch, features): the output keeps all dims
+        // (last -> hidden); h_n is (num_layers*num_directions, batch, hidden).
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq batch 10\"]):\n        out, h = self.gru(x)";
         let analysis = analyze(code);
 
@@ -9195,21 +9213,55 @@ mod rnn_tuple_unpacking_tests {
             find_shape(&analysis, "out"),
             Some(&shape(&["seq", "batch", "20"]))
         );
-        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["batch", "20"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["1", "batch", "20"])));
     }
 
     #[test]
     fn test_lstm_nested_h_c_state_pattern() {
         // `out, (h, c) = self.lstm(x)` — one level of nested tuple-pattern
         // support (`TupleTarget::Nested`): both `h` and `c` bind to the same
-        // approximated state shape.
+        // state shape.
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out, (h, c) = self.lstm(x)";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
-        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["20"])));
-        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["20"])));
+        assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["1", "20"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["1", "20"])));
+    }
+
+    fn lstm_block(ctor: &str, input: &str, lhs: &str) -> String {
+        format!("import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = {ctor}\n        self.fc = nn.Linear(32, 4)\n\n    def forward(self, x: Float[Array, \"{input}\"]):\n        {lhs} = self.lstm(x)\n        y = self.fc(o)")
+    }
+
+    /// Case, constructor, input, LHS, expected `o`, `h`, `c`.
+    type LstmRow<'a> = (&'a str, &'a str, &'a str, &'a str, Option<&'a [&'a str]>, Option<&'a [&'a str]>, Option<&'a [&'a str]>);
+
+    #[test]
+    fn test_lstm_options() {
+        let rows: &[LstmRow] = &[
+            // A bidirectional output feeds `Linear(32, 4)` without an error.
+            ("bidirectional", "nn.LSTM(8, 16, bidirectional=True)", "5 3 8", "o, (h, c)", Some(&["5", "3", "32"]), Some(&["2", "3", "16"]), Some(&["2", "3", "16"])),
+            ("batch first layers", "nn.LSTM(8, 16, num_layers=3, batch_first=True, bidirectional=True)", "3 5 8", "o, (h, c)", Some(&["3", "5", "32"]), Some(&["6", "3", "16"]), Some(&["6", "3", "16"])),
+            // h and c differ under a projection: one shape cannot bind both.
+            ("projection", "nn.LSTM(8, 32, proj_size=16, bidirectional=True)", "5 3 8", "o, (h, c)", Some(&["5", "3", "32"]), None, None),
+            // An LSTM state is a pair, so a plain name gets no tensor shape.
+            ("state name", "nn.LSTM(8, 16, bidirectional=True)", "5 3 8", "o, h", Some(&["5", "3", "32"]), None, None),
+        ];
+        for (case, ctor, input, lhs, o, h, c) in rows {
+            let analysis = analyze(&lstm_block(ctor, input, lhs));
+            assert!(analysis.errors.is_empty(), "case: {case}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "o"), o.map(shape).as_ref(), "case: {case}");
+            assert_eq!(find_shape(&analysis, "h"), h.map(shape).as_ref(), "case: {case}");
+            assert_eq!(find_shape(&analysis, "c"), c.map(shape).as_ref(), "case: {case}");
+        }
+    }
+
+    #[test]
+    fn test_lstm_unidirectional_output_mismatch_is_reported() {
+        let analysis = analyze(&lstm_block("nn.LSTM(8, 16)", "5 3 8", "o, (h, c)"));
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert!(analysis.errors[0].message.contains("expected input last dim 32, got 16"));
     }
 
     #[test]
@@ -16044,3 +16096,4 @@ mod symbolic_slice_tests {
         }
     }
 }
+

@@ -774,12 +774,16 @@ pub enum LayerKind {
     },
     /// Max/Avg pooling, channels-first like Conv: channels preserved, the
     /// trailing `spatial_rank` dims follow the conv output formula.
+    /// `dilation` is `"1"` for AvgPool and equinox. `ceil_mode` is the torch
+    /// text; a value that is not a literal bool gives unknown spatial dims.
     Pool {
         name: String,
         spatial_rank: usize,
         kernel_size: String,
         stride: String,
         padding: String,
+        dilation: String,
+        ceil_mode: String,
     },
     /// Adaptive pooling: the trailing `spatial_rank` dims all become
     /// `output_size`, channels preserved.
@@ -789,8 +793,8 @@ pub enum LayerKind {
         output_size: String,
     },
     /// torch.nn.MultiheadAttention — returns an (output, weights) tuple:
-    /// output has the query's shape, weights are (..., L, S) with L/S the
-    /// query/key sequence lengths. Only tuple-unpacking LHS is modelled.
+    /// output has the query's shape, weights are `(N, L, S)` (or
+    /// `(N, num_heads, L, S)`), without `N` when unbatched. Only tuple-unpacking LHS is modelled.
     ///
     /// `feature_dim` is the ctor's per-token model dimension: `embed_dim`
     /// for `torch.nn.MultiheadAttention(embed_dim, num_heads)`, or
@@ -800,8 +804,17 @@ pub enum LayerKind {
     /// resolved module path rather than reusing one binding key for both
     /// frameworks (previously it always read torch's `embed_dim` key, so
     /// equinox ctors were silently unclassified/misbound).
+    ///
+    /// torch only (`returns_weights`): `batch_first`, `num_heads`, and
+    /// `added_keys`, the count of key positions that `add_bias_kv` and
+    /// `add_zero_attn` add (`UNPROVEN_DIM` when not literal). equinox returns
+    /// the output only.
     MultiheadAttention {
         feature_dim: String,
+        num_heads: String,
+        batch_first: String,
+        added_keys: String,
+        returns_weights: bool,
     },
     /// Index lookup table: appends `embedding_size` to the input shape
     /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
@@ -835,10 +848,9 @@ pub enum LayerKind {
         scale_factor: Option<String>,
         size: Option<String>,
     },
-    /// ConvTranspose1d/2d/3d (torch + equinox): inverse of the conv output
-    /// formula: `out = (in-1)*stride - 2*padding + kernel`. Channels-first
-    /// layout, same convention as `Conv`. `output_padding`
-    /// and `dilation` are not modelled (assumed 0 / 1).
+    /// ConvTranspose1d/2d/3d (torch + equinox): `out = (in-1)*stride -
+    /// 2*padding + dilation*(kernel-1) + output_padding + 1`. Channels-first
+    /// layout, same convention as `Conv`.
     ConvTranspose {
         spatial_rank: usize,
         in_channels: String,
@@ -846,21 +858,24 @@ pub enum LayerKind {
         kernel_size: String,
         stride: String,
         padding: String,
+        output_padding: String,
+        dilation: String,
     },
-    /// torch.nn.RNN/LSTM/GRU full-sequence modules. Models only the primary
-    /// output tensor (last dim replaced by `hidden_size`, all other dims
-    /// preserved); the true return value is an `(output, final_state)`
-    /// tuple, which this analyzer can't express without tuple-unpacking
-    /// support in the layer-application pipeline (that lives in
-    /// `analysis.rs`, outside this module's scope), so direct/non-tuple
-    /// application is an approximation. `batch_first` doesn't change the
-    /// formula: the feature dim is always trailing regardless of (seq,
-    /// batch) ordering, so it isn't tracked. `bidirectional`/`num_layers`
-    /// are not modelled (hidden_size is used as-is).
+    /// torch.nn.RNN/LSTM/GRU full-sequence modules, `(output, h_n)` or
+    /// `(output, (h_n, c_n))`. A direct application gives `output` only:
+    /// last dim `D*H_out`, with `D` 2 when bidirectional and `H_out` the
+    /// `proj_size` of an LSTM when it is above 0, else `hidden_size`. The
+    /// state is `[D*num_layers, N, H_out]` (`c_n` keeps `hidden_size`).
+    /// `batch_first`, `bidirectional`, `num_layers` and `proj_size` are the
+    /// constructor text; a value that is not a literal gives an unknown dim.
     Rnn {
         name: String,
         input_size: String,
         hidden_size: String,
+        num_layers: String,
+        bidirectional: String,
+        proj_size: String,
+        batch_first: String,
     },
     /// torch.nn.RNNCell/GRUCell/LSTMCell and equinox.nn.LSTMCell/GRUCell —
     /// single-step cells. RNNCell/GRUCell genuinely return one tensor of

@@ -284,7 +284,8 @@ def t_torch_rnn(i):
     L.append(f"    def forward(self, ids: {ann([b, s])}):")
     L.append(f"        e = self.emb(ids){es(e=[b, s, E])}")
     L.append(f"        out, _ = self.gru(e){es(out=[b, s, Hh])}")
-    L.append(f"        att, w = self.mha(out, out, out){es(att=[b, s, Hh], w=[b, s, s])}")
+    # batch_first=False reads (b, s, Hh) as (L, N, E): weights are (N, L, L).
+    L.append(f"        att, w = self.mha(out, out, out){es(att=[b, s, Hh], w=[s, b, b])}")
     L.append(f"        logits = self.head(att){es(logits=[b, s, V])}")
     L.append(f"        pooled = logits.mean(dim=1){es(pooled=[b, V])}")
     L.append(f"        last = out[:, -1, :]{es(last=[b, Hh])}")

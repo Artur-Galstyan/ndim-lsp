@@ -16,6 +16,10 @@ use crate::resolution::{
 };
 use crate::types::*;
 
+/// The fifth positional parameter of `torch.nn.RNN`: `nonlinearity` in recent
+/// torch, `bias` before. A call that binds it is not classified.
+const RNN_POSITION_4: &str = "__rnn_position_4";
+
 /// Stands for a constructor dim whose value the file does not prove.
 pub(crate) const UNPROVEN_DIM: &str = "__unproven";
 
@@ -26,14 +30,18 @@ pub(crate) const PADDING_NAME: &str = "__padding_";
 
 /// Layers whose output shape is the input shape. LocalResponseNorm normalizes
 /// across a window of neighboring channels. TransformerEncoderLayer and
-/// TransformerDecoderLayer preserve d_model on their primary input; the
-/// second (`memory`) input of the decoder is not tracked, the same
-/// single-input limit as Bilinear/CosineSimilarity.
-const SHAPE_PRESERVING_LAYERS: [&str; 25] = [
+/// TransformerDecoderLayer, and the TransformerEncoder/TransformerDecoder stacks,
+/// preserve d_model on their primary input; the second (`memory`) input of the
+/// decoder is not tracked, the same single-input limit as
+/// Bilinear/CosineSimilarity.
+const SHAPE_PRESERVING_LAYERS: [&str; 49] = [
     "Dropout", "Dropout1d", "Dropout2d", "Dropout3d", "BatchNorm", "BatchNorm1d", "BatchNorm2d",
     "BatchNorm3d", "LayerNorm", "GroupNorm", "ReLU", "GELU", "Sigmoid", "Tanh", "Softmax", "PReLU",
     "Identity", "InstanceNorm1d", "InstanceNorm2d", "InstanceNorm3d", "RMSNorm", "AlphaDropout",
-    "LocalResponseNorm", "TransformerEncoderLayer", "TransformerDecoderLayer",
+    "LocalResponseNorm", "TransformerEncoderLayer", "TransformerDecoderLayer", "TransformerEncoder",
+    "TransformerDecoder", "SiLU", "LeakyReLU", "ELU", "SELU", "CELU", "Softplus", "Mish", "Hardswish",
+    "Hardsigmoid", "Hardtanh", "ReLU6", "LogSoftmax", "Softmin", "Softsign", "Tanhshrink", "Threshold",
+    "LogSigmoid", "Softshrink", "Hardshrink", "RReLU", "FeatureAlphaDropout", "Softmax2d",
 ];
 
 #[cfg(test)]
@@ -154,13 +162,12 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             if is_sequence(&kernel_size) {
                 return None;
             }
-            // torch default: stride = kernel_size. (equinox defaults to
-            // stride=1 — divergence accepted until it bites.)
-            let stride = call
-                .bindings
-                .get("stride")
-                .cloned()
-                .unwrap_or_else(|| kernel_size.clone());
+            // torch: stride=None means kernel_size. equinox: stride=1.
+            let stride = match call.bindings.get("stride").map(|stride| stride.trim()) {
+                Some(stride) if stride != "None" => stride.to_string(),
+                _ if is_equinox_module => "1".to_string(),
+                _ => kernel_size.clone(),
+            };
             if is_sequence(&stride) {
                 return None;
             }
@@ -168,12 +175,32 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             if is_sequence(&padding) {
                 return None;
             }
+            let flag = |name: &str| call.bindings.get(name).map_or("False", |value| value.trim());
+            // `return_indices=True` gives an `(output, indices)` tuple.
+            if flag("return_indices") != "False" {
+                return None;
+            }
+            // equinox `use_ceil` rounds up without the torch rule that drops a
+            // last window that starts in the padding: not modelled.
+            let ceil_mode = if is_equinox_module {
+                if flag("use_ceil") == "False" { "False".to_string() } else { UNPROVEN_DIM.to_string() }
+            } else {
+                flag("ceil_mode").to_string()
+            };
+            let dilation = call
+                .bindings
+                .get("dilation")
+                .filter(|_| owner.starts_with("MaxPool") && is_torch_module)
+                .cloned()
+                .unwrap_or_else(|| "1".to_string());
             Some(LayerKind::Pool {
                 name: owner.to_string(),
                 spatial_rank,
                 kernel_size,
                 stride,
                 padding,
+                dilation,
+                ceil_mode,
             })
         }
         "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
@@ -201,10 +228,25 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             } else {
                 call.bindings.get("embed_dim")?
             };
+            let flag = |name: &str| call.bindings.get(name).map_or("False", |value| value.trim());
+            let added_keys = match (flag("add_bias_kv"), flag("add_zero_attn")) {
+                (a @ ("True" | "False"), b @ ("True" | "False")) => {
+                    ((a == "True") as u8 + (b == "True") as u8).to_string()
+                }
+                _ => UNPROVEN_DIM.to_string(),
+            };
             Some(LayerKind::MultiheadAttention {
                 feature_dim: feature_dim.clone(),
+                num_heads: call.bindings.get("num_heads").cloned().unwrap_or_else(|| UNPROVEN_DIM.to_string()),
+                batch_first: flag("batch_first").to_string(),
+                added_keys,
+                returns_weights: !is_equinox_module,
             })
         }
+        // flax.linen.Embed(num_embeddings, features).
+        "Embed" if is_flax_module => Some(LayerKind::Embedding {
+            embedding_size: call.bindings.get("features")?.clone(),
+        }),
         // equinox names it `embedding_size`, torch `embedding_dim`.
         "Embedding" => Some(LayerKind::Embedding {
             embedding_size: call
@@ -257,6 +299,9 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
             if is_sequence(&padding) || (is_torch_module && string_text(&padding).is_some()) {
                 return None;
             }
+            let or_default = |name: &str, default: &str| {
+                call.bindings.get(name).cloned().unwrap_or_else(|| default.to_string())
+            };
             Some(LayerKind::ConvTranspose {
                 spatial_rank,
                 in_channels: call.bindings.get("in_channels")?.clone(),
@@ -264,13 +309,28 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 kernel_size,
                 stride,
                 padding,
+                output_padding: or_default("output_padding", "0"),
+                dilation: or_default("dilation", "1"),
             })
         }
-        "RNN" | "LSTM" | "GRU" => Some(LayerKind::Rnn {
-            name: owner.to_string(),
-            input_size: call.bindings.get("input_size")?.clone(),
-            hidden_size: call.bindings.get("hidden_size")?.clone(),
-        }),
+        "RNN" | "LSTM" | "GRU" if is_torch_module => {
+            // torch.nn.RNN takes `nonlinearity` fourth in recent versions only.
+            if call.bindings.contains_key(RNN_POSITION_4) {
+                return None;
+            }
+            let or_default = |name: &str, default: &str| {
+                call.bindings.get(name).map_or(default.to_string(), |value| value.trim().to_string())
+            };
+            Some(LayerKind::Rnn {
+                name: owner.to_string(),
+                input_size: call.bindings.get("input_size")?.clone(),
+                hidden_size: call.bindings.get("hidden_size")?.clone(),
+                num_layers: or_default("num_layers", "1"),
+                bidirectional: or_default("bidirectional", "False"),
+                proj_size: if owner == "LSTM" { or_default("proj_size", "0") } else { "0".to_string() },
+                batch_first: or_default("batch_first", "False"),
+            })
+        }
         "RNNCell" | "LSTMCell" | "GRUCell" => Some(LayerKind::RnnCell {
             name: owner.to_string(),
             input_size: call.bindings.get("input_size")?.clone(),
@@ -463,12 +523,16 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size,
             stride,
             padding,
+            dilation,
+            ceil_mode,
         } => LayerKind::Pool {
             name,
             spatial_rank,
             kernel_size: f(&kernel_size),
             stride: f(&stride),
             padding: f(&padding),
+            dilation: f(&dilation),
+            ceil_mode: f(&ceil_mode),
         },
         LayerKind::AdaptivePool {
             name,
@@ -479,8 +543,18 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             spatial_rank,
             output_size: f(&output_size),
         },
-        LayerKind::MultiheadAttention { feature_dim } => LayerKind::MultiheadAttention {
+        LayerKind::MultiheadAttention {
+            feature_dim,
+            num_heads,
+            batch_first,
+            added_keys,
+            returns_weights,
+        } => LayerKind::MultiheadAttention {
             feature_dim: f(&feature_dim),
+            num_heads: f(&num_heads),
+            batch_first: f(&batch_first),
+            added_keys: f(&added_keys),
+            returns_weights,
         },
         LayerKind::Embedding { embedding_size } => LayerKind::Embedding {
             embedding_size: f(&embedding_size),
@@ -505,6 +579,8 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size,
             stride,
             padding,
+            output_padding,
+            dilation,
         } => LayerKind::ConvTranspose {
             spatial_rank,
             in_channels: f(&in_channels),
@@ -512,15 +588,25 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             kernel_size: f(&kernel_size),
             stride: f(&stride),
             padding: f(&padding),
+            output_padding: f(&output_padding),
+            dilation: f(&dilation),
         },
         LayerKind::Rnn {
             name,
             input_size,
             hidden_size,
+            num_layers,
+            bidirectional,
+            proj_size,
+            batch_first,
         } => LayerKind::Rnn {
             name,
             input_size: f(&input_size),
             hidden_size: f(&hidden_size),
+            num_layers: f(&num_layers),
+            bidirectional: f(&bidirectional),
+            proj_size: f(&proj_size),
+            batch_first: f(&batch_first),
         },
         LayerKind::RnnCell {
             name,
@@ -655,9 +741,16 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         }
         "Linear" => &["self", "in_features", "out_features", "use_bias"],
         "Embedding" => &["self", "num_embeddings", "embedding_size"],
-        "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => {
-            &["self", "kernel_size", "stride", "padding"]
+        "Embed" if framework == "flax" => &["self", "num_embeddings", "features"],
+        "MaxPool1d" | "MaxPool2d" | "MaxPool3d" | "AvgPool1d" | "AvgPool2d" | "AvgPool3d"
+            if framework == "equinox" =>
+        {
+            &["self", "kernel_size", "stride", "padding", "use_ceil"]
         }
+        "MaxPool1d" | "MaxPool2d" | "MaxPool3d" => {
+            &["self", "kernel_size", "stride", "padding", "dilation", "return_indices", "ceil_mode"]
+        }
+        "AvgPool1d" | "AvgPool2d" | "AvgPool3d" => &["self", "kernel_size", "stride", "padding", "ceil_mode"],
         "AdaptiveMaxPool1d" | "AdaptiveMaxPool2d" | "AdaptiveMaxPool3d" | "AdaptiveAvgPool1d"
         | "AdaptiveAvgPool2d" | "AdaptiveAvgPool3d" => &["self", "output_size"],
         // equinox.nn.MultiheadAttention(num_heads, query_size, key_size=None,
@@ -671,7 +764,18 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
             "value_size",
             "output_size",
         ],
-        "MultiheadAttention" => &["self", "embed_dim", "num_heads"],
+        "MultiheadAttention" => &[
+            "self",
+            "embed_dim",
+            "num_heads",
+            "dropout",
+            "bias",
+            "add_bias_kv",
+            "add_zero_attn",
+            "kdim",
+            "vdim",
+            "batch_first",
+        ],
         "Conv1d" | "Conv2d" | "Conv3d" => &[
             "self",
             "in_channels",
@@ -687,10 +791,19 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
         "Flatten" => &["self", "start_dim", "end_dim"],
         "Unflatten" => &["self", "dim", "sizes"],
         "Upsample" => &["self", "size", "scale_factor", "mode", "align_corners"],
-        // Shares the first 5 positions (in/out channels, kernel_size, stride,
-        // padding) with Conv1d/2d/3d; torch and equinox diverge on the order
-        // of `groups`/`dilation`/`bias` afterwards, which we don't read, so
-        // the trailing placeholder names only need to absorb positions.
+        // equinox puts `output_padding` before `padding`, torch after.
+        "ConvTranspose1d" | "ConvTranspose2d" | "ConvTranspose3d" if framework == "equinox" => &[
+            "self",
+            "in_channels",
+            "out_channels",
+            "kernel_size",
+            "stride",
+            "output_padding",
+            "padding",
+            "dilation",
+            "groups",
+            "use_bias",
+        ],
         "ConvTranspose1d" | "ConvTranspose2d" | "ConvTranspose3d" => &[
             "self",
             "in_channels",
@@ -699,13 +812,25 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
             "stride",
             "padding",
             "output_padding",
-            "groups_or_dilation",
-            "dilation_or_groups",
-            "use_bias",
+            "groups",
+            "bias",
+            "dilation",
         ],
-        // torch/equinox agree on (input_size, hidden_size, ...) for all six
-        // of these; only the first two are ever read.
-        "RNN" | "LSTM" | "GRU" | "RNNCell" | "LSTMCell" | "GRUCell" => &[
+        "RNN" => &["self", "input_size", "hidden_size", "num_layers", RNN_POSITION_4],
+        "LSTM" | "GRU" => &[
+            "self",
+            "input_size",
+            "hidden_size",
+            "num_layers",
+            "bias",
+            "batch_first",
+            "dropout",
+            "bidirectional",
+            "proj_size",
+        ],
+        // torch/equinox agree on (input_size, hidden_size, ...) for the
+        // cells; only the first two are ever read.
+        "RNNCell" | "LSTMCell" | "GRUCell" => &[
             "self",
             "input_size",
             "hidden_size",
@@ -1363,33 +1488,35 @@ fn conv_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding:
 /// `flax.linen.Conv` is added, a separate variant or layout field will be
 /// needed.
 /// Inverse of `conv_spatial_dim` for transposed/deconvolutions.
-/// Formula: `out = (in-1)*stride - 2*padding + kernel` (`output_padding` and
-/// `dilation` are not modelled and assumed 0 / 1).
+/// Formula: `out = (in-1)*stride - 2*padding + kernel + output_padding`, with
+/// `kernel` the effective (dilated) kernel size.
 ///
 /// Fully concrete when every input is a literal int; otherwise built
 /// symbolically with constant-folding where possible, mirroring
-/// `conv_spatial_dim`'s approach.
+/// `conv_spatial_dim`'s approach. An overflow gives `UNKNOWN_DIM`.
 fn conv_transpose_spatial_dim(
     spatial_dim: &str,
     kernel_size: &str,
     stride: &str,
     padding: &str,
+    output_padding: &str,
 ) -> String {
-    let inputs = [spatial_dim, kernel_size, stride, padding];
-    let [spatial_dim, kernel_size, stride, padding] = inputs.map(without_literal_mark);
-    if let (Ok(l), Ok(k), Ok(s), Ok(p)) = (
+    let inputs = [spatial_dim, kernel_size, stride, padding, output_padding];
+    let [spatial_dim, kernel_size, stride, padding, output_padding] = inputs.map(without_literal_mark);
+    if let (Ok(l), Ok(k), Ok(s), Ok(p), Ok(op)) = (
         spatial_dim.parse::<i64>(),
         kernel_size.parse::<i64>(),
         stride.parse::<i64>(),
         padding.parse::<i64>(),
+        output_padding.parse::<i64>(),
     ) {
         let size = l.checked_sub(1).and_then(|l| l.checked_mul(s)).and_then(|scaled| {
-            scaled.checked_sub(p.checked_mul(2)?)?.checked_add(k)
+            scaled.checked_sub(p.checked_mul(2)?)?.checked_add(k)?.checked_add(op)
         });
         return size.map_or(UNKNOWN_DIM.to_string(), |size| literal_mark(&inputs.concat(), size));
     }
 
-    // Symbolic: (L-1)*stride - 2*padding + kernel
+    // Symbolic: (L-1)*stride - 2*padding + kernel + output_padding
     let stride_val: Option<isize> = stride.parse::<isize>().ok();
     let scaled = match stride_val {
         Some(1) => apply_offset(spatial_dim, -1),
@@ -1406,11 +1533,127 @@ fn conv_transpose_spatial_dim(
     } else {
         result = format!("{}-2*{}", result, padding);
     }
-    if let Ok(k) = kernel_size.parse::<isize>() {
-        apply_offset(&result, k)
-    } else {
-        format!("{}+{}", result, kernel_size)
+    for added in [kernel_size, output_padding] {
+        result = match added.parse::<isize>() {
+            Ok(value) => apply_offset(&result, value),
+            Err(_) => format!("{}+{}", result, added),
+        };
+        if result == UNKNOWN_DIM {
+            return result;
+        }
     }
+    result
+}
+
+/// torch pooling with `ceil_mode=True`: `ceil((L + 2*padding - kernel) /
+/// stride) + 1`, one less when the last window starts in the right padding.
+/// Only integers are modelled: any other input gives `UNKNOWN_DIM`.
+fn pool_ceil_spatial_dim(spatial_dim: &str, kernel_size: &str, stride: &str, padding: &str) -> String {
+    let inputs = [spatial_dim, kernel_size, stride, padding];
+    let [l, k, s, p] = inputs.map(|dim| without_literal_mark(dim).parse::<i64>().ok());
+    let (Some(l), Some(k), Some(s), Some(p)) = (l, k, s, p) else {
+        return UNKNOWN_DIM.to_string();
+    };
+    if s <= 0 {
+        return UNKNOWN_DIM.to_string();
+    }
+    let size = p.checked_mul(2).and_then(|pad| l.checked_add(pad)?.checked_sub(k)).and_then(|span| {
+        if span < 0 {
+            return Some(-1);
+        }
+        let windows = span.checked_add(s - 1)? / s + 1;
+        let last_start = (windows - 1).checked_mul(s)?;
+        Some(if last_start >= l.checked_add(p)? { windows - 1 } else { windows })
+    });
+    size.map_or(UNKNOWN_DIM.to_string(), |size| literal_mark(&inputs.concat(), size))
+}
+
+/// The shapes that `torch.nn.RNN`/`LSTM`/`GRU` gives for one input shape.
+pub(crate) struct RnnOutputs {
+    /// The last dim of `output`.
+    pub output: String,
+    /// `h_n`; `None` when the input rank is not 2 or 3.
+    pub hidden: Option<Vec<String>>,
+    /// `c_n` of an LSTM, the same as `hidden` without a projection.
+    pub cell: Option<Vec<String>>,
+}
+
+/// The output last dim and the final states of an `Rnn` layer. A dim that a
+/// non-literal option controls is `UNKNOWN_DIM`.
+pub(crate) fn rnn_outputs(kind: &LayerKind, input_shape: &[String]) -> RnnOutputs {
+    let LayerKind::Rnn { hidden_size, num_layers, bidirectional, proj_size, batch_first, .. } = kind else {
+        unreachable!("rnn_outputs takes only Rnn");
+    };
+    let unknown = || UNKNOWN_DIM.to_string();
+    let directions = match bidirectional.as_str() {
+        "False" => Some(1),
+        "True" => Some(2),
+        _ => None,
+    };
+    let h_out = match without_literal_mark(proj_size).parse::<u64>() {
+        Ok(0) => hidden_size.clone(),
+        Ok(_) => proj_size.clone(),
+        Err(_) => unknown(),
+    };
+    let output = match directions {
+        Some(1) => h_out.clone(),
+        Some(d) => mul_dim(&h_out, d),
+        None => unknown(),
+    };
+    let layers = without_literal_mark(num_layers).parse::<u64>().ok().filter(|n| *n > 0);
+    let leading = match (directions, layers) {
+        (Some(d), Some(n)) => n.checked_mul(d).map_or_else(unknown, |product| product.to_string()),
+        _ => unknown(),
+    };
+    let batch = match (input_shape.len(), batch_first.as_str()) {
+        (2, _) => None,
+        (3, "False") => Some(input_shape[1].clone()),
+        (3, "True") => Some(input_shape[0].clone()),
+        (3, _) => Some(unknown()),
+        _ => return RnnOutputs { output, hidden: None, cell: None },
+    };
+    let state = |last: &String| {
+        let mut state = vec![leading.clone()];
+        state.extend(batch.clone());
+        state.push(last.clone());
+        state
+    };
+    RnnOutputs { output, hidden: Some(state(&h_out)), cell: Some(state(hidden_size)) }
+}
+
+/// The attention weights of `torch.nn.MultiheadAttention` for a query and a
+/// key shape: `(N, L, S)`, or `(N, num_heads, L, S)` when `average` is
+/// `"False"`, without `N` for an unbatched input. `None` when the call does
+/// not return weights or an option is not a literal.
+pub(crate) fn attention_weights(
+    kind: &LayerKind,
+    query: &[String],
+    key: &[String],
+    need_weights: &str,
+    average: &str,
+) -> Option<Vec<String>> {
+    let LayerKind::MultiheadAttention { num_heads, batch_first, added_keys, returns_weights: true, .. } = kind else {
+        return None;
+    };
+    if need_weights != "True" || query.len() != key.len() {
+        return None;
+    }
+    let added = without_literal_mark(added_keys).parse::<isize>().ok()?;
+    let (batch, l, s) = match (query.len(), batch_first.as_str()) {
+        (2, _) => (None, &query[0], &key[0]),
+        (3, "False") => (Some(&query[1]), &query[0], &key[0]),
+        (3, "True") => (Some(&query[0]), &query[1], &key[1]),
+        _ => return None,
+    };
+    let s = apply_offset(s, added);
+    let mut weights: Vec<String> = batch.into_iter().cloned().collect();
+    match average {
+        "True" => {}
+        "False" if !num_heads.contains(UNPROVEN_DIM) => weights.push(num_heads.clone()),
+        _ => return None,
+    }
+    weights.extend([l.clone(), s]);
+    Some(weights)
 }
 
 /// The integer of a `LITERAL_DIM` dim, and any other dim as it is.
@@ -1596,7 +1839,6 @@ fn replace_last_dim(
     output: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(last_dim) = input_shape.last() else {
-        let name = if name == "Linear" { "linear" } else { name };
         return Err(format!("Cannot apply {} layer '{}' to scalar input '{}'", name, layer, input));
     };
     if let Some(expected) = expected
@@ -1619,13 +1861,20 @@ fn apply_conv_layer(
     input: &str,
     input_shape: &[String],
 ) -> Result<Option<Vec<String>>, String> {
-    let (name, spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation) = match kind {
+    let (name, spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation, output_padding) = match kind {
         LayerKind::Conv { spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation } => {
-            ("Conv", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, Some(dilation))
+            ("Conv", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation, None)
         }
-        LayerKind::ConvTranspose { spatial_rank, in_channels, out_channels, kernel_size, stride, padding } => {
-            ("ConvTranspose", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, None)
-        }
+        LayerKind::ConvTranspose {
+            spatial_rank,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+        } => ("ConvTranspose", *spatial_rank, in_channels, out_channels, kernel_size, stride, padding, dilation, Some(output_padding)),
         _ => unreachable!("apply_conv_layer takes only Conv and ConvTranspose"),
     };
     let layer_name = format!("{name}{spatial_rank}d");
@@ -1648,21 +1897,37 @@ fn apply_conv_layer(
         ConvPadding::Amount(padding) => padding,
     };
     let spatial = &mut output_shape[channels_idx + 1..];
-    let Some(dilation) = dilation else {
-        for dim in spatial {
-            *dim = conv_transpose_spatial_dim(dim, kernel_size, stride, padding);
-        }
-        return Ok(Some(output_shape));
-    };
     let Some(dilations) = conv_dilations(dilation, spatial_rank) else {
         return Ok(None);
     };
-    for (dim, dilation) in spatial.iter_mut().zip(&dilations) {
+    let output_paddings = match output_padding {
+        None => None,
+        Some(output_padding) => match per_axis(output_padding, spatial_rank) {
+            Some(output_paddings) => Some(output_paddings),
+            None => return Ok(None),
+        },
+    };
+    for (axis, (dim, dilation)) in spatial.iter_mut().zip(&dilations).enumerate() {
         let Some(kernel) = effective_kernel_size(without_literal_mark(kernel_size), dilation) else {
             return Ok(None);
         };
         let kernel = if dilation == "1" { kernel_size } else { &kernel };
-        *dim = conv_spatial_dim(dim, kernel, stride, padding);
+        *dim = match &output_paddings {
+            Some(output_paddings) => {
+                let output_padding = &output_paddings[axis];
+                // torch refuses an output_padding that is not below stride or dilation.
+                if let (Ok(op), Ok(s), Ok(d)) = (
+                    output_padding.parse::<i64>(),
+                    without_literal_mark(stride).parse::<i64>(),
+                    dilation.parse::<i64>(),
+                ) && (op < 0 || (op >= s && op >= d))
+                {
+                    return Ok(None);
+                }
+                conv_transpose_spatial_dim(dim, kernel, stride, padding, output_padding)
+            }
+            None => conv_spatial_dim(dim, kernel, stride, padding),
+        };
     }
     Ok(Some(output_shape))
 }
@@ -1670,13 +1935,19 @@ fn apply_conv_layer(
 /// The dilation of each of `spatial_rank` axes. `None` when one is not known
 /// as a positive integer.
 fn conv_dilations(dilation: &str, spatial_rank: usize) -> Option<Vec<String>> {
-    let dilations = if is_sequence(dilation) {
-        parse_dim_sequence(dilation).filter(|axes| axes.len() == spatial_rank)?
-    } else {
-        vec![dilation.to_string(); spatial_rank]
-    };
-    let dilations: Vec<String> = dilations.iter().map(|axis| without_literal_mark(axis).to_string()).collect();
+    let dilations = per_axis(dilation, spatial_rank)?;
     dilations.iter().all(|axis| axis.parse::<i64>().is_ok_and(|d| d > 0)).then_some(dilations)
+}
+
+/// The value of each of `spatial_rank` axes: a scalar applies to every axis,
+/// a sequence must have one value per axis.
+fn per_axis(value: &str, spatial_rank: usize) -> Option<Vec<String>> {
+    let values = if is_sequence(value) {
+        parse_dim_sequence(value).filter(|axes| axes.len() == spatial_rank)?
+    } else {
+        vec![value.to_string(); spatial_rank]
+    };
+    Some(values.iter().map(|axis| without_literal_mark(axis).to_string()).collect())
 }
 
 /// Returns the minimum input rank required by a shape-preserving layer,
@@ -1691,6 +1962,7 @@ fn conv_dilations(dilation: &str, spatial_rank: usize) -> Option<Vec<String>> {
 ///   Dropout3d   → 4  (C, D, H, W)
 ///   GroupNorm   → 1  (needs a channel dim)
 ///   LayerNorm   → 1  (needs at least one dim to normalize)
+///   LocalResponseNorm, Softmax2d → 3
 ///
 /// Equinox `BatchNorm` and activations (`ReLU`, `GELU`, etc.) accept any rank.
 fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
@@ -1701,6 +1973,7 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
         "BatchNorm2d" | "Dropout2d" | "InstanceNorm2d" => Some(3),
         "BatchNorm3d" | "Dropout3d" | "InstanceNorm3d" => Some(4),
         "LayerNorm" | "GroupNorm" | "RMSNorm" => Some(1),
+        "LocalResponseNorm" | "Softmax2d" => Some(3),
         // Dropout, BatchNorm (equinox), ReLU, GELU, Sigmoid, Tanh, Softmax,
         // PReLU, Identity, AlphaDropout, TransformerEncoderLayer,
         // TransformerDecoderLayer accept any rank including scalars.
@@ -1823,15 +2096,28 @@ fn apply_layer_rule(
             kernel_size,
             stride,
             padding,
+            dilation,
+            ceil_mode,
         } => {
             check_min_rank(name, layer, input, input_shape.len(), spatial_rank + 1)?;
             if string_text(padding).is_some() || padding.starts_with(PADDING_NAME) {
                 return Ok(None);
             }
+            let Some(dilations) = conv_dilations(dilation, *spatial_rank) else {
+                return Ok(None);
+            };
             let mut output_shape = input_shape.to_vec();
             let start = input_shape.len() - spatial_rank;
-            for dim in &mut output_shape[start..] {
-                *dim = conv_spatial_dim(dim, kernel_size, stride, padding);
+            for (dim, dilation) in output_shape[start..].iter_mut().zip(&dilations) {
+                let Some(kernel) = effective_kernel_size(without_literal_mark(kernel_size), dilation) else {
+                    return Ok(None);
+                };
+                let kernel = if dilation == "1" { kernel_size } else { &kernel };
+                *dim = match ceil_mode.as_str() {
+                    "False" => conv_spatial_dim(dim, kernel, stride, padding),
+                    "True" => pool_ceil_spatial_dim(dim, kernel, stride, padding),
+                    _ => UNKNOWN_DIM.to_string(),
+                };
             }
             Ok(Some(output_shape))
         }
@@ -1927,18 +2213,26 @@ fn apply_layer_rule(
         // torch.nn.RNN/LSTM/GRU: approximated as the primary output tensor
         // only (see LayerKind::Rnn doc comment). RNNCell/GRUCell/LSTMCell:
         // the same rule for a single step, optionally unbatched.
-        LayerKind::Rnn {
-            name,
-            input_size,
-            hidden_size,
+        LayerKind::Rnn { name, input_size, .. } => {
+            check_min_rank(name, layer, input, input_shape.len(), 2)?;
+            if input_shape.len() > 3 {
+                return Err(format!(
+                    "{} layer '{}' expects input with 2 or 3 dims, got {} for '{}'",
+                    name,
+                    layer,
+                    input_shape.len(),
+                    input
+                ));
+            }
+            let output = rnn_outputs(kind, input_shape).output;
+            replace_last_dim(name, layer, input, input_shape, Some(input_size), &output)
         }
-        | LayerKind::RnnCell {
+        LayerKind::RnnCell {
             name,
             input_size,
             hidden_size,
         } => {
-            let min_rank = if matches!(kind, LayerKind::Rnn { .. }) { 2 } else { 1 };
-            check_min_rank(name, layer, input, input_shape.len(), min_rank)?;
+            check_min_rank(name, layer, input, input_shape.len(), 1)?;
             replace_last_dim(name, layer, input, input_shape, Some(input_size), hidden_size)
         }
         // torch.nn.PixelShuffle(r): (*, C*r^2, H, W) -> (*, C, H*r, W*r).
@@ -2211,6 +2505,20 @@ mod table_tests {
     }
 
     fn conv_transpose(spatial_rank: usize, in_channels: &str, out_channels: &str, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
+        conv_transpose_with(spatial_rank, in_channels, out_channels, kernel_size, stride, padding, "0", "1")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_transpose_with(
+        spatial_rank: usize,
+        in_channels: &str,
+        out_channels: &str,
+        kernel_size: &str,
+        stride: &str,
+        padding: &str,
+        output_padding: &str,
+        dilation: &str,
+    ) -> LayerKind {
         LayerKind::ConvTranspose {
             spatial_rank,
             in_channels: s(in_channels),
@@ -2218,11 +2526,25 @@ mod table_tests {
             kernel_size: s(kernel_size),
             stride: s(stride),
             padding: s(padding),
+            output_padding: s(output_padding),
+            dilation: s(dilation),
         }
     }
 
     fn pool(name: &str, spatial_rank: usize, kernel_size: &str, stride: &str, padding: &str) -> LayerKind {
-        LayerKind::Pool { name: s(name), spatial_rank, kernel_size: s(kernel_size), stride: s(stride), padding: s(padding) }
+        pool_with(name, spatial_rank, kernel_size, stride, padding, "1", "False")
+    }
+
+    fn pool_with(name: &str, spatial_rank: usize, kernel_size: &str, stride: &str, padding: &str, dilation: &str, ceil_mode: &str) -> LayerKind {
+        LayerKind::Pool {
+            name: s(name),
+            spatial_rank,
+            kernel_size: s(kernel_size),
+            stride: s(stride),
+            padding: s(padding),
+            dilation: s(dilation),
+            ceil_mode: s(ceil_mode),
+        }
     }
 
     fn einops(name: &str, pattern: &str, kwargs: &[(&str, &str)]) -> LayerKind {
@@ -2239,7 +2561,26 @@ mod table_tests {
     }
 
     fn mha(feature_dim: &str) -> LayerKind {
-        LayerKind::MultiheadAttention { feature_dim: s(feature_dim) }
+        mha_with(feature_dim, "8", "False", "0")
+    }
+
+    fn mha_with(feature_dim: &str, num_heads: &str, batch_first: &str, added_keys: &str) -> LayerKind {
+        LayerKind::MultiheadAttention {
+            feature_dim: s(feature_dim),
+            num_heads: s(num_heads),
+            batch_first: s(batch_first),
+            added_keys: s(added_keys),
+            returns_weights: true,
+        }
+    }
+
+    fn eqx_mha(feature_dim: &str, num_heads: &str) -> LayerKind {
+        match mha_with(feature_dim, num_heads, "False", "0") {
+            LayerKind::MultiheadAttention { feature_dim, num_heads, batch_first, added_keys, .. } => {
+                LayerKind::MultiheadAttention { feature_dim, num_heads, batch_first, added_keys, returns_weights: false }
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn embedding(embedding_size: &str) -> LayerKind {
@@ -2247,7 +2588,21 @@ mod table_tests {
     }
 
     fn rnn(name: &str, input_size: &str, hidden_size: &str) -> LayerKind {
-        LayerKind::Rnn { name: s(name), input_size: s(input_size), hidden_size: s(hidden_size) }
+        rnn_with(name, input_size, hidden_size, ["1", "False", "0", "False"])
+    }
+
+    /// `options`: num_layers, bidirectional, proj_size, batch_first.
+    fn rnn_with(name: &str, input_size: &str, hidden_size: &str, options: [&str; 4]) -> LayerKind {
+        let [num_layers, bidirectional, proj_size, batch_first] = options.map(s);
+        LayerKind::Rnn {
+            name: s(name),
+            input_size: s(input_size),
+            hidden_size: s(hidden_size),
+            num_layers,
+            bidirectional,
+            proj_size,
+            batch_first,
+        }
     }
 
     fn pad(padding: &str) -> LayerKind {
@@ -2283,7 +2638,7 @@ mod table_tests {
             ("linear rank 1", linear("3", "5"), &["3"], Gives(&["5"])),
             ("linear symbolic", linear("features", "hidden"), &["batch", "features"], Gives(&["batch", "hidden"])),
             ("linear keeps leading dims", linear("features", "hidden"), &["time", "batch", "features"], Gives(&["time", "batch", "hidden"])),
-            ("linear scalar input", linear("3", "5"), &[], Fails(&["scalar input"])),
+            ("linear scalar input", linear("3", "5"), &[], Fails(&["Cannot apply Linear layer", "scalar input"])),
             ("linear last dim mismatch", linear("3", "5"), &["batch", "4"], Fails(&["expected input last dim 3", "got 4"])),
             // Issue #47: ctor-argument text and annotation dims are different
             // vocabularies, so a symbolic mismatch is unprovable and trusted.
@@ -2300,6 +2655,13 @@ mod table_tests {
                 &["32", "16", "16"],
                 Gives(&["32", "1", "1"]),
             ),
+            ("maxpool ceil mode", pool_with("MaxPool2d", 2, "3", "3", "0", "1", "True"), &["3", "16", "16"], Gives(&["3", "6", "6"])),
+            // The last window would start in the right padding, so torch drops it.
+            ("pool ceil mode drops last window", pool_with("AvgPool1d", 1, "2", "2", "1", "1", "True"), &["3", "5"], Gives(&["3", "3"])),
+            ("pool ceil mode symbolic", pool_with("MaxPool1d", 1, "2", "2", "0", "1", "True"), &["c", "L"], Gives(&["c", UNKNOWN_DIM])),
+            ("pool unproven ceil mode", pool_with("MaxPool1d", 1, "2", "2", "0", "1", "flag"), &["3", "8"], Gives(&["3", UNKNOWN_DIM])),
+            // Effective kernel 2*(3-1)+1 = 5.
+            ("maxpool dilation", pool_with("MaxPool1d", 1, "3", "1", "0", "2", "False"), &["3", "9"], Gives(&["3", "5"])),
             ("pool rank too low", pool("MaxPool2d", 2, "2", "2", "0"), &["16"], Fails(&["requires input with at least 3 dims"])),
             ("flatten middle dims", flatten("1", "2"), &["2", "3", "4", "5"], Gives(&["2", "12", "5"])),
             ("flatten symbolic, negative end", flatten("1", "-1"), &["batch", "c", "d"], Gives(&["batch", "c*d"])),
@@ -2311,8 +2673,38 @@ mod table_tests {
             ("upsample rank too low", upsample(Some("2"), None), &["3", "8"], Fails(&["requires input with at least 3 dims"])),
             // conv_spatial_dim(8, k=4, s=2, p=1) == 4; the transpose inverts it.
             ("conv transpose2d", conv_transpose(2, "3", "16", "4", "2", "1"), &["3", "4", "4"], Gives(&["16", "8", "8"])),
+            (
+                "conv transpose2d output padding",
+                conv_transpose_with(2, "3", "3", "3", "2", "1", "1", "1"),
+                &["1", "3", "16", "16"],
+                Gives(&["1", "3", "32", "32"]),
+            ),
+            // (5-1)*1 - 0 + 2*(3-1) + 1 = 9.
+            (
+                "conv transpose1d dilation",
+                conv_transpose_with(1, "3", "3", "3", "1", "0", "0", "2"),
+                &["3", "5"],
+                Gives(&["3", "9"]),
+            ),
+            (
+                "conv transpose symbolic output padding",
+                conv_transpose_with(1, "3", "3", "3", "2", "1", "1", "1"),
+                &["3", "L"],
+                Gives(&["3", "(L-1)*2-2+3+1"]),
+            ),
+            // torch refuses an output_padding that is not below the stride.
+            (
+                "conv transpose output padding too large",
+                conv_transpose_with(1, "3", "3", "3", "2", "1", "2", "1"),
+                &["3", "5"],
+                Unknown,
+            ),
             ("conv transpose2d channels", conv_transpose(2, "3", "16", "4", "2", "1"), &["5", "4", "4"], Fails(&["expected 3 input channels"])),
             ("rnn hidden size", rnn("GRU", "10", "20"), &["seq", "10"], Gives(&["seq", "20"])),
+            ("lstm bidirectional", rnn_with("LSTM", "8", "16", ["1", "True", "0", "False"]), &["5", "3", "8"], Gives(&["5", "3", "32"])),
+            ("lstm projection", rnn_with("LSTM", "8", "16", ["2", "True", "4", "False"]), &["5", "8"], Gives(&["5", "8"])),
+            ("rnn unproven bidirectional", rnn_with("GRU", "8", "16", ["1", "flag", "0", "False"]), &["5", "8"], Gives(&["5", UNKNOWN_DIM])),
+            ("rnn rank 4", rnn("GRU", "10", "20"), &["2", "5", "3", "10"], Fails(&["expects input with 2 or 3 dims"])),
             ("rnn input size mismatch", rnn("GRU", "10", "20"), &["seq", "9"], Fails(&["expected input last dim 10"])),
             (
                 "rnn cell unbatched",
@@ -2335,6 +2727,9 @@ mod table_tests {
             ("mlp in size mismatch", mlp("10", "5"), &["9"], Fails(&["expected input last dim 10"])),
             ("instance norm2d min rank", kept("InstanceNorm2d"), &["8"], Fails(&["requires input with at least 3 dims"])),
             ("identity any rank", kept("Identity"), &[], Gives(&[])),
+            ("local response norm min rank", kept("LocalResponseNorm"), &["4", "8"], Fails(&["requires input with at least 3 dims"])),
+            ("silu any rank", kept("SiLU"), &["4"], Gives(&["4"])),
+            ("transformer encoder stack", kept("TransformerEncoder"), &["seq", "batch", "512"], Gives(&["seq", "batch", "512"])),
             ("alpha dropout any rank", kept("AlphaDropout"), &[], Gives(&[])),
             ("transformer encoder any rank", kept("TransformerEncoderLayer"), &[], Gives(&[])),
             ("transformer decoder any rank", kept("TransformerDecoderLayer"), &[], Gives(&[])),
@@ -2407,6 +2802,56 @@ mod table_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Case, options (num_layers, bidirectional, proj_size, batch_first), input,
+    /// output last dim, h_n, c_n.
+    type RnnRow<'a> = (&'a str, [&'a str; 4], &'a [&'a str], &'a str, Option<&'a [&'a str]>, Option<&'a [&'a str]>);
+
+    #[test]
+    fn rnn_output_cases() {
+        let u = UNKNOWN_DIM;
+        let rows: &[RnnRow] = &[
+            ("default batched", ["1", "False", "0", "False"], &["5", "3", "8"], "16", Some(&["1", "3", "16"]), Some(&["1", "3", "16"])),
+            ("unbatched", ["1", "False", "0", "False"], &["5", "8"], "16", Some(&["1", "16"]), Some(&["1", "16"])),
+            ("bidirectional layers", ["2", "True", "0", "False"], &["5", "3", "8"], "32", Some(&["4", "3", "16"]), Some(&["4", "3", "16"])),
+            ("batch first keeps batch at axis 1", ["1", "False", "0", "True"], &["3", "5", "8"], "16", Some(&["1", "3", "16"]), Some(&["1", "3", "16"])),
+            ("projection", ["1", "True", "4", "False"], &["5", "3", "8"], "8", Some(&["2", "3", "4"]), Some(&["2", "3", "16"])),
+            ("unproven num_layers", ["n", "False", "0", "False"], &["5", "3", "8"], "16", Some(&[u, "3", "16"]), Some(&[u, "3", "16"])),
+            ("unproven batch_first", ["1", "False", "0", "bf"], &["5", "3", "8"], "16", Some(&["1", u, "16"]), Some(&["1", u, "16"])),
+            ("unproven proj_size", ["1", "False", "p", "False"], &["5", "8"], u, Some(&["1", u]), Some(&["1", "16"])),
+            ("rank 4", ["1", "False", "0", "False"], &["2", "5", "3", "8"], "16", None, None),
+        ];
+        for (case, options, input, output, hidden, cell) in rows {
+            let outputs = rnn_outputs(&rnn_with("LSTM", "8", "16", *options), &shape(input));
+            assert_eq!(outputs.output, *output, "case: {case}");
+            assert_eq!(outputs.hidden, hidden.map(shape), "case: {case}");
+            assert_eq!(outputs.cell, cell.map(shape), "case: {case}");
+        }
+    }
+
+    /// Case, layer, query, key, (need_weights, average_attn_weights), weights.
+    type AttentionRow<'a> = (&'a str, LayerKind, &'a [&'a str], &'a [&'a str], [&'a str; 2], Option<&'a [&'a str]>);
+
+    #[test]
+    fn attention_weight_cases() {
+        let rows: &[AttentionRow] = &[
+            ("sequence first", mha("16"), &["7", "2", "16"], &["9", "2", "16"], ["True", "True"], Some(&["2", "7", "9"])),
+            ("batch first", mha_with("16", "4", "True", "0"), &["2", "7", "16"], &["2", "9", "16"], ["True", "True"], Some(&["2", "7", "9"])),
+            ("unbatched", mha("16"), &["7", "16"], &["9", "16"], ["True", "True"], Some(&["7", "9"])),
+            ("per head", mha_with("16", "4", "False", "0"), &["7", "2", "16"], &["9", "2", "16"], ["True", "False"], Some(&["2", "4", "7", "9"])),
+            ("need_weights false", mha("16"), &["7", "2", "16"], &["9", "2", "16"], ["False", "True"], None),
+            ("unproven need_weights", mha("16"), &["7", "2", "16"], &["9", "2", "16"], ["flag", "True"], None),
+            ("unproven average", mha("16"), &["7", "2", "16"], &["9", "2", "16"], ["True", "avg"], None),
+            ("unproven batch_first", mha_with("16", "4", "bf", "0"), &["7", "2", "16"], &["9", "2", "16"], ["True", "True"], None),
+            ("added keys", mha_with("16", "4", "False", "2"), &["7", "2", "16"], &["9", "2", "16"], ["True", "True"], Some(&["2", "7", "11"])),
+            ("unproven added keys", mha_with("16", "4", "False", UNPROVEN_DIM), &["7", "2", "16"], &["9", "2", "16"], ["True", "True"], None),
+            ("equinox", eqx_mha("16", "4"), &["7", "16"], &["9", "16"], ["True", "True"], None),
+        ];
+        for (case, kind, query, key, [need, average], expected) in rows {
+            let weights = attention_weights(kind, &shape(query), &shape(key), need, average);
+            assert_eq!(weights, expected.map(shape), "case: {case}");
         }
     }
 
@@ -2492,7 +2937,7 @@ mod table_tests {
                 Some("MultiheadAttention"),
                 init,
                 &[("num_heads", "8"), ("query_size", "512")],
-                Some(mha("512")),
+                Some(eqx_mha("512", "8")),
             ),
             (
                 "equinox multihead attention ignores embed_dim",
@@ -2500,7 +2945,7 @@ mod table_tests {
                 Some("MultiheadAttention"),
                 init,
                 &[("embed_dim", "8"), ("num_heads", "8"), ("query_size", "512")],
-                Some(mha("512")),
+                Some(eqx_mha("512", "8")),
             ),
             (
                 "einops torch rearrange",
@@ -2730,6 +3175,34 @@ mod table_tests {
             ("equinox embedding", "import equinox as eqx\nemb = eqx.nn.Embedding(10000, 512)", &[("emb", embedding("512"))]),
             ("torch embedding kwarg", "import torch\nemb = torch.nn.Embedding(10000, embedding_dim=768)", &[("emb", embedding("768"))]),
             ("torch maxpool2d", "import torch\npool = torch.nn.MaxPool2d(2)", &[("pool", pool("MaxPool2d", 2, "2", "2", "0"))]),
+            ("equinox maxpool2d default stride", "import equinox as eqx\npool = eqx.nn.MaxPool2d(2)", &[("pool", pool("MaxPool2d", 2, "2", "1", "0"))]),
+            ("equinox use_ceil", "import equinox as eqx\npool = eqx.nn.AvgPool1d(2, 2, 0, True)", &[("pool", pool_with("AvgPool1d", 1, "2", "2", "0", "1", UNPROVEN_DIM))]),
+            ("torch stride none", "import torch\npool = torch.nn.AvgPool2d(3, None)", &[("pool", pool("AvgPool2d", 2, "3", "3", "0"))]),
+            (
+                "torch maxpool positional dilation",
+                "import torch\npool = torch.nn.MaxPool1d(3, 1, 0, 2, False, True)",
+                &[("pool", pool_with("MaxPool1d", 1, "3", "1", "0", "2", "True"))],
+            ),
+            ("torch avgpool positional ceil mode", "import torch\npool = torch.nn.AvgPool1d(2, 2, 0, True)", &[("pool", pool_with("AvgPool1d", 1, "2", "2", "0", "1", "True"))]),
+            ("torch maxpool return indices", "import torch\npool = torch.nn.MaxPool2d(2, return_indices=True)", &[]),
+            ("flax embed", "import flax.linen as nn\nemb = nn.Embed(1000, 64)", &[("emb", embedding("64"))]),
+            (
+                "torch lstm options",
+                "import torch.nn as nn\nr = nn.LSTM(8, 16, 2, True, True, 0.0, True, 4)",
+                &[("r", rnn_with("LSTM", "8", "16", ["2", "True", "4", "True"]))],
+            ),
+            ("gru ignores proj_size", "import torch.nn as nn\nr = nn.GRU(8, 16, proj_size=4)", &[("r", rnn("GRU", "8", "16"))]),
+            ("rnn fifth positional", "import torch.nn as nn\nr = nn.RNN(8, 16, 1, 'relu')", &[]),
+            (
+                "torch multihead attention options",
+                "import torch.nn as nn\na = nn.MultiheadAttention(16, 4, add_zero_attn=True, batch_first=True)",
+                &[("a", mha_with("16", "4", "True", "1"))],
+            ),
+            (
+                "multihead attention unproven add_bias_kv",
+                "import torch.nn as nn\na = nn.MultiheadAttention(16, 4, add_bias_kv=flag)",
+                &[("a", mha_with("16", "4", "False", UNPROVEN_DIM))],
+            ),
             (
                 "adaptive avgpool",
                 "import torch\npool = torch.nn.AdaptiveAvgPool2d(1)",
@@ -2748,11 +3221,11 @@ mod table_tests {
             ("user layer", "import my_module\nlayer = my_module.Linear(3, 5)", &[]),
             ("torch multihead attention", "import torch.nn as nn\nattn = nn.MultiheadAttention(512, 8)", &[("attn", mha("512"))]),
             // equinox binds (num_heads, query_size) positionally.
-            ("equinox multihead attention", "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(8, 512)", &[("attn", mha("512"))]),
+            ("equinox multihead attention", "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(8, 512)", &[("attn", eqx_mha("512", "8"))]),
             (
                 "equinox multihead attention keywords",
                 "import equinox as eqx\nattn = eqx.nn.MultiheadAttention(num_heads=4, query_size=256)",
-                &[("attn", mha("256"))],
+                &[("attn", eqx_mha("256", "4"))],
             ),
             (
                 "torch flatten",
@@ -2763,6 +3236,17 @@ mod table_tests {
                 "torch conv transpose2d",
                 "import torch\nlayer = torch.nn.ConvTranspose2d(3, 16, 4, stride=2, padding=1)",
                 &[("layer", conv_transpose(2, "3", "16", "4", "2", "1"))],
+            ),
+            (
+                "torch conv transpose output padding and dilation",
+                "import torch\nlayer = torch.nn.ConvTranspose2d(3, 16, 4, 2, 1, 1, 1, True, 2)",
+                &[("layer", conv_transpose_with(2, "3", "16", "4", "2", "1", "1", "2"))],
+            ),
+            // equinox orders (stride, output_padding, padding, dilation).
+            (
+                "equinox conv transpose positional order",
+                "import equinox as eqx\nlayer = eqx.nn.ConvTranspose2d(3, 16, 4, 2, 1, 0, 2)",
+                &[("layer", conv_transpose_with(2, "3", "16", "4", "2", "0", "1", "2"))],
             ),
             (
                 "torch sequential",
@@ -2843,9 +3327,11 @@ mod overflow_tests {
         assert_eq!(conv_spatial_dim("n", "3", "1", &max), unknown);
         assert_eq!(conv_spatial_dim("n", "3", "2", &max), unknown);
         assert_eq!(conv_spatial_dim("n", "k", "2", &max), unknown);
-        assert_eq!(conv_transpose_spatial_dim("5", "3", &max, "0"), unknown);
-        assert_eq!(conv_transpose_spatial_dim("5", "3", "1", &max), unknown);
-        assert_eq!(conv_transpose_spatial_dim("n", "3", "1", &max), unknown);
+        assert_eq!(conv_transpose_spatial_dim("5", "3", &max, "0", "0"), unknown);
+        assert_eq!(conv_transpose_spatial_dim("5", "3", "1", &max, "0"), unknown);
+        assert_eq!(conv_transpose_spatial_dim("n", "3", "1", &max, "0"), unknown);
+        assert_eq!(conv_transpose_spatial_dim("5", "3", "1", "0", &max), unknown);
+        assert_eq!(pool_ceil_spatial_dim(&max, "1", "1", "1"), unknown);
         assert_eq!(effective_kernel_size("3", &max), Some(unknown.clone()));
         assert_eq!(div_dim_by_dims("6", &[u64::MAX.to_string(), "2".to_string()]), Ok(unknown));
     }
@@ -2856,7 +3342,8 @@ mod overflow_tests {
         assert_eq!(apply_offset("n", -2), "n-2");
         assert_eq!(mul_dim("4", 2), "8");
         assert_eq!(conv_spatial_dim("10", "3", "2", "1"), "5");
-        assert_eq!(conv_transpose_spatial_dim("5", "3", "2", "1"), "9");
+        assert_eq!(conv_transpose_spatial_dim("5", "3", "2", "1", "0"), "9");
+        assert_eq!(conv_transpose_spatial_dim("16", "3", "2", "1", "1"), "32");
         assert_eq!(effective_kernel_size("3", "2"), Some("5".to_string()));
     }
 

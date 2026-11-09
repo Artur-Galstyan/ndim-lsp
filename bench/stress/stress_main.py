@@ -722,7 +722,7 @@ class SeqModel11(nn.Module):
     def forward(self, ids: Float[Array, "b11 s11"]):
         e = self.emb(ids)  # expected-shape: e=[b11, s11, 128]
         out, _ = self.gru(e)  # expected-shape: out=[b11, s11, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b11, s11, 64]; w=[b11, s11, s11]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b11, s11, 64]; w=[s11, b11, b11]
         logits = self.head(att)  # expected-shape: logits=[b11, s11, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b11, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b11, 64]
@@ -2668,7 +2668,7 @@ class SeqModel45(nn.Module):
     def forward(self, ids: Float[Array, "b45 s45"]):
         e = self.emb(ids)  # expected-shape: e=[b45, s45, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b45, s45, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b45, s45, 64]; w=[b45, s45, s45]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b45, s45, 64]; w=[s45, b45, b45]
         logits = self.head(att)  # expected-shape: logits=[b45, s45, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b45, 500]
         last = out[:, -1, :]  # expected-shape: last=[b45, 64]
@@ -2810,7 +2810,7 @@ class SeqModel54(nn.Module):
     def forward(self, ids: Float[Array, "b54 s54"]):
         e = self.emb(ids)  # expected-shape: e=[b54, s54, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b54, s54, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b54, s54, 64]; w=[b54, s54, s54]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b54, s54, 64]; w=[s54, b54, b54]
         logits = self.head(att)  # expected-shape: logits=[b54, s54, 1000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b54, 1000]
         last = out[:, -1, :]  # expected-shape: last=[b54, 64]
@@ -2883,7 +2883,7 @@ class SeqModel59(nn.Module):
     def forward(self, ids: Float[Array, "b59 s59"]):
         e = self.emb(ids)  # expected-shape: e=[b59, s59, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b59, s59, 32]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b59, s59, 32]; w=[b59, s59, s59]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b59, s59, 32]; w=[s59, b59, b59]
         logits = self.head(att)  # expected-shape: logits=[b59, s59, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b59, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b59, 32]
@@ -2949,7 +2949,7 @@ class SeqModel62(nn.Module):
     def forward(self, ids: Float[Array, "b62 s62"]):
         e = self.emb(ids)  # expected-shape: e=[b62, s62, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b62, s62, 32]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b62, s62, 32]; w=[b62, s62, s62]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b62, s62, 32]; w=[s62, b62, b62]
         logits = self.head(att)  # expected-shape: logits=[b62, s62, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b62, 500]
         last = out[:, -1, :]  # expected-shape: last=[b62, 32]
@@ -3789,7 +3789,7 @@ class SeqModel72(nn.Module):
     def forward(self, ids: Float[Array, "b72 s72"]):
         e = self.emb(ids)  # expected-shape: e=[b72, s72, 128]
         out, _ = self.gru(e)  # expected-shape: out=[b72, s72, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b72, s72, 128]; w=[b72, s72, s72]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b72, s72, 128]; w=[s72, b72, b72]
         logits = self.head(att)  # expected-shape: logits=[b72, s72, 1000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b72, 1000]
         last = out[:, -1, :]  # expected-shape: last=[b72, 128]
@@ -9121,7 +9121,7 @@ class SeqModel187(nn.Module):
     def forward(self, ids: Float[Array, "b187 s187"]):
         e = self.emb(ids)  # expected-shape: e=[b187, s187, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b187, s187, 32]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b187, s187, 32]; w=[b187, s187, s187]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b187, s187, 32]; w=[s187, b187, b187]
         logits = self.head(att)  # expected-shape: logits=[b187, s187, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b187, 500]
         last = out[:, -1, :]  # expected-shape: last=[b187, 32]
@@ -9715,7 +9715,7 @@ class SeqModel201(nn.Module):
     def forward(self, ids: Float[Array, "b201 s201"]):
         e = self.emb(ids)  # expected-shape: e=[b201, s201, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b201, s201, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b201, s201, 64]; w=[b201, s201, s201]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b201, s201, 64]; w=[s201, b201, b201]
         logits = self.head(att)  # expected-shape: logits=[b201, s201, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b201, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b201, 64]
@@ -9900,7 +9900,7 @@ class SeqModel210(nn.Module):
     def forward(self, ids: Float[Array, "b210 s210"]):
         e = self.emb(ids)  # expected-shape: e=[b210, s210, 128]
         out, _ = self.gru(e)  # expected-shape: out=[b210, s210, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b210, s210, 128]; w=[b210, s210, s210]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b210, s210, 128]; w=[s210, b210, b210]
         logits = self.head(att)  # expected-shape: logits=[b210, s210, 1000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b210, 1000]
         last = out[:, -1, :]  # expected-shape: last=[b210, 128]
@@ -11784,7 +11784,7 @@ class SeqModel246(nn.Module):
     def forward(self, ids: Float[Array, "b246 s246"]):
         e = self.emb(ids)  # expected-shape: e=[b246, s246, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b246, s246, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b246, s246, 128]; w=[b246, s246, s246]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b246, s246, 128]; w=[s246, b246, b246]
         logits = self.head(att)  # expected-shape: logits=[b246, s246, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b246, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b246, 128]
@@ -12781,7 +12781,7 @@ class SeqModel271(nn.Module):
     def forward(self, ids: Float[Array, "b271 s271"]):
         e = self.emb(ids)  # expected-shape: e=[b271, s271, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b271, s271, 32]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b271, s271, 32]; w=[b271, s271, s271]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b271, s271, 32]; w=[s271, b271, b271]
         logits = self.head(att)  # expected-shape: logits=[b271, s271, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b271, 500]
         last = out[:, -1, :]  # expected-shape: last=[b271, 32]
@@ -12943,7 +12943,7 @@ class SeqModel279(nn.Module):
     def forward(self, ids: Float[Array, "b279 s279"]):
         e = self.emb(ids)  # expected-shape: e=[b279, s279, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b279, s279, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b279, s279, 128]; w=[b279, s279, s279]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b279, s279, 128]; w=[s279, b279, b279]
         logits = self.head(att)  # expected-shape: logits=[b279, s279, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b279, 500]
         last = out[:, -1, :]  # expected-shape: last=[b279, 128]
@@ -13071,7 +13071,7 @@ class SeqModel285(nn.Module):
     def forward(self, ids: Float[Array, "b285 s285"]):
         e = self.emb(ids)  # expected-shape: e=[b285, s285, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b285, s285, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b285, s285, 64]; w=[b285, s285, s285]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b285, s285, 64]; w=[s285, b285, b285]
         logits = self.head(att)  # expected-shape: logits=[b285, s285, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b285, 500]
         last = out[:, -1, :]  # expected-shape: last=[b285, 64]
@@ -13316,7 +13316,7 @@ class SeqModel297(nn.Module):
     def forward(self, ids: Float[Array, "b297 s297"]):
         e = self.emb(ids)  # expected-shape: e=[b297, s297, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b297, s297, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b297, s297, 64]; w=[b297, s297, s297]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b297, s297, 64]; w=[s297, b297, b297]
         logits = self.head(att)  # expected-shape: logits=[b297, s297, 1000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b297, 1000]
         last = out[:, -1, :]  # expected-shape: last=[b297, 64]
@@ -14703,7 +14703,7 @@ class SeqModel335(nn.Module):
     def forward(self, ids: Float[Array, "b335 s335"]):
         e = self.emb(ids)  # expected-shape: e=[b335, s335, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b335, s335, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b335, s335, 128]; w=[b335, s335, s335]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b335, s335, 128]; w=[s335, b335, b335]
         logits = self.head(att)  # expected-shape: logits=[b335, s335, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b335, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b335, 128]
@@ -17654,7 +17654,7 @@ class SeqModel390(nn.Module):
     def forward(self, ids: Float[Array, "b390 s390"]):
         e = self.emb(ids)  # expected-shape: e=[b390, s390, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b390, s390, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b390, s390, 128]; w=[b390, s390, s390]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b390, s390, 128]; w=[s390, b390, b390]
         logits = self.head(att)  # expected-shape: logits=[b390, s390, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b390, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b390, 128]
@@ -18957,7 +18957,7 @@ class SeqModel443(nn.Module):
     def forward(self, ids: Float[Array, "b443 s443"]):
         e = self.emb(ids)  # expected-shape: e=[b443, s443, 32]
         out, _ = self.gru(e)  # expected-shape: out=[b443, s443, 64]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b443, s443, 64]; w=[b443, s443, s443]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b443, s443, 64]; w=[s443, b443, b443]
         logits = self.head(att)  # expected-shape: logits=[b443, s443, 500]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b443, 500]
         last = out[:, -1, :]  # expected-shape: last=[b443, 64]
@@ -19789,7 +19789,7 @@ class SeqModel462(nn.Module):
     def forward(self, ids: Float[Array, "b462 s462"]):
         e = self.emb(ids)  # expected-shape: e=[b462, s462, 128]
         out, _ = self.gru(e)  # expected-shape: out=[b462, s462, 128]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b462, s462, 128]; w=[b462, s462, s462]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b462, s462, 128]; w=[s462, b462, b462]
         logits = self.head(att)  # expected-shape: logits=[b462, s462, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b462, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b462, 128]

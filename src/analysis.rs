@@ -5348,19 +5348,26 @@ fn tuple_rhs_shapes(
             }
 
             // `attn_out, attn_weights = self.attn(q, k, v)` where self.attn
-            // is a MultiheadAttention built in __init__: output has the
-            // query's shape; weights are (..., L, S) with default
-            // average_attn_weights.
+            // is a torch MultiheadAttention built in __init__: output has the
+            // query's shape; `attention_weights` gives the weights. equinox
+            // returns the output only.
             if let Some(attr) = target.strip_prefix("self.")
-                && matches!(
-                    ctx.self_attr_layer_at(attr, rhs.start_byte()),
-                    Some(LayerKind::MultiheadAttention { .. })
-                )
+                && let Some(layer @ LayerKind::MultiheadAttention { returns_weights, .. }) =
+                    ctx.self_attr_layer_at(attr, rhs.start_byte())
             {
-                if n_targets != 2 {
+                if n_targets != 2 || !returns_weights {
                     return None;
                 }
                 let args = raw_args()?;
+                let argument = |name: &str, position: usize, default: &'static str| {
+                    let keyword = args.iter().find_map(|arg| match arg {
+                        CallArgument::Keyword { name: n, value } if n == name => Some(value.trim()),
+                        _ => None,
+                    });
+                    keyword.or_else(|| positional_values(&args).nth(position).map(str::trim)).unwrap_or(default)
+                };
+                let need_weights = argument("need_weights", 4, "True");
+                let average = argument("average_attn_weights", 6, "True");
                 let mut positionals = positional_values(&args);
                 let query = positionals.next()?;
                 let key = positionals.next().unwrap_or(query);
@@ -5369,41 +5376,25 @@ fn tuple_rhs_shapes(
                     return None;
                 }
                 let weights = ctx.resolve_shape(key, scope_idx).and_then(|key_shape| {
-                    let s = key_shape.get(key_shape.len().checked_sub(2)?)?.clone();
-                    let mut w = query_shape.clone();
-                    w.pop();
-                    w.push(s);
-                    Some(w)
+                    crate::layers::attention_weights(&layer, &query_shape, &key_shape, need_weights, average)
                 });
                 return Some(vec![Some(query_shape), weights]);
             }
 
             // `out, h = self.gru(x)` / `out, (h, c) = self.lstm(x)` —
-            // self.<attr> resolves to an RNN full-sequence layer
-            // (`LayerKind::Rnn`) built in `__init__`. Element 0 (`out`) is
-            // the full sequence output: same rule as `apply_layer_kind`'s
-            // `Rnn` arm (last dim -> `hidden_size`, all other dims
-            // preserved). Element 1 is the final state — for LSTM's nested
-            // `(h, c)` pattern both members are bound to this same shape
-            // (see `handle_tuple_assignment`'s `TupleTarget::Nested` arm),
-            // which is exactly right for the *shape* (real torch `h`/`c` do
-            // share one shape) even though only `h` is truly "the state" for
-            // a GRU/RNN. The shape itself is approximated by dropping the
-            // leading (sequence) axis and replacing the last dim with
-            // `hidden_size` — this assumes `batch_first=False` (torch's
-            // default, not tracked by `LayerKind::Rnn`) and `num_layers *
-            // num_directions == 1` (also not tracked), so for a batched
-            // input it is missing the real leading `num_layers*num_
-            // directions` axis that torch's actual `h_n`/`c_n` carries.
-            // Documented as an approximation in TO_IMPLEMENT.md. A single-step
-            // cell (`LayerKind::RnnCell`, `h, c = self.cell(x, (h0, c0))`) binds
-            // both names to its output: last dim -> `hidden_size`, min rank 1.
+            // self.<attr> resolves to a torch RNN full-sequence layer
+            // (`LayerKind::Rnn`) built in `__init__`; `rnn_outputs` gives the
+            // shapes. Element 1 of an LSTM is the `(h, c)` pair: only a nested
+            // target binds it, and only when `h` and `c` share one shape. An
+            // LSTM cell (`h, c = self.cell(x, (h0, c0))`) binds both names to
+            // its output: last dim -> `hidden_size`, min rank 1. The other
+            // cells return one tensor.
             if let Some(attr) = target.strip_prefix("self.")
                 && let Some(layer) = ctx.self_attr_layer_at(attr, rhs.start_byte())
-                && let LayerKind::Rnn { hidden_size, .. } | LayerKind::RnnCell { hidden_size, .. } = &layer
+                && let LayerKind::Rnn { name, hidden_size, .. } | LayerKind::RnnCell { name, hidden_size, .. } = &layer
             {
                 let cell = matches!(layer, LayerKind::RnnCell { .. });
-                if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) {
+                if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) || (cell && name != "LSTMCell") {
                     return None;
                 }
                 let args = raw_args()?;
@@ -5413,15 +5404,26 @@ fn tuple_rhs_shapes(
                     return None;
                 }
                 let mut output = input_shape.clone();
-                *output.last_mut()? = hidden_size.clone();
                 if cell {
+                    *output.last_mut()? = hidden_size.clone();
                     return Some(vec![Some(output.clone()), Some(output)]);
                 }
-                let mut state = input_shape[1..].to_vec();
-                if let Some(last_dim) = state.last_mut() {
-                    *last_dim = hidden_size.clone();
+                if input_shape.len() > 3 {
+                    return None;
                 }
-                return Some(vec![Some(output), Some(state)]);
+                let outputs = crate::layers::rnn_outputs(&layer, &input_shape);
+                if outputs.output.contains(UNPROVEN_DIM) {
+                    return None;
+                }
+                *output.last_mut()? = outputs.output;
+                let nested = matches!(targets[1], TupleTarget::Nested(_));
+                let state = match (name.as_str(), nested) {
+                    ("LSTM", true) if outputs.hidden == outputs.cell => outputs.hidden,
+                    ("LSTM", _) | (_, true) => None,
+                    _ => outputs.hidden,
+                };
+                let state = state.filter(|state| !state.iter().any(|dim| dim.contains(UNPROVEN_DIM)));
+                return Some(vec![Some(output), state]);
             }
 
             let resolved = resolve_call_target(target, ctx.imports.at(rhs.start_byte()));

@@ -232,7 +232,7 @@ class SeqModel9012(nn.Module):
     def forward(self, ids: Float[Array, "b9012 s9012"]):
         e = self.emb(ids)  # expected-shape: e=[b9012, s9012, 64]
         out, _ = self.gru(e)  # expected-shape: out=[b9012, s9012, 32]
-        att, w = self.mha(out, out, out)  # expected-shape: att=[b9012, s9012, 32]; w=[b9012, s9012, s9012]
+        att, w = self.mha(out, out, out)  # expected-shape: att=[b9012, s9012, 32]; w=[s9012, b9012, b9012]
         logits = self.head(att)  # expected-shape: logits=[b9012, s9012, 5000]
         pooled = logits.mean(dim=1)  # expected-shape: pooled=[b9012, 5000]
         last = out[:, -1, :]  # expected-shape: last=[b9012, 32]
