@@ -2799,19 +2799,6 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
             let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
 
-            // MultiheadAttention's real return is an `(output, weights)`
-            // tuple; `apply_layer_application` can't express that and
-            // always returns `Ok(None)` for it (tuple LHS is handled
-            // separately in `tuple_rhs_shapes`). A single-assignment call
-            // site (`out = self.attn(q, k, v)`) still wants *something* —
-            // bind the primary output, which has the query's shape (same
-            // rule as `tuple_rhs_shapes`'s `attn_out`).
-            if matches!(layer, LayerKind::MultiheadAttention { .. }) {
-                let CallArgument::Positional { value: query } = args.first()?.clone() else {
-                    return None;
-                };
-                return ctx.resolve_shape(&query, scope_idx);
-            }
 
             let CallArgument::Positional { value: input } = args.first()?.clone() else {
                 return None;
@@ -5481,14 +5468,21 @@ fn tuple_rhs_shapes(
                 );
             }
 
+            // The layer of `self.<attr>` or of a local name in scope.
+            let call_layer = match target.strip_prefix("self.") {
+                Some(attr) => ctx.self_attr_layer_at(attr, rhs.start_byte()),
+                None if func.kind() == "identifier" => {
+                    find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, rhs.start_byte(), target)
+                        .map(|record| ctx.layer_at(&record.kind, record.byte_position))
+                }
+                None => None,
+            };
+
             // `attn_out, attn_weights = self.attn(q, k, v)` where self.attn
             // is a torch MultiheadAttention built in __init__: output has the
             // query's shape; `attention_weights` gives the weights. equinox
             // returns the output only.
-            if let Some(attr) = target.strip_prefix("self.")
-                && let Some(layer @ LayerKind::MultiheadAttention { returns_weights, .. }) =
-                    ctx.self_attr_layer_at(attr, rhs.start_byte())
-            {
+            if let Some(layer @ LayerKind::MultiheadAttention { returns_weights, .. }) = call_layer.clone() {
                 if n_targets != 2 || !returns_weights {
                     return None;
                 }
@@ -5523,9 +5517,9 @@ fn tuple_rhs_shapes(
             // LSTM cell (`h, c = self.cell(x, (h0, c0))`) binds both names to
             // its output: last dim -> `hidden_size`, min rank 1. The other
             // cells return one tensor.
-            if let Some(attr) = target.strip_prefix("self.")
-                && let Some(layer) = ctx.self_attr_layer_at(attr, rhs.start_byte())
-                && let LayerKind::Rnn { name, hidden_size, .. } | LayerKind::RnnCell { name, hidden_size, .. } = &layer
+            if let Some(layer) = call_layer
+                && let LayerKind::Rnn { name, input_size, hidden_size, .. }
+                | LayerKind::RnnCell { name, input_size, hidden_size, .. } = &layer
             {
                 let cell = matches!(layer, LayerKind::RnnCell { .. });
                 if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) || (cell && name != "LSTMCell") {
@@ -5534,7 +5528,7 @@ fn tuple_rhs_shapes(
                 let args = raw_args()?;
                 let input = positional_values(&args).next()?;
                 let input_shape = ctx.resolve_shape(input, scope_idx)?;
-                if input_shape.len() < if cell { 1 } else { 2 } {
+                if input_shape.len() < if cell { 1 } else { 2 } || crate::layers::dims_provably_mismatch(input_size, input_shape.last()?) {
                     return None;
                 }
                 let mut output = input_shape.clone();
@@ -6558,18 +6552,7 @@ fn apply_inline_vmap_layer_chain(
         shape = peeled;
     }
 
-    // MultiheadAttention's real return is an `(output, weights)` tuple;
-    // `apply_layer_application` can't express that and always returns
-    // `Ok(None)` for it. A single-assignment vmap'd call site
-    // (`out = jax.vmap(self.attn)(q, k, v)`) still wants *something* — the
-    // query's per-example shape is unchanged by attention (same rule as the
-    // direct-call MHA special case in `shape_of_call`), so just re-prepend
-    // the peeled batch dims onto it.
-    let mut output = if matches!(layer, LayerKind::MultiheadAttention { .. }) {
-        shape
-    } else {
-        ctx.check(apply_layer_kind(layer, &shape, layer_name, input_name), "", range)??
-    };
+    let mut output = ctx.check(apply_layer_kind(layer, &shape, layer_name, input_name), "", range)??;
     for (&(_, out_axes), dim) in axes.iter().zip(batch_dims).rev() {
         output = prepend_batch_dim(output, out_axes, dim);
     }

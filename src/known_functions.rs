@@ -135,6 +135,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "index_select" => Some(KnownFunction::IndexSelect),
             "kthvalue" => Some(KnownFunction::KthValue),
             "median" | "mode" => Some(KnownFunction::MedianDim),
+            "sort" => Some(KnownFunction::TorchSort),
             "combinations" => Some(KnownFunction::Combinations),
             "cartesian_prod" => Some(KnownFunction::CartesianProd),
             "block_diag" => Some(KnownFunction::BlockDiag),
@@ -149,7 +150,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
 
     if is_torch_nn_functional {
         return match name.as_str() {
-            "pad" => Some(KnownFunction::Pad),
+            "pad" => Some(KnownFunction::TorchPad),
             "interpolate" => Some(KnownFunction::Interpolate),
             "conv1d" => Some(KnownFunction::FunctionalConv1d),
             "conv2d" => Some(KnownFunction::FunctionalConv2d),
@@ -388,6 +389,12 @@ fn parse_bool(value: &str) -> Option<bool> {
         "False" | "false" => Some(false),
         _ => None,
     }
+}
+
+/// Whether the flag at positional `at` or keyword `name` is absent or a
+/// literal `False`.
+fn flag_unset(args: &[CallArgument], at: usize, name: &str) -> bool {
+    nth_positional_or_keyword(args, at, &[name]).is_none_or(|value| parse_bool(value) == Some(false))
 }
 
 fn parse_axis_list(value: &str) -> Option<Vec<isize>> {
@@ -967,6 +974,7 @@ pub fn torch_method_reading(method: &KnownFunction) -> Option<KnownFunction> {
         KnownFunction::Max | KnownFunction::Min => Some(KnownFunction::TorchMaxMin),
         KnownFunction::Repeat => Some(KnownFunction::TorchRepeat),
         KnownFunction::Squeeze => Some(KnownFunction::TorchSqueeze),
+        KnownFunction::Sort => Some(KnownFunction::TorchSort),
         _ => None,
     }
 }
@@ -1167,6 +1175,7 @@ fn apply_known_rule(
         KnownFunction::Repeat | KnownFunction::RepeatInterleave => apply_known_repeat(args, shapes),
         KnownFunction::Clamp => apply_known_clamp(args, shapes),
         KnownFunction::Pad => apply_known_pad(args, shapes),
+        KnownFunction::TorchPad => apply_known_torch_pad(args, shapes),
         KnownFunction::NumpyPad => apply_known_numpy_pad(args, shapes),
         KnownFunction::Rot90 => apply_known_rot90(args, shapes),
         KnownFunction::Vstack => apply_known_stack_family(args, shapes, "vstack"),
@@ -1252,7 +1261,8 @@ fn apply_known_rule(
             Ok(positional_arg_values(args).get(1).and_then(|name| shapes.shape(name)).cloned())
         }
         KnownFunction::Argwhere => apply_known_argwhere(args, shapes),
-        KnownFunction::Histogram => apply_known_histogram(args),
+        // `(hist, bin_edges)`: a tuple, not one array.
+        KnownFunction::Histogram | KnownFunction::TorchSort => Ok(None),
         KnownFunction::Cross => apply_known_cross(args, shapes),
         KnownFunction::TorchCross => apply_known_torch_cross(args, shapes),
         KnownFunction::LinalgSolve => apply_known_linalg_solve(args, shapes),
@@ -1296,15 +1306,12 @@ fn apply_known_rule(
         KnownFunction::FunctionalConv1d => apply_known_functional_conv(args, shapes, 1),
         KnownFunction::FunctionalConv2d => apply_known_functional_conv(args, shapes, 2),
         KnownFunction::FunctionalConv3d => apply_known_functional_conv(args, shapes, 3),
-        KnownFunction::FunctionalMaxPool1d | KnownFunction::FunctionalAvgPool1d => {
-            apply_known_functional_pool(args, shapes, 1)
-        }
-        KnownFunction::FunctionalMaxPool2d | KnownFunction::FunctionalAvgPool2d => {
-            apply_known_functional_pool(args, shapes, 2)
-        }
-        KnownFunction::FunctionalMaxPool3d | KnownFunction::FunctionalAvgPool3d => {
-            apply_known_functional_pool(args, shapes, 3)
-        }
+        KnownFunction::FunctionalMaxPool1d => apply_known_functional_pool(args, shapes, 1, true),
+        KnownFunction::FunctionalMaxPool2d => apply_known_functional_pool(args, shapes, 2, true),
+        KnownFunction::FunctionalMaxPool3d => apply_known_functional_pool(args, shapes, 3, true),
+        KnownFunction::FunctionalAvgPool1d => apply_known_functional_pool(args, shapes, 1, false),
+        KnownFunction::FunctionalAvgPool2d => apply_known_functional_pool(args, shapes, 2, false),
+        KnownFunction::FunctionalAvgPool3d => apply_known_functional_pool(args, shapes, 3, false),
         KnownFunction::FunctionalEmbedding => apply_known_functional_embedding(args, shapes),
         KnownFunction::PadSequence => apply_known_pad_sequence(args, shapes),
         KnownFunction::Elementwise { parameters, rank_promotion } => {
@@ -1654,74 +1661,112 @@ fn apply_known_einsum(
     else {
         return Ok(None);
     };
-
-    // If equation contains ellipsis, return Ok(None) for v1
-    if equation_str.contains("...") {
-        return Ok(None);
-    }
-
-    // Split on "->" for explicit output
-    let Some((inputs_part, output_part)) = equation_str.split_once("->") else {
-        // Implicit-mode (no "->"), return Ok(None) for v1
+    // NumPy, torch and JAX skip spaces; each other subscript is one ASCII letter.
+    let equation: String = equation_str.chars().filter(|c| *c != ' ').collect();
+    let letters = |spec: &str| -> Option<Vec<char>> {
+        spec.chars().map(|c| c.is_ascii_alphabetic().then_some(c)).collect()
+    };
+    let (inputs_part, output_part) = match equation.split_once("->") {
+        Some((inputs, output)) => (inputs, Some(output)),
+        None => (equation.as_str(), None),
+    };
+    let Some(input_specs) = inputs_part.split(',').map(letters).collect::<Option<Vec<_>>>() else {
         return Ok(None);
     };
+    let output_spec = match output_part {
+        Some(output) => match letters(output) {
+            Some(labels) => labels,
+            None => return Ok(None),
+        },
+        None => {
+            let mut once: Vec<char> = input_specs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|label| input_specs.iter().flatten().filter(|other| *other == label).count() == 1)
+                .collect();
+            once.sort_unstable();
+            once
+        }
+    };
+    einsum_output_shape("einsum", &input_specs, &output_spec, &positional_values[1..], shapes)
+}
 
-    let input_specs: Vec<&str> = inputs_part.split(',').map(str::trim).collect();
-    let output_spec = output_part.trim();
-
-    // Collect operand shapes (reuse positional_values from above)
-    let operand_names = &positional_values[1..]; // Skip equation string
-
+/// The shape of an einsum with one label list per operand. `None` when an
+/// operand is a star argument or has no known shape, or the output repeats a label. A dim of `1`
+/// broadcasts against the other dims of its label.
+fn einsum_output_shape<L: Copy + Eq + std::hash::Hash + std::fmt::Display>(
+    context: &str,
+    input_specs: &[Vec<L>],
+    output_spec: &[L],
+    operand_names: &[String],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    if operand_names.iter().any(|name| name.starts_with('*')) {
+        return Ok(None);
+    }
     if operand_names.len() != input_specs.len() {
         return Err(format!(
-            "einsum equation has {} input specs but got {} operands",
+            "{} equation has {} input specs but got {} operands",
+            context,
             input_specs.len(),
             operand_names.len()
         ));
     }
-
-    // Build label→dim map
-    let mut label_map: HashMap<char, String> = HashMap::new();
-
-    for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
-        let Some(shape) = shapes.shape(operand_name.as_str()) else {
-            return Ok(None);
-        };
-
-        // Note: einsum subscripts are ASCII letters in practice, so chars().count() == byte len.
-        // Using chars().count() is more correct for the rank comparison.
-        let spec_label_count = spec.chars().count();
-        if shape.len() != spec_label_count {
+    let Some(operand_shapes) = operand_names
+        .iter()
+        .map(|name| shapes.shape(name.as_str()))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let letters = context == "einsum";
+    let spec_text = |spec: &[L]| {
+        let text = spec.iter().map(ToString::to_string).collect::<Vec<_>>();
+        match letters {
+            true => format!("'{}' has length {}", text.concat(), spec.len()),
+            false => format!("'{}' has {} axes", text.join(" "), spec.len()),
+        }
+    };
+    let mut label_map: HashMap<L, String> = HashMap::new();
+    for ((spec, operand_name), shape) in input_specs.iter().zip(operand_names).zip(operand_shapes) {
+        if shape.len() != spec.len() {
             return Err(format!(
-                "einsum operand '{}' has rank {} but subscript '{}' has length {}",
+                "{} operand '{}' has rank {} but subscript {}",
+                context,
                 operand_name,
                 shape.len(),
-                spec,
-                spec_label_count
+                spec_text(spec)
             ));
         }
-
-        for (label_char, dim) in spec.chars().zip(shape.iter()) {
-            if let Some(existing_dim) = label_map.get(&label_char) {
-                check_dim_match(existing_dim, dim, &format!("einsum label '{}'", label_char))?;
-            } else {
-                label_map.insert(label_char, dim.clone());
+        for (label, dim) in spec.iter().zip(shape.iter()) {
+            match label_map.get(label) {
+                Some(existing) if existing == "1" => {
+                    label_map.insert(*label, dim.clone());
+                }
+                Some(_) if dim == "1" => {}
+                Some(existing) => {
+                    check_dim_match(existing, dim, &format!("{} label '{}'", context, label))?;
+                }
+                None => {
+                    label_map.insert(*label, dim.clone());
+                }
             }
         }
     }
-
-    // Build output shape
-    let mut output_shape = Vec::new();
-    for label_char in output_spec.chars() {
-        let Some(dim) = label_map.get(&label_char) else {
+    let mut output_shape = Vec::with_capacity(output_spec.len());
+    for (index, label) in output_spec.iter().enumerate() {
+        if output_spec[..index].contains(label) {
+            return Ok(None);
+        }
+        let Some(dim) = label_map.get(label) else {
             return Err(format!(
-                "einsum output label '{}' not found in input subscripts",
-                label_char
+                "{} output label '{}' not found in input subscripts",
+                context, label
             ));
         };
         output_shape.push(dim.clone());
     }
-
     Ok(Some(output_shape))
 }
 
@@ -2487,6 +2532,10 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
 }
 
 fn apply_known_linspace(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    // `retstep=True` gives a `(samples, step)` tuple.
+    if !flag_unset(args, 4, "retstep") {
+        return Ok(None);
+    }
     for arg in args {
         if let CallArgument::Keyword { name, value } = arg
             && (name == "num" || name == "steps")
@@ -3628,6 +3677,39 @@ fn apply_known_rot90(
     Ok(Some(output))
 }
 
+/// The items of a tuple or list literal. `None` for other text.
+fn literal_items(text: &str) -> Option<Vec<&str>> {
+    let inner = sequence_inner(text.trim())?;
+    let mut items: Vec<&str> = split_top_level(inner).into_iter().map(str::trim).collect();
+    if items.last() == Some(&"") {
+        items.pop();
+    }
+    (!items.contains(&"")).then_some(items)
+}
+
+/// `np.pad`/`jnp.pad`: `pad_width` broadcasts to one `(before, after)` pair
+/// per axis, in axis order. Negative or other widths stay unknown.
+fn numpy_pad_pairs(width: &str, rank: usize) -> Option<Vec<(isize, isize)>> {
+    let int = |text: &str| text.trim().parse::<isize>().ok().filter(|value| *value >= 0);
+    let pair = |text: &str| match literal_items(text)?.as_slice() {
+        [value] => int(value).map(|value| (value, value)),
+        [before, after] => Some((int(before)?, int(after)?)),
+        _ => None,
+    };
+    if let Some(value) = int(width) {
+        return Some(vec![(value, value); rank]);
+    }
+    if let Some(pair) = pair(width) {
+        return Some(vec![pair; rank]);
+    }
+    let pairs = literal_items(width)?.into_iter().map(pair).collect::<Option<Vec<_>>>()?;
+    match pairs.len() {
+        1 => Some(vec![pairs[0]; rank]),
+        len if len == rank => Some(pairs),
+        _ => None,
+    }
+}
+
 fn apply_known_pad(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -3635,36 +3717,19 @@ fn apply_known_pad(
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
-
-    let Some(pad_width) = nth_positional_or_keyword(args, 1, &["pad_width", "pad"]) else {
+    let Some(pad_width) = nth_positional_or_keyword(args, 1, &["pad_width"]) else {
         return Ok(None);
     };
-    if pad_width.contains(['{', '}']) {
-        return Ok(None);
-    }
-    let values = parse_ints(pad_width);
-    if values.is_empty() {
-        return Ok(None);
-    }
-
-    let additions = if values.len() == 1 {
-        values[0].checked_mul(2).map(|addition| vec![addition; input_shape.len()])
-    } else if values.len() == 2 {
-        values[0].checked_add(values[1]).map(|addition| vec![addition; input_shape.len()])
-    } else if values.len() == input_shape.len() * 2 {
-        values
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| pair[0].checked_add(pair[1]))
-            .collect::<Option<Vec<_>>>()
-    } else {
+    let Some(pairs) = numpy_pad_pairs(pad_width, input_shape.len()) else {
         return Ok(None);
     };
-    let Some(additions) = additions else {
+    let Some(additions) = pairs
+        .iter()
+        .map(|(before, after)| before.checked_add(*after))
+        .collect::<Option<Vec<_>>>()
+    else {
         return Ok(None);
     };
-
     Ok(Some(
         input_shape
             .iter()
@@ -3672,6 +3737,52 @@ fn apply_known_pad(
             .map(|(dim, addition)| add_to_dim(dim, *addition))
             .collect(),
     ))
+}
+
+/// `F.pad(x, pad)`: `pad` holds `(left, right)` pairs for the last dims, the
+/// last dim first. A pad that is not an integer gives that dim no size.
+fn apply_known_torch_pad(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let Some(pad) = nth_positional_or_keyword(args, 1, &["pad"]) else {
+        return Ok(None);
+    };
+    let Some(items) = literal_items(pad) else {
+        return Ok(None);
+    };
+    if items.iter().any(|item| item.starts_with('*') || bracket_inner(item).is_some()) {
+        return Ok(None);
+    }
+    if items.len() % 2 != 0 {
+        return Err(format!("pad length must be even, got {}", items.len()));
+    }
+    if items.len() > 2 * input_shape.len() {
+        return Err(format!(
+            "pad has {} values but the input has rank {}, at most {} values",
+            items.len(),
+            input_shape.len(),
+            2 * input_shape.len()
+        ));
+    }
+    let mut output = input_shape.clone();
+    for (pair, dim) in items.chunks(2).zip(output.iter_mut().rev()) {
+        let (Ok(left), Ok(right)) = (pair[0].parse::<isize>(), pair[1].parse::<isize>()) else {
+            *dim = UNKNOWN_DIM.to_string();
+            continue;
+        };
+        let Some(addition) = left.checked_add(right) else {
+            return Ok(None);
+        };
+        *dim = add_to_dim(dim, addition);
+        if dim.parse::<isize>().is_ok_and(|size| size < 0) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(output))
 }
 
 fn apply_known_numpy_pad(
@@ -3860,6 +3971,11 @@ fn apply_reduction(
     let Some((_input_name, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
     };
+    // `logsumexp(a, axis, b, keepdims, return_sign)` gives a tuple with the sign.
+    let sign_at = if (axis_at, keepdims_at, q_at) == (1, Some(3), None) { 4 } else { usize::MAX };
+    if !flag_unset(args, sign_at, "return_sign") {
+        return Ok(None);
+    }
 
     let leading = match q_at {
         Some(at) => match nth_positional_or_keyword(args, at, &["q"]).and_then(|q| quantile_shape(q, shapes)) {
@@ -4060,6 +4176,11 @@ fn apply_known_linalg_det(
 
 /// A single assignment cannot store the multiple arrays returned by split.
 /// Validate here; tuple unpacking calls `compute_split_shapes` directly.
+/// The most pieces that a split, chunk or array_split gives a shape to. A
+/// call with more pieces has no shape, so that a large literal count does not
+/// allocate one shape per piece.
+const MAX_PIECES: usize = 256;
+
 fn apply_known_split(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -4172,6 +4293,9 @@ fn compute_split_shapes_impl(
         }
         let axis_dim = &input_shape[axis];
         if array_split {
+            if n > MAX_PIECES {
+                return Ok(None);
+            }
             if let Ok(axis_size) = axis_dim.parse::<usize>() {
                 let small = axis_size / n;
                 let large = axis_size % n;
@@ -4199,6 +4323,9 @@ fn compute_split_shapes_impl(
                 "split cannot divide axis size {} evenly into {} parts",
                 axis_size, n
             ));
+        }
+        if n > MAX_PIECES {
+            return Ok(None);
         }
 
         // Synthetic dimension naming convention:
@@ -4348,6 +4475,9 @@ pub fn compute_torch_split_shapes(
 
         if let Ok(axis_size) = axis_dim.parse::<usize>() {
             let count = axis_size.div_ceil(size).max(1);
+            if count > MAX_PIECES {
+                return Ok(None);
+            }
             let mut output_shapes = Vec::with_capacity(count);
             let mut remaining = axis_size;
             for _ in 0..count {
@@ -4983,6 +5113,10 @@ fn apply_known_tri(args: &[CallArgument]) -> Result<Option<Vec<String>>, String>
 /// `jnp.indices(dimensions)` — prepends a rank dimension:
 /// `indices((2, 3)).shape == (2, 2, 3)`.
 fn apply_known_indices(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+    // `sparse=True` gives a tuple of arrays.
+    if !flag_unset(args, 2, "sparse") {
+        return Ok(None);
+    }
     let Some(dims_raw) = nth_positional_or_keyword(args, 0, &["dimensions"]) else {
         return Ok(None);
     };
@@ -5284,26 +5418,6 @@ fn apply_known_argwhere(
     ]))
 }
 
-/// `jnp.histogram(a, bins=10, ...)` — 1D output of length `bins` when
-/// `bins` is an integer literal, or `len(edges) - 1` when `bins` is a
-/// literal list of bin edges. Otherwise unresolvable statically.
-fn apply_known_histogram(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
-    let Some(bins_raw) = nth_positional_or_keyword(args, 1, &["bins"]) else {
-        return Ok(Some(vec!["10".to_string()])); // numpy/jax default
-    };
-    let trimmed = bins_raw.trim();
-    if let Ok(n) = trimmed.parse::<usize>() {
-        return Ok(Some(vec![n.to_string()]));
-    }
-    if bracket_inner(trimmed).is_some()
-        && let Some(edges) = parse_simple_sequence_names(trimmed)
-        && edges.len() >= 2
-    {
-        return Ok(Some(vec![(edges.len() - 1).to_string()]));
-    }
-    Ok(None)
-}
-
 fn apply_known_cross(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
@@ -5475,65 +5589,29 @@ fn apply_known_einops_einsum(
     let Some(equation_str) = string_text(equation) else {
         return Ok(None);
     };
-    if equation_str.contains("...") {
-        return Ok(None);
-    }
     let Some((inputs_part, output_part)) = equation_str.split_once("->") else {
         return Ok(None);
     };
+    // Space-separated axis names. `...`, `(...)` and anonymous axes stay unknown.
+    let Some(input_specs) = inputs_part.split(',').map(einops_axis_names).collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    let Some(output_spec) = einops_axis_names(output_part) else {
+        return Ok(None);
+    };
+    einsum_output_shape("einops.einsum", &input_specs, &output_spec, operand_names, shapes)
+}
 
-    let input_specs: Vec<Vec<&str>> = inputs_part
-        .split(',')
-        .map(|s| s.split_whitespace().collect())
-        .collect();
-    let output_spec: Vec<&str> = output_part.split_whitespace().collect();
-
-    if operand_names.len() != input_specs.len() {
-        return Err(format!(
-            "einops.einsum equation has {} input specs but got {} operands",
-            input_specs.len(),
-            operand_names.len()
-        ));
-    }
-
-    let mut label_map: HashMap<&str, String> = HashMap::new();
-    for (spec, operand_name) in input_specs.iter().zip(operand_names.iter()) {
-        let Some(shape) = shapes.shape(operand_name.as_str()) else {
-            return Ok(None);
-        };
-        if shape.len() != spec.len() {
-            return Err(format!(
-                "einops.einsum operand '{}' has rank {} but subscript '{}' has {} axes",
-                operand_name,
-                shape.len(),
-                spec.join(" "),
-                spec.len()
-            ));
-        }
-        for (label, dim) in spec.iter().zip(shape.iter()) {
-            if let Some(existing_dim) = label_map.get(label) {
-                check_dim_match(
-                    existing_dim,
-                    dim,
-                    &format!("einops.einsum label '{}'", label),
-                )?;
-            } else {
-                label_map.insert(label, dim.clone());
-            }
-        }
-    }
-
-    let mut output_shape = Vec::with_capacity(output_spec.len());
-    for label in output_spec {
-        let Some(dim) = label_map.get(label) else {
-            return Err(format!(
-                "einops.einsum output label '{}' not found in input subscripts",
-                label
-            ));
-        };
-        output_shape.push(dim.clone());
-    }
-    Ok(Some(output_shape))
+/// The space-separated axis names of one einops.einsum operand. `None` for
+/// `...`, `(...)`, anonymous axes and repeated names.
+fn einops_axis_names(spec: &str) -> Option<Vec<&str>> {
+    let names: Vec<&str> = spec.split_whitespace().collect();
+    let valid = |name: &str| {
+        name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    let unique = names.iter().enumerate().all(|(i, name)| !names[..i].contains(name));
+    (names.iter().all(|name| valid(name)) && unique).then_some(names)
 }
 
 /// `einops.pack(tensors, pattern)` — restricted to patterns where `*`
@@ -5890,12 +5968,18 @@ pub fn compute_chunk_shapes(
     let axis_dim = &input_shape[dim];
 
     let Ok(axis_size) = axis_dim.parse::<usize>() else {
+        if n > MAX_PIECES {
+            return Ok(None);
+        }
         let mut out = input_shape.clone();
         out[dim] = format!("chunk({}, {})", axis_dim, n);
         return Ok(Some(vec![out; n]));
     };
 
     let chunk_size = axis_size.div_ceil(n).max(1);
+    if axis_size.div_ceil(chunk_size) > MAX_PIECES {
+        return Ok(None);
+    }
     let mut output_shapes = Vec::new();
     let mut remaining = axis_size;
     for _ in 0..n {
@@ -6107,15 +6191,24 @@ fn apply_known_functional_conv(
 
 /// `torch.nn.functional.max_pool1d/2d/3d` / `avg_pool1d/2d/3d(input,
 /// kernel_size, stride=None, padding=0, ...)` — channels-first; `stride`
-/// defaults to `kernel_size` (torch convention) when omitted. `dilation`
-/// (max_pool only) isn't modelled (assumed 1). A window larger than the input
-/// is unknown, as torch refuses it.
+/// defaults to `kernel_size` (torch convention) when omitted. `ceil_mode` and
+/// max_pool's `return_indices` (a tuple) give unknown. A window larger than
+/// the input is unknown, as torch refuses it.
 fn apply_known_functional_pool(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
     spatial_rank: usize,
+    max: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    let ceil_at = if max { 5 } else { 4 };
+    if !flag_unset(args, ceil_at, "ceil_mode") || (max && !flag_unset(args, 6, "return_indices")) {
+        return Ok(None);
+    }
+    let dilation = if max { nth_positional_or_keyword(args, 4, &["dilation"]) } else { None };
+    let Some(dilation) = parse_int_seq_arg(dilation, spatial_rank, 1).filter(|d| d.iter().all(|d| *d >= 1)) else {
         return Ok(None);
     };
     if input_shape.len() != spatial_rank + 2 {
@@ -6149,7 +6242,10 @@ fn apply_known_functional_pool(
             return Ok(None);
         };
         let s = stride[i].max(1);
-        let count = padded_size(d, padding[i], padding[i]).and_then(|padded| window_count(padded, kernel[i], s));
+        let Some(window) = kernel[i].checked_sub(1).and_then(|k| k.checked_mul(dilation[i])).and_then(|k| k.checked_add(1)) else {
+            return Ok(None);
+        };
+        let count = padded_size(d, padding[i], padding[i]).and_then(|padded| window_count(padded, window, s));
         let Some(count) = count else {
             return Ok(None);
         };

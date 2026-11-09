@@ -386,6 +386,32 @@ fn test_pad_cases() {
         ("pad_per_axis_widths", vec![pos("x"), pos("((1, 2), (3, 4))")], &[("x", &["10", "20"])], Ok(Some(&["13", "27"]))),
         ("pad_symbolic_per_axis_widths", vec![pos("x"), kw("pad_width", "((1, 2), (3, 4))")], &[("x", &["h", "w"])], Ok(Some(&["h+3", "w+7"]))),
         ("pad_dynamic_width_returns_none", vec![pos("x"), pos("pad_width")], &[("x", &["h", "w"])], Ok(None)),
+        ("pad_one_pair_broadcasts", vec![pos("x"), pos("((1, 2),)")], &[("x", &["h", "w"])], Ok(Some(&["h+3", "w+3"]))),
+        ("pad_per_axis_single_widths", vec![pos("x"), pos("((1,), (2,))")], &[("x", &["10", "20"])], Ok(Some(&["12", "24"]))),
+        ("pad_flat_four_widths_returns_none", vec![pos("x"), pos("(1, 2, 3, 4)")], &[("x", &["10", "20"])], Ok(None)),
+        ("pad_axis_count_mismatch_returns_none", vec![pos("x"), pos("((1, 2), (3, 4), (5, 6))")], &[("x", &["10", "20"])], Ok(None)),
+        ("pad_negative_width_returns_none", vec![pos("x"), pos("(-1, 2)")], &[("x", &["10", "20"])], Ok(None)),
+        ("pad_name_width_returns_none", vec![pos("x"), pos("((k, 2), (3, 4))")], &[("x", &["10", "20"])], Ok(None)),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn test_torch_pad_cases() {
+    check(KnownFunction::TorchPad, None, &[
+        ("torch_pad_one_pair_pads_last_dim", vec![pos("x"), pos("(1, 2)")], &[("x", &["b", "c", "h", "w"])], Ok(Some(&["b", "c", "h", "w+3"]))),
+        ("torch_pad_one_pair_integer", vec![pos("x"), pos("(1, 2)")], &[("x", &["2", "3", "8", "8"])], Ok(Some(&["2", "3", "8", "11"]))),
+        ("torch_pad_two_pairs_last_dim_first", vec![pos("x"), pos("(1, 1, 2, 2)")], &[("x", &["b", "c", "h", "w"])], Ok(Some(&["b", "c", "h+4", "w+2"]))),
+        ("torch_pad_two_pairs_integer", vec![pos("x"), pos("[1, 1, 2, 2]")], &[("x", &["2", "3", "8", "8"])], Ok(Some(&["2", "3", "12", "10"]))),
+        ("torch_pad_negative_crops", vec![pos("x"), kw("pad", "(-1, -1)")], &[("x", &["4", "8"])], Ok(Some(&["4", "6"]))),
+        ("torch_pad_negative_size_returns_none", vec![pos("x"), pos("(-5, -5)")], &[("x", &["4", "8"])], Ok(None)),
+        ("torch_pad_name_gives_free_dim", vec![pos("x"), pos("(p, p, 1, 1)")], &[("x", &["4", "8"])], Ok(Some(&["6", UNKNOWN_DIM]))),
+        ("torch_pad_empty_keeps_shape", vec![pos("x"), pos("()")], &[("x", &["4", "8"])], Ok(Some(&["4", "8"]))),
+        ("torch_pad_odd_length_errors", vec![pos("x"), pos("(1, 2, 3)")], &[("x", &["4", "8"])], Err(&["must be even"])),
+        ("torch_pad_too_long_errors", vec![pos("x"), pos("(1, 1, 1, 1, 1, 1)")], &[("x", &["4", "8"])], Err(&["rank 2"])),
+        ("torch_pad_nested_returns_none", vec![pos("x"), pos("((1, 2), (3, 4))")], &[("x", &["4", "8"])], Ok(None)),
+        ("torch_pad_star_returns_none", vec![pos("x"), pos("(*p, 1)")], &[("x", &["4", "8"])], Ok(None)),
+        ("torch_pad_name_returns_none", vec![pos("x"), pos("pad")], &[("x", &["4", "8"])], Ok(None)),
     ]);
 }
 
@@ -568,6 +594,13 @@ fn test_sum_cases() {
         ("norm_ord_is_not_axis", vec![pos("x"), pos("1")], &[("x", &["b", "d"])], Ok(Some(&[]))),
         ("norm_axis_keyword", vec![pos("x"), kw("axis", "1")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
         ("norm_positional_axis_keepdims", vec![pos("x"), pos("2"), pos("0"), pos("True")], &[("x", &["b", "d"])], Ok(Some(&["1", "d"]))),
+    ]);
+    check(KnownFunction::Reduction { axis: 1, keepdims: Some(3), q: None }, None, &[
+        ("logsumexp_reduces_axis", vec![pos("x"), kw("axis", "1")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
+        ("logsumexp_return_sign_is_a_tuple", vec![pos("x"), kw("axis", "1"), kw("return_sign", "True")], &[("x", &["b", "d"])], Ok(None)),
+        ("logsumexp_positional_return_sign", vec![pos("x"), pos("1"), pos("None"), pos("False"), pos("True")], &[("x", &["b", "d"])], Ok(None)),
+        ("logsumexp_return_sign_not_literal", vec![pos("x"), kw("return_sign", "flag")], &[("x", &["b", "d"])], Ok(None)),
+        ("logsumexp_return_sign_false", vec![pos("x"), kw("axis", "1"), kw("return_sign", "False")], &[("x", &["b", "d"])], Ok(Some(&["b"]))),
     ]);
     check(KnownFunction::Reduction { axis: 2, keepdims: Some(6), q: Some(1) }, None, &[
         ("quantile_scalar_q", vec![pos("x"), pos("50")], &[("x", &["b", "d"])], Ok(Some(&[]))),
@@ -766,6 +799,9 @@ fn test_linspace_cases() {
         ("linspace_default_num_is_50", vec![pos("0"), pos("1")], &[], Ok(Some(&["50"]))),
         ("torch_linspace_keyword_steps", vec![pos("0"), pos("1"), kw("steps", "steps")], &[], Ok(Some(&["steps"]))),
         ("torch_linspace_positional_steps", vec![pos("0"), pos("1"), pos("200")], &[], Ok(Some(&["200"]))),
+        ("linspace_retstep_is_a_tuple", vec![pos("0"), pos("1"), pos("5"), kw("retstep", "True")], &[], Ok(None)),
+        ("linspace_positional_retstep", vec![pos("0"), pos("1"), pos("5"), pos("True"), pos("True")], &[], Ok(None)),
+        ("linspace_retstep_false", vec![pos("0"), pos("1"), pos("5"), kw("retstep", "False")], &[], Ok(Some(&["5"]))),
     ]);
 }
 
@@ -809,6 +845,19 @@ fn test_einsum_cases() {
         ("einsum_output_label_not_in_inputs_errors", vec![pos("\"ij->z\""), pos("a")], &[("a", &["m", "n"])], Err(&["output label 'z' not found"])),
         // "ijk" has 3 labels but operand has rank 2
         ("einsum_rank_mismatch_errors", vec![pos("\"ijk->ij\""), pos("a")], &[("a", &["m", "n"])], Err(&["rank 2 but subscript 'ijk' has length 3"])),
+        ("einsum_spaces_are_ignored", vec![pos("\"l d, d n -> l d n\""), pos("a"), pos("b")], &[("a", &["l", "d"]), ("b", &["d", "n"])], Ok(Some(&["l", "d", "n"]))),
+        ("einsum_spaces_rank_mismatch_errors", vec![pos("\"l d k, d n -> l n\""), pos("a"), pos("b")], &[("a", &["l", "d"]), ("b", &["d", "n"])], Err(&["rank 2 but subscript 'ldk' has length 3"])),
+        ("einsum_implicit_output_is_sorted_single_labels", vec![pos("\"kj,ji\""), pos("a"), pos("b")], &[("a", &["2", "3"]), ("b", &["3", "4"])], Ok(Some(&["4", "2"]))),
+        ("einsum_implicit_uppercase_sorts_first", vec![pos("\"aB\""), pos("a")], &[("a", &["2", "3"])], Ok(Some(&["3", "2"]))),
+        ("einsum_implicit_trace_is_scalar", vec![pos("\"ii\""), pos("a")], &[("a", &["3", "3"])], Ok(Some(&[]))),
+        ("einsum_diagonal", vec![pos("\"ii->i\""), pos("a")], &[("a", &["3", "3"])], Ok(Some(&["3"]))),
+        ("einsum_diagonal_mismatch_errors", vec![pos("\"ii->i\""), pos("a")], &[("a", &["3", "4"])], Err(&["label 'i'"])),
+        ("einsum_uppercase_labels", vec![pos("\"Ij,jK->IK\""), pos("a"), pos("b")], &[("a", &["2", "3"]), ("b", &["3", "4"])], Ok(Some(&["2", "4"]))),
+        ("einsum_size_one_broadcasts", vec![pos("\"ij,ij->ij\""), pos("a"), pos("b")], &[("a", &["1", "3"]), ("b", &["5", "3"])], Ok(Some(&["5", "3"]))),
+        ("einsum_repeated_output_label_returns_none", vec![pos("\"ij->ii\""), pos("a")], &[("a", &["3", "3"])], Ok(None)),
+        ("einsum_non_letter_label_returns_none", vec![pos("\"i1->i\""), pos("a")], &[("a", &["3", "3"])], Ok(None)),
+        ("einsum_operand_list_form_returns_none", vec![pos("a"), pos("[0, 1]"), pos("b"), pos("[1, 2]")], &[("a", &["2", "3"]), ("b", &["3", "4"])], Ok(None)),
+        ("einsum_star_operands_returns_none", vec![pos("\"ij,jk->ik\""), pos("*xs")], &[], Ok(None)),
     ]);
 }
 
@@ -955,6 +1004,9 @@ fn test_tri_cases() {
 fn test_indices_cases() {
     check(KnownFunction::Indices, None, &[
         ("indices_prepends_rank", vec![pos("(2, 3)")], &[], Ok(Some(&["2", "2", "3"]))),
+        ("indices_sparse_is_a_tuple", vec![pos("(2, 3)"), kw("sparse", "True")], &[], Ok(None)),
+        ("indices_positional_sparse", vec![pos("(2, 3)"), pos("int"), pos("True")], &[], Ok(None)),
+        ("indices_sparse_false", vec![pos("(2, 3)"), kw("sparse", "False")], &[], Ok(Some(&["2", "2", "3"]))),
     ]);
 }
 
@@ -1109,11 +1161,24 @@ fn test_search_sorted_cases() {
 
 #[test]
 #[rustfmt::skip]
+fn test_torch_sort_is_a_values_indices_tuple() {
+    assert_eq!(torch_method_reading(&KnownFunction::Sort), Some(KnownFunction::TorchSort));
+    check(KnownFunction::TorchSort, None, &[
+        ("torch_sort_single_name_returns_none", vec![pos("x"), kw("dim", "1"), kw("descending", "True")], &[("x", &["b", "d"])], Ok(None)),
+    ]);
+    check(KnownFunction::Sort, None, &[
+        ("numpy_sort_stable_keeps_shape", vec![pos("x"), kw("axis", "1"), kw("stable", "True")], &[("x", &["b", "d"])], Ok(Some(&["b", "d"]))),
+        ("jax_sort_descending_keeps_shape", vec![pos("x"), kw("axis", "1"), kw("descending", "True")], &[("x", &["b", "d"])], Ok(Some(&["b", "d"]))),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
 fn test_histogram_cases() {
     check(KnownFunction::Histogram, None, &[
-        ("histogram_default_bins", vec![pos("x")], &[], Ok(Some(&["10"]))),
-        ("histogram_literal_bin_count", vec![pos("x"), pos("20")], &[], Ok(Some(&["20"]))),
-        ("histogram_literal_edges_list", vec![pos("x"), pos("[0, 1, 2, 3]")], &[], Ok(Some(&["3"]))),
+        // `(hist, bin_edges)` is a tuple, not one array.
+        ("histogram_default_bins_is_a_tuple", vec![pos("x")], &[], Ok(None)),
+        ("histogram_literal_bin_count_is_a_tuple", vec![pos("x"), pos("20")], &[], Ok(None)),
     ]);
 }
 
@@ -1195,6 +1260,13 @@ fn test_linalg_lstsq_solution_vector_rhs() {
 fn test_einops_einsum_cases() {
     check(KnownFunction::EinopsEinsum, None, &[
         ("einops_einsum_pattern_is_last_positional", vec![pos("a"), pos("b"), pos("\"i j, j k -> i k\"")], &[("a", &["m", "n"]), ("b", &["n", "p"])], Ok(Some(&["m", "p"]))),
+        ("einops_einsum_multi_letter_names", vec![pos("a"), pos("b"), pos("\"batch dim, dim out -> batch out\"")], &[("a", &["m", "n"]), ("b", &["n", "p"])], Ok(Some(&["m", "p"]))),
+        ("einops_einsum_rank_mismatch_errors", vec![pos("a"), pos("\"batch dim -> dim\"")], &[("a", &["m", "n", "k"])], Err(&["rank 3 but subscript 'batch dim' has 2 axes"])),
+        ("einops_einsum_label_mismatch_errors", vec![pos("a"), pos("b"), pos("\"i j, j k -> i k\"")], &[("a", &["2", "3"]), ("b", &["4", "5"])], Err(&["label 'j'"])),
+        ("einops_einsum_ellipsis_returns_none", vec![pos("a"), pos("\"... i -> i\"")], &[("a", &["m", "n"])], Ok(None)),
+        ("einops_einsum_parenthesis_returns_none", vec![pos("a"), pos("\"(i j) -> i\"")], &[("a", &["m"])], Ok(None)),
+        ("einops_einsum_no_arrow_returns_none", vec![pos("a"), pos("\"i j\"")], &[("a", &["m", "n"])], Ok(None)),
+        ("einops_einsum_non_literal_pattern_returns_none", vec![pos("a"), pos("pattern")], &[("a", &["m", "n"])], Ok(None)),
     ]);
 }
 

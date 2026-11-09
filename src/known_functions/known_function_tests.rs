@@ -227,7 +227,7 @@ known_cases! {
     torch_block_rejected_for_now, ["torch", "block"], None;
 
     // torch.nn.functional.* — deep module path classification
-    torch_nn_functional_pad, ["torch", "nn", "functional", "pad"], Some(KnownFunction::Pad);
+    torch_nn_functional_pad, ["torch", "nn", "functional", "pad"], Some(KnownFunction::TorchPad);
     // Was a locking test for an unclassified gap (`F.relu` fell through to
     // `None`); the full activation family is now classified as
     // shape-preserving (`KnownFunction::Copy`), same rule as
@@ -293,7 +293,7 @@ known_cases! {
 
     jnp_sort, ["jax", "numpy", "sort"], Some(KnownFunction::Sort);
     np_sort, ["numpy", "sort"], Some(KnownFunction::Sort);
-    torch_sort, ["torch", "sort"], Some(KnownFunction::Sort);
+    torch_sort, ["torch", "sort"], Some(KnownFunction::TorchSort);
 
     jnp_cumsum, ["jax", "numpy", "cumsum"], Some(KnownFunction::Cumsum);
     np_cumsum, ["numpy", "cumsum"], Some(KnownFunction::Cumsum);
@@ -368,9 +368,9 @@ alias_cases! {
     alias_exact_matching_rejected, "import numpy as np", "npx.concatenate", None;
 
     // torch.nn.functional alias/import tests
-    alias_torch_nn_functional_imported_as_f_pad, "import torch.nn.functional as F", "F.pad", Some(KnownFunction::Pad);
-    from_import_torch_nn_functional_pad, "from torch.nn.functional import pad", "pad", Some(KnownFunction::Pad);
-    from_import_torch_nn_functional_pad_alias, "from torch.nn.functional import pad as F_pad", "F_pad", Some(KnownFunction::Pad);
+    alias_torch_nn_functional_imported_as_f_pad, "import torch.nn.functional as F", "F.pad", Some(KnownFunction::TorchPad);
+    from_import_torch_nn_functional_pad, "from torch.nn.functional import pad", "pad", Some(KnownFunction::TorchPad);
+    from_import_torch_nn_functional_pad_alias, "from torch.nn.functional import pad as F_pad", "F_pad", Some(KnownFunction::TorchPad);
     alias_torch_nn_functional_imported_as_f_relu_classified_shape_preserving, "import torch.nn.functional as F", "F.relu", Some(KnownFunction::Copy);
 }
 

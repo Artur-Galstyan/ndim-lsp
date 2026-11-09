@@ -860,6 +860,9 @@ pub enum LayerKind {
         batch_first: String,
         added_keys: String,
         returns_weights: bool,
+        /// The last dim of the output: `output_size` in equinox (default
+        /// `query_size`), `embed_dim` in torch.
+        output_size: String,
     },
     /// Index lookup table: appends `embedding_size` to the input shape
     /// (scalar index → `(embedding_size,)`, `(batch, seq)` → `(batch, seq, embedding_size)`).
@@ -907,8 +910,8 @@ pub enum LayerKind {
         dilation: String,
     },
     /// torch.nn.RNN/LSTM/GRU full-sequence modules, `(output, h_n)` or
-    /// `(output, (h_n, c_n))`. A direct application gives `output` only:
-    /// last dim `D*H_out`, with `D` 2 when bidirectional and `H_out` the
+    /// `(output, (h_n, c_n))`. A direct application checks the input and
+    /// gives no shape, as the result is a tuple. `output` has last dim `D*H_out`, with `D` 2 when bidirectional and `H_out` the
     /// `proj_size` of an LSTM when it is above 0, else `hidden_size`. The
     /// state is `[D*num_layers, N, H_out]` (`c_n` keeps `hidden_size`).
     /// `batch_first`, `bidirectional`, `num_layers` and `proj_size` are the
@@ -924,9 +927,8 @@ pub enum LayerKind {
     },
     /// torch.nn.RNNCell/GRUCell/LSTMCell and equinox.nn.LSTMCell/GRUCell —
     /// single-step cells. RNNCell/GRUCell genuinely return one tensor of
-    /// shape `hidden_size`; LSTMCell returns `(h, c)` — modelled as just the
-    /// `h` component (same shape as GRUCell's output), an approximation for
-    /// the same tuple-output reason as `Rnn`.
+    /// shape `hidden_size`; LSTMCell returns `(h, c)`, so a direct
+    /// application gives no shape.
     RnnCell {
         name: String,
         input_size: String,
@@ -1140,6 +1142,8 @@ pub enum KnownFunction {
     AtLeast2D,
     AtLeast3D,
     Pad,
+    TorchPad,
+    TorchSort,
     NumpyPad,
     Roll,
     Flip,
