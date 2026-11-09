@@ -1276,7 +1276,10 @@ pub enum KnownFunction {
     EmptyLike,
     Identity,
     Linspace,
+    /// `logspace` and `geomspace` of numpy and jax.
     Logspace,
+    /// torch `linspace` and `logspace`: the endpoints are scalars.
+    TorchLinspace,
     All,
     Any,
     ArgMax,

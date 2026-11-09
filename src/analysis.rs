@@ -27,7 +27,10 @@ use crate::python_ast::{
     extract_call_arguments, insert_identifiers, insert_target_names, only_wrapped,
     self_attr_aliases_from_writes,
 };
-use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
+use crate::resolution::{
+    ResolutionCache, bind_call_arguments, resolve_call_target, resolve_imported_function_shape,
+    resolve_imported_function_signature,
+};
 
 use crate::types::*;
 
@@ -2636,6 +2639,20 @@ fn file_backend(import_map: &HashMap<String, ImportPath>) -> FileBackend {
     }
 }
 
+/// Whether the file imports jax (or a library on jax), and neither numpy nor
+/// torch.
+fn imports_only_jax(import_map: &HashMap<String, ImportPath>) -> bool {
+    let mut jax = false;
+    for import in import_map.values() {
+        match import.module.first().unwrap_or(&import.name).as_str() {
+            "jax" | "flax" | "equinox" | "haiku" | "optax" => jax = true,
+            "numpy" | "torch" => return false,
+            _ => {}
+        }
+    }
+    jax
+}
+
 /// `x.transpose(i, j)` swaps two dims in torch but is a full axes permutation
 /// in numpy/jax. `dim0`/`dim1` keywords only exist in torch. With two
 /// positional dims and no known backend, the result is kept only when both
@@ -2647,6 +2664,11 @@ fn apply_method_call_for_backend(
     import_map: &HashMap<String, ImportPath>,
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
+    // `ndarray.sort()` sorts in place and returns `None`, a torch tensor gives
+    // a tuple, and only a jax array gives a sorted copy.
+    if matches!(known, KnownFunction::Sort) && !imports_only_jax(import_map) {
+        return Ok(None);
+    }
     if let Some(torch) = torch_method_reading(known) {
         return apply_method_readings(&torch, known, receiver, args, import_map, shapes);
     }
@@ -3005,6 +3027,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             &ctx.scope_shapes(scope_idx),
             ctx.links,
             ctx.scopes,
+            ctx.original_shapes,
         );
         return ctx.check(result, target, args_node.range()).flatten();
     }
@@ -3055,7 +3078,14 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     out_axes: 0,
                     site: call_byte,
                 };
-                let result = apply_vmap_call(&info, &rest, &ctx.scope_shapes(scope_idx), ctx.links, ctx.scopes);
+                let result = apply_vmap_call(
+                    &info,
+                    &rest,
+                    &ctx.scope_shapes(scope_idx),
+                    ctx.links,
+                    ctx.scopes,
+                    ctx.original_shapes,
+                );
                 return ctx.check(result, "", args_node.range()).flatten();
             }
             return None;
@@ -3103,10 +3133,15 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             Some(SequenceArg::Opaque) if first_arg_is_tuple(args_node) => return None,
             _ => args,
         };
-        let args = if matches!(known, KnownFunction::Clamp) {
-            without_scalar_bounds(args, args_node, true, ctx)
-        } else {
-            args
+        let args = match known {
+            KnownFunction::Clamp => without_scalar_bounds(args, args_node, true, ctx),
+            KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
+                with_scalar_operands(args, args_node, 2, &["start", "stop", "end"], ctx)
+            }
+            KnownFunction::Where => {
+                with_scalar_operands(args, args_node, 3, &["condition", "x", "y", "input", "other"], ctx)
+            }
+            _ => args,
         };
         let args = with_size_names(&known, false, args, args_node, scope_idx, ctx)?;
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
@@ -3204,6 +3239,43 @@ fn binary_call_shape(
         (Some(shape), None) | (None, Some(shape)) => Some(shape),
         (None, None) => is_scalar_expr(node, ctx, &mut Vec::new()).then(Vec::new),
     }
+}
+
+/// The first `positions` positional arguments and the `keywords` arguments
+/// of a call, as `0` when they are provable scalars.
+fn with_scalar_operands(
+    args: Vec<CallArgument>,
+    args_node: Node,
+    positions: usize,
+    keywords: &[&str],
+    ctx: &ShapeCtx,
+) -> Vec<CallArgument> {
+    let mut positional = 0usize;
+    args.into_iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let value_node = match &arg {
+                CallArgument::Positional { .. } => {
+                    positional += 1;
+                    if positional > positions {
+                        return arg;
+                    }
+                    args_node.named_child(i as u32)
+                }
+                CallArgument::Keyword { name, .. } if keywords.contains(&name.as_str()) => {
+                    args_node.named_child(i as u32).and_then(|n| n.child_by_field_name("value"))
+                }
+                CallArgument::Keyword { .. } => return arg,
+            };
+            if !value_node.is_some_and(|n| is_scalar_expr(n, ctx, &mut Vec::new())) {
+                return arg;
+            }
+            match arg {
+                CallArgument::Positional { .. } => CallArgument::Positional { value: "0".to_string() },
+                CallArgument::Keyword { name, .. } => CallArgument::Keyword { name, value: "0".to_string() },
+            }
+        })
+        .collect()
 }
 
 /// Removes the `clip` / `clamp` bounds that are `None` or provable scalars,
@@ -5356,7 +5428,7 @@ fn is_array_expr(node: Node, ctx: &ShapeCtx, visiting: &mut Vec<(usize, String)>
                         name.as_str(),
                         "zeros" | "ones" | "empty" | "full" | "zeros_like" | "ones_like"
                             | "empty_like" | "full_like" | "rand" | "randn" | "randint"
-                            | "rand_like" | "randn_like" | "arange" | "linspace" | "eye"
+                            | "rand_like" | "randn_like" | "arange" | "linspace" | "logspace" | "geomspace" | "eye"
                             | "identity" | "array" | "asarray" | "tensor" | "reshape"
                             | "transpose" | "matmul" | "einsum" | "concatenate" | "concat"
                             | "cat" | "stack" | "squeeze" | "unsqueeze" | "expand_dims"
@@ -5559,7 +5631,7 @@ fn tuple_rhs_shapes(
                     &known,
                     &method_args,
                     args_node,
-                    n_targets,
+                    targets,
                     scope_idx,
                     ctx,
                 );
@@ -5882,7 +5954,7 @@ fn tuple_rhs_shapes(
                 } else {
                     args = resolve_call_args(args, args_node, scope_idx, ctx)?;
                 }
-                return tuple_multi_output_shapes(&known?, &args, args_node, n_targets, scope_idx, ctx);
+                return tuple_multi_output_shapes(&known?, &args, args_node, targets, scope_idx, ctx);
             }
 
             if !matches!(known, Some(KnownFunction::Split | KnownFunction::ArraySplit)) {
@@ -5894,10 +5966,40 @@ fn tuple_rhs_shapes(
             } else {
                 compute_split_shapes(&args, &ctx.scope_shapes(scope_idx))
             };
-            Some(ctx.check(result, "", args_node.range())??.into_iter().map(Some).collect())
+            fit_pieces(ctx.check(result, "", args_node.range())??, targets)
         }
         _ => None,
     }
+}
+
+/// The shape of each target of `a, *r, b = <pieces>`. Python raises when
+/// the count does not fit, so then no target has a shape. A star or a
+/// nested target gets no shape: a list, or a piece unpacked again.
+fn fit_pieces(pieces: Vec<Vec<String>>, targets: &[TupleTarget]) -> Option<Vec<Option<Vec<String>>>> {
+    let star = targets.iter().position(|t| matches!(t, TupleTarget::Star(_)));
+    let fits = match star {
+        None => pieces.len() == targets.len(),
+        Some(_) => pieces.len() + 1 >= targets.len(),
+    };
+    if !fits {
+        return None;
+    }
+    let after = star.map_or(0, |k| targets.len() - k - 1);
+    let front = star.unwrap_or(targets.len());
+    let mut pieces = pieces.into_iter().map(Some).collect::<Vec<_>>();
+    let back = pieces.split_off(pieces.len() - after);
+    pieces.truncate(front);
+    let mut out: Vec<Option<Vec<String>>> = pieces;
+    if star.is_some() {
+        out.push(None);
+    }
+    out.extend(back);
+    for (shape, target) in out.iter_mut().zip(targets) {
+        if matches!(target, TupleTarget::Nested(_)) {
+            *shape = None;
+        }
+    }
+    Some(out)
 }
 
 /// The values of the positional arguments, as written.
@@ -5916,10 +6018,11 @@ fn tuple_multi_output_shapes(
     known: &KnownFunction,
     args: &[CallArgument],
     args_node: Node,
-    n_targets: usize,
+    targets: &[TupleTarget],
     scope_idx: usize,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<Option<Vec<String>>>> {
+    let n_targets = targets.len();
     let range = args_node.range();
     match known {
         KnownFunction::TopK | KnownFunction::KthValue | KnownFunction::MinMax | KnownFunction::MedianDim => {
@@ -5950,8 +6053,10 @@ fn tuple_multi_output_shapes(
             if n_targets == 0 {
                 return None;
             }
-            let result = compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets);
-            Some(vec![Some(ctx.check(result, "", range)??); n_targets])
+            let star = targets.iter().any(|t| matches!(t, TupleTarget::Star(_)));
+            let result = compute_unbind_shape(args, &ctx.scope_shapes(scope_idx), n_targets, star);
+            let shape = ctx.check(result, "", range)??;
+            Some(targets.iter().map(|t| matches!(t, TupleTarget::Name(_)).then(|| shape.clone())).collect())
         }
         // `TorchSplit` has real torch semantics (chunk *size*, not section
         // count) — covers both `torch.split(x, ...)` (free function) and
@@ -5959,12 +6064,13 @@ fn tuple_multi_output_shapes(
         // `n_targets` lets the literal-size / symbolic-axis-dim case still
         // bind a chunk list.
         KnownFunction::Chunk | KnownFunction::TorchSplit => {
+            let star = targets.iter().any(|t| matches!(t, TupleTarget::Star(_)));
             let result = if matches!(known, KnownFunction::Chunk) {
                 compute_chunk_shapes(args, &ctx.scope_shapes(scope_idx))
             } else {
-                compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), Some(n_targets))
+                compute_torch_split_shapes(args, &ctx.scope_shapes(scope_idx), (!star).then_some(n_targets))
             };
-            Some(ctx.check(result, "", range)??.into_iter().map(Some).collect())
+            fit_pieces(ctx.check(result, "", range)??, targets)
         }
         _ => None,
     }
@@ -6164,6 +6270,7 @@ fn apply_vmap_call(
     caller_shapes: &dyn ShapeLookup,
     links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
+    original_shapes: &[HashMap<String, Vec<String>>],
 ) -> Result<Option<Vec<String>>, String> {
     apply_vmap_call_chain(
         &[(info.in_axes, info.out_axes)],
@@ -6173,6 +6280,7 @@ fn apply_vmap_call(
         caller_shapes,
         links,
         scopes,
+        original_shapes,
     )
 }
 
@@ -6245,7 +6353,9 @@ fn peel_vmap_args<'a>(
 /// Peels one leading batch dim per level (checking cross-argument agreement
 /// at each level independently), resolves `f`'s shape on the fully-peeled
 /// per-example inputs, then re-prepends the batch dims outward-to-inward
-/// in reverse.
+/// in reverse. The callee binds its annotations (`original_shapes`), not the
+/// shapes that an earlier call specialized.
+#[allow(clippy::too_many_arguments)]
 fn apply_vmap_call_chain(
     axes: &[(isize, isize)],
     wrapped: &str,
@@ -6254,6 +6364,7 @@ fn apply_vmap_call_chain(
     caller_shapes: &dyn ShapeLookup,
     links: &ScopeLinks,
     scopes: &[FunctionShapeScope],
+    original_shapes: &[HashMap<String, Vec<String>>],
 ) -> Result<Option<Vec<String>>, String> {
     let Some((current, batch_dims)) = peel_vmap_args(axes, args, caller_shapes)? else {
         return Ok(None);
@@ -6263,7 +6374,10 @@ fn apply_vmap_call_chain(
     let Some(callee_idx) = find_callee_scope(wrapped, site, links, scopes) else {
         return Ok(None); // wrapped function not found — skip silently
     };
-    let callee = &scopes[callee_idx];
+    let Some(original) = original_shapes.get(callee_idx) else {
+        return Ok(None);
+    };
+    let callee = &FunctionShapeScope { shapes: original.clone(), ..scopes[callee_idx].clone() };
 
     // If the callee has no jaxtyping annotations at all, skip.
     if callee.shapes.is_empty() && callee.return_shape.is_none() {
@@ -6367,6 +6481,7 @@ fn shape_of_inline_vmap(
             &ctx.scope_shapes(scope_idx),
             ctx.links,
             ctx.scopes,
+            ctx.original_shapes,
         );
         return ctx.check(result, "", outer_args_node.range()).flatten();
     }
@@ -6857,12 +6972,17 @@ fn apply_user_function(
     // that depend on the call, like a partially annotated callee: only its
     // `-> ReturnType` annotation is call-independent.
     let captures = ctx.links.captures[callee_idx];
+    let Some(function) = ctx.scope_function_nodes[callee_idx] else {
+        return Some(None);
+    };
+    let bound = bound_parameters(function, ctx.text, args);
     if let Some(result) = bind_user_function_args(
         &ctx.scopes[callee_idx],
+        &ctx.original_shapes[callee_idx],
         name,
-        args,
+        &bound,
         &ctx.scope_shapes(scope_idx),
-        ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
+        Some((function, ctx.text)),
     ) {
         match ctx.check(result, display, args_node.range()) {
             None => return Some(None),
@@ -7093,11 +7213,12 @@ fn substitute_dim(dim: &str, binding: &HashMap<String, String>) -> String {
 /// than building a general expression re-evaluator across scopes.
 fn trace_user_function_return(
     callee: &FunctionShapeScope,
+    declared: &HashMap<String, Vec<String>>,
     target_name: &str,
     positional_arg_shapes: &[(&str, Vec<String>)],
     (func_node, text): (Node, &str),
 ) -> Result<Option<Vec<String>>, String> {
-    let binding = build_dim_binding(&callee.shapes, target_name, positional_arg_shapes)?;
+    let binding = build_dim_binding(declared, target_name, positional_arg_shapes)?;
     let Some(body) = func_node.child_by_field_name("body") else {
         return Ok(None);
     };
@@ -7857,87 +7978,41 @@ fn scan_body_ys_shape(
 /// intentionally bails on the whole call rather than partially validating);
 /// `Some(Ok(Some(shape)))` / `Some(Err(msg))` otherwise.
 ///
-/// v1 limitations (documented in PR #34, still true for the cross-file
-/// extension):
-/// - Only positional arguments are matched. Keyword args that match a param
-///   name are honoured; otherwise the call is skipped with Ok(None).
-/// - Fresh output dims (not in the binding) pass through unchanged.
+/// Each argument binds a parameter by the rules of Python, over the full
+/// parameter list (`bound`). Fresh output dims (not in the binding) pass
+/// through unchanged. Imported helpers pass no `function` and use their
+/// annotations only.
 fn bind_user_function_args(
     callee: &FunctionShapeScope,
+    declared: &HashMap<String, Vec<String>>,
     target: &str,
-    args: &[CallArgument],
+    bound: &[(String, &str)],
     caller_shapes: &dyn ShapeLookup,
-    // The existing function node and its source enable body tracing for
-    // same-file calls. Imported helpers pass None and use annotations only.
-    source: Option<(Node, &str)>,
+    function: Option<(Node, &str)>,
 ) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
-    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+    if declared.is_empty() && callee.return_shape.is_none() {
         return None;
     }
 
-    // A function of this file binds its arguments by the rules of Python.
     // An argument without a shape for an array parameter skips the call.
-    if let Some((function, text)) = source {
-        let mut arg_shapes: Vec<(String, Vec<String>)> = Vec::new();
-        for (param, value) in bound_parameters(function, text, args) {
-            let Some(declared) = callee.shapes.get(&param) else {
-                continue;
-            };
-            match caller_shapes.shape(value) {
-                Some(shape) => arg_shapes.push((param, shape.clone())),
-                None if declared.is_empty() => {}
-                None => return Some(Ok(None)),
-            }
-        }
-        let arg_shapes: Vec<(&str, Vec<String>)> =
-            arg_shapes.iter().map(|(param, shape)| (param.as_str(), shape.clone())).collect();
-        return Some(if callee.return_shape.is_some() {
-            bind_and_substitute(callee, target, &arg_shapes)
-        } else {
-            trace_user_function_return(callee, target, &arg_shapes, (function, text))
-        });
-    }
-
-    // Resolve each positional arg to a shape from the caller's scope.
-    // We match positional args to declared params in declaration order.
-    let param_names = &callee.param_order;
-    let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new(); // (param_name, arg_shape)
-    let mut positional_idx = 0usize;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                let Some(param_name) = param_names.get(positional_idx) else {
-                    break; // more positional args than annotated params — ignore extras
-                };
-                let Some(shape) = caller_shapes.shape(value.as_str()) else {
-                    // Arg has no known shape (literal, untracked variable, etc.)
-                    // — skip entire function. v1 intentionally bails early
-                    // rather than partially validating some args, to avoid
-                    // noisy diagnostics on calls that mix typed and untyped
-                    // arguments.
-                    return Some(Ok(None));
-                };
-                arg_shapes.push((param_name, shape.clone()));
-                positional_idx += 1;
-            }
-            CallArgument::Keyword { name, value } => {
-                // v1: honour keyword args whose name matches a declared param.
-                if callee.shapes.contains_key(name) {
-                    let Some(shape) = caller_shapes.shape(value.as_str()) else {
-                        return Some(Ok(None));
-                    };
-                    arg_shapes.push((name, shape.clone()));
-                }
-                // Non-matching keyword args are silently ignored in v1.
-            }
+    let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new();
+    for (param, value) in bound {
+        let Some(annotation) = declared.get(param) else {
+            continue;
+        };
+        match caller_shapes.shape(value) {
+            Some(shape) => arg_shapes.push((param.as_str(), shape.clone())),
+            None if annotation.is_empty() => {}
+            None => return Some(Ok(None)),
         }
     }
-
-    // Delegate to the shared bind_and_substitute helper.
     if callee.return_shape.is_some() {
-        Some(bind_and_substitute(callee, target, &arg_shapes))
+        let annotated = FunctionShapeScope { shapes: declared.clone(), ..callee.clone() };
+        Some(bind_and_substitute(&annotated, target, &arg_shapes))
+    } else if let Some(function) = function {
+        Some(trace_user_function_return(callee, declared, target, &arg_shapes, function))
     } else {
         Some(Ok(None))
     }
@@ -7967,7 +8042,25 @@ fn apply_imported_user_function(
         Ok(None) => return None,
         Err(message) => return Some(Err(message)),
     };
-    bind_user_function_args(&callee, target, args, caller_shapes, None)
+    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+        return None;
+    }
+    let signature = match resolve_imported_function_signature(
+        target, import_map, search_roots, read_file, max_depth, cache,
+    ) {
+        Ok(Some(signature)) => signature,
+        Ok(None) => return Some(Ok(None)),
+        Err(message) => return Some(Err(message)),
+    };
+    let Some(bindings) = bind_call_arguments(&signature, args) else {
+        return Some(Ok(None));
+    };
+    let bound: Vec<(String, &str)> = signature
+        .params
+        .iter()
+        .filter_map(|param| Some((param.clone(), bindings.get(param)?.as_str())))
+        .collect();
+    bind_user_function_args(&callee, &callee.shapes, target, &bound, caller_shapes, None)
 }
 
 fn apply_matmul_shape(

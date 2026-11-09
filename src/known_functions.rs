@@ -49,7 +49,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "zeros" => Some(KnownFunction::Zeros),
             "ones" => Some(KnownFunction::Ones),
             "empty" => Some(KnownFunction::Empty),
-            "logspace" => Some(KnownFunction::Logspace),
+            "logspace" | "geomspace" => Some(KnownFunction::Logspace),
             "identity" => Some(KnownFunction::Identity),
             "broadcast_arrays" => Some(KnownFunction::BroadcastArrays),
             "pad" if is_numpy => Some(KnownFunction::NumpyPad),
@@ -139,6 +139,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "combinations" => Some(KnownFunction::Combinations),
             "cartesian_prod" => Some(KnownFunction::CartesianProd),
             "block_diag" => Some(KnownFunction::BlockDiag),
+            "linspace" | "logspace" => Some(KnownFunction::TorchLinspace),
             _ => classify_array_function(name),
         };
     }
@@ -925,7 +926,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         | "rsqrt" | "abs" | "neg" | "sigmoid" | "tanh" | "relu" | "sin" | "cos" | "square"
         | "floor" | "ceil" | "round" | "sign" | "exp_" | "log_" | "sqrt_" | "rsqrt_" | "abs_"
         | "neg_" | "sigmoid_" | "tanh_" | "relu_" | "sin_" | "cos_" | "square_" | "floor_"
-        | "ceil_" | "round_" | "sign_" => Some(KnownFunction::Copy),
+        | "ceil_" | "round_" | "sign_" | "zero_" | "fill_" | "add_" | "sub_" | "mul_" | "div_"
+        | "pow_" | "clamp_" | "copy_" | "uniform_" | "normal_" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
@@ -1117,7 +1119,9 @@ fn apply_known_rule(
         | KnownFunction::Scatter
         | KnownFunction::MaskedFill => apply_known_shape_preserving(args, shapes),
         KnownFunction::Arange => apply_known_arange(args),
-        KnownFunction::Linspace | KnownFunction::Logspace => apply_known_linspace(args),
+        KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
+            apply_known_linspace(function, args, shapes)
+        }
         KnownFunction::Eye | KnownFunction::Identity => apply_known_eye(args),
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
         KnownFunction::DotGeneral => apply_known_dot_general(args, shapes),
@@ -2039,7 +2043,7 @@ fn resolve_shape_index(dim: &str, shapes: &dyn ShapeLookup) -> Option<String> {
     let resolved = if idx >= 0 {
         shape.get(idx as usize)?
     } else {
-        let from_end = (-idx) as usize;
+        let from_end = idx.unsigned_abs();
         shape.get(shape.len().checked_sub(from_end)?)?
     };
     Some(resolved.clone())
@@ -2547,23 +2551,49 @@ fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, Stri
     Ok(Some(vec![format!("{}-{}", values[1], values[0])]))
 }
 
-fn apply_known_linspace(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+/// `linspace(start, stop, num)`: numpy and jax give `[num, *broadcast(start,
+/// stop)]` for array endpoints. A number is a scalar endpoint (the analysis
+/// writes `0` for a provable scalar). torch needs scalar endpoints and `steps`.
+fn apply_known_linspace(
+    function: &KnownFunction,
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let torch = matches!(function, KnownFunction::TorchLinspace);
     // `retstep=True` gives a `(samples, step)` tuple.
-    if !flag_unset(args, 4, "retstep") {
+    if matches!(function, KnownFunction::Linspace) && !flag_unset(args, 4, "retstep") {
         return Ok(None);
     }
-    for arg in args {
-        if let CallArgument::Keyword { name, value } = arg
-            && (name == "num" || name == "steps")
-        {
-            return Ok(Some(vec![value.clone()]));
+    let endpoint = |value: Option<&str>| -> Option<Vec<String>> {
+        let value = value?.trim();
+        if value.parse::<f64>().is_ok() {
+            return Some(Vec::new());
         }
+        shapes.shape(value).cloned()
+    };
+    let start = endpoint(nth_positional_or_keyword(args, 0, &["start"]));
+    let stop = endpoint(nth_positional_or_keyword(args, 1, &["stop", "end"]));
+    let (Some(start), Some(stop)) = (start, stop) else {
+        return Ok(None);
+    };
+    let keywords: &[&str] = if torch { &["steps"] } else { &["num"] };
+    let num = match nth_positional_or_keyword(args, 2, keywords) {
+        Some(num) => num.to_string(),
+        None if torch => return Ok(None),
+        None => "50".to_string(),
+    };
+    if torch {
+        return Ok((start.is_empty() && stop.is_empty()).then(|| vec![num]));
     }
-    let values = positional_arg_values(args);
-    if let Some(num) = values.get(2) {
-        return Ok(Some(vec![num.clone()]));
+    let tail = broadcast_two_shapes(&start, &stop)?;
+    let axis_set = positional_arg_values(args).len() > 5
+        || args.iter().any(|arg| matches!(arg, CallArgument::Keyword { name, value } if name == "axis" && value.trim() != "0"));
+    if !tail.is_empty() && axis_set {
+        return Ok(None);
     }
-    Ok(Some(vec!["50".to_string()]))
+    let mut output = vec![num];
+    output.extend(tail);
+    Ok(Some(output))
 }
 
 fn apply_known_eye(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
@@ -3896,22 +3926,36 @@ fn apply_known_numpy_pad(
     ))
 }
 
+/// `where(condition, x, y)` broadcasts its three operands. Two operands with
+/// shapes that do not broadcast are a conflict even when the third has no
+/// shape. One argument gives a tuple of index arrays.
 fn apply_known_where(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
-    let values = positional_arg_values(args);
-    if values.len() < 3 {
+    let operands = [
+        nth_positional_or_keyword(args, 0, &["condition"]),
+        nth_positional_or_keyword(args, 1, &["x", "input"]),
+        nth_positional_or_keyword(args, 2, &["y", "other"]),
+    ];
+    if operands[1].is_none() || operands[2].is_none() {
         return Ok(None);
     }
+    let known: Vec<Option<Vec<String>>> = operands
+        .into_iter()
+        .map(|value| {
+            let value = value?.trim();
+            if value.parse::<f64>().is_ok() {
+                return Some(Vec::new());
+            }
+            shapes.shape(value).cloned()
+        })
+        .collect();
     let mut output = Vec::new();
-    for value in values.iter().take(3) {
-        let Some(shape) = shapes.shape(value) else {
-            return Ok(None);
-        };
+    for shape in known.iter().flatten() {
         output = broadcast_two_shapes(&output, shape)?;
     }
-    Ok(Some(output))
+    Ok(known.iter().all(Option::is_some).then_some(output))
 }
 
 /// `torch.max(a, b)` broadcasts elementwise. A `dim` returns a
@@ -5931,6 +5975,7 @@ pub fn compute_unbind_shape(
     args: &[CallArgument],
     shapes: &dyn ShapeLookup,
     n_targets: usize,
+    star: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
         return Ok(None);
@@ -5945,7 +5990,13 @@ pub fn compute_unbind_shape(
     let Ok(size) = input_shape[dim].parse::<usize>() else {
         return Ok(None);
     };
-    if size != n_targets {
+    if star && size + 1 < n_targets {
+        return Err(format!(
+            "unbind along dim {} produces {} outputs, but at least {} were unpacked",
+            dim, size, n_targets - 1
+        ));
+    }
+    if !star && size != n_targets {
         return Err(format!(
             "unbind along dim {} produces {} outputs, but {} were unpacked",
             dim, size, n_targets
@@ -5987,12 +6038,14 @@ pub fn compute_chunk_shapes(
     };
     let axis_dim = &input_shape[dim];
 
+    // A symbolic size gives `n` equal pieces only when `n` divides it as a
+    // factor. Else torch may give fewer pieces, and a smaller last piece.
     let Ok(axis_size) = axis_dim.parse::<usize>() else {
         if n > MAX_PIECES {
             return Ok(None);
         }
         let mut out = input_shape.clone();
-        out[dim] = format!("chunk({}, {})", axis_dim, n);
+        out[dim] = cancel_product_factor(axis_dim, n).unwrap_or_else(|| UNKNOWN_DIM.to_string());
         return Ok(Some(vec![out; n]));
     };
 

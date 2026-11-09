@@ -4635,6 +4635,56 @@ mod constructor_coverage_integration_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["n"])));
     }
+
+    /// `where` reports two operands that do not broadcast, with the kind of
+    /// a binary operator, also when the condition has no shape.
+    #[test]
+    fn test_where_operands_must_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("jnp.where(c > 0, a, b)", None, Some(ShapeErrorKind::Mismatch)),
+            ("jnp.where(c > 0, a, n)", None, Some(ShapeErrorKind::Approximation)),
+            ("torch.where(c, a, a)", Some(vec!["3"]), None),
+            ("np.where(c, a, -np.inf)", Some(vec!["3"]), None),
+            ("np.where(c)", None, None),
+        ];
+        for (call, expected, kind) in cases {
+            let code = format!(
+                "import numpy as np\nimport torch\nimport jax.numpy as jnp\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"5\"], n: Float[Array, \"n\"], c: Bool[Array, \"3\"]):\n    y = {call}\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(analysis.errors.iter().map(|e| e.kind).collect::<Vec<_>>(), kind.into_iter().collect::<Vec<_>>(), "{call}");
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
+
+    /// Array endpoints add their broadcast shape after `num`; a provable
+    /// scalar expression adds nothing; an unknown endpoint gives no shape.
+    #[test]
+    fn test_linspace_endpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("np.linspace(a, b, 10)", Some(vec!["10", "2", "3"])),
+            ("np.linspace(0, 2 * np.pi, 10)", Some(vec!["10"])),
+            ("np.geomspace(1.0, a, 4)", Some(vec!["4", "3"])),
+            ("np.logspace(-1.0, a * 2)", Some(vec!["50", "3"])),
+            ("np.linspace(lo, 1, 10)", None),
+            ("torch.linspace(0, math.pi, 7)", Some(vec!["7"])),
+            ("torch.linspace(a, 1, 7)", None),
+        ];
+        for (call, expected) in cases {
+            let code = format!(
+                "import math\nimport numpy as np\nimport torch\ndef f(a: Float[Array, \"3\"], b: Float[Array, \"2 3\"]):\n    y = {call}\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{call}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
 }
 
 mod torch_varargs_size_tests {
@@ -5321,6 +5371,56 @@ def f(x: Float[Array, "batch 4"]) -> None:
         );
     }
 
+    /// A parameter that the body assigns again binds by its annotation, not
+    /// by the last shape of the name.
+    #[test]
+    fn test_user_function_binds_the_annotation_of_a_reassigned_parameter() {
+        let tmp = tempfile::tempdir().unwrap();
+        for ret in ["-> Float[Array, \"b a\"]", "-> None"] {
+            let code = format!(
+                "def f(x: Float[Array, \"a b\"]) {ret}:\n    x = x.T\n    return x\n\ndef c(y: Float[Array, \"3 4\"]) -> None:\n    z = f(y)\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{ret}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "c", "z"), Some(&shape(&["4", "3"])), "{ret}");
+        }
+    }
+
+    /// An imported helper binds its arguments by the full parameter list:
+    /// an unannotated parameter takes a position, `*` and `/` hold.
+    #[test]
+    fn test_cross_file_arguments_bind_the_full_parameter_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def f(a, x: Float[Array, \"n d\"]) -> Float[Array, \"n d\"]:\n    pass\n\
+             def g(x: Float[Array, \"n d\"], /, *, w: Float[Array, \"d\"]) -> Float[Array, \"n\"]:\n    pass\n",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cases = [
+            ("f(k, y)", Some(vec!["b", "3"]), 0),
+            ("f(y, k)", None, 1),
+            ("f(k, x=y)", Some(vec!["b", "3"]), 0),
+            ("g(y, w=v)", Some(vec!["b"]), 0),
+            ("g(y, w=u)", None, 1),
+            ("g(y, u)", Some(vec!["b"]), 0),
+            ("g(x=y, w=v)", Some(vec!["n"]), 0),
+        ];
+        for (call, expected, errors) in cases {
+            let code = format!(
+                "from mylib.helpers import f, g\n\ndef c(y: Float[Array, \"b 3\"], k: Float[Array, \"7\"], v: Float[Array, \"3\"], u: Float[Array, \"5\"]) -> None:\n    z = {call}\n"
+            );
+            let tree = parse(&code);
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(analysis.errors.len(), errors, "{call}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "c", "z"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
+
     /// Argument rank disagrees with the imported helper's declared param
     /// rank — the mismatch must still surface as a `ShapeError`, same as a
     /// same-file helper.
@@ -5816,6 +5916,34 @@ def caller(x: Float[Array, "B n"]) -> None:
             find_shape_in_scope(&analysis, "caller", "y"),
             Some(&shape(&["B", "m"]))
         );
+    }
+
+    /// A vmapped call of a partly annotated callee binds against the
+    /// annotations, not against the shapes an earlier call specialized.
+    #[test]
+    fn test_vmap_ignores_an_earlier_specialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        for vmapped in ["jax.vmap(g)(r, s)", "vg(r, s)"] {
+            let code = format!(
+                r#"
+import jax
+
+def g(a, x: Float[Array, "d"]) -> Float[Array, "d"]:
+    return x
+
+vg = jax.vmap(g)
+
+def caller(p: Float[Array, "3"], q: Float[Array, "3"], r: Float[Array, "b 5"], s: Float[Array, "b 5"]) -> None:
+    u = g(p, q)
+    v = {vmapped}
+"#
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{vmapped}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "caller", "v"), Some(&shape(&["b", "5"])), "{vmapped}");
+        }
     }
 }
 
@@ -8752,6 +8880,64 @@ mod torch_new_builtin_tests {
         assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3"])));
         assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["3"])));
         assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["1"])));
+    }
+
+    /// The pieces of a split must match the targets in number, else Python
+    /// raises. A star target takes the pieces between. A symbolic `chunk`
+    /// keeps the rank, but not the size of a piece.
+    #[test]
+    fn test_split_pieces_against_the_unpacked_names() {
+        let unknown = "?";
+        type Expected<'a> = &'a [Option<&'a [&'a str]>];
+        let cases: &[(&str, &str, Expected)] = &[
+            ("6 4", "a, b = x.split(1)", &[None, None]),
+            ("6 4", "a, b = torch.split(x, 2)", &[None, None]),
+            ("6 4", "a, b = jnp.split(x, 3)", &[None, None]),
+            ("6 4", "a, b, c, d = x.chunk(3)", &[None, None, None, None]),
+            ("7", "a, b = torch.chunk(x, 3)", &[None, None]),
+            ("6 4", "a, *r, b = jnp.split(x, 3)", &[Some(&["2", "4"]), None, Some(&["2", "4"])]),
+            ("6 4", "*r, b = x.split(4)", &[None, Some(&["2", "4"])]),
+            ("6 4", "a, *r, b, c = jnp.split(x, 2)", &[None, None, None, None]),
+            ("n 4", "a, b = x.chunk(2)", &[Some(&[unknown, "4"]), Some(&[unknown, "4"])]),
+            ("n 4", "a, b = x.chunk(3)", &[None, None]),
+            ("2*n 4", "a, b = x.chunk(2)", &[Some(&["n", "4"]), Some(&["n", "4"])]),
+            ("6 4", "(a, b), c = jnp.split(x, 2)", &[None, None, Some(&["3", "4"])]),
+            ("3 4", "a, *r = x.unbind(0)", &[Some(&["4"]), None]),
+        ];
+        for (dims, line, expected) in cases {
+            let code = format!("import torch\nimport jax.numpy as jnp\ndef f(x: Float[Array, \"{dims}\"]):\n    a = b = c = d = x\n    {line}\n");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{line}: {:?}", analysis.errors);
+            let names = ["a", "r", "b", "c", "d"].into_iter().filter(|n| line.split('=').next().unwrap().contains(n));
+            for (name, want) in names.zip(expected.iter()) {
+                assert_eq!(find_shape(&analysis, name), want.map(shape).as_ref(), "{line}: {name}");
+            }
+        }
+    }
+
+    /// `x.sort()` returns `None` for numpy (in place) and a tuple for torch.
+    /// Only a jax array gives a sorted copy. Other in-place numpy methods
+    /// return `None`; a torch `_` method returns `self`.
+    #[test]
+    fn test_in_place_methods_by_backend() {
+        let cases = [
+            ("import numpy as np", "x.sort()", None),
+            ("import jax.numpy as jnp", "x.sort()", Some(vec!["3", "2"])),
+            ("import jax.numpy as jnp\nimport numpy as np", "x.sort()", None),
+            ("", "x.sort()", None),
+            ("import torch", "x.sort()", None),
+            ("import numpy as np", "x.fill(0)", None),
+            ("import numpy as np", "x.partition(1)", None),
+            ("import numpy as np", "x.resize((2, 3))", None),
+            ("import torch", "x.add_(1)", Some(vec!["3", "2"])),
+            ("import torch", "x.zero_()", Some(vec!["3", "2"])),
+        ];
+        for (imports, call, expected) in cases {
+            let code = format!("{imports}\ndef f(x: Float[Array, \"3 2\"]):\n    y = {call}\n");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{imports} {call}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{imports} {call}");
+        }
     }
 
     #[test]

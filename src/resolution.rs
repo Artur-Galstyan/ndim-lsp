@@ -1058,6 +1058,31 @@ where
     Ok(found)
 }
 
+/// The full parameter list of the imported function `target`, with the
+/// markers of `bind_call_arguments`.
+pub fn resolve_imported_function_signature<F>(
+    target: &str,
+    import_map: &HashMap<String, ImportPath>,
+    search_roots: &[PathBuf],
+    read_file: F,
+    max_depth: usize,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<PythonCallableSignature>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let resolved_target = resolve_call_target(target, import_map);
+    let Some(implementation) =
+        resolve_implementation(resolved_target, search_roots, &read_file, max_depth, cache)?
+    else {
+        return Ok(None);
+    };
+    let Some(symbol @ PythonSymbol::Function { .. }) = &implementation.symbol else {
+        return Ok(None);
+    };
+    callable_signature(&implementation.target.file_path, symbol, &read_file, cache)
+}
+
 /// The argument of each parameter that a call binds. `params` marks a bare
 /// `*` and `/`, and a splat parameter with its stars. A splat in the call
 /// can fill any parameter, so it gives `None`.

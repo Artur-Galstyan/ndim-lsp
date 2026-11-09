@@ -480,7 +480,7 @@ fn symbolic_slice_len(start: Option<i64>, stop: Option<i64>, step: i64, n: &str)
         return None;
     }
     let size = form_slice_len(start, stop, n)?;
-    if step.abs() == 1 || size == "0" {
+    if step.unsigned_abs() == 1 || size == "0" {
         return Some(size);
     }
     Some(format!("{FREE_DIM}ceil({}/{})", factor_text(&size), step.checked_abs()?))

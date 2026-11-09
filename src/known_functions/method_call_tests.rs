@@ -1130,7 +1130,7 @@ fn test_compute_unbind_shape_removes_dim() {
     let shapes = HashMap::from([("x".to_string(), shape(&["3", "4", "5"]))]);
     let args = vec![pos("x"), kw("dim", "0")];
 
-    let output = compute_unbind_shape(&args, &shapes, 3).unwrap();
+    let output = compute_unbind_shape(&args, &shapes, 3, false).unwrap();
 
     assert_eq!(output, Some(shape(&["4", "5"])));
 }
@@ -1140,7 +1140,7 @@ fn test_compute_unbind_shape_mismatched_count_errors() {
     let shapes = HashMap::from([("x".to_string(), shape(&["3", "4", "5"]))]);
     let args = vec![pos("x"), kw("dim", "0")];
 
-    let result = compute_unbind_shape(&args, &shapes, 2);
+    let result = compute_unbind_shape(&args, &shapes, 2, false);
 
     assert!(result.is_err());
 }
