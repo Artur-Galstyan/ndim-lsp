@@ -261,3 +261,36 @@ fn a_helper_buffer_equal_to_the_disk_does_not_republish() {
     let republished = c.notes.iter().filter(|n| n["method"] == "textDocument/publishDiagnostics").skip(from).any(|n| n["params"]["uri"] == main.as_str());
     assert!(!republished);
 }
+
+fn check(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new(common::BIN)
+        .arg("check")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
+}
+
+#[test]
+fn check_mode_prints_diagnostics_like_a_compiler() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (code, out) = check(repo, &["corpus"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains(": error: "), "{out}");
+
+    let bad = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    y = a @ b\n    z = a\n";
+    let (_dir, root) = project(&[("bad.py", bad)]);
+    let (code, out) = check(&root, &["--shapes", "bad.py"]);
+    assert_eq!(code, 1, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "bad.py:3:26: error: y: matmul dimension mismatch: a last dim k != b second-to-last dim n",
+            "bad.py:5: z: [m, k]",
+        ]
+    );
+    let (code, _) = check(&root, &[]);
+    assert_eq!(code, 2);
+}

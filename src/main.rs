@@ -33,6 +33,7 @@ use ndim_lsp::{
     first_analysis_difference, first_tree_difference, new_resolution_cache, reparse,
 };
 
+mod check;
 mod sync;
 
 use sync::{Encoding, LineIndex, Pace, Run, apply_changes};
@@ -1976,8 +1977,16 @@ fn new_backend(client: Client) -> Backend {
     }
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "check") {
+        std::process::exit(check::run(&args[1..]));
+    }
+    serve();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
