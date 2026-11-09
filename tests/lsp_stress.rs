@@ -644,7 +644,15 @@ fn group_key(f: &Value) -> String {
 /// Differential oracle: a fresh server that opens `text` must publish the same
 /// diagnostics and inlay hints as the long-running server.
 fn oracle(rec: &mut Recorder, scenario: &str, root: &Path, d: &Doc, run_hints: &[Value]) {
+    oracle_with(rec, scenario, root, d, run_hints, &[]);
+}
+
+/// `oracle`, with the editor buffers `open` (uri, text) open before `d`.
+fn oracle_with(rec: &mut Recorder, scenario: &str, root: &Path, d: &Doc, run_hints: &[Value], open: &[(&str, &str)]) {
     let mut f = Server::spawn(root);
+    for (uri, text) in open {
+        open_doc(&mut f, uri, text);
+    }
     let (fd, _) = open_doc(&mut f, &d.uri, &d.text);
     let (fh, _) = full_hints(&mut f, &fd);
     f.kill();
@@ -1244,7 +1252,7 @@ fn one_run(run: usize, rec: &mut Recorder) {
         rec.sample("main_after_helper_unsaved_edit", s);
         let (h, _) = full_hints(&mut srv, &doc);
         let y_unsaved = y_of(&h);
-        oracle(rec, "helper_unsaved_edit", &root, &doc, &h);
+        oracle_with(rec, "helper_unsaved_edit", &root, &doc, &h, &[(&helper_uri, &modified)]);
 
         fs::write(&helper_path, &modified).unwrap();
         srv.notify(
@@ -1266,7 +1274,7 @@ fn one_run(run: usize, rec: &mut Recorder) {
         fresh.kill();
         if first {
             rec.note("helper_edit.baseline_y", format!("{y_base:?}"));
-            rec.note("helper_edit.after_unsaved_buffer_change", format!("{y_unsaved:?} (server reads imports from disk, so the unsaved buffer has no effect)"));
+            rec.note("helper_edit.after_unsaved_buffer_change", format!("{y_unsaved:?} (imports read the unsaved buffer)"));
             rec.note(
                 "helper_edit.after_save_running_server",
                 format!("{y_saved:?}"),

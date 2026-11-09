@@ -299,6 +299,19 @@ impl ResolutionCache {
         true
     }
 
+    /// The editor text of `path` changed, and its disk state may not have.
+    /// A resolution that runs now may read the old text, so it must not insert.
+    /// If an entry looked at `path`, drop the entries as `revalidate` does for
+    /// a saved file. Returns whether it dropped anything.
+    pub fn buffer_changed(&self, path: &std::path::Path) -> bool {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if !self.tracked.read().unwrap().stamps.contains_key(path) {
+            return false;
+        }
+        self.handled_events.lock().unwrap().remove(path);
+        self.revalidate(&[path.to_path_buf()])
+    }
+
     /// Identifies this cache among others.
     pub fn id(&self) -> u64 {
         self.id

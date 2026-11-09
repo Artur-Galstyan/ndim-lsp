@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, watch};
-use tower_lsp::jsonrpc::Result;
+use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, ConfigurationItem, Diagnostic,
@@ -13,10 +13,13 @@ use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentChanges, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
+    DocumentChanges, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
-    InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, OneOf,
+    InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
+    TextDocumentPositionParams,
     OptionalVersionedTextDocumentIdentifier, Position, TextDocumentContentChangeEvent, PositionEncodingKind, Range, Registration,
     ServerCapabilities, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
@@ -30,9 +33,10 @@ use ndim_lsp::{
     first_analysis_difference, first_tree_difference, new_resolution_cache, reparse, with_document,
 };
 
+mod check;
 mod sync;
 
-use sync::{Pace, Run, apply_changes};
+use sync::{Encoding, LineIndex, Pace, Run, apply_changes};
 
 /// Longest quiet time after a change before its text is analyzed. `Pace`
 /// shortens it for a document with a known, low analysis cost.
@@ -139,11 +143,49 @@ pub struct CachedAnalysis {
     pub analysis: Arc<LayerShapeAnalysis>,
     pub text: Arc<str>,
     pub tree: Arc<Tree>,
+    /// The LSP lines of `text`.
+    pub lines: Arc<LineIndex>,
     /// The top-level statements this analysis left to the next one to reuse.
     pub memo: Arc<UnitMemo>,
+    /// The file texts that imports read, per path.
+    pub reads: Arc<Reads>,
     pub version: i32,
     pub rev: u64,
 }
+
+impl CachedAnalysis {
+    fn lines(&self, enc: Encoding) -> Lines<'_> {
+        Lines { text: &self.text, index: &self.lines, enc }
+    }
+}
+
+/// Positions in one analyzed text: tree-sitter bytes to LSP positions and back.
+struct Lines<'a> {
+    text: &'a str,
+    index: &'a LineIndex,
+    enc: Encoding,
+}
+
+impl Lines<'_> {
+    fn position(&self, byte: usize) -> Position {
+        self.index.position(self.text, byte, self.enc)
+    }
+
+    fn range(&self, ts: tree_sitter::Range) -> Range {
+        Range::new(self.position(ts.start_byte), self.position(ts.end_byte))
+    }
+
+    fn offset(&self, position: &Position) -> Option<usize> {
+        self.index.offset(self.text, *position, self.enc)
+    }
+}
+
+/// The texts of the open documents that an analysis reads imports from.
+pub type Buffers = HashMap<PathBuf, Arc<str>>;
+
+/// Each file an analysis read, with the editor text it got. `None`: it read
+/// the disk.
+pub type Reads = HashMap<PathBuf, Option<Arc<str>>>;
 
 /// One text snapshot of an open document. `rev` is unique per text write, so
 /// results keyed on it can never belong to a closed or replaced text.
@@ -213,6 +255,10 @@ pub struct Backend {
     pub can_refresh_hints: Arc<AtomicBool>,
     /// The client accepts `workspace/configuration`.
     pub can_pull_settings: Arc<AtomicBool>,
+    /// The client accepts versioned edits (`documentChanges`) in a workspace edit.
+    pub can_version_edits: Arc<AtomicBool>,
+    /// The client offered UTF-8 positions, and the server chose them.
+    pub utf8: Arc<AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -239,7 +285,17 @@ impl LanguageServer for Backend {
                 .store(refresh == Some(true), Ordering::Relaxed);
             self.can_pull_settings
                 .store(ws.configuration == Some(true), Ordering::Relaxed);
+            let versioned = ws.workspace_edit.as_ref().and_then(|c| c.document_changes);
+            self.can_version_edits
+                .store(versioned == Some(true), Ordering::Relaxed);
         }
+        let utf8 = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+            .is_some_and(|kinds| kinds.contains(&PositionEncodingKind::UTF8));
+        self.utf8.store(utf8, Ordering::Relaxed);
 
         if let Some(opts) = params.initialization_options.as_ref() {
             *self.settings.write().await = Settings::default().updated(opts);
@@ -247,7 +303,11 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                position_encoding: Some(PositionEncodingKind::UTF16),
+                position_encoding: Some(if utf8 {
+                    PositionEncodingKind::UTF8
+                } else {
+                    PositionEncodingKind::UTF16
+                }),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -259,6 +319,12 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
@@ -311,8 +377,12 @@ impl LanguageServer for Backend {
         if let Some(state) = self.documents.write().unwrap().get_mut(&doc.uri) {
             state.pace = Pace::default();
         }
+        let differs = differs_from_disk(&doc.uri, &doc.text);
         if let Some(rev) = self.set_document(&doc.uri, doc.text, doc.version, Duration::ZERO, false)
         {
+            if differs {
+                self.buffer_changed(&doc.uri);
+            }
             self.spawn_publish(doc.uri, rev);
         }
         self.client
@@ -326,9 +396,13 @@ impl LanguageServer for Backend {
         // newest text always wins. The analysis runs in its own task after
         // the debounce, so this handler does not hold a concurrency slot.
         match self.change_document(&uri, params.text_document.version, &params.content_changes) {
-            Change::Stored(rev) => self.spawn_publish(uri, rev),
+            Change::Stored(rev) => {
+                self.buffer_changed(&uri);
+                self.spawn_publish(uri, rev);
+            }
             Change::Stale => {}
             Change::Unusable(rev) => {
+                self.buffer_changed(&uri);
                 self.spawn_publish(uri, rev);
                 self.client
                     .log_message(
@@ -359,7 +433,10 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         // Evict all per-document state so long-lived sessions don't leak.
         // An analysis still running finds no matching text and drops itself.
-        self.documents.write().unwrap().remove(uri);
+        let closed = self.documents.write().unwrap().remove(uri);
+        if closed.is_some_and(|s| s.doc.in_sync && differs_from_disk(uri, &s.doc.text)) {
+            self.buffer_changed(uri);
+        }
         // Clear any diagnostics the client may still be showing.
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
@@ -438,6 +515,84 @@ impl LanguageServer for Backend {
         self.on_goto_definition(&uri, &position).await
     }
 
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        let skip = usize::from(!params.context.include_declaration);
+        Ok(Some(
+            dim.sites[skip..]
+                .iter()
+                .map(|r| Location::new(uri.clone(), lines.range(*r)))
+                .collect(),
+        ))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            dim.sites
+                .iter()
+                .map(|r| DocumentHighlight {
+                    range: lines.range(*r),
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect(),
+        ))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let Some(cached) = self.get_current_analysis(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        Ok(dimension_at(&cached.analysis.scopes, &lines, &params.position)
+            .map(|dim| PrepareRenameResponse::Range(lines.range(dim.current))))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        let new_name = params.new_name;
+        if let Some(reason) = rename_error(&dim, &new_name) {
+            return Err(Error::invalid_params(reason));
+        }
+        let edits = dim
+            .sites
+            .iter()
+            .map(|r| TextEdit::new(lines.range(*r), new_name.clone()))
+            .collect();
+        let versioned = self.can_version_edits.load(Ordering::Relaxed);
+        Ok(Some(workspace_edit(&uri, versioned.then_some(cached.version), edits)))
+    }
+
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let Some(cached) = self.get_current_analysis(&uri).await else {
@@ -445,7 +600,7 @@ impl LanguageServer for Backend {
         };
         Ok(Some(transpose_quick_fixes(
             &cached.analysis,
-            &cached.text,
+            &cached.lines(self.encoding()),
             &uri,
             cached.version,
             &params.range,
@@ -455,6 +610,14 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    fn encoding(&self) -> Encoding {
+        if self.utf8.load(Ordering::Relaxed) {
+            Encoding::Utf8
+        } else {
+            Encoding::Utf16
+        }
+    }
+
     fn document(&self, uri: &Url) -> Option<Document> {
         self.documents.read().unwrap().get(uri).map(|s| s.doc.clone())
     }
@@ -470,6 +633,52 @@ impl Backend {
         if dropped || running {
             self.reanalyze_open_documents();
         }
+    }
+
+    /// The text that imports of `uri` read changed: its editor buffer was
+    /// opened, changed, or closed. The cache entries that read the file are
+    /// dropped, and the documents that may depend on it are analyzed again
+    /// after their debounce: all of them if the cache dropped an entry (the
+    /// cache does not record which document used which file), else the ones
+    /// whose last analysis read the file. Their cost is kept: the run costs
+    /// what an edit of the helper costs them, and sets their debounce.
+    fn buffer_changed(&self, uri: &Url) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let all = self.resolution_cache.buffer_changed(&path);
+        let mut revs = Vec::new();
+        let mut docs = self.documents.write().unwrap();
+        for (other, state) in docs.iter_mut() {
+            let reads = state.committed.as_ref().is_some_and(|c| c.reads.contains_key(&path));
+            if other == uri || !(all || reads) {
+                continue;
+            }
+            let debounce = state.pace.debounce();
+            state.doc.rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+            state.doc.ready_at = Instant::now() + debounce;
+            state.doc.debounce = debounce;
+            revs.push((other.clone(), state.doc.rev));
+        }
+        drop(docs);
+        if revs.is_empty() {
+            return;
+        }
+        for (other, rev) in revs {
+            self.spawn_publish(other, rev);
+        }
+        self.refresh_inlay_hints();
+    }
+
+    /// The texts of the open documents, for the imports of one analysis.
+    fn buffers(&self) -> Buffers {
+        self.documents
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.doc.in_sync)
+            .filter_map(|(uri, s)| Some((uri.to_file_path().ok()?, s.doc.text.clone())))
+            .collect()
     }
 
     /// Ask the client for the settings. The reply is dropped if a notification
@@ -617,7 +826,7 @@ impl Backend {
         let text = if current.is_some_and(|d| !d.in_sync) && !resync {
             None
         } else {
-            apply_changes(current.map(|d| &*d.text), changes)
+            apply_changes(current.map(|d| &*d.text), changes, self.encoding())
         };
         let Some(text) = text else {
             let Some(doc) = current else {
@@ -720,9 +929,10 @@ impl Backend {
         let base = self.documents.read().unwrap().get(&uri).and_then(|s| s.committed.clone());
         let had_base = base.is_some();
         let document = uri.to_file_path().ok();
+        let buffers = self.buffers();
         let run = tokio::task::spawn_blocking(move || {
             with_document(document.as_deref(), || {
-                compute_analysis(&text, base.as_ref(), &roots, &resolution_cache)
+                compute_analysis(&text, base.as_ref(), &roots, &resolution_cache, &buffers)
             })
         })
         .await;
@@ -774,7 +984,9 @@ impl Backend {
                     analysis: Arc::new(run.analysis),
                     text: doc.text.clone(),
                     tree: Arc::new(run.tree),
+                    lines: Arc::new(run.lines),
                     memo: Arc::new(run.memo),
+                    reads: Arc::new(run.reads),
                     version: doc.version,
                     rev: doc.rev,
                 })
@@ -795,8 +1007,10 @@ impl Backend {
 
         // Cache only if this is still the newest text; a stale entry would
         // never be read and a closed document must not be re-populated.
-        if let Some(cached) = &result {
-            self.commit(&uri, cached);
+        if let Some(cached) = &result
+            && let Some(rev) = self.commit(&uri, cached)
+        {
+            self.spawn_publish(uri.clone(), rev);
         }
         if let Some(state) = self.documents.write().unwrap().get_mut(&uri) {
             match sample {
@@ -811,12 +1025,22 @@ impl Backend {
 
     /// Keep `cached` as the newest result for `uri`, and as the base of the
     /// next incremental parse, if its text is still the newest. A result for
-    /// old text, or for a closed document, changes no state.
-    fn commit(&self, uri: &Url, cached: &CachedAnalysis) {
+    /// old text, or for a closed document, changes no state. A result that
+    /// read a file whose editor text changed since is not kept: the document
+    /// gets a new rev after its debounce, which is returned.
+    fn commit(&self, uri: &Url, cached: &CachedAnalysis) -> Option<u64> {
         let mut docs = self.documents.write().unwrap();
-        if let Some(state) = docs.get_mut(uri).filter(|s| s.doc.rev == cached.rev) {
+        let current = reads_current(&docs, &cached.reads);
+        let state = docs.get_mut(uri).filter(|s| s.doc.rev == cached.rev)?;
+        if current {
             state.committed = Some(cached.clone());
+            return None;
         }
+        let debounce = state.pace.debounce();
+        state.doc.rev = self.next_rev.fetch_add(1, Ordering::Relaxed);
+        state.doc.ready_at = Instant::now() + debounce;
+        state.doc.debounce = debounce;
+        Some(state.doc.rev)
     }
 
     /// Publish diagnostics for `rev` in a task of its own, after the debounce.
@@ -846,7 +1070,7 @@ impl Backend {
                     shape_error_to_diagnostic(
                         e,
                         uri,
-                        &cached.text,
+                        &cached.lines(self.encoding()),
                         settings.diagnostic_severity,
                         settings.approximation_severity,
                     )
@@ -879,10 +1103,7 @@ impl Backend {
         let cached = self.get_current_analysis(uri).await?;
         let analysis = &cached.analysis;
 
-        // Line lengths (UTF-16) for the visible window, computed in one pass
-        // over the snapshot text the analysis was built from.
-        let line_lens =
-            line_lengths_in_range(&cached.text, visible_range.start.line, visible_range.end.line);
+        let enc = self.encoding();
 
         let t_build = Instant::now();
         let mut hints: Vec<InlayHint> = Vec::new();
@@ -894,7 +1115,7 @@ impl Backend {
             if rec.name.starts_with('_') {
                 continue;
             }
-            let line = rec.line;
+            let line = assignment_line(&cached, rec.line, &rec.name);
             if line < visible_range.start.line || line > visible_range.end.line {
                 continue;
             }
@@ -908,7 +1129,7 @@ impl Backend {
             } else {
                 format!(": [{}]", rec.shape.join(", "))
             };
-            let char_pos = line_lens.get(&line).copied().unwrap_or(0);
+            let char_pos = cached.lines.line_length(&cached.text, line, enc).unwrap_or(0);
             // Same text hover shows for this variable (e.g. `x: Float[Array,
             // "batch features"]"`), so both surfaces stay consistent.
             let tooltip = InlayHintTooltip::String(format_hover(&rec.name, &rec.shape));
@@ -968,18 +1189,14 @@ impl Backend {
             return Ok(None);
         };
         let root = cached.tree.root_node();
-        let Some(cursor_byte) = lsp_position_to_byte(&cached.text, pos) else {
+        let lines = cached.lines(self.encoding());
+        let Some(cursor_byte) = lines.offset(pos) else {
             return Ok(None);
         };
-        let Some(node) = root.descendant_for_byte_range(cursor_byte, cursor_byte) else {
+        let Some((node, var_name, shape)) =
+            hover_shape(&cached.analysis, root, &cached.text, cursor_byte)
+        else {
             return Ok(None);
-        };
-        if node.kind() != "identifier" {
-            return Ok(None);
-        }
-        let var_name = match node.utf8_text(cached.text.as_bytes()) {
-            Ok(v) => v.to_string(),
-            Err(_) => return Ok(None),
         };
         let total_ms = t_total.elapsed().as_millis();
         self.client
@@ -992,14 +1209,8 @@ impl Backend {
             )
             .await;
 
-        // Walk from innermost scope outward, looking for the variable
-        let shape = match find_shape_for_variable(&cached.analysis.scopes, cursor_byte, &var_name) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
         let hover_content = format_hover(&var_name, &shape);
-        let hover_range = ts_range_to_lsp_range(&cached.text, node.range());
+        let hover_range = lines.range(node.range());
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -1018,18 +1229,210 @@ impl Backend {
         let Some(cached) = self.get_current_analysis(uri).await else {
             return Ok(None);
         };
-        let Some(range) = find_dimension_definition(
-            &cached.analysis.scopes,
-            &cached.text,
-            position,
-        ) else {
+        let lines = cached.lines(self.encoding());
+        let Some(range) = find_dimension_definition(&cached.analysis.scopes, &lines, position)
+        else {
             return Ok(None);
         };
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
-            range: ts_range_to_lsp_range(&cached.text, range),
+            range: lines.range(range),
         })))
     }
+}
+
+/// The name under `byte` and its shape at that point: a variable read or
+/// write, or a parameter. An attribute name, a keyword argument name, an
+/// import, and an annotation give nothing.
+fn hover_shape<'t>(
+    analysis: &LayerShapeAnalysis,
+    root: tree_sitter::Node<'t>,
+    text: &str,
+    byte: usize,
+) -> Option<(tree_sitter::Node<'t>, String, Vec<String>)> {
+    let node = root.descendant_for_byte_range(byte, byte)?;
+    if node.kind() != "identifier" || !is_variable_name(node) {
+        return None;
+    }
+    let name = node.utf8_text(text.as_bytes()).ok()?.to_string();
+    let shape = shape_at(analysis, root, text, node, &name)?;
+    Some((node, name, shape))
+}
+
+fn is_variable_name(node: tree_sitter::Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    let is_field = |field: &str| parent.child_by_field_name(field) == Some(node);
+    let mut up = Some(parent);
+    while let Some(n) = up {
+        if matches!(
+            n.kind(),
+            "type" | "dotted_name" | "aliased_import" | "import_statement" | "import_from_statement"
+                | "decorator" | "global_statement" | "nonlocal_statement"
+        ) {
+            return false;
+        }
+        up = n.parent();
+    }
+    match parent.kind() {
+        "attribute" => !is_field("attribute"),
+        "keyword_argument" => !is_field("name"),
+        "function_definition" | "class_definition" => !is_field("name"),
+        _ => true,
+    }
+}
+
+/// The statement that `node` (an identifier) binds a name in, and the byte
+/// from which the new binding holds. `None` for a read.
+fn binding_of(node: tree_sitter::Node) -> Option<(tree_sitter::Node, usize)> {
+    let mut child = node;
+    let mut parent = node.parent()?;
+    while matches!(
+        parent.kind(),
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "tuple" | "list"
+            | "parenthesized_expression" | "list_splat_pattern"
+    ) {
+        child = parent;
+        parent = parent.parent()?;
+    }
+    let is_field = |field: &str| parent.child_by_field_name(field) == Some(child);
+    match parent.kind() {
+        "assignment" | "augmented_assignment" if is_field("left") => {
+            Some((parent, parent.end_byte()))
+        }
+        "named_expression" if is_field("name") => Some((parent, parent.end_byte())),
+        "for_statement" if is_field("left") => {
+            Some((parent, parent.child_by_field_name("right")?.end_byte()))
+        }
+        "as_pattern_target" => Some((parent, parent.end_byte())),
+        _ => None,
+    }
+}
+
+/// The identifiers that bind `name` in the scope `scope`, in source order,
+/// with their statements and the bytes from which they hold.
+fn binding_sites<'t>(
+    analysis: &LayerShapeAnalysis,
+    root: tree_sitter::Node<'t>,
+    text: &str,
+    scope: &ndim_lsp::FunctionShapeScope,
+    name: &str,
+) -> Vec<(tree_sitter::Node<'t>, tree_sitter::Node<'t>, usize)> {
+    let mut sites = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= scope.start_byte || node.start_byte() >= scope.end_byte {
+            continue;
+        }
+        if node.kind() == "identifier" {
+            if node.utf8_text(text.as_bytes()) == Ok(name)
+                && ndim_lsp::scope_for_byte(&analysis.scopes, node.start_byte())
+                    .is_some_and(|s| std::ptr::eq(s, scope))
+                && let Some((statement, from)) = binding_of(node)
+            {
+                sites.push((node, statement, from));
+            }
+            continue;
+        }
+        if matches!(node.kind(), "lambda" | "list_comprehension" | "set_comprehension"
+            | "dictionary_comprehension" | "generator_expression")
+        {
+            continue;
+        }
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    sites
+}
+
+/// The shape of the variable `name` at `node`. A name bound in the scope of
+/// the cursor takes the shape of the assignment that holds there, as the
+/// inlay hint of that assignment shows. A name with no binding in that scope
+/// takes the scope shape (a parameter, or a name of an outer scope).
+fn shape_at(
+    analysis: &LayerShapeAnalysis,
+    root: tree_sitter::Node,
+    text: &str,
+    node: tree_sitter::Node,
+    name: &str,
+) -> Option<Vec<String>> {
+    let byte = node.start_byte();
+    let scope = ndim_lsp::scope_for_byte(&analysis.scopes, byte)?;
+    let sites = binding_sites(analysis, root, text, scope, name);
+    if sites.is_empty() {
+        return find_shape_for_variable(&analysis.scopes, byte, name);
+    }
+    let chosen = sites
+        .iter()
+        .rposition(|(site, _, _)| *site == node)
+        .or_else(|| sites.iter().rposition(|(_, _, from)| *from <= byte));
+    let Some(chosen) = chosen else {
+        // Read before the first binding: only a parameter has a shape here.
+        if !scope.all_params.iter().any(|p| p == name) {
+            return None;
+        }
+        let mut dims: Vec<_> = scope
+            .dimension_sites
+            .iter()
+            .filter(|d| d.binding.as_deref() == Some(name))
+            .collect();
+        dims.sort_by_key(|d| d.axis);
+        return (!dims.is_empty()).then(|| dims.iter().map(|d| d.value.clone()).collect());
+    };
+    // In a loop, a binding later in the body can reach the cursor too.
+    let mut up = node.parent();
+    while let Some(n) = up {
+        if matches!(n.kind(), "for_statement" | "while_statement")
+            && sites[chosen + 1..]
+                .iter()
+                .any(|(site, _, _)| n.start_byte() <= site.start_byte() && site.end_byte() <= n.end_byte())
+        {
+            return None;
+        }
+        up = n.parent();
+    }
+    let (_, statement, _) = sites[chosen];
+    let row = statement.start_position().row as u32;
+    if let Some(record) = analysis
+        .assignment_shapes
+        .iter()
+        .find(|r| r.line == row && r.name == name)
+    {
+        return Some(record.shape.clone());
+    }
+    // An annotated or untracked binding: the scope shape holds after the
+    // last binding only.
+    if chosen + 1 == sites.len() {
+        return scope.shapes.get(name).cloned();
+    }
+    None
+}
+
+/// Whether the text of the file of `uri` on disk is not `text`.
+fn differs_from_disk(uri: &Url, text: &str) -> bool {
+    uri.to_file_path()
+        .is_ok_and(|path| std::fs::read_to_string(path).ok().as_deref() != Some(text))
+}
+
+/// Whether each file in `reads` still gives the text that the analysis read:
+/// the same editor text, or the disk while no editor text differs from it.
+fn reads_current(docs: &HashMap<Url, DocState>, reads: &Reads) -> bool {
+    if reads.is_empty() {
+        return true;
+    }
+    let buffers: HashMap<PathBuf, &Arc<str>> = docs
+        .iter()
+        .filter(|(_, s)| s.doc.in_sync)
+        .filter_map(|(uri, s)| Some((uri.to_file_path().ok()?, &s.doc.text)))
+        .collect();
+    reads.iter().all(|(path, read)| match (read, buffers.get(path)) {
+        (Some(read), Some(now)) => Arc::ptr_eq(read, now) || read == *now,
+        (None, None) => true,
+        (Some(read), None) => std::fs::read_to_string(path).ok().as_deref() == Some(&**read),
+        (None, Some(now)) => std::fs::read_to_string(path).ok().as_deref() == Some(&***now),
+    })
 }
 
 /// Walk from the innermost scope containing `cursor_byte` outward until a
@@ -1068,12 +1471,26 @@ fn is_symbolic_dimension(value: &str) -> bool {
         && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
-fn find_dimension_definition(
+/// A symbolic dimension name in an annotation string and every annotation
+/// site of the same name in its function scope.
+struct DimensionName {
+    value: String,
+    /// The site under the cursor.
+    current: tree_sitter::Range,
+    /// All sites, in source order. The first is the definition.
+    sites: Vec<tree_sitter::Range>,
+    /// The other dimension names of the scope.
+    others: HashSet<String>,
+    /// A dimension expression of the scope (`n*2`, `*n`) reads the name.
+    in_expression: bool,
+}
+
+fn dimension_at(
     scopes: &[ndim_lsp::FunctionShapeScope],
-    text: &str,
+    lines: &Lines,
     position: &Position,
-) -> Option<tree_sitter::Range> {
-    let byte = lsp_position_to_byte(text, position)?;
+) -> Option<DimensionName> {
+    let byte = lines.offset(position)?;
     let scope = ndim_lsp::scope_for_byte(scopes, byte)?;
     let current = scope
         .dimension_sites
@@ -1082,12 +1499,77 @@ fn find_dimension_definition(
     if !is_symbolic_dimension(&current.value) {
         return None;
     }
-    scope
+    let mut sites: Vec<_> = scope
         .dimension_sites
         .iter()
         .filter(|site| site.value == current.value)
-        .min_by_key(|site| site.range.start_byte)
         .map(|site| site.range)
+        .collect();
+    sites.sort_by_key(|r| r.start_byte);
+    sites.dedup_by_key(|r| r.start_byte);
+    let in_expression = scope.dimension_sites.iter().any(|site| {
+        site.value != current.value
+            && site
+                .value
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == current.value)
+    });
+    Some(DimensionName {
+        in_expression,
+        value: current.value.clone(),
+        current: current.range,
+        sites,
+        others: scope
+            .dimension_sites
+            .iter()
+            .filter(|site| site.value != current.value)
+            .map(|site| site.value.clone())
+            .collect(),
+    })
+}
+
+fn find_dimension_definition(
+    scopes: &[ndim_lsp::FunctionShapeScope],
+    lines: &Lines,
+    position: &Position,
+) -> Option<tree_sitter::Range> {
+    dimension_at(scopes, lines, position).map(|dim| dim.sites[0])
+}
+
+/// Why `dim` cannot get the name `new_name`, or `None` if it can. The new name
+/// must be a simple dimension name, keep a leading `_` (an unchecked
+/// dimension) as it was, and not merge with another name of the scope.
+fn rename_error(dim: &DimensionName, new_name: &str) -> Option<String> {
+    if !is_symbolic_dimension(new_name) || new_name == "_" {
+        return Some(format!("`{new_name}` is not a simple dimension name"));
+    }
+    if new_name.starts_with('_') != dim.value.starts_with('_') {
+        return Some("a leading `_` marks an unchecked dimension: keep it as it is".to_string());
+    }
+    if dim.in_expression {
+        return Some(format!("`{}` is used in a dimension expression", dim.value));
+    }
+    if dim.others.contains(new_name) {
+        return Some(format!("`{new_name}` is already a dimension in this function"));
+    }
+    None
+}
+
+/// Edits of one document, versioned if `version` is set.
+fn workspace_edit(uri: &Url, version: Option<i32>, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    match version {
+        Some(version) => WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }])),
+            ..Default::default()
+        },
+        None => WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), edits)])),
+            ..Default::default()
+        },
+    }
 }
 
 fn position_is_before_or_equal(left: &Position, right: &Position) -> bool {
@@ -1101,7 +1583,7 @@ fn ranges_intersect(left: &Range, right: &Range) -> bool {
 
 fn transpose_quick_fixes(
     analysis: &LayerShapeAnalysis,
-    text: &str,
+    lines: &Lines,
     uri: &Url,
     version: i32,
     requested_range: &Range,
@@ -1124,17 +1606,14 @@ fn transpose_quick_fixes(
         else {
             continue;
         };
-        let error_range = ts_range_to_lsp_range(text, error.range);
-        let expression_range = ts_range_to_lsp_range(text, *expression_range);
+        let error_range = lines.range(error.range);
+        let expression_range = lines.range(*expression_range);
         if !ranges_intersect(requested_range, &error_range)
             && !ranges_intersect(requested_range, &expression_range)
         {
             continue;
         }
-        let Some(position) = byte_to_lsp_position(text, operand_range.end_byte, operand_range.end_point)
-        else {
-            continue;
-        };
+        let position = lines.position(operand_range.end_byte);
         let edit = TextEdit {
             range: Range {
                 start: position,
@@ -1142,13 +1621,7 @@ fn transpose_quick_fixes(
             },
             new_text: ".T".to_string(),
         };
-        let workspace_edit = WorkspaceEdit {
-            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
-                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
-                edits: vec![OneOf::Left(edit)],
-            }])),
-            ..Default::default()
-        };
+        let workspace_edit = workspace_edit(uri, Some(version), vec![edit]);
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
             title: "Append .T to the right operand".to_string(),
             kind: Some(CodeActionKind::QUICKFIX),
@@ -1173,16 +1646,32 @@ fn format_hover(var_name: &str, shape: &[String]) -> String {
 }
 
 
-/// UTF-16 code-unit counts (LSP `Position.character` units) for each 0-based
-/// line in `start..=end`, computed in a single pass over `text`. Lines past
-/// the end of the text are simply absent from the map.
-fn line_lengths_in_range(text: &str, start: u32, end: u32) -> HashMap<u32, u32> {
-    text.lines()
-        .enumerate()
-        .skip(start as usize)
-        .take((end as usize).saturating_sub(start as usize) + 1)
-        .map(|(i, l)| (i as u32, l.encode_utf16().count() as u32))
-        .collect()
+/// The LSP line of the target `name` on the tree-sitter row `row`. A tree-sitter row holds more than one
+/// LSP line after a lone `\r`: the line of the target on that row counts.
+fn assignment_line(cached: &CachedAnalysis, row: u32, name: &str) -> u32 {
+    let lines = cached.lines.row_lines(row as usize);
+    if lines.len() <= 1 {
+        return lines.start;
+    }
+    let (row, start, end) = (row as usize, tree_sitter::Point::new(row as usize, 0), tree_sitter::Point::new(row as usize + 1, 0));
+    let root = cached.tree.root_node();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.end_position() <= start || node.start_position() >= end {
+            continue;
+        }
+        if node.kind() == "identifier"
+            && node.start_position().row == row
+            && node.utf8_text(cached.text.as_bytes()) == Ok(name)
+            && binding_of(node).is_some()
+        {
+            return cached.lines.position(&cached.text, node.start_byte(), Encoding::Utf16).line;
+        }
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    lines.start
 }
 
 /// Map a settings value at `key` to a diagnostic severity.
@@ -1220,7 +1709,7 @@ fn parse_severity(
 fn shape_error_to_diagnostic(
     error: ShapeError,
     uri: &Url,
-    text: &str,
+    lines: &Lines,
     mismatch_severity: DiagnosticSeverity,
     approximation_severity: DiagnosticSeverity,
 ) -> Diagnostic {
@@ -1232,13 +1721,13 @@ fn shape_error_to_diagnostic(
         vec![DiagnosticRelatedInformation {
             location: Location {
                 uri: uri.clone(),
-                range: ts_range_to_lsp_range(text, range),
+                range: lines.range(range),
             },
             message,
         }]
     });
     Diagnostic {
-        range: ts_range_to_lsp_range(text, error.range),
+        range: lines.range(error.range),
         severity: Some(severity),
         source: Some("ndim-lsp".to_string()),
         message: if error.variable.is_empty() {
@@ -1246,55 +1735,17 @@ fn shape_error_to_diagnostic(
         } else {
             format!("{}: {}", error.variable, error.message)
         },
-        code: None,
+        code: Some(NumberOrString::String(error_code(error.kind).to_string())),
         related_information,
         ..Default::default()
     }
 }
 
-/// The position of `byte`, whose tree-sitter point is `point`. The point gives
-/// the row and the line start, so only the line before `byte` is scanned.
-fn byte_to_lsp_position(text: &str, byte: usize, point: tree_sitter::Point) -> Option<Position> {
-    let line = text.get(byte.checked_sub(point.column)?..byte)?;
-    Some(Position {
-        line: point.row as u32,
-        character: line.encode_utf16().count() as u32,
-    })
-}
-
-fn lsp_position_to_byte(text: &str, position: &Position) -> Option<usize> {
-    let line_start = if position.line == 0 {
-        0
-    } else {
-        text.match_indices('\n')
-            .nth(position.line as usize - 1)
-            .map(|(i, _)| i + 1)?
-    };
-    let line_end = text[line_start..]
-        .find('\n')
-        .map_or(text.len(), |i| line_start + i);
-    let line = &text[line_start..line_end];
-    let mut utf16 = 0u32;
-    for (offset, ch) in line.char_indices() {
-        if utf16 == position.character {
-            return Some(line_start + offset);
-        }
-        utf16 += ch.len_utf16() as u32;
-        if utf16 > position.character {
-            return None;
-        }
-    }
-    (utf16 == position.character).then_some(line_end)
-}
-
-fn ts_range_to_lsp_range(text: &str, ts: tree_sitter::Range) -> Range {
-    let position = |byte, point: tree_sitter::Point| {
-        byte_to_lsp_position(text, byte, point)
-            .unwrap_or(Position::new(point.row as u32, point.column as u32))
-    };
-    Range {
-        start: position(ts.start_byte, ts.start_point),
-        end: position(ts.end_byte, ts.end_point),
+/// A stable diagnostic code for each kind of shape error.
+fn error_code(kind: ShapeErrorKind) -> &'static str {
+    match kind {
+        ShapeErrorKind::Mismatch => "shape-mismatch",
+        ShapeErrorKind::Approximation => "shape-approximation",
     }
 }
 
@@ -1363,6 +1814,7 @@ fn python_site_packages_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
 struct AnalysisRun {
     analysis: LayerShapeAnalysis,
     tree: Tree,
+    lines: LineIndex,
     parse_ms: u128,
     roots_ms: u128,
     analyze_ms: u128,
@@ -1373,6 +1825,7 @@ struct AnalysisRun {
     search_roots: usize,
     read_count: usize,
     read_bytes: usize,
+    reads: Reads,
 }
 
 /// Parse and analyze `text`. Pure CPU and file reads: call from a blocking
@@ -1382,12 +1835,13 @@ fn compute_analysis(
     base: Option<&CachedAnalysis>,
     workspace_roots: &[PathBuf],
     resolution_cache: &ResolutionCache,
+    buffers: &Buffers,
 ) -> std::result::Result<AnalysisRun, String> {
     let t_roots = Instant::now();
     let mut search_roots = workspace_roots.to_vec();
     search_roots.extend(python_site_packages_roots(workspace_roots));
     let roots_ms = t_roots.elapsed().as_millis();
-    let mut run = analyze_text(text, base, &search_roots, resolution_cache, *VERIFY)?;
+    let mut run = analyze_text(text, base, &search_roots, resolution_cache, buffers, *VERIFY)?;
     run.roots_ms = roots_ms;
     Ok(run)
 }
@@ -1400,6 +1854,7 @@ fn analyze_text(
     base: Option<&CachedAnalysis>,
     search_roots: &[PathBuf],
     resolution_cache: &ResolutionCache,
+    buffers: &Buffers,
     verify: bool,
 ) -> std::result::Result<AnalysisRun, String> {
     let verify = verify && base.is_some();
@@ -1427,8 +1882,15 @@ fn analyze_text(
 
     let read_count = AtomicUsize::new(0);
     let read_bytes = AtomicUsize::new(0);
+    let reads = Mutex::new(Reads::new());
+    // An open document gives its editor text, any other file its disk text.
     let read_file = |path: &PathBuf| {
-        let result = std::fs::read_to_string(path).ok();
+        let buffer = buffers.get(path);
+        reads.lock().unwrap().insert(path.clone(), buffer.cloned());
+        let result = match buffer {
+            Some(text) => Some(text.to_string()),
+            None => std::fs::read_to_string(path).ok(),
+        };
         if let Some(ref s) = result {
             read_count.fetch_add(1, Ordering::Relaxed);
             read_bytes.fetch_add(s.len(), Ordering::Relaxed);
@@ -1487,6 +1949,7 @@ fn analyze_text(
     Ok(AnalysisRun {
         analysis,
         tree,
+        lines: LineIndex::new(text),
         parse_ms,
         roots_ms: 0,
         analyze_ms,
@@ -1495,6 +1958,7 @@ fn analyze_text(
         search_roots: search_roots.len(),
         read_count,
         read_bytes,
+        reads: reads.into_inner().unwrap(),
     })
 }
 
@@ -1511,11 +1975,21 @@ fn new_backend(client: Client) -> Backend {
         can_watch_files: Default::default(),
         can_refresh_hints: Default::default(),
         can_pull_settings: Default::default(),
+        can_version_edits: Default::default(),
+        utf8: Default::default(),
     }
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "check") {
+        std::process::exit(check::run(&args[1..]));
+    }
+    serve();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -1534,6 +2008,25 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines<'a>(text: &'a str, index: &'a LineIndex) -> Lines<'a> {
+        Lines { text, index, enc: Encoding::Utf16 }
+    }
+
+    fn ts_range_to_lsp_range(text: &str, ts: tree_sitter::Range) -> Range {
+        lines(text, &LineIndex::new(text)).range(ts)
+    }
+
+    fn lsp_position_to_byte(text: &str, position: &Position) -> Option<usize> {
+        lines(text, &LineIndex::new(text)).offset(position)
+    }
+
+    fn line_lengths_in_range(text: &str, start: u32, end: u32) -> HashMap<u32, u32> {
+        let index = LineIndex::new(text);
+        (start..=end)
+            .filter_map(|l| Some((l, index.line_length(text, l, Encoding::Utf16)?)))
+            .collect()
+    }
 
     fn analyze(code: &str) -> LayerShapeAnalysis {
         let mut parser = Parser::new();
@@ -1614,7 +2107,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             mismatch,
             &uri,
-            "x",
+            &lines("x", &LineIndex::new("x")),
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -1623,7 +2116,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             approximation,
             &uri,
-            "y",
+            &lines("y", &LineIndex::new("y")),
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -1633,7 +2126,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             approximation2,
             &uri,
-            "z",
+            &lines("z", &LineIndex::new("z")),
             DiagnosticSeverity::HINT,
             DiagnosticSeverity::INFORMATION,
         );
@@ -1662,7 +2155,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             error,
             &uri,
-            text,
+            &lines(text, &LineIndex::new(text)),
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -1687,7 +2180,7 @@ mod tests {
         let diag = shape_error_to_diagnostic(
             error,
             &uri,
-            "x",
+            &lines("x", &LineIndex::new("x")),
             DiagnosticSeverity::ERROR,
             DiagnosticSeverity::WARNING,
         );
@@ -1721,7 +2214,7 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         let use_byte = code.rfind("n width").unwrap();
         let second_start = code.find("def second").unwrap();
         let position = Position::new(3, (use_byte - second_start) as u32);
-        let definition = find_dimension_definition(&analysis.scopes, code, &position).unwrap();
+        let definition = find_dimension_definition(&analysis.scopes, &lines(code, &LineIndex::new(code)), &position).unwrap();
 
         assert!(definition.start_byte > second_start);
         assert_eq!(&code[definition.start_byte..definition.end_byte], "n");
@@ -1735,7 +2228,7 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         for token in ["3", "hidden*2"] {
             let byte = code.find(token).unwrap();
             let position = Position::new(0, byte as u32);
-            assert!(find_dimension_definition(&analysis.scopes, code, &position).is_none());
+            assert!(find_dimension_definition(&analysis.scopes, &lines(code, &LineIndex::new(code)), &position).is_none());
         }
     }
 
@@ -1748,7 +2241,7 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
             analysis.errors[0].fix.as_ref().unwrap();
         let request_range = ts_range_to_lsp_range(code, *expression_range);
         let uri = Url::parse("file:///test.py").unwrap();
-        let actions = transpose_quick_fixes(&analysis, code, &uri, 7, &request_range, None);
+        let actions = transpose_quick_fixes(&analysis, &lines(code, &LineIndex::new(code)), &uri, 7, &request_range, None);
 
         assert_eq!(actions.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
@@ -1769,13 +2262,50 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
 
         let filtered = transpose_quick_fixes(
             &analysis,
-            code,
+            &lines(code, &LineIndex::new(code)),
             &uri,
             7,
             &request_range,
             Some(&[CodeActionKind::REFACTOR]),
         );
         assert!(filtered.is_empty());
+    }
+
+    fn hover_at(code: &str, needle: &str, nth: usize) -> Option<Vec<String>> {
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let byte = code.match_indices(needle).nth(nth).expect(needle).0;
+        hover_shape(&analyze(code), tree.root_node(), code, byte).map(|(_, _, shape)| shape)
+    }
+
+    #[test]
+    fn hover_shows_the_shape_that_holds_at_the_cursor() {
+        let code = "import torch\n\ndef f(y: Float[Array, \"a b\"], obj):\n    x = torch.zeros(3, 4)\n    z = obj.x + x\n    g(x=y)\n    x = torch.zeros(5)\n    w = x\n    y = y.T\n    u = y\n    x = foo()\n    v = x\n";
+        let s = |dims: &[&str]| Some(dims.iter().map(|d| d.to_string()).collect::<Vec<_>>());
+        let cases: &[(&str, usize, Option<Vec<String>>)] = &[
+            ("x = torch.zeros(3", 0, s(&["3", "4"])),
+            ("x + x", 0, None),
+            ("x\n    g", 0, s(&["3", "4"])),
+            ("x=y", 0, None),
+            ("y)\n", 0, s(&["a", "b"])),
+            ("x = torch.zeros(5", 0, s(&["5"])),
+            ("x\n    y = y.T", 0, s(&["5"])),
+            ("y: Float", 0, s(&["a", "b"])),
+            ("y.T", 0, s(&["a", "b"])),
+            ("y\n    x = foo", 0, s(&["b", "a"])),
+            ("x\n", 2, None),
+        ];
+        for (needle, nth, want) in cases {
+            assert_eq!(&hover_at(code, needle, *nth), want, "{needle}");
+        }
+    }
+
+    #[test]
+    fn hover_in_a_loop_with_a_later_binding_is_unknown() {
+        let code = "import torch\n\ndef f(w):\n    x = torch.zeros(3, 4)\n    for i in range(2):\n        y = x\n        x = x @ w\n";
+        assert_eq!(hover_at(code, "x\n        x =", 0), None);
+        assert_eq!(hover_at(code, "x = torch", 0), Some(vec!["3".into(), "4".into()]));
     }
 
     #[test]
@@ -2165,7 +2695,9 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
             analysis: Arc::new(analyze(text)),
             text: Arc::from(text),
             tree: Arc::new(parser.parse(text, None).unwrap()),
+            lines: Arc::new(LineIndex::new(text)),
             memo: Arc::default(),
+            reads: Arc::default(),
             version: 1,
             rev,
         }
@@ -2177,8 +2709,8 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         let old = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 4))\n    return y\n";
         let new = "import jax.numpy as jnp\n\ndef f(x):\n    y = jnp.zeros((3, 5))\n    z = y.T\n    return z\n";
         let base = cached(old, 0);
-        let inc = compute_analysis(new, Some(&base), &[], &cache).unwrap();
-        let fresh = compute_analysis(new, None, &[], &cache).unwrap();
+        let inc = compute_analysis(new, Some(&base), &[], &cache, &Buffers::new()).unwrap();
+        let fresh = compute_analysis(new, None, &[], &cache, &Buffers::new()).unwrap();
         assert_eq!(inc.analysis, fresh.analysis);
         assert!(first_tree_difference(&inc.tree, &fresh.tree).is_none());
         assert!(inc.mismatch.is_none());
@@ -2196,8 +2728,8 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
         let mut hits = Vec::new();
         for text in texts {
             // Verified: a difference from the fresh analysis panics.
-            let run = analyze_text(text, base.as_ref(), &[], &cache, true).unwrap();
-            let fresh = compute_analysis(text, None, &[], &cache).unwrap();
+            let run = analyze_text(text, base.as_ref(), &[], &cache, &Buffers::new(), true).unwrap();
+            let fresh = compute_analysis(text, None, &[], &cache, &Buffers::new()).unwrap();
             assert_eq!(run.analysis, fresh.analysis);
             assert!(run.mismatch.is_none());
             hits.push(run.memo.stats().syntax_hits);
@@ -2205,7 +2737,9 @@ def second(x: Float[Array, "n width"], y: Float[Array, "n width"]):
                 analysis: Arc::new(run.analysis),
                 text: Arc::from(text),
                 tree: Arc::new(run.tree),
+                lines: Arc::new(run.lines),
                 memo: Arc::new(run.memo),
+                reads: Arc::new(run.reads),
                 version: 1,
                 rev: 0,
             });

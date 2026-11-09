@@ -89,6 +89,7 @@ impl Pace {
 pub fn apply_changes(
     current: Option<&str>,
     changes: &[TextDocumentContentChangeEvent],
+    enc: Encoding,
 ) -> Option<String> {
     let (mut text, ranged) = match changes.iter().rposition(|c| c.range.is_none()) {
         Some(i) => (changes[i].text.clone(), &changes[i + 1..]),
@@ -99,8 +100,9 @@ pub fn apply_changes(
     }
     for change in ranged {
         let range = change.range?;
-        let start = offset(&text, range.start)?;
-        let end = offset(&text, range.end)?;
+        let lines = LineIndex::new(&text);
+        let start = lines.offset_clamped(&text, range.start, enc)?;
+        let end = lines.offset_clamped(&text, range.end, enc)?;
         if start > end {
             return None;
         }
@@ -109,37 +111,126 @@ pub fn apply_changes(
     Some(text)
 }
 
-/// Byte offset of a UTF-16 position. Lines end at `\n`, `\r\n`, or `\r`.
-fn offset(text: &str, position: Position) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let is_break = |b: &u8| *b == b'\n' || *b == b'\r';
-    let mut start = 0;
-    for _ in 0..position.line {
-        let Some(p) = bytes[start..].iter().position(is_break) else {
+/// The unit of `Position.character`.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Encoding {
+    Utf8,
+    #[default]
+    Utf16,
+}
+
+impl Encoding {
+    fn units(self, ch: char) -> u32 {
+        match self {
+            Encoding::Utf8 => ch.len_utf8() as u32,
+            Encoding::Utf16 => ch.len_utf16() as u32,
+        }
+    }
+
+    fn count(self, s: &str) -> u32 {
+        match self {
+            Encoding::Utf8 => s.len() as u32,
+            Encoding::Utf16 => s.encode_utf16().count() as u32,
+        }
+    }
+}
+
+/// The lines of one text under the LSP line model: a line ends at `\n`,
+/// `\r\n`, or `\r`. Tree-sitter rows end at `\n` only, so a row can hold
+/// more than one LSP line.
+#[derive(Debug, Default)]
+pub struct LineIndex {
+    /// Byte offset of each line start.
+    starts: Vec<usize>,
+    /// The line of each tree-sitter row start.
+    rows: Vec<u32>,
+}
+
+impl LineIndex {
+    pub fn new(text: &str) -> LineIndex {
+        let bytes = text.as_bytes();
+        let mut starts = vec![0];
+        let mut rows = vec![0];
+        for (i, &b) in bytes.iter().enumerate() {
+            let ends = b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n'));
+            if ends {
+                starts.push(i + 1);
+            }
+            if b == b'\n' {
+                rows.push(starts.len() as u32 - 1);
+            }
+        }
+        LineIndex { starts, rows }
+    }
+
+    /// The start of `line` and the end of its text, before the line break.
+    fn bounds(&self, text: &str, line: usize) -> Option<(usize, usize)> {
+        let start = *self.starts.get(line)?;
+        let end = match self.starts.get(line + 1) {
+            Some(&next) if text.as_bytes()[..next].ends_with(b"\r\n") => next - 2,
+            Some(&next) => next - 1,
+            None => text.len(),
+        };
+        Some((start, end))
+    }
+
+    pub fn position(&self, text: &str, byte: usize, enc: Encoding) -> Position {
+        let line = self.starts.partition_point(|&s| s <= byte) - 1;
+        let (start, end) = self.bounds(text, line).unwrap_or((0, 0));
+        let character = text.get(start..byte.min(end)).map_or(0, |s| enc.count(s));
+        Position::new(line as u32, character)
+    }
+
+    /// The byte of `position`, or `None` if the line or the character is past
+    /// its end, or inside a char.
+    pub fn offset(&self, text: &str, position: Position, enc: Encoding) -> Option<usize> {
+        let (start, end) = self.bounds(text, position.line as usize)?;
+        let byte = self.offset_in(text, start, end, position.character, enc)?;
+        (byte < end || self.character_count(text, start, end, enc) == position.character)
+            .then_some(byte)
+    }
+
+    /// As `offset`, but a position past the end of a line or of the text
+    /// means that end, as the LSP spec says.
+    pub fn offset_clamped(&self, text: &str, position: Position, enc: Encoding) -> Option<usize> {
+        let Some((start, end)) = self.bounds(text, position.line as usize) else {
             return Some(text.len());
         };
-        start += p;
-        start += if bytes[start] == b'\r' && bytes.get(start + 1) == Some(&b'\n') {
-            2
-        } else {
-            1
+        self.offset_in(text, start, end, position.character, enc)
+    }
+
+    fn offset_in(&self, text: &str, start: usize, end: usize, character: u32, enc: Encoding) -> Option<usize> {
+        let mut units = 0u32;
+        for (i, ch) in text[start..end].char_indices() {
+            if units == character {
+                return Some(start + i);
+            }
+            units += enc.units(ch);
+            if units > character {
+                return None;
+            }
+        }
+        Some(end)
+    }
+
+    fn character_count(&self, text: &str, start: usize, end: usize, enc: Encoding) -> u32 {
+        enc.count(&text[start..end])
+    }
+
+    /// The length of the text of `line`.
+    pub fn line_length(&self, text: &str, line: u32, enc: Encoding) -> Option<u32> {
+        let (start, end) = self.bounds(text, line as usize)?;
+        Some(self.character_count(text, start, end, enc))
+    }
+
+    /// The lines that the tree-sitter row `row` holds.
+    pub fn row_lines(&self, row: usize) -> std::ops::Range<u32> {
+        let Some(&first) = self.rows.get(row) else {
+            return 0..0;
         };
+        let next = self.rows.get(row + 1).copied().unwrap_or(self.starts.len() as u32);
+        first..next
     }
-    let end = bytes[start..]
-        .iter()
-        .position(is_break)
-        .map_or(text.len(), |p| start + p);
-    let mut units = 0u32;
-    for (i, ch) in text[start..end].char_indices() {
-        if units == position.character {
-            return Some(start + i);
-        }
-        units += ch.len_utf16() as u32;
-        if units > position.character {
-            return None;
-        }
-    }
-    Some(end)
 }
 
 #[cfg(test)]
@@ -155,6 +246,10 @@ mod tests {
         }
     }
 
+    fn apply(current: Option<&str>, changes: &[TextDocumentContentChangeEvent]) -> Option<String> {
+        apply_changes(current, changes, Encoding::Utf16)
+    }
+
     fn full(text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
             range: None,
@@ -165,12 +260,12 @@ mod tests {
 
     #[test]
     fn changes_apply_in_order() {
-        let got = apply_changes(
+        let got = apply(
             Some("ab\ncd\n"),
             &[edit(0, 1, 0, 1, "X"), edit(1, 0, 1, 2, "Y")],
         );
         assert_eq!(got.as_deref(), Some("aXb\nY\n"));
-        let got = apply_changes(
+        let got = apply(
             Some("abc"),
             &[edit(0, 0, 0, 1, "xyz"), edit(0, 3, 0, 4, "")],
         );
@@ -179,61 +274,80 @@ mod tests {
 
     #[test]
     fn change_without_range_replaces_the_text() {
-        let got = apply_changes(
+        let got = apply(
             Some("old"),
             &[edit(0, 0, 0, 1, "z"), full("new"), edit(0, 3, 0, 3, "!")],
         );
         assert_eq!(got.as_deref(), Some("new!"));
         assert_eq!(
-            apply_changes(None, &[full("fresh")]).as_deref(),
+            apply(None, &[full("fresh")]).as_deref(),
             Some("fresh")
         );
-        assert_eq!(apply_changes(None, &[edit(0, 0, 0, 0, "x")]), None);
-        assert_eq!(apply_changes(Some("a"), &[]), None);
+        assert_eq!(apply(None, &[edit(0, 0, 0, 0, "x")]), None);
+        assert_eq!(apply(Some("a"), &[]), None);
     }
 
     #[test]
     fn columns_count_utf16_units() {
         let text = "é\u{1F600}x\n";
         assert_eq!(
-            apply_changes(Some(text), &[edit(0, 3, 0, 4, "y")]).as_deref(),
+            apply(Some(text), &[edit(0, 3, 0, 4, "y")]).as_deref(),
             Some("é\u{1F600}y\n")
         );
         assert_eq!(
-            apply_changes(Some(text), &[edit(0, 1, 0, 3, "")]).as_deref(),
+            apply(Some(text), &[edit(0, 1, 0, 3, "")]).as_deref(),
             Some("éx\n")
         );
-        assert_eq!(apply_changes(Some(text), &[edit(0, 2, 0, 3, "")]), None);
+        assert_eq!(apply(Some(text), &[edit(0, 2, 0, 3, "")]), None);
     }
 
     #[test]
     fn crlf_and_lone_cr_end_a_line() {
         let text = "a\r\nb\rc\n";
         assert_eq!(
-            apply_changes(Some(text), &[edit(1, 0, 1, 1, "B")]).as_deref(),
+            apply(Some(text), &[edit(1, 0, 1, 1, "B")]).as_deref(),
             Some("a\r\nB\rc\n")
         );
         assert_eq!(
-            apply_changes(Some(text), &[edit(2, 1, 2, 1, "C")]).as_deref(),
+            apply(Some(text), &[edit(2, 1, 2, 1, "C")]).as_deref(),
             Some("a\r\nb\rcC\n")
         );
         assert_eq!(
-            apply_changes(Some(text), &[edit(0, 9, 0, 9, "!")]).as_deref(),
+            apply(Some(text), &[edit(0, 9, 0, 9, "!")]).as_deref(),
             Some("a!\r\nb\rc\n")
         );
     }
 
     #[test]
+    fn line_index_maps_bytes_and_rows_to_lsp_lines() {
+        let text = "a\r\nb\rcé\n";
+        let index = LineIndex::new(text);
+        let p = |line, character| Position::new(line, character);
+        let cases = [(0, p(0, 0)), (1, p(0, 1)), (3, p(1, 0)), (5, p(2, 0)), (6, p(2, 1)), (9, p(3, 0))];
+        for (byte, position) in cases {
+            assert_eq!(index.position(text, byte, Encoding::Utf16), position, "{byte}");
+            assert_eq!(index.offset(text, position, Encoding::Utf16), Some(byte), "{byte}");
+        }
+        assert_eq!(index.position(text, 8, Encoding::Utf8), p(2, 3));
+        assert_eq!(index.offset(text, p(2, 3), Encoding::Utf16), None);
+        assert_eq!(index.offset(text, p(4, 0), Encoding::Utf16), None);
+        assert_eq!(index.offset_clamped(text, p(2, 9), Encoding::Utf16), Some(8));
+        assert_eq!(index.line_length(text, 0, Encoding::Utf16), Some(1));
+        assert_eq!(index.line_length(text, 2, Encoding::Utf8), Some(3));
+        assert_eq!((index.row_lines(0), index.row_lines(1), index.row_lines(2)), (0..1, 1..3, 3..4));
+    }
+
+    #[test]
     fn positions_past_the_end_clamp() {
         assert_eq!(
-            apply_changes(Some("ab\ncd"), &[edit(0, 99, 0, 99, "!")]).as_deref(),
+            apply(Some("ab\ncd"), &[edit(0, 99, 0, 99, "!")]).as_deref(),
             Some("ab!\ncd")
         );
         assert_eq!(
-            apply_changes(Some("ab\ncd"), &[edit(7, 0, 7, 3, "!")]).as_deref(),
+            apply(Some("ab\ncd"), &[edit(7, 0, 7, 3, "!")]).as_deref(),
             Some("ab\ncd!")
         );
-        assert_eq!(apply_changes(Some("ab"), &[edit(0, 2, 0, 1, "!")]), None);
+        assert_eq!(apply(Some("ab"), &[edit(0, 2, 0, 1, "!")]), None);
     }
 
     #[test]
