@@ -8838,7 +8838,8 @@ mod torch_new_builtin_tests {
     #[test]
     fn test_split_pieces_against_the_unpacked_names() {
         let unknown = "?";
-        let cases: &[(&str, &str, &[Option<&[&str]>])] = &[
+        type Expected<'a> = &'a [Option<&'a [&'a str]>];
+        let cases: &[(&str, &str, Expected)] = &[
             ("6 4", "a, b = x.split(1)", &[None, None]),
             ("6 4", "a, b = torch.split(x, 2)", &[None, None]),
             ("6 4", "a, b = jnp.split(x, 3)", &[None, None]),
