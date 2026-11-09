@@ -151,3 +151,130 @@ fn torch_split_overflow_gives_unknown() {
     ];
     assert_eq!(super::compute_torch_split_shapes(&args, &shapes, Some(3)), Ok(None));
 }
+
+const F: &str = "import torch\nimport torch.nn.functional as F\n";
+
+#[test]
+#[rustfmt::skip]
+fn tensor_methods() {
+    let xy = "x: Float[Array, \"a b\"], y: Float[Array, \"b c\"], v: Float[Array, \"b\"]";
+    check(&[
+        (TORCH, AB, "x.exp()", Some(&["a", "b"]), 0),
+        (TORCH, AB, "x.rsqrt()", Some(&["a", "b"]), 0),
+        (TORCH, AB, "x.log_softmax(-1)", Some(&["a", "b"]), 0),
+        (TORCH, AB, "x.relu_()", Some(&["a", "b"]), 0),
+        (TORCH, "x: Float[Array, \"a b\"], y: Float[Array, \"c\"]", "x.type_as(y)", Some(&["a", "b"]), 0),
+        (TORCH, "x: Float[Array, \"a b\"], m: Bool[Array, \"a b\"]", "x.masked_fill_(m, 0.0)", Some(&["a", "b"]), 0),
+        (TORCH, AB, "x.t()", Some(&["b", "a"]), 0),
+        (TORCH, "x: Float[Array, \"a\"]", "x.t()", Some(&["a"]), 0),
+        (TORCH, "x: Float[Array, \"a b c\"]", "x.t()", None, 1),
+        (TORCH, xy, "x.mm(y)", Some(&["a", "c"]), 0),
+        (TORCH, xy, "x.matmul(y)", Some(&["a", "c"]), 0),
+        (TORCH, xy, "x.mv(v)", Some(&["a"]), 0),
+        (TORCH, xy, "y.mm(x)", None, 1),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn torch_matrix_products() {
+    let xy = "x: Float[Array, \"a b\"], y: Float[Array, \"b c\"], v: Float[Array, \"b\"], bias: Float[Array, \"c\"]";
+    let batched = "i: Float[Array, \"n a c\"], x: Float[Array, \"n a b\"], y: Float[Array, \"n b c\"], z: Float[Array, \"*s a b\"]";
+    check(&[
+        (TORCH, xy, "torch.mm(x, y)", Some(&["a", "c"]), 0),
+        (TORCH, xy, "torch.mm(x, v)", None, 1),
+        (TORCH, xy, "torch.mv(x, v)", Some(&["a"]), 0),
+        (TORCH, xy, "torch.addmm(bias, x, y)", Some(&["a", "c"]), 0),
+        (TORCH, xy, "torch.addmm(x, x, y)", None, 1),
+        (TORCH, batched, "torch.baddbmm(i, x, y)", Some(&["n", "a", "c"]), 0),
+        (TORCH, batched, "torch.mm(z, y)", None, 0),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn functional_layers() {
+    let lin = "x: Float[Array, \"n i\"], w: Float[Array, \"o i\"], u: Float[Array, \"i\"], b: Float[Array, \"o\"]";
+    let attention = "q: Float[Array, \"n h l e\"], k: Float[Array, \"n g s e\"], v: Float[Array, \"n g s f\"], w: Float[Array, \"n g s d\"]";
+    check(&[
+        (F, lin, "F.linear(x, w, b)", Some(&["n", "o"]), 0),
+        (F, lin, "F.linear(x, u)", Some(&["n"]), 0),
+        (F, "x: Float[Array, \"n 3\"], w: Float[Array, \"o 4\"]", "F.linear(x, w)", None, 1),
+        (F, "x: Float[Array, \"n c h\"]", "F.layer_norm(x, (h,))", Some(&["n", "c", "h"]), 0),
+        (F, "x: Float[Array, \"n c h\"], m: Float[Array, \"c\"]", "F.batch_norm(x, m, m)", Some(&["n", "c", "h"]), 0),
+        (F, "x: Float[Array, \"n c h\"]", "F.group_norm(x, 2)", Some(&["n", "c", "h"]), 0),
+        (F, "x: Float[Array, \"n c h\"]", "F.instance_norm(x)", Some(&["n", "c", "h"]), 0),
+        (F, "x: Float[Array, \"n c h\"]", "F.alpha_dropout(x, 0.1)", Some(&["n", "c", "h"]), 0),
+        (F, attention, "F.scaled_dot_product_attention(q, k, v)", Some(&["n", "h", "l", "f"]), 0),
+        (F, "q: Float[Array, \"l 4\"], k: Float[Array, \"s 5\"], v: Float[Array, \"s f\"]", "F.scaled_dot_product_attention(q, k, v)", None, 1),
+        (F, "q: Float[Array, \"*b l e\"], k: Float[Array, \"*b s e\"], v: Float[Array, \"*b s f\"]", "F.scaled_dot_product_attention(q, k, v)", None, 0),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn functional_losses() {
+    let xy = "x: Float[Array, \"n 3\"], y: Float[Array, \"n 3\"], z: Float[Array, \"n 4\"]";
+    check(&[
+        (F, xy, "F.mse_loss(x, y)", Some(&[]), 0),
+        (F, xy, "F.mse_loss(x, y, reduction='none')", Some(&["n", "3"]), 0),
+        (F, xy, "F.mse_loss(x, y, None, None, 'none')", Some(&["n", "3"]), 0),
+        (F, xy, "F.mse_loss(x, y, reduce=False)", None, 0),
+        (F, xy, "F.mse_loss(x, y, reduction='avg')", None, 1),
+        (F, xy, "F.l1_loss(x, z)", None, 1),
+        (F, xy, "F.smooth_l1_loss(x, y, reduction='sum')", Some(&[]), 0),
+        (F, xy, "F.huber_loss(x, y, 'none')", Some(&["n", "3"]), 0),
+        (F, xy, "F.binary_cross_entropy(x, y, None, None, None, 'none')", Some(&["n", "3"]), 0),
+        (F, xy, "F.binary_cross_entropy_with_logits(x, z)", None, 1),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn data_dependent_sizes() {
+    let xm = "x: Float[Array, \"a b\"], m: Bool[Array, \"a b\"]";
+    check(&[
+        (NUMPY, AB, "np.unique(x)", Some(&["?"]), 0),
+        (JAX, AB, "jnp.unique(x, equal_nan=False)", Some(&["?"]), 0),
+        (TORCH, AB, "torch.unique(x, sorted=True)", Some(&["?"]), 0),
+        (NUMPY, AB, "np.unique(x, return_counts=True)", None, 0),
+        (NUMPY, AB, "np.unique(x, True)", None, 0),
+        (NUMPY, AB, "np.unique(x, axis=0)", None, 0),
+        (JAX, AB, "jnp.unique(x, size=4)", None, 0),
+        (TORCH, xm, "torch.masked_select(x, m)", Some(&["?"]), 0),
+        (TORCH, xm, "x.masked_select(m)", Some(&["?"]), 0),
+        (NUMPY, xm, "np.extract(m, x)", Some(&["?"]), 0),
+        (NUMPY, "x: Float[Array, \"a b\"], c: Bool[Array, \"b\"]", "np.compress(c, x)", Some(&["?"]), 0),
+        (NUMPY, "x: Float[Array, \"a b\"], c: Bool[Array, \"b\"]", "np.compress(c, x, axis=1)", None, 0),
+        (NUMPY, "x: Int[Array, \"a\"]", "np.bincount(x)", Some(&["?"]), 0),
+        (TORCH, "x: Int[Array, \"a\"]", "torch.bincount(x)", Some(&["?"]), 0),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn linalg_additions() {
+    let abc = "a: Float[Array, \"m k\"], b: Float[Array, \"k p\"], c: Float[Array, \"p n\"], v: Float[Array, \"n\"], s: Float[Array, \"k k\"]";
+    check(&[
+        (JAX, "x: Float[Array, \"b n n\"]", "jnp.linalg.eigvals(x)", Some(&["b", "n"]), 0),
+        (NUMPY, "x: Float[Array, \"n n\"]", "np.linalg.eigvalsh(x)", Some(&["n"]), 0),
+        (TORCH, "x: Float[Array, \"3 4\"]", "torch.linalg.eigvals(x)", None, 1),
+        (NUMPY, "x: Float[Array, \"n n\"]", "np.linalg.matrix_power(x, 3)", Some(&["n", "n"]), 0),
+        (NUMPY, abc, "np.linalg.multi_dot([a, b, c])", Some(&["m", "n"]), 0),
+        (JAX, abc, "jnp.linalg.multi_dot([a, b, c, v])", Some(&["m"]), 0),
+        (TORCH, abc, "torch.linalg.multi_dot([a, c])", None, 1),
+        (NUMPY, abc, "np.linalg.multi_dot([a, s, b, c])", Some(&["m", "n"]), 0),
+    ]);
+}
+
+#[test]
+fn slogdet_unpacks_two_scalars() {
+    let code = "import jax.numpy as jnp\ndef f(x: Float[Array, \"n n\"]):\n    sign, logdet = jnp.linalg.slogdet(x)\n";
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(code, None).unwrap();
+    let analysis = analyze_layer_shapes(tree.root_node(), code, &[], |_| None, 5, None).unwrap();
+    let shape = |name: &str| analysis.scopes.iter().find_map(|scope| scope.shapes.get(name)).cloned();
+    assert_eq!((shape("sign"), shape("logdet")), (Some(Vec::new()), Some(Vec::new())));
+    assert_eq!(run(NUMPY, "x: Float[Array, \"3 4\"]", "np.linalg.slogdet(x)"), (None, 1));
+}

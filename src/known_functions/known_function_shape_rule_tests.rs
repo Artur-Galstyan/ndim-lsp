@@ -1121,7 +1121,7 @@ fn test_histogram_cases() {
 #[rustfmt::skip]
 fn test_bin_count_cases() {
     check(KnownFunction::BinCount, None, &[
-        ("bincount_conservatively_unknown", vec![pos("x")], &[("x", &["100"])], Ok(None)),
+        ("bincount_one_axis_of_unknown_size", vec![pos("x")], &[("x", &["100"])], Ok(Some(&["__free_?"]))),
     ]);
 }
 
@@ -1129,7 +1129,7 @@ fn test_bin_count_cases() {
 #[rustfmt::skip]
 fn test_unique_cases() {
     check(KnownFunction::Unique, None, &[
-        ("unique_conservatively_unknown", vec![pos("x")], &[("x", &["100"])], Ok(None)),
+        ("unique_one_axis_of_unknown_size", vec![pos("x")], &[("x", &["100"])], Ok(Some(&["__free_?"]))),
     ]);
 }
 

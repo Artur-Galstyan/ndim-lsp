@@ -5614,6 +5614,7 @@ fn tuple_rhs_shapes(
                     KnownFunction::LinalgSvd
                         | KnownFunction::LinalgQr
                         | KnownFunction::LinalgEig
+                        | KnownFunction::LinalgSlogdet
                         | KnownFunction::Meshgrid
                 )
             ) {
@@ -5826,6 +5827,9 @@ fn linalg_tuple_shapes(
                         Some(vec![n.clone()]),
                         Some(vec![n.clone(), n.clone()]),
                     ])
+                }
+                KnownFunction::LinalgSlogdet if n_targets == 2 && !dims_conflict(m, n) => {
+                    Some(vec![Some(Vec::new()), Some(Vec::new())])
                 }
                 _ => None,
             }

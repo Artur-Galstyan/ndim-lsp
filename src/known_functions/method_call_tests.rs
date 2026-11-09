@@ -953,7 +953,7 @@ fn test_scatter_method_cases() {
 #[rustfmt::skip]
 fn test_masked_select_method_cases() {
     check(KnownFunction::MaskedSelect, Some("x"), &[
-        ("apply_masked_select_is_conservatively_unknown", vec![pos("mask")], &[("x", &["4", "3"])], Ok(None)),
+        ("apply_masked_select_one_axis_of_unknown_size", vec![pos("mask")], &[("x", &["4", "3"])], Ok(Some(&["__free_?"]))),
     ]);
 }
 

@@ -1012,6 +1012,33 @@ pub enum KnownFunction {
     DotGeneral,
     /// `torch.bmm` / `Tensor.bmm`: rank-3 operands, equal batch (no broadcast).
     Bmm,
+    /// `torch.mm` / `Tensor.mm`: two rank-2 operands.
+    Mm,
+    /// `torch.mv` / `Tensor.mv`: a rank-2 and a rank-1 operand.
+    Mv,
+    /// `torch.addmm(input, mat1, mat2)`: `mm`, and `input` broadcasts to it.
+    Addmm,
+    /// `torch.baddbmm(input, batch1, batch2)`: `bmm`, and `input` broadcasts to it.
+    Baddbmm,
+    /// `Tensor.t()`: the transpose of a tensor of rank 2 or less.
+    TorchT,
+    /// `torch.nn.functional.linear(input, weight, bias)`, `weight` is `[out, in]`.
+    Linear,
+    /// `torch.nn.functional.scaled_dot_product_attention(query, key, value)`.
+    ScaledDotProductAttention,
+    /// A `torch.nn.functional` loss with the rule of the loss module `layer`.
+    /// `reduction` is the positional index of the `reduction` argument, and
+    /// `deprecated` the indices of `size_average` and `reduce`.
+    FunctionalLoss {
+        layer: &'static str,
+        reduction: usize,
+        deprecated: Option<(usize, usize)>,
+    },
+    LinalgEigvals,
+    LinalgMatrixPower,
+    LinalgMultiDot,
+    /// `linalg.slogdet`: a `(sign, logabsdet)` tuple.
+    LinalgSlogdet,
     Dot,
     Einsum,
     Split,

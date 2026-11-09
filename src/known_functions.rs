@@ -103,6 +103,11 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "squeeze" => Some(KnownFunction::TorchSqueeze),
             "repeat_interleave" => Some(KnownFunction::Repeat),
             "bmm" => Some(KnownFunction::Bmm),
+            "mm" => Some(KnownFunction::Mm),
+            "mv" => Some(KnownFunction::Mv),
+            "addmm" => Some(KnownFunction::Addmm),
+            "baddbmm" => Some(KnownFunction::Baddbmm),
+            "bincount" => Some(KnownFunction::BinCount),
             // Real torch `split` semantics: 2nd arg is a chunk *size*, not a
             // section count. `tensor_split` keeps numpy/jnp `array_split`
             // semantics (verified against torch docs).
@@ -156,6 +161,16 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "avg_pool2d" => Some(KnownFunction::FunctionalAvgPool2d),
             "avg_pool3d" => Some(KnownFunction::FunctionalAvgPool3d),
             "one_hot" => Some(KnownFunction::OneHot),
+            "linear" => Some(KnownFunction::Linear),
+            "scaled_dot_product_attention" => Some(KnownFunction::ScaledDotProductAttention),
+            "mse_loss" => Some(functional_loss("MSELoss", 4, Some((2, 3)))),
+            "l1_loss" => Some(functional_loss("L1Loss", 4, Some((2, 3)))),
+            "smooth_l1_loss" => Some(functional_loss("SmoothL1Loss", 4, Some((2, 3)))),
+            "huber_loss" => Some(functional_loss("HuberLoss", 2, None)),
+            "binary_cross_entropy" => Some(functional_loss("BCELoss", 5, Some((3, 4)))),
+            "binary_cross_entropy_with_logits" => {
+                Some(functional_loss("BCEWithLogitsLoss", 5, Some((3, 4))))
+            }
             "cross_entropy" => Some(KnownFunction::CrossEntropy),
             "nll_loss" => Some(KnownFunction::NllLoss),
             "embedding" => Some(KnownFunction::FunctionalEmbedding),
@@ -163,7 +178,8 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "softmax" | "log_softmax" | "normalize" | "relu" | "relu6" | "gelu" | "silu"
             | "sigmoid" | "tanh" | "softplus" | "softsign" | "selu" | "celu" | "elu"
             | "leaky_relu" | "hardtanh" | "hardswish" | "hardsigmoid" | "mish" | "dropout"
-            | "dropout2d" | "dropout3d" => Some(KnownFunction::Copy),
+            | "dropout1d" | "dropout2d" | "dropout3d" | "alpha_dropout" | "feature_alpha_dropout"
+            | "layer_norm" | "batch_norm" | "group_norm" | "instance_norm" => Some(KnownFunction::Copy),
             // `glu` halves a dim rather than preserving shape.
             "glu" => Some(KnownFunction::FunctionalGlu),
             _ => None,
@@ -192,6 +208,10 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "pinv" => Some(KnownFunction::LinalgPinv),
             "matrix_rank" => Some(KnownFunction::LinalgMatrixRank),
             "matrix_sqrth" if is_torch_linalg => Some(KnownFunction::LinalgMatrixSqrth),
+            "eigvals" | "eigvalsh" => Some(KnownFunction::LinalgEigvals),
+            "matrix_power" => Some(KnownFunction::LinalgMatrixPower),
+            "multi_dot" => Some(KnownFunction::LinalgMultiDot),
+            "slogdet" => Some(KnownFunction::LinalgSlogdet),
             _ => None,
         };
     }
@@ -852,6 +872,10 @@ fn concat_dim(dims: &[String]) -> String {
     joined_dim(dims, "+")
 }
 
+fn functional_loss(layer: &'static str, reduction: usize, deprecated: Option<(usize, usize)>) -> KnownFunction {
+    KnownFunction::FunctionalLoss { layer, reduction, deprecated }
+}
+
 pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
     match method {
         "reshape" | "view" => Some(KnownFunction::Reshape),
@@ -884,14 +908,18 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "expand" | "broadcast_to" => Some(KnownFunction::BroadcastTo),
         "astype" => Some(KnownFunction::Astype),
         "copy" | "byteswap" | "clone" | "cpu" | "cuda" | "float" | "long" | "int" | "bool"
-        | "double" | "half" | "softmax" => Some(KnownFunction::Copy),
+        | "double" | "half" | "softmax" | "log_softmax" | "type_as" | "exp" | "log" | "sqrt"
+        | "rsqrt" | "abs" | "neg" | "sigmoid" | "tanh" | "relu" | "sin" | "cos" | "square"
+        | "floor" | "ceil" | "round" | "sign" | "exp_" | "log_" | "sqrt_" | "rsqrt_" | "abs_"
+        | "neg_" | "sigmoid_" | "tanh_" | "relu_" | "sin_" | "cos_" | "square_" | "floor_"
+        | "ceil_" | "round_" | "sign_" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
         "gather" => Some(KnownFunction::Gather),
         "scatter" => Some(KnownFunction::Scatter),
         "masked_select" => Some(KnownFunction::MaskedSelect),
-        "masked_fill" => Some(KnownFunction::MaskedFill),
+        "masked_fill" | "masked_fill_" => Some(KnownFunction::MaskedFill),
         "index_select" => Some(KnownFunction::IndexSelect),
         "narrow" => Some(KnownFunction::Narrow),
         "select" => Some(KnownFunction::SelectDim),
@@ -911,6 +939,10 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "chunk" => Some(KnownFunction::Chunk),
         "unbind" => Some(KnownFunction::Unbind),
         "bmm" => Some(KnownFunction::Bmm),
+        "mm" => Some(KnownFunction::Mm),
+        "mv" => Some(KnownFunction::Mv),
+        "matmul" => Some(KnownFunction::Matmul),
+        "t" => Some(KnownFunction::TorchT),
         // Tensor method form: `x.split(size, dim=0)` — real torch semantics
         // (chunk size, not section count); see `KnownFunction::TorchSplit`.
         "split" => Some(KnownFunction::TorchSplit),
@@ -1076,6 +1108,49 @@ fn apply_known_rule(
         KnownFunction::Matmul => apply_known_matmul(args, shapes),
         KnownFunction::DotGeneral => apply_known_dot_general(args, shapes),
         KnownFunction::Bmm => apply_known_bmm(args, shapes),
+        KnownFunction::Mm => apply_known_mm(args, shapes, 2),
+        KnownFunction::Mv => apply_known_mm(args, shapes, 1),
+        KnownFunction::Addmm => apply_known_add_product(args, shapes, KnownFunction::Mm),
+        KnownFunction::Baddbmm => apply_known_add_product(args, shapes, KnownFunction::Bmm),
+        KnownFunction::TorchT => apply_known_torch_t(args, shapes),
+        KnownFunction::Linear => apply_known_linear(args, shapes),
+        KnownFunction::ScaledDotProductAttention => apply_known_scaled_dot_product_attention(args, shapes),
+        KnownFunction::FunctionalLoss { layer, reduction, deprecated } => {
+            apply_known_functional_loss(args, shapes, layer, *reduction, *deprecated)
+        }
+        KnownFunction::LinalgEigvals => {
+            let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+                return Ok(None);
+            };
+            require_square_matrix(input_shape, "linalg.eigvals")?;
+            Ok(Some(input_shape[..input_shape.len() - 1].to_vec()))
+        }
+        KnownFunction::LinalgMatrixPower => {
+            let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+                return Ok(None);
+            };
+            require_square_matrix(input_shape, "linalg.matrix_power")?;
+            Ok(Some(input_shape.clone()))
+        }
+        KnownFunction::LinalgSlogdet => {
+            if let Some((_, input_shape)) = first_array_arg_shape(args, shapes) {
+                require_square_matrix(input_shape, "linalg.slogdet")?;
+            }
+            Ok(None)
+        }
+        KnownFunction::LinalgMultiDot => apply_known_multi_dot(args, shapes),
+        KnownFunction::Unique => apply_known_unique(args, shapes),
+        KnownFunction::MaskedSelect | KnownFunction::BinCount => {
+            Ok(first_array_arg_shape(args, shapes).map(|_| vec![UNKNOWN_DIM.to_string()]))
+        }
+        KnownFunction::Extract => {
+            Ok(shape_arg(args, 1, &["arr"], shapes).map(|_| vec![UNKNOWN_DIM.to_string()]))
+        }
+        KnownFunction::Compress => {
+            let axis = nth_positional_or_keyword(args, 2, &["axis"]).filter(|axis| axis.trim() != "None");
+            let input = shape_arg(args, 1, &["a"], shapes);
+            Ok(input.filter(|_| axis.is_none()).map(|_| vec![UNKNOWN_DIM.to_string()]))
+        }
         KnownFunction::Dot => apply_known_dot(args, shapes),
         KnownFunction::TensorDot => apply_known_tensordot(args, shapes),
         KnownFunction::Outer => apply_known_outer(args, shapes),
@@ -1209,7 +1284,6 @@ fn apply_known_rule(
         }
         // A dict of axis sizes, a data-dependent size, or a tuple of arrays.
         KnownFunction::EinopsParseShape
-        | KnownFunction::MaskedSelect
         | KnownFunction::TopK
         | KnownFunction::MinMax
         | KnownFunction::Unbind
@@ -2586,6 +2660,205 @@ fn apply_known_bmm(
     check_dim_match(&left[0], &right[0], "bmm batch")?;
     check_dim_match(&left[2], &right[1], "bmm")?;
     Ok(Some(vec![left[0].clone(), left[1].clone(), right[2].clone()]))
+}
+
+/// `torch.mm(input, mat2)` with a rank-2 `mat2`, or `torch.mv(input, vec)`
+/// with a rank-1 `vec`. `input` has rank 2. No operand broadcasts.
+fn apply_known_mm(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    right_rank: usize,
+) -> Result<Option<Vec<String>>, String> {
+    let name = if right_rank == 2 { "mm" } else { "mv" };
+    let (Some(left), Some(right)) = (
+        shape_arg(args, 0, &["input"], shapes),
+        shape_arg(args, 1, &["mat2", "vec"], shapes),
+    ) else {
+        return Ok(None);
+    };
+    if has_variadic_dim(left) || has_variadic_dim(right) {
+        return Ok(None);
+    }
+    for (operand, dims, rank) in [("input", left, 2), ("the second operand", right, right_rank)] {
+        if dims.len() != rank {
+            return Err(format!("{name} requires {operand} to have rank {rank}, got rank {}", dims.len()));
+        }
+    }
+    check_dim_match(&left[1], &right[0], name)?;
+    Ok(Some([&left[..1], &right[1..]].concat()))
+}
+
+/// `torch.addmm(input, mat1, mat2)` and `torch.baddbmm(input, batch1,
+/// batch2)`: the product of the two matrices, to which `input` broadcasts.
+fn apply_known_add_product(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    product: KnownFunction,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(left), Some(right)) = (
+        nth_positional_or_keyword(args, 1, &["mat1", "batch1"]),
+        nth_positional_or_keyword(args, 2, &["mat2", "batch2"]),
+    ) else {
+        return Ok(None);
+    };
+    let operands = [CallArgument::Positional { value: left.to_string() }, CallArgument::Positional { value: right.to_string() }];
+    let Some(output) = apply_known_rule(&product, &operands, shapes)? else {
+        return Ok(None);
+    };
+    let Some(input) = shape_arg(args, 0, &["input"], shapes) else {
+        return Ok(None);
+    };
+    if has_variadic_dim(input) || broadcast_changes(&output, input)? {
+        return Ok(None);
+    }
+    Ok(Some(output))
+}
+
+/// `Tensor.t()` swaps the two axes of a matrix and keeps a tensor of rank 0 or 1.
+fn apply_known_torch_t(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some((_, input_shape)) = first_array_arg_shape(args, shapes) else {
+        return Ok(None);
+    };
+    if has_variadic_dim(input_shape) {
+        return Ok(None);
+    }
+    if input_shape.len() > 2 {
+        return Err(format!("t() expects a tensor with rank 2 or less, got rank {}", input_shape.len()));
+    }
+    Ok(Some(input_shape.iter().rev().cloned().collect()))
+}
+
+/// `F.linear(input, weight)`: the last dim of `input` is the `in` dim of
+/// `weight`. A `[out, in]` weight gives `[..., out]`, a `[in]` weight `[...]`.
+fn apply_known_linear(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(input), Some(weight)) = (
+        shape_arg(args, 0, &["input"], shapes),
+        shape_arg(args, 1, &["weight"], shapes),
+    ) else {
+        return Ok(None);
+    };
+    let Some(features) = input.last().filter(|dim| !is_variadic_dim(dim)) else {
+        return Ok(None);
+    };
+    if has_variadic_dim(weight) {
+        return Ok(None);
+    }
+    let out = match weight.as_slice() {
+        [out, inner] => {
+            check_dim_match(features, inner, "linear")?;
+            Some(out)
+        }
+        [inner] => {
+            check_dim_match(features, inner, "linear")?;
+            None
+        }
+        _ => return Err(format!("linear requires weight to have rank 1 or 2, got rank {}", weight.len())),
+    };
+    Ok(Some(input[..input.len() - 1].iter().chain(out).cloned().collect()))
+}
+
+/// `F.scaled_dot_product_attention(query, key, value)`: `[..., L, E]`,
+/// `[..., S, E]`, and `[..., S, Ev]` give `[..., L, Ev]`. The head dims can
+/// differ (`enable_gqa`), so only the ranks and the last two dims are read.
+fn apply_known_scaled_dot_product_attention(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(query), Some(key), Some(value)) = (
+        shape_arg(args, 0, &["query"], shapes),
+        shape_arg(args, 1, &["key"], shapes),
+        shape_arg(args, 2, &["value"], shapes),
+    ) else {
+        return Ok(None);
+    };
+    let rank = query.len();
+    if rank < 2 || key.len() != rank || value.len() != rank || [query, key, value].iter().any(|shape| has_variadic_dim(shape)) {
+        return Ok(None);
+    }
+    check_dim_match(&query[rank - 1], &key[rank - 1], "scaled_dot_product_attention key")?;
+    check_dim_match(&key[rank - 2], &value[rank - 2], "scaled_dot_product_attention value")?;
+    Ok(Some(query[..rank - 1].iter().chain(&value[rank - 1..]).cloned().collect()))
+}
+
+/// A `torch.nn.functional` loss by the rule of its module, see `apply_loss_layer`.
+fn apply_known_functional_loss(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    layer: &str,
+    reduction: usize,
+    deprecated: Option<(usize, usize)>,
+) -> Result<Option<Vec<String>>, String> {
+    let (Some(input), Some(target)) = (
+        nth_positional_or_keyword(args, 0, &["input"]),
+        nth_positional_or_keyword(args, 1, &["target"]),
+    ) else {
+        return Ok(None);
+    };
+    let given = |position, name| {
+        nth_positional_or_keyword(args, position, &[name]).is_some_and(|value| value != "None")
+    };
+    let reduction = match deprecated {
+        Some((size_average, reduce)) if given(size_average, "size_average") || given(reduce, "reduce") => None,
+        _ => Some(nth_positional_or_keyword(args, reduction, &["reduction"]).unwrap_or("'mean'")),
+    };
+    apply_loss_layer(layer, reduction, input, target, shapes)
+}
+
+/// `linalg.multi_dot(arrays)`: a chain of matrix products. The first array
+/// can be a row and the last a column, all others have rank 2.
+fn apply_known_multi_dot(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(names) = sequence_arg_value(args).and_then(parse_simple_sequence_names) else {
+        return Ok(None);
+    };
+    let Some(operands) = names.iter().map(|name| shapes.shape(name)).collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    if operands.len() < 2 || operands.iter().any(|shape| has_variadic_dim(shape)) {
+        return Ok(None);
+    }
+    let last = operands.len() - 1;
+    for (at, shape) in operands.iter().enumerate() {
+        let allowed = shape.len() == 2 || (shape.len() == 1 && (at == 0 || at == last));
+        if !allowed {
+            return Err(format!("multi_dot operand {at} must have rank 2, got rank {}", shape.len()));
+        }
+    }
+    let mut output = operands[0].clone();
+    for shape in &operands[1..] {
+        let inner = output.pop().unwrap_or_default();
+        check_dim_match(&inner, &shape[0], "multi_dot")?;
+        output.extend(shape[1..].iter().cloned());
+    }
+    Ok(Some(output))
+}
+
+/// `unique` without options: the distinct values of the flat input, so one
+/// axis of a size the file does not prove. An option that changes the result
+/// type or rank (`return_*`, `axis`, `dim`, `size`) gives no shape.
+fn apply_known_unique(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
+    if first_array_arg_shape(args, shapes).is_none() {
+        return Ok(None);
+    }
+    let unset = |value: &str| matches!(value.trim(), "False" | "None");
+    let plain = args.iter().skip(1).all(|arg| match arg {
+        CallArgument::Positional { value } => unset(value),
+        CallArgument::Keyword { name, value } => {
+            matches!(name.as_str(), "sorted" | "equal_nan") || unset(value)
+        }
+    });
+    Ok(plain.then(|| vec![UNKNOWN_DIM.to_string()]))
 }
 
 /// `F.cross_entropy` / `F.nll_loss`. The class dim is 0 for an unbatched
