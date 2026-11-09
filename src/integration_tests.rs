@@ -4029,8 +4029,6 @@ mod torch_nn_functional_pad_tests {
 
     #[test]
     fn test_torch_nn_functional_pad_2d_symbolic() {
-        // apply_known_pad applies pad pairs in dimension order (dim 0 first, dim 1 second),
-        // unlike PyTorch's reverse-axis convention. We test against the existing parser semantics.
         let code = "import torch\ndef f(x: Float[Array, \"h w\"]):\n    y = torch.nn.functional.pad(x, (1, 2, 3, 4))";
         let tree = parse(code);
         let roots = vec![];
@@ -4038,7 +4036,7 @@ mod torch_nn_functional_pad_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["h+3", "w+7"])));
+        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["h+7", "w+3"])));
     }
 
     #[test]
@@ -4052,7 +4050,7 @@ mod torch_nn_functional_pad_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(
             find_shape(&analysis, "y"),
-            Some(&shape(&["height+3", "width+3"]))
+            Some(&shape(&["height", "width+3"]))
         );
     }
 
@@ -4107,7 +4105,7 @@ mod torch_nn_functional_pad_tests {
     }
 
     #[test]
-    fn test_f_pad_per_axis_numeric() {
+    fn test_f_pad_nested_pairs_is_unknown() {
         let code = "import torch.nn.functional as F\ndef f(x: Float[Array, \"10 20\"]):\n    y = F.pad(x, ((1, 2), (3, 4)))";
         let tree = parse(code);
         let roots = vec![];
@@ -4115,7 +4113,7 @@ mod torch_nn_functional_pad_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["13", "27"])));
+        assert_eq!(find_shape(&analysis, "y"), None);
     }
 }
 
@@ -6911,12 +6909,10 @@ def running_ema(
 
     /// End-to-end mirror of corpus/eqx_lstm_gru_scan.py's `LSTMEncoder`:
     /// an inline `(h0, c0)` tuple carry through `jax.lax.scan`, plus the
-    /// direct single-step `self.lstm(x, (h0, c0))` call outside the scan
-    /// (already worked before this change). Lazy call-site parameter
-    /// seeding now shapes the nested `body` closure too: `carry` is seeded
-    /// from `(h0, c0)`'s shape, so `h, c = carry` resolves, and `hs` is
-    /// traced from the body's second return element (`h_new`) with
-    /// `encoded`'s leading axis prepended.
+    /// direct single-step `self.lstm(x, (h0, c0))` call outside the scan,
+    /// which returns the `(h, c)` tuple. Lazy call-site parameter seeding
+    /// shapes the nested `body` closure: `carry` is seeded from `(h0, c0)`'s
+    /// shape, so `h, c = carry` resolves.
     #[test]
     fn test_lstm_encoder_tuple_carry_mirror() {
         let code = "\
@@ -6951,13 +6947,13 @@ class LSTMEncoder(eqx.Module):
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "step_h"), Some(&shape(&["hidden"])));
+        // `eqx.nn.LSTMCell` returns the `(h, c)` tuple: one name gets no shape.
+        assert_eq!(find_shape(&analysis, "step_h"), None);
         assert_eq!(find_shape(&analysis, "carry_final"), None);
         assert_eq!(find_shape(&analysis, "h_final"), Some(&shape(&["hidden"])));
         assert_eq!(find_shape(&analysis, "c_final"), Some(&shape(&["hidden"])));
-        // `hs`: encoded's leading "seq" axis prepended to the body's
-        // per-step `h_new` output.
-        assert_eq!(find_shape(&analysis, "hs"), Some(&shape(&["seq", "hidden"])));
+        // `hs`: the body's per-step `h_new` is the cell's tuple, so no shape.
+        assert_eq!(find_shape(&analysis, "hs"), None);
         // Seeded carry destructuring inside the nested `body` now resolves.
         assert_eq!(find_shape(&analysis, "h"), Some(&shape(&["hidden"])));
     }
@@ -7900,69 +7896,52 @@ mod multihead_attention_tests {
     }
 
     #[test]
-    fn test_multihead_attention_single_lhs_binds_primary_output() {
-        // `out = self.attn(x, x, x)` (no tuple unpacking) previously bound
-        // nothing (`apply_layer_application`'s `MultiheadAttention` arm
-        // always returns `Ok(None)`, since the real return is a 2-tuple).
-        // Single-assignment call sites now bind the primary output — the
-        // query's shape, same rule as `attn_out` in the tuple-LHS case.
-        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, x: Float[Array, \"seq 512\"]):\n        out = self.attn(x, x, x)";
-        let analysis = analyze(code);
-
-        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "512"])));
+    fn test_multihead_attention_single_lhs_is_a_tuple() {
+        // torch `MultiheadAttention.forward` always returns `(output, weights)`:
+        // one name gets no shape, also through `jax.vmap`.
+        let block = |forward: &str| format!("import torch.nn as nn\nimport jax\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"], b: Float[Array, \"batch seq 512\"]):\n        {forward}");
+        for forward in ["out = self.attn(q, q, q)", "out = self.attn(q, kv, kv)", "out = jax.vmap(self.attn)(b, b, b)"] {
+            let analysis = analyze(&block(forward));
+            assert!(analysis.errors.is_empty(), "{forward}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "out"), None, "{forward}");
+        }
     }
 
     #[test]
-    fn test_multihead_attention_single_lhs_cross_attention_uses_query_shape() {
-        // Query and key/value have different sequence lengths — the primary
-        // output still follows the query's shape, not the key/value's.
-        let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"tgt 512\"], kv: Float[Array, \"src 512\"]):\n        out = self.attn(q, kv, kv)";
-        let analysis = analyze(code);
-
-        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["tgt", "512"])));
+    fn test_equinox_multihead_attention_output_size() {
+        let block = |ctor: &str, call: &str| format!("import equinox as eqx\nimport jax\n\nclass Block(eqx.Module):\n    def __init__(self, key):\n        self.attn = {ctor}\n\n    def __call__(self, q: Float[Array, \"tgt 16\"], kv: Float[Array, \"src 16\"], b: Float[Array, \"batch tgt 16\"]):\n        out = {call}");
+        let cases: &[(&str, &str, Option<&[&str]>)] = &[
+            ("eqx.nn.MultiheadAttention(4, 16, key=key)", "self.attn(q, kv, kv)", Some(&["tgt", "16"])),
+            ("eqx.nn.MultiheadAttention(4, 16, output_size=8, key=key)", "self.attn(q, kv, kv)", Some(&["tgt", "8"])),
+            ("eqx.nn.MultiheadAttention(4, 16, None, None, 8, key=key)", "self.attn(q, kv, kv)", Some(&["tgt", "8"])),
+            ("eqx.nn.MultiheadAttention(4, 16, output_size=None, key=key)", "self.attn(q, kv, kv)", Some(&["tgt", "16"])),
+            ("eqx.nn.MultiheadAttention(4, 16, output_size=8, key=key)", "jax.vmap(self.attn)(b, b, b)", Some(&["batch", "tgt", "8"])),
+            ("eqx.nn.MultiheadAttention(4, 16, output_size=8, key=key)", "self.attn(b, b, b)", None),
+        ];
+        for (ctor, call, want) in cases {
+            let analysis = analyze(&block(ctor, call));
+            assert!(analysis.errors.is_empty(), "{ctor} {call}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "out"), want.map(shape).as_ref(), "{ctor} {call}");
+        }
     }
 
     #[test]
-    fn test_multihead_attention_vmap_single_lhs_binds_primary_output() {
-        // `out = jax.vmap(self.attn)(q, k, v)` — batched MHA applied via
-        // inline vmap with a single (non-tuple) LHS. Previously bound
-        // nothing: `apply_inline_vmap_layer`'s layer-application path
-        // returned `Ok(None)` for MultiheadAttention, same underlying cause
-        // as the direct-call case fixed above. The batch axis peeled by
-        // vmap must be restored on the query's shape.
-        let code = "import torch.nn as nn\nimport jax\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.attn = nn.MultiheadAttention(512, 8)\n\n    def forward(self, q: Float[Array, \"batch seq 512\"], k: Float[Array, \"batch seq 512\"], v: Float[Array, \"batch seq 512\"]):\n        out = jax.vmap(self.attn)(q, k, v)";
-        let analysis = analyze(code);
-
-        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(
-            find_shape(&analysis, "out"),
-            Some(&shape(&["batch", "seq", "512"]))
-        );
-    }
-
-    #[test]
-    fn test_lstm_single_lhs_binds_primary_output() {
-        // `out = self.lstm(x)` (no tuple unpacking): `apply_layer_application`'s
-        // `LayerKind::Rnn` arm already approximates the real `(output,
-        // final_state)` tuple return as just the primary output tensor
-        // (last dim replaced by `hidden_size`) — regression-covered here
-        // alongside the MultiheadAttention fix above.
+    fn test_lstm_single_lhs_is_a_tuple() {
+        // `out = self.lstm(x)` binds the `(output, (h_n, c_n))` tuple: no shape.
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.lstm = nn.LSTM(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.lstm(x)";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 
     #[test]
-    fn test_gru_single_lhs_binds_primary_output() {
+    fn test_gru_single_lhs_is_a_tuple() {
         let code = "import torch.nn as nn\n\nclass Block(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.gru = nn.GRU(10, 20)\n\n    def forward(self, x: Float[Array, \"seq 10\"]):\n        out = self.gru(x)";
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["seq", "20"])));
+        assert_eq!(find_shape(&analysis, "out"), None);
     }
 }
 
@@ -9379,6 +9358,24 @@ mod rnn_tuple_unpacking_tests {
         let analysis = analyze(&lstm_block("nn.LSTM(8, 16)", "5 3 8", "o, (h, c)"));
         assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         assert!(analysis.errors[0].message.contains("expected input last dim 32, got 16"));
+    }
+
+    #[test]
+    fn test_local_layer_tuple_unpacking() {
+        let head = "import torch.nn as nn\ndef f(x: Float[Array, \"5 3 8\"], q: Float[Array, \"5 3 9\"], v: Float[Array, \"8\"]):\n";
+        let cases: &[(&str, &str, &str, Option<&[&str]>)] = &[
+            ("lstm", "    r = nn.LSTM(8, 16)\n    a, (b, c) = r(x)\n", "b", Some(&["1", "3", "16"])),
+            ("lstm output", "    r = nn.LSTM(8, 16)\n    a, _ = r(x)\n", "a", Some(&["5", "3", "16"])),
+            ("gru", "    r = nn.GRU(8, 16)\n    a, b = r(x)\n", "b", Some(&["1", "3", "16"])),
+            ("lstm cell", "    r = nn.LSTMCell(8, 16)\n    a, b = r(v)\n", "b", Some(&["16"])),
+            ("input size mismatch", "    r = nn.LSTM(9, 16)\n    a, b = r(x)\n", "a", None),
+            ("attention", "    r = nn.MultiheadAttention(9, 3)\n    a, b = r(q, q, q)\n", "b", Some(&["3", "5", "5"])),
+        ];
+        for (case, body, name, want) in cases {
+            let analysis = analyze(&format!("{head}{body}"));
+            assert!(analysis.errors.is_empty(), "case: {case}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, name), want.map(shape).as_ref(), "case: {case}");
+        }
     }
 
     #[test]

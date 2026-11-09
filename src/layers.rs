@@ -235,7 +235,12 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 }
                 _ => UNPROVEN_DIM.to_string(),
             };
+            let output_size = match call.bindings.get("output_size").map(|value| value.trim()) {
+                Some(size) if is_equinox_module && size != "None" => size.to_string(),
+                _ => feature_dim.clone(),
+            };
             Some(LayerKind::MultiheadAttention {
+                output_size,
                 feature_dim: feature_dim.clone(),
                 num_heads: call.bindings.get("num_heads").cloned().unwrap_or_else(|| UNPROVEN_DIM.to_string()),
                 batch_first: flag("batch_first").to_string(),
@@ -549,12 +554,14 @@ pub(crate) fn map_layer_dims(kind: LayerKind, f: &dyn Fn(&str) -> String) -> Lay
             batch_first,
             added_keys,
             returns_weights,
+            output_size,
         } => LayerKind::MultiheadAttention {
             feature_dim: f(&feature_dim),
             num_heads: f(&num_heads),
             batch_first: f(&batch_first),
             added_keys: f(&added_keys),
             returns_weights,
+            output_size: f(&output_size),
         },
         LayerKind::Embedding { embedding_size } => LayerKind::Embedding {
             embedding_size: f(&embedding_size),
@@ -1987,7 +1994,7 @@ fn min_rank_for_shape_preserving(name: &str) -> Option<usize> {
 /// vocabulary than jaxtyping annotation dims (issue #47). A mismatch is only
 /// an error when both sides are concrete integers; otherwise it's unprovable
 /// and the layer's output shape is trusted.
-fn dims_provably_mismatch(expected: &str, actual: &str) -> bool {
+pub(crate) fn dims_provably_mismatch(expected: &str, actual: &str) -> bool {
     !dims_canonically_equal(expected, actual)
         && without_literal_mark(expected).trim().parse::<u64>().is_ok()
         && without_literal_mark(actual).trim().parse::<u64>().is_ok()
@@ -2042,10 +2049,16 @@ fn apply_layer_rule(
             out_features,
         } => replace_last_dim("Linear", layer, input, input_shape, Some(in_features), out_features),
         LayerKind::Conv { .. } | LayerKind::ConvTranspose { .. } => apply_conv_layer(kind, layer, input, input_shape),
-        // Returns an (output, weights) tuple — a single shape can't express
-        // it, so direct application skips; tuple unpacking is handled in
-        // analysis::tuple_rhs_shapes.
-        LayerKind::MultiheadAttention { .. } => Ok(None),
+        // torch returns an (output, weights) tuple: no shape here; tuple
+        // unpacking is handled in analysis::tuple_rhs_shapes. equinox returns
+        // `(query_seq, output_size)` for a `(query_seq, query_size)` query.
+        LayerKind::MultiheadAttention { returns_weights: true, .. } => Ok(None),
+        LayerKind::MultiheadAttention { feature_dim, output_size, .. } => {
+            if input_shape.len() != 2 {
+                return Ok(None);
+            }
+            replace_last_dim("MultiheadAttention", layer, input, input_shape, Some(feature_dim), output_size)
+        }
         // flax channels-last: last dim becomes `features`, nothing to check
         // (flax infers the input width at runtime).
         LayerKind::Dense { features } => replace_last_dim("Dense", layer, input, input_shape, None, features),
@@ -2212,9 +2225,8 @@ fn apply_layer_rule(
             }
             Ok(Some(output_shape))
         }
-        // torch.nn.RNN/LSTM/GRU: approximated as the primary output tensor
-        // only (see LayerKind::Rnn doc comment). RNNCell/GRUCell/LSTMCell:
-        // the same rule for a single step, optionally unbatched.
+        // torch.nn.RNN/LSTM/GRU and LSTMCell return a tuple: the input is
+        // checked, but one name gets no shape. Tuple unpacking gives the parts.
         LayerKind::Rnn { name, input_size, .. } => {
             check_min_rank(name, layer, input, input_shape.len(), 2)?;
             if input_shape.len() > 3 {
@@ -2227,7 +2239,7 @@ fn apply_layer_rule(
                 ));
             }
             let output = rnn_outputs(kind, input_shape).output;
-            replace_last_dim(name, layer, input, input_shape, Some(input_size), &output)
+            replace_last_dim(name, layer, input, input_shape, Some(input_size), &output).map(|_| None)
         }
         LayerKind::RnnCell {
             name,
@@ -2235,7 +2247,8 @@ fn apply_layer_rule(
             hidden_size,
         } => {
             check_min_rank(name, layer, input, input_shape.len(), 1)?;
-            replace_last_dim(name, layer, input, input_shape, Some(input_size), hidden_size)
+            let output = replace_last_dim(name, layer, input, input_shape, Some(input_size), hidden_size)?;
+            Ok(output.filter(|_| name != "LSTMCell"))
         }
         // torch.nn.PixelShuffle(r): (*, C*r^2, H, W) -> (*, C, H*r, W*r).
         LayerKind::PixelShuffle { upscale_factor } => {
@@ -2573,13 +2586,25 @@ mod table_tests {
             batch_first: s(batch_first),
             added_keys: s(added_keys),
             returns_weights: true,
+            output_size: s(feature_dim),
         }
     }
 
     fn eqx_mha(feature_dim: &str, num_heads: &str) -> LayerKind {
+        eqx_mha_with(feature_dim, num_heads, feature_dim)
+    }
+
+    fn eqx_mha_with(feature_dim: &str, num_heads: &str, output_size: &str) -> LayerKind {
         match mha_with(feature_dim, num_heads, "False", "0") {
             LayerKind::MultiheadAttention { feature_dim, num_heads, batch_first, added_keys, .. } => {
-                LayerKind::MultiheadAttention { feature_dim, num_heads, batch_first, added_keys, returns_weights: false }
+                LayerKind::MultiheadAttention {
+                    feature_dim,
+                    num_heads,
+                    batch_first,
+                    added_keys,
+                    returns_weights: false,
+                    output_size: s(output_size),
+                }
             }
             _ => unreachable!(),
         }
@@ -2702,17 +2727,28 @@ mod table_tests {
                 Unknown,
             ),
             ("conv transpose2d channels", conv_transpose(2, "3", "16", "4", "2", "1"), &["5", "4", "4"], Fails(&["expected 3 input channels"])),
-            ("rnn hidden size", rnn("GRU", "10", "20"), &["seq", "10"], Gives(&["seq", "20"])),
-            ("lstm bidirectional", rnn_with("LSTM", "8", "16", ["1", "True", "0", "False"]), &["5", "3", "8"], Gives(&["5", "3", "32"])),
-            ("lstm projection", rnn_with("LSTM", "8", "16", ["2", "True", "4", "False"]), &["5", "8"], Gives(&["5", "8"])),
-            ("rnn unproven bidirectional", rnn_with("GRU", "8", "16", ["1", "flag", "0", "False"]), &["5", "8"], Gives(&["5", UNKNOWN_DIM])),
+            // `(output, h_n)` is a tuple: one name gets no shape.
+            ("rnn output is a tuple", rnn("GRU", "10", "20"), &["seq", "10"], Unknown),
+            ("lstm output is a tuple", rnn_with("LSTM", "8", "16", ["1", "True", "0", "False"]), &["5", "3", "8"], Unknown),
             ("rnn rank 4", rnn("GRU", "10", "20"), &["2", "5", "3", "10"], Fails(&["expects input with 2 or 3 dims"])),
             ("rnn input size mismatch", rnn("GRU", "10", "20"), &["seq", "9"], Fails(&["expected input last dim 10"])),
             (
                 "rnn cell unbatched",
-                LayerKind::RnnCell { name: s("LSTMCell"), input_size: s("10"), hidden_size: s("20") },
+                LayerKind::RnnCell { name: s("GRUCell"), input_size: s("10"), hidden_size: s("20") },
                 &["10"],
                 Gives(&["20"]),
+            ),
+            (
+                "lstm cell output is a tuple",
+                LayerKind::RnnCell { name: s("LSTMCell"), input_size: s("10"), hidden_size: s("20") },
+                &["10"],
+                Unknown,
+            ),
+            (
+                "lstm cell input size mismatch",
+                LayerKind::RnnCell { name: s("LSTMCell"), input_size: s("10"), hidden_size: s("20") },
+                &["9"],
+                Fails(&["expected input last dim 10"]),
             ),
             ("pixel shuffle", LayerKind::PixelShuffle { upscale_factor: s("2") }, &["8", "4", "4"], Gives(&["2", "8", "8"])),
             ("pixel shuffle indivisible", LayerKind::PixelShuffle { upscale_factor: s("2") }, &["9", "4", "4"], Fails(&["not evenly divisible"])),

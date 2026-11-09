@@ -426,6 +426,28 @@ fn test_split_non_divisible_numeric_errors() {
 }
 
 #[test]
+fn test_split_piece_count_over_the_limit_is_unknown() {
+    let big = "1000000000";
+    let shapes = HashMap::from([
+        ("x".to_string(), shape(&[big])),
+        ("s".to_string(), shape(&["n"])),
+        ("small".to_string(), shape(&["512"])),
+    ]);
+    let pieces = |result: Result<Option<Vec<Vec<String>>>, String>| result.unwrap().map(|p| p.len());
+    assert_eq!(pieces(compute_torch_split_shapes(&[pos("x"), pos("1")], &shapes, None)), None);
+    assert_eq!(pieces(compute_torch_split_shapes(&[pos("x"), pos("4000000")], &shapes, None)), Some(250));
+    assert_eq!(pieces(compute_split_shapes(&[pos("x"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_split_shapes(&[pos("s"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_split_shapes(&[pos("s"), pos("256")], &shapes)), Some(256));
+    assert_eq!(pieces(compute_array_split_shapes(&[pos("x"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_chunk_shapes(&[pos("x"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_chunk_shapes(&[pos("s"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_chunk_shapes(&[pos("small"), pos(big)], &shapes)), None);
+    assert_eq!(pieces(compute_chunk_shapes(&[pos("small"), pos("2")], &shapes)), Some(2));
+    assert!(compute_split_shapes(&[pos("small"), pos(big)], &shapes).is_err());
+}
+
+#[test]
 fn test_split_index_exceeds_axis_size_clips() {
     let shapes = HashMap::from([("x".to_string(), shape(&["5"]))]);
     let args = vec![pos("x"), pos("[2, 7]"), kw("axis", "0")];
@@ -1196,6 +1218,12 @@ fn test_functional_conv2d_cases() {
 fn test_functional_max_pool2d_cases() {
     check(KnownFunction::FunctionalMaxPool2d, None, &[
         ("apply_functional_max_pool2d_default_stride_equals_kernel", vec![pos("x"), pos("2")], &[("x", &["8", "3", "32", "32"])], Ok(Some(&["8", "3", "16", "16"]))),
+        ("max_pool2d_return_indices_is_a_tuple", vec![pos("x"), pos("2"), kw("return_indices", "True")], &[("x", &["8", "3", "32", "32"])], Ok(None)),
+        ("max_pool2d_positional_return_indices", vec![pos("x"), pos("2"), pos("2"), pos("0"), pos("1"), pos("False"), pos("True")], &[("x", &["8", "3", "32", "32"])], Ok(None)),
+        ("max_pool2d_return_indices_false", vec![pos("x"), pos("2"), kw("return_indices", "False")], &[("x", &["8", "3", "32", "32"])], Ok(Some(&["8", "3", "16", "16"]))),
+        ("max_pool2d_ceil_mode_returns_none", vec![pos("x"), pos("2"), kw("ceil_mode", "True")], &[("x", &["8", "3", "9", "9"])], Ok(None)),
+        ("max_pool2d_dilation_widens_window", vec![pos("x"), pos("3"), pos("1"), pos("0"), pos("2")], &[("x", &["8", "3", "9", "9"])], Ok(Some(&["8", "3", "5", "5"]))),
+        ("max_pool2d_dynamic_dilation_returns_none", vec![pos("x"), pos("3"), kw("dilation", "d")], &[("x", &["8", "3", "9", "9"])], Ok(None)),
     ]);
 }
 
@@ -1204,6 +1232,8 @@ fn test_functional_max_pool2d_cases() {
 fn test_functional_avg_pool1d_cases() {
     check(KnownFunction::FunctionalAvgPool1d, None, &[
         ("apply_functional_avg_pool1d", vec![pos("x"), pos("2"), pos("2")], &[("x", &["8", "3", "10"])], Ok(Some(&["8", "3", "5"]))),
+        ("avg_pool1d_positional_ceil_mode_returns_none", vec![pos("x"), pos("2"), pos("2"), pos("0"), pos("True")], &[("x", &["8", "3", "9"])], Ok(None)),
+        ("avg_pool1d_count_include_pad_keeps_shape", vec![pos("x"), pos("2"), pos("2"), pos("0"), pos("False"), pos("False")], &[("x", &["8", "3", "9"])], Ok(Some(&["8", "3", "4"]))),
     ]);
 }
 
