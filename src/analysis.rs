@@ -2639,6 +2639,20 @@ fn file_backend(import_map: &HashMap<String, ImportPath>) -> FileBackend {
     }
 }
 
+/// Whether the file imports jax (or a library on jax), and neither numpy nor
+/// torch.
+fn imports_only_jax(import_map: &HashMap<String, ImportPath>) -> bool {
+    let mut jax = false;
+    for import in import_map.values() {
+        match import.module.first().unwrap_or(&import.name).as_str() {
+            "jax" | "flax" | "equinox" | "haiku" | "optax" => jax = true,
+            "numpy" | "torch" => return false,
+            _ => {}
+        }
+    }
+    jax
+}
+
 /// `x.transpose(i, j)` swaps two dims in torch but is a full axes permutation
 /// in numpy/jax. `dim0`/`dim1` keywords only exist in torch. With two
 /// positional dims and no known backend, the result is kept only when both
@@ -2650,6 +2664,11 @@ fn apply_method_call_for_backend(
     import_map: &HashMap<String, ImportPath>,
     shapes: &dyn ShapeLookup,
 ) -> Result<Option<Vec<String>>, String> {
+    // `ndarray.sort()` sorts in place and returns `None`, a torch tensor gives
+    // a tuple, and only a jax array gives a sorted copy.
+    if matches!(known, KnownFunction::Sort) && !imports_only_jax(import_map) {
+        return Ok(None);
+    }
     if let Some(torch) = torch_method_reading(known) {
         return apply_method_readings(&torch, known, receiver, args, import_map, shapes);
     }

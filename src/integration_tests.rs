@@ -8891,6 +8891,31 @@ mod torch_new_builtin_tests {
         }
     }
 
+    /// `x.sort()` returns `None` for numpy (in place) and a tuple for torch.
+    /// Only a jax array gives a sorted copy. Other in-place numpy methods
+    /// return `None`; a torch `_` method returns `self`.
+    #[test]
+    fn test_in_place_methods_by_backend() {
+        let cases = [
+            ("import numpy as np", "x.sort()", None),
+            ("import jax.numpy as jnp", "x.sort()", Some(vec!["3", "2"])),
+            ("import jax.numpy as jnp\nimport numpy as np", "x.sort()", None),
+            ("", "x.sort()", None),
+            ("import torch", "x.sort()", None),
+            ("import numpy as np", "x.fill(0)", None),
+            ("import numpy as np", "x.partition(1)", None),
+            ("import numpy as np", "x.resize((2, 3))", None),
+            ("import torch", "x.add_(1)", Some(vec!["3", "2"])),
+            ("import torch", "x.zero_()", Some(vec!["3", "2"])),
+        ];
+        for (imports, call, expected) in cases {
+            let code = format!("{imports}\ndef f(x: Float[Array, \"3 2\"]):\n    y = {call}\n");
+            let analysis = analyze(&code);
+            assert!(analysis.errors.is_empty(), "{imports} {call}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|s| shape(&s)).as_ref(), "{imports} {call}");
+        }
+    }
+
     #[test]
     fn test_method_unbind_tuple_unpacking() {
         let code = "def f(x: Float[Array, \"3 4 5\"]):\n    a, b, c = x.unbind(0)";

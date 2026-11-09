@@ -926,7 +926,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         | "rsqrt" | "abs" | "neg" | "sigmoid" | "tanh" | "relu" | "sin" | "cos" | "square"
         | "floor" | "ceil" | "round" | "sign" | "exp_" | "log_" | "sqrt_" | "rsqrt_" | "abs_"
         | "neg_" | "sigmoid_" | "tanh_" | "relu_" | "sin_" | "cos_" | "square_" | "floor_"
-        | "ceil_" | "round_" | "sign_" => Some(KnownFunction::Copy),
+        | "ceil_" | "round_" | "sign_" | "zero_" | "fill_" | "add_" | "sub_" | "mul_" | "div_"
+        | "pow_" | "clamp_" | "copy_" | "uniform_" | "normal_" => Some(KnownFunction::Copy),
         "detach" => Some(KnownFunction::Detach),
         "contiguous" => Some(KnownFunction::Contiguous),
         "to" => Some(KnownFunction::To),
