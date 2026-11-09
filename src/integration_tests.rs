@@ -5321,6 +5321,39 @@ def f(x: Float[Array, "batch 4"]) -> None:
         );
     }
 
+    /// An imported helper binds its arguments by the full parameter list:
+    /// an unannotated parameter takes a position, `*` and `/` hold.
+    #[test]
+    fn test_cross_file_arguments_bind_the_full_parameter_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mylib")).unwrap();
+        fs::write(
+            tmp.path().join("mylib/helpers.py"),
+            "def f(a, x: Float[Array, \"n d\"]) -> Float[Array, \"n d\"]:\n    pass\n\
+             def g(x: Float[Array, \"n d\"], /, *, w: Float[Array, \"d\"]) -> Float[Array, \"n\"]:\n    pass\n",
+        )
+        .unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let cases = [
+            ("f(k, y)", Some(vec!["b", "3"]), 0),
+            ("f(y, k)", None, 1),
+            ("f(k, x=y)", Some(vec!["b", "3"]), 0),
+            ("g(y, w=v)", Some(vec!["b"]), 0),
+            ("g(y, w=u)", None, 1),
+            ("g(y, u)", Some(vec!["b"]), 0),
+            ("g(x=y, w=v)", Some(vec!["n"]), 0),
+        ];
+        for (call, expected, errors) in cases {
+            let code = format!(
+                "from mylib.helpers import f, g\n\ndef c(y: Float[Array, \"b 3\"], k: Float[Array, \"7\"], v: Float[Array, \"3\"], u: Float[Array, \"5\"]) -> None:\n    z = {call}\n"
+            );
+            let tree = parse(&code);
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(analysis.errors.len(), errors, "{call}: {:?}", analysis.errors);
+            assert_eq!(find_shape_in_scope(&analysis, "c", "z"), expected.map(|s| shape(&s)).as_ref(), "{call}");
+        }
+    }
+
     /// Argument rank disagrees with the imported helper's declared param
     /// rank — the mismatch must still surface as a `ShapeError`, same as a
     /// same-file helper.

@@ -27,7 +27,10 @@ use crate::python_ast::{
     extract_call_arguments, insert_identifiers, insert_target_names, only_wrapped,
     self_attr_aliases_from_writes,
 };
-use crate::resolution::{ResolutionCache, resolve_call_target, resolve_imported_function_shape};
+use crate::resolution::{
+    ResolutionCache, bind_call_arguments, resolve_call_target, resolve_imported_function_shape,
+    resolve_imported_function_signature,
+};
 
 use crate::types::*;
 
@@ -6857,12 +6860,16 @@ fn apply_user_function(
     // that depend on the call, like a partially annotated callee: only its
     // `-> ReturnType` annotation is call-independent.
     let captures = ctx.links.captures[callee_idx];
+    let Some(function) = ctx.scope_function_nodes[callee_idx] else {
+        return Some(None);
+    };
+    let bound = bound_parameters(function, ctx.text, args);
     if let Some(result) = bind_user_function_args(
         &ctx.scopes[callee_idx],
         name,
-        args,
+        &bound,
         &ctx.scope_shapes(scope_idx),
-        ctx.scope_function_nodes[callee_idx].map(|node| (node, ctx.text)),
+        Some((function, ctx.text)),
     ) {
         match ctx.check(result, display, args_node.range()) {
             None => return Some(None),
@@ -7857,19 +7864,16 @@ fn scan_body_ys_shape(
 /// intentionally bails on the whole call rather than partially validating);
 /// `Some(Ok(Some(shape)))` / `Some(Err(msg))` otherwise.
 ///
-/// v1 limitations (documented in PR #34, still true for the cross-file
-/// extension):
-/// - Only positional arguments are matched. Keyword args that match a param
-///   name are honoured; otherwise the call is skipped with Ok(None).
-/// - Fresh output dims (not in the binding) pass through unchanged.
+/// Each argument binds a parameter by the rules of Python, over the full
+/// parameter list (`bound`). Fresh output dims (not in the binding) pass
+/// through unchanged. Imported helpers pass no `function` and use their
+/// annotations only.
 fn bind_user_function_args(
     callee: &FunctionShapeScope,
     target: &str,
-    args: &[CallArgument],
+    bound: &[(String, &str)],
     caller_shapes: &dyn ShapeLookup,
-    // The existing function node and its source enable body tracing for
-    // same-file calls. Imported helpers pass None and use annotations only.
-    source: Option<(Node, &str)>,
+    function: Option<(Node, &str)>,
 ) -> Option<Result<Option<Vec<String>>, String>> {
     // If the callee has no jaxtyping annotations at all, fall through to
     // the known-function branch.
@@ -7877,67 +7881,22 @@ fn bind_user_function_args(
         return None;
     }
 
-    // A function of this file binds its arguments by the rules of Python.
     // An argument without a shape for an array parameter skips the call.
-    if let Some((function, text)) = source {
-        let mut arg_shapes: Vec<(String, Vec<String>)> = Vec::new();
-        for (param, value) in bound_parameters(function, text, args) {
-            let Some(declared) = callee.shapes.get(&param) else {
-                continue;
-            };
-            match caller_shapes.shape(value) {
-                Some(shape) => arg_shapes.push((param, shape.clone())),
-                None if declared.is_empty() => {}
-                None => return Some(Ok(None)),
-            }
-        }
-        let arg_shapes: Vec<(&str, Vec<String>)> =
-            arg_shapes.iter().map(|(param, shape)| (param.as_str(), shape.clone())).collect();
-        return Some(if callee.return_shape.is_some() {
-            bind_and_substitute(callee, target, &arg_shapes)
-        } else {
-            trace_user_function_return(callee, target, &arg_shapes, (function, text))
-        });
-    }
-
-    // Resolve each positional arg to a shape from the caller's scope.
-    // We match positional args to declared params in declaration order.
-    let param_names = &callee.param_order;
-    let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new(); // (param_name, arg_shape)
-    let mut positional_idx = 0usize;
-    for arg in args {
-        match arg {
-            CallArgument::Positional { value } => {
-                let Some(param_name) = param_names.get(positional_idx) else {
-                    break; // more positional args than annotated params — ignore extras
-                };
-                let Some(shape) = caller_shapes.shape(value.as_str()) else {
-                    // Arg has no known shape (literal, untracked variable, etc.)
-                    // — skip entire function. v1 intentionally bails early
-                    // rather than partially validating some args, to avoid
-                    // noisy diagnostics on calls that mix typed and untyped
-                    // arguments.
-                    return Some(Ok(None));
-                };
-                arg_shapes.push((param_name, shape.clone()));
-                positional_idx += 1;
-            }
-            CallArgument::Keyword { name, value } => {
-                // v1: honour keyword args whose name matches a declared param.
-                if callee.shapes.contains_key(name) {
-                    let Some(shape) = caller_shapes.shape(value.as_str()) else {
-                        return Some(Ok(None));
-                    };
-                    arg_shapes.push((name, shape.clone()));
-                }
-                // Non-matching keyword args are silently ignored in v1.
-            }
+    let mut arg_shapes: Vec<(&str, Vec<String>)> = Vec::new();
+    for (param, value) in bound {
+        let Some(declared) = callee.shapes.get(param) else {
+            continue;
+        };
+        match caller_shapes.shape(value) {
+            Some(shape) => arg_shapes.push((param.as_str(), shape.clone())),
+            None if declared.is_empty() => {}
+            None => return Some(Ok(None)),
         }
     }
-
-    // Delegate to the shared bind_and_substitute helper.
     if callee.return_shape.is_some() {
         Some(bind_and_substitute(callee, target, &arg_shapes))
+    } else if let Some(function) = function {
+        Some(trace_user_function_return(callee, target, &arg_shapes, function))
     } else {
         Some(Ok(None))
     }
@@ -7967,7 +7926,25 @@ fn apply_imported_user_function(
         Ok(None) => return None,
         Err(message) => return Some(Err(message)),
     };
-    bind_user_function_args(&callee, target, args, caller_shapes, None)
+    if callee.shapes.is_empty() && callee.return_shape.is_none() {
+        return None;
+    }
+    let signature = match resolve_imported_function_signature(
+        target, import_map, search_roots, read_file, max_depth, cache,
+    ) {
+        Ok(Some(signature)) => signature,
+        Ok(None) => return Some(Ok(None)),
+        Err(message) => return Some(Err(message)),
+    };
+    let Some(bindings) = bind_call_arguments(&signature, args) else {
+        return Some(Ok(None));
+    };
+    let bound: Vec<(String, &str)> = signature
+        .params
+        .iter()
+        .filter_map(|param| Some((param.clone(), bindings.get(param)?.as_str())))
+        .collect();
+    bind_user_function_args(&callee, target, &bound, caller_shapes, None)
 }
 
 fn apply_matmul_shape(
