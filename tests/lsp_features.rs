@@ -64,3 +64,137 @@ fn positions_follow_the_editor_line_model() {
         assert!(hover["contents"]["value"].as_str().unwrap().contains("\"3 4\""));
     }
 }
+
+const DIMS: &str = "from jaxtyping import Float, Array\n\ndef f(x: Float[Array, \"n d\"], y: Float[Array, \"n d\"]) -> Float[Array, \"n\"]:\n    z: Float[Array, \"n d\"] = x + y\n    return z.sum(1)\n\ndef g(x: Float[Array, \"n k\"], w: Float[Array, \"k*2\"]):\n    pass\n";
+
+fn ranges(v: &Value) -> Vec<(u32, u32)> {
+    v.as_array().unwrap().iter().map(|x| start_of(x.get("range").unwrap_or(x))).collect()
+}
+
+/// The positions of every `"n` dim of `f` in DIMS.
+fn n_sites_of_f() -> Vec<(u32, u32)> {
+    let f = &DIMS[..DIMS.find("def g").unwrap()];
+    let mut out = Vec::new();
+    for (i, line) in f.split('\n').enumerate() {
+        for (c, _) in line.match_indices("\"n") {
+            out.push((i as u32, c as u32 + 1));
+        }
+    }
+    out
+}
+
+#[test]
+fn references_and_highlights_of_a_dimension_stay_in_its_function() {
+    let (_dir, root) = project(&[]);
+    let uri = file_uri(&root.join("main.py"));
+    let mut c = Client::start(&root, json!({}));
+    c.open(&uri, DIMS);
+    let want = n_sites_of_f();
+    assert_eq!(want.len(), 4);
+    let (line, character) = want[2];
+
+    let all = c.at("references", &uri, line, character, json!({"context": {"includeDeclaration": true}}));
+    assert_eq!(ranges(&all), want);
+    assert!(all.as_array().unwrap().iter().all(|l| l["uri"] == uri.as_str()));
+    let uses = c.at("references", &uri, line, character, json!({"context": {"includeDeclaration": false}}));
+    assert_eq!(ranges(&uses), want[1..]);
+    let highlights = c.at("documentHighlight", &uri, line, character, json!({}));
+    assert_eq!(ranges(&highlights), want);
+
+    let (gl, gc) = pos(DIMS, "n k\"");
+    assert_eq!(ranges(&c.at("references", &uri, gl, gc, json!({"context": {"includeDeclaration": true}}))), [(gl, gc)]);
+    let (cl, cc) = pos(DIMS, "k*2");
+    assert_eq!(c.at("references", &uri, cl, cc, json!({"context": {"includeDeclaration": true}})), Value::Null);
+}
+
+fn rename(c: &mut Client, uri: &str, at: (u32, u32), name: &str) -> Value {
+    let id = c.send_request(
+        "textDocument/rename",
+        json!({"textDocument": {"uri": uri}, "position": {"line": at.0, "character": at.1}, "newName": name}),
+    );
+    c.wait_response(id)
+}
+
+#[test]
+fn rename_of_a_dimension_edits_its_function_and_rejects_bad_names() {
+    let (_dir, root) = project(&[]);
+    let uri = file_uri(&root.join("main.py"));
+    let versioned = json!({"workspace": {"workspaceEdit": {"documentChanges": true}}});
+    let mut c = Client::start(&root, versioned);
+    c.open(&uri, DIMS);
+    let sites = n_sites_of_f();
+
+    let prepared = c.at("prepareRename", &uri, sites[1].0, sites[1].1, json!({}));
+    assert_eq!(start_of(&prepared), sites[1]);
+    assert_eq!(prepared["end"]["character"].as_u64(), Some(sites[1].1 as u64 + 1));
+    let (dl, dc) = pos(DIMS, "def f");
+    assert_eq!(c.at("prepareRename", &uri, dl, dc, json!({})), Value::Null);
+
+    let edit = rename(&mut c, &uri, sites[0], "batch")["result"].clone();
+    let doc = &edit["documentChanges"][0];
+    assert_eq!(doc["textDocument"]["version"], 1);
+    assert_eq!(ranges(&doc["edits"]), sites);
+    assert!(doc["edits"].as_array().unwrap().iter().all(|e| e["newText"] == "batch"));
+
+    for bad in ["2n", "n d", "", "_", "_n", "d"] {
+        let reply = rename(&mut c, &uri, sites[0], bad);
+        assert_eq!(reply["error"]["code"], -32602, "{bad}: {reply}");
+    }
+    let (gl, gc) = pos(DIMS, "k\"], w");
+    let reply = rename(&mut c, &uri, (gl, gc), "m");
+    assert_eq!(reply["error"]["code"], -32602, "k is read by `k*2`: {reply}");
+
+    let (_dir2, root2) = project(&[]);
+    let uri2 = file_uri(&root2.join("main.py"));
+    let mut plain = Client::start(&root2, json!({}));
+    plain.open(&uri2, DIMS);
+    let edit = rename(&mut plain, &uri2, sites[0], "batch")["result"].clone();
+    assert!(edit.get("documentChanges").is_none(), "{edit}");
+    assert_eq!(ranges(&edit["changes"][uri2.as_str()]), sites);
+}
+
+#[test]
+fn diagnostics_have_a_code_per_kind() {
+    let (_dir, root) = project(&[]);
+    let uri = file_uri(&root.join("main.py"));
+    let mut c = Client::start(&root, json!({}));
+    let text = "from jaxtyping import Float, Array\n\ndef f(a: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    return a @ b\n";
+    let diags = c.open(&uri, text);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["code"], "shape-mismatch");
+    assert_eq!(diags[0]["source"], "ndim-lsp");
+}
+
+#[test]
+fn utf8_positions_when_the_client_offers_them() {
+    let text = "from jaxtyping import Float, Array\n\ndef f(é: Float[Array, \"m k\"], b: Float[Array, \"n k\"]):\n    y = é @ b\n    return y\n";
+    let line = 2;
+    let row = text.split('\n').nth(2).unwrap();
+    let byte_col = row.find("k\"], b").unwrap() as u32;
+    let use_col = row.find("k\"]):").unwrap() as u32;
+    for (caps, enc, col) in [
+        (json!({"general": {"positionEncodings": ["utf-8", "utf-16"]}}), "utf-8", byte_col),
+        (json!({"general": {"positionEncodings": ["utf-16"]}}), "utf-16", byte_col - 1),
+        (json!({}), "utf-16", byte_col - 1),
+    ] {
+        let (_dir, root) = project(&[]);
+        let uri = file_uri(&root.join("main.py"));
+        let mut c = Client::start(&root, caps);
+        assert_eq!(c.init["capabilities"]["positionEncoding"], enc);
+        let diags = c.open(&uri, text);
+        assert_eq!(start_of(&diags[0]["range"]), (line, col), "{enc}");
+        let shift = byte_col - col;
+        let k = c.at("definition", &uri, line, use_col - shift, json!({}));
+        assert_eq!(start_of(&k["range"]), (line, col), "{enc}");
+
+        let from = c.published();
+        c.notify(
+            "textDocument/didChange",
+            json!({"textDocument": {"uri": uri, "version": 2},
+                   "contentChanges": [{"range": {"start": {"line": line, "character": col},
+                                                 "end": {"line": line, "character": col + 1}},
+                                       "text": "n"}]}),
+        );
+        assert_eq!(c.wait_diagnostics(&uri, from), Vec::<Value>::new(), "{enc}");
+    }
+}

@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, watch};
-use tower_lsp::jsonrpc::Result;
+use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, ConfigurationItem, Diagnostic,
@@ -13,10 +13,13 @@ use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentChanges, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
+    DocumentChanges, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
-    InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, OneOf,
+    InlayHintTooltip, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
+    TextDocumentPositionParams,
     OptionalVersionedTextDocumentIdentifier, Position, TextDocumentContentChangeEvent, PositionEncodingKind, Range, Registration,
     ServerCapabilities, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
@@ -242,6 +245,10 @@ pub struct Backend {
     pub can_refresh_hints: Arc<AtomicBool>,
     /// The client accepts `workspace/configuration`.
     pub can_pull_settings: Arc<AtomicBool>,
+    /// The client accepts versioned edits (`documentChanges`) in a workspace edit.
+    pub can_version_edits: Arc<AtomicBool>,
+    /// The client offered UTF-8 positions, and the server chose them.
+    pub utf8: Arc<AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -268,7 +275,17 @@ impl LanguageServer for Backend {
                 .store(refresh == Some(true), Ordering::Relaxed);
             self.can_pull_settings
                 .store(ws.configuration == Some(true), Ordering::Relaxed);
+            let versioned = ws.workspace_edit.as_ref().and_then(|c| c.document_changes);
+            self.can_version_edits
+                .store(versioned == Some(true), Ordering::Relaxed);
         }
+        let utf8 = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+            .is_some_and(|kinds| kinds.contains(&PositionEncodingKind::UTF8));
+        self.utf8.store(utf8, Ordering::Relaxed);
 
         if let Some(opts) = params.initialization_options.as_ref() {
             *self.settings.write().await = Settings::default().updated(opts);
@@ -276,7 +293,11 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                position_encoding: Some(PositionEncodingKind::UTF16),
+                position_encoding: Some(if utf8 {
+                    PositionEncodingKind::UTF8
+                } else {
+                    PositionEncodingKind::UTF16
+                }),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -288,6 +309,12 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
@@ -467,6 +494,84 @@ impl LanguageServer for Backend {
         self.on_goto_definition(&uri, &position).await
     }
 
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        let skip = usize::from(!params.context.include_declaration);
+        Ok(Some(
+            dim.sites[skip..]
+                .iter()
+                .map(|r| Location::new(uri.clone(), lines.range(*r)))
+                .collect(),
+        ))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            dim.sites
+                .iter()
+                .map(|r| DocumentHighlight {
+                    range: lines.range(*r),
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect(),
+        ))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let Some(cached) = self.get_current_analysis(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        Ok(dimension_at(&cached.analysis.scopes, &lines, &params.position)
+            .map(|dim| PrepareRenameResponse::Range(lines.range(dim.current))))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(cached) = self.get_current_analysis(&uri).await else {
+            return Ok(None);
+        };
+        let lines = cached.lines(self.encoding());
+        let Some(dim) = dimension_at(&cached.analysis.scopes, &lines, &position) else {
+            return Ok(None);
+        };
+        let new_name = params.new_name;
+        if let Some(reason) = rename_error(&dim, &new_name) {
+            return Err(Error::invalid_params(reason));
+        }
+        let edits = dim
+            .sites
+            .iter()
+            .map(|r| TextEdit::new(lines.range(*r), new_name.clone()))
+            .collect();
+        let versioned = self.can_version_edits.load(Ordering::Relaxed);
+        Ok(Some(workspace_edit(&uri, versioned.then_some(cached.version), edits)))
+    }
+
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let Some(cached) = self.get_current_analysis(&uri).await else {
@@ -485,7 +590,11 @@ impl LanguageServer for Backend {
 
 impl Backend {
     fn encoding(&self) -> Encoding {
-        Encoding::Utf16
+        if self.utf8.load(Ordering::Relaxed) {
+            Encoding::Utf8
+        } else {
+            Encoding::Utf16
+        }
     }
 
     fn document(&self, uri: &Url) -> Option<Document> {
@@ -1253,11 +1362,25 @@ fn is_symbolic_dimension(value: &str) -> bool {
         && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
-fn find_dimension_definition(
+/// A symbolic dimension name in an annotation string and every annotation
+/// site of the same name in its function scope.
+struct DimensionName {
+    value: String,
+    /// The site under the cursor.
+    current: tree_sitter::Range,
+    /// All sites, in source order. The first is the definition.
+    sites: Vec<tree_sitter::Range>,
+    /// The other dimension names of the scope.
+    others: HashSet<String>,
+    /// A dimension expression of the scope (`n*2`, `*n`) reads the name.
+    in_expression: bool,
+}
+
+fn dimension_at(
     scopes: &[ndim_lsp::FunctionShapeScope],
     lines: &Lines,
     position: &Position,
-) -> Option<tree_sitter::Range> {
+) -> Option<DimensionName> {
     let byte = lines.offset(position)?;
     let scope = ndim_lsp::scope_for_byte(scopes, byte)?;
     let current = scope
@@ -1267,12 +1390,77 @@ fn find_dimension_definition(
     if !is_symbolic_dimension(&current.value) {
         return None;
     }
-    scope
+    let mut sites: Vec<_> = scope
         .dimension_sites
         .iter()
         .filter(|site| site.value == current.value)
-        .min_by_key(|site| site.range.start_byte)
         .map(|site| site.range)
+        .collect();
+    sites.sort_by_key(|r| r.start_byte);
+    sites.dedup_by_key(|r| r.start_byte);
+    let in_expression = scope.dimension_sites.iter().any(|site| {
+        site.value != current.value
+            && site
+                .value
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == current.value)
+    });
+    Some(DimensionName {
+        in_expression,
+        value: current.value.clone(),
+        current: current.range,
+        sites,
+        others: scope
+            .dimension_sites
+            .iter()
+            .filter(|site| site.value != current.value)
+            .map(|site| site.value.clone())
+            .collect(),
+    })
+}
+
+fn find_dimension_definition(
+    scopes: &[ndim_lsp::FunctionShapeScope],
+    lines: &Lines,
+    position: &Position,
+) -> Option<tree_sitter::Range> {
+    dimension_at(scopes, lines, position).map(|dim| dim.sites[0])
+}
+
+/// Why `dim` cannot get the name `new_name`, or `None` if it can. The new name
+/// must be a simple dimension name, keep a leading `_` (an unchecked
+/// dimension) as it was, and not merge with another name of the scope.
+fn rename_error(dim: &DimensionName, new_name: &str) -> Option<String> {
+    if !is_symbolic_dimension(new_name) || new_name == "_" {
+        return Some(format!("`{new_name}` is not a simple dimension name"));
+    }
+    if new_name.starts_with('_') != dim.value.starts_with('_') {
+        return Some("a leading `_` marks an unchecked dimension: keep it as it is".to_string());
+    }
+    if dim.in_expression {
+        return Some(format!("`{}` is used in a dimension expression", dim.value));
+    }
+    if dim.others.contains(new_name) {
+        return Some(format!("`{new_name}` is already a dimension in this function"));
+    }
+    None
+}
+
+/// Edits of one document, versioned if `version` is set.
+fn workspace_edit(uri: &Url, version: Option<i32>, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    match version {
+        Some(version) => WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }])),
+            ..Default::default()
+        },
+        None => WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), edits)])),
+            ..Default::default()
+        },
+    }
 }
 
 fn position_is_before_or_equal(left: &Position, right: &Position) -> bool {
@@ -1324,13 +1512,7 @@ fn transpose_quick_fixes(
             },
             new_text: ".T".to_string(),
         };
-        let workspace_edit = WorkspaceEdit {
-            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
-                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
-                edits: vec![OneOf::Left(edit)],
-            }])),
-            ..Default::default()
-        };
+        let workspace_edit = workspace_edit(uri, Some(version), vec![edit]);
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
             title: "Append .T to the right operand".to_string(),
             kind: Some(CodeActionKind::QUICKFIX),
@@ -1444,9 +1626,17 @@ fn shape_error_to_diagnostic(
         } else {
             format!("{}: {}", error.variable, error.message)
         },
-        code: None,
+        code: Some(NumberOrString::String(error_code(error.kind).to_string())),
         related_information,
         ..Default::default()
+    }
+}
+
+/// A stable diagnostic code for each kind of shape error.
+fn error_code(kind: ShapeErrorKind) -> &'static str {
+    match kind {
+        ShapeErrorKind::Mismatch => "shape-mismatch",
+        ShapeErrorKind::Approximation => "shape-approximation",
     }
 }
 
@@ -1665,6 +1855,8 @@ fn new_backend(client: Client) -> Backend {
         can_watch_files: Default::default(),
         can_refresh_hints: Default::default(),
         can_pull_settings: Default::default(),
+        can_version_edits: Default::default(),
+        utf8: Default::default(),
     }
 }
 
