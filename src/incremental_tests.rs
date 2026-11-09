@@ -396,9 +396,12 @@ mod resolution {
     fn a_unit_that_ran_during_a_drop_is_not_kept() {
         let s = setup();
         let path = s.tmp.path().join("mymod.py");
-        // The cache holds `Block`, so the unit takes it from there and then
-        // reads the helper, which an editor event changes at that moment.
-        checked_run("warm", &UnitMemo::default(), MAIN, &s.roots, &s.cache);
+        // The cache holds `Block` but not its signature, so the unit takes it
+        // from there and then reads the helper, which an editor event changes
+        // at that moment.
+        let block = crate::types::ResolvedTarget { dots: 0, parts: vec!["mymod".into(), "Block".into()] };
+        let read = |p: &PathBuf| fs::read_to_string(p).ok();
+        crate::resolution::resolve_implementation(block, &s.roots, read, 8, Some(&s.cache)).unwrap();
         let dropper = |p: &PathBuf| {
             fs::write(
                 &path,

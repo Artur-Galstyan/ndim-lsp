@@ -12,7 +12,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::python_ast::{
     extract_call_arguments, extract_callable_signature, extract_jaxtyping_shapes,
-    find_top_level_symbol,
+    binds_name, find_top_level_symbol, undecorated,
 };
 use crate::types::*;
 
@@ -48,7 +48,10 @@ pub struct ResolutionCache {
     /// the function but no matching jaxtyping scope, so repeat calls to an
     /// unannotated cross-file helper don't re-parse the file.
     pub signatures: std::sync::RwLock<HashMap<(PathBuf, String), Option<FunctionShapeScope>>>,
-    /// Lock order: `tracked`, then `map`, then `signatures`.
+    /// The parameters of each class or function, per file and symbol (see
+    /// `callable_signature`).
+    callables: std::sync::RwLock<HashMap<(PathBuf, String), Option<PythonCallableSignature>>>,
+    /// Lock order: `tracked`, then `map`, then `signatures`, then `callables`.
     tracked: std::sync::RwLock<Tracked>,
     /// Disk state of each path an editor event already dropped entries for,
     /// so a second event for the same change does not drop them again.
@@ -93,6 +96,10 @@ const MAX_MODULE_PROBES: usize = 512;
 /// Parsed files kept at most. The map is emptied when it is full.
 const MAX_PARSED_FILES: usize = 128;
 
+/// Handled editor events kept at most. The map is emptied when it is full:
+/// a second event for a forgotten change then drops entries once more.
+const MAX_HANDLED_EVENTS: usize = 4096;
+
 #[derive(Default)]
 struct Tracked {
     stamps: HashMap<PathBuf, Stamp>,
@@ -101,7 +108,8 @@ struct Tracked {
     /// The file each `signatures` entry was read from.
     signature_files: HashMap<(PathBuf, String), PathBuf>,
     /// Number of times `revalidate` marked each path stale. A path never
-    /// marked has generation 0. Kept across `clear`.
+    /// marked has generation 0. `clear` empties it: the clear count makes
+    /// every older `Deps` invalid.
     generations: HashMap<PathBuf, u64>,
     /// Number of times the whole cache was cleared.
     clears: u64,
@@ -130,6 +138,49 @@ struct Touches {
 
 thread_local! {
     static TOUCHES: RefCell<Option<Touches>> = const { RefCell::new(None) };
+    /// The file of the document under analysis, for its relative imports.
+    static DOCUMENT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `document` as the file whose relative imports resolve. With
+/// `None` (an untitled buffer, or a nested analysis of another file) a
+/// relative import resolves to nothing.
+pub fn with_document<T>(document: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+    struct Put(Option<PathBuf>);
+    impl Drop for Put {
+        fn drop(&mut self) {
+            DOCUMENT.with(|d| *d.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Put(DOCUMENT.with(|d| d.replace(document.map(std::path::Path::to_path_buf))));
+    f()
+}
+
+/// A relative target of the document as an absolute one, with the roots to
+/// look it up in. The import names a file next to the document, so its
+/// package is the directory of the document, `dots - 1` levels up. The module
+/// path starts at the longest search root above that package, or else at the
+/// package's parent, which then comes first among the roots.
+fn from_document(target: &ResolvedTarget, search_roots: &[PathBuf]) -> Option<(ResolvedTarget, Vec<PathBuf>)> {
+    let document = DOCUMENT.with(|d| d.borrow().clone())?;
+    let mut package = document.parent()?;
+    for _ in 1..target.dots {
+        package = package.parent()?;
+    }
+    let root = search_roots
+        .iter()
+        .filter(|root| package.starts_with(root) && package != root.as_path())
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .or_else(|| package.parent().map(std::path::Path::to_path_buf))?;
+    let mut parts = Vec::new();
+    for part in package.strip_prefix(&root).ok()?.components() {
+        parts.push(part.as_os_str().to_str()?.to_string());
+    }
+    parts.extend(target.parts.iter().cloned());
+    let mut roots = vec![root.clone()];
+    roots.extend(search_roots.iter().filter(|r| **r != root).cloned());
+    Some((ResolvedTarget { dots: 0, parts }, roots))
 }
 
 /// Puts back the recording that was active before a nested one, also when
@@ -199,6 +250,9 @@ impl ResolutionCache {
             for p in changed.iter().filter(|p| tracked.stamps.contains_key(*p)) {
                 let now = stamp_of(p);
                 if handled.get(p) != Some(&now) {
+                    if handled.len() >= MAX_HANDLED_EVENTS {
+                        handled.clear();
+                    }
                     handled.insert(p.clone(), now);
                     stale.insert(p.clone());
                 }
@@ -239,6 +293,7 @@ impl ResolutionCache {
             }
             keep
         });
+        self.callables.write().unwrap().retain(|(file, _), _| !stale.contains(file));
         self.parsed.lock().unwrap().retain(|p, _| !stale.contains(p));
         tracked.stamps.retain(|p, _| !stale.contains(p));
         true
@@ -347,14 +402,14 @@ impl ResolutionCache {
     fn clear(&self) {
         let mut tracked = self.tracked.write().unwrap();
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        let (generations, clears) = (std::mem::take(&mut tracked.generations), tracked.clears + 1);
         *tracked = Tracked {
-            generations,
-            clears,
+            clears: tracked.clears + 1,
             ..Tracked::default()
         };
+        self.handled_events.lock().unwrap().clear();
         self.map.write().unwrap().clear();
         self.signatures.write().unwrap().clear();
+        self.callables.write().unwrap().clear();
         self.parsed.lock().unwrap().clear();
         self.module_probes.lock().unwrap().clear();
         self.class_sources.lock().unwrap().clear();
@@ -378,6 +433,7 @@ pub fn new_resolution_cache() -> Arc<ResolutionCache> {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         map: std::sync::RwLock::new(HashMap::new()),
         signatures: std::sync::RwLock::new(HashMap::new()),
+        callables: std::sync::RwLock::new(HashMap::new()),
         tracked: std::sync::RwLock::new(Tracked::default()),
         handled_events: std::sync::Mutex::new(HashMap::new()),
         epoch: AtomicU64::new(0),
@@ -420,16 +476,17 @@ fn resolve_module_probing(
     if module.is_empty() {
         return None;
     }
+    // CPython takes a package directory before a module file of one name.
     for root in search_roots {
         let module_path = root.join(module.join("/"));
-        let file_path = module_path.with_extension("py");
-        if probe(&file_path, probes) {
-            return Some(file_path);
-        }
-
         let package_path = module_path.join("__init__.py");
         if probe(&package_path, probes) {
             return Some(package_path);
+        }
+
+        let file_path = module_path.with_extension("py");
+        if probe(&file_path, probes) {
+            return Some(file_path);
         }
     }
     None
@@ -476,14 +533,25 @@ pub fn resolve_target_on_disk(
     target: &ResolvedTarget,
     search_roots: &[PathBuf],
 ) -> Option<ResolvedModuleTarget> {
-    resolve_target_probing(target, search_roots, &mut Vec::new())
+    let read = |path: &PathBuf| std::fs::read_to_string(path).ok();
+    resolve_target_probing(target, search_roots, &read, None, &mut Vec::new())
 }
 
-fn resolve_target_probing(
+/// The longest prefix of `target` that is a module. A submodule `a.b` is also
+/// the attribute `b` of `a` that the package's `__init__.py` may bind to
+/// something else. Which one wins depends on the order of imports at run
+/// time, so a package that binds the name to anything but the submodule
+/// gives no module.
+fn resolve_target_probing<F>(
     target: &ResolvedTarget,
     search_roots: &[PathBuf],
+    read_file: &F,
+    cache: Option<&ResolutionCache>,
     probes: &mut Probes,
-) -> Option<ResolvedModuleTarget> {
+) -> Option<ResolvedModuleTarget>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
     if target.dots > 0 || target.parts.is_empty() {
         return None;
     }
@@ -493,6 +561,9 @@ fn resolve_target_probing(
         let symbol_parts = &target.parts[len..];
 
         if let Some(file_path) = resolve_module_probing(module_parts, search_roots, probes) {
+            if !submodule_unshadowed(&file_path, module_parts, read_file, cache, probes) {
+                return None;
+            }
             return Some(ResolvedModuleTarget {
                 dots: target.dots,
                 module_parts: module_parts.to_vec(),
@@ -503,6 +574,53 @@ fn resolve_target_probing(
     }
 
     None
+}
+
+/// Whether no `__init__.py` above the module `file_path` binds the next part
+/// of `module_parts` to anything but that submodule.
+fn submodule_unshadowed<F>(
+    file_path: &std::path::Path,
+    module_parts: &[String],
+    read_file: &F,
+    cache: Option<&ResolutionCache>,
+    probes: &mut Probes,
+) -> bool
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let mut dir = file_path.parent();
+    if file_path.file_name().is_some_and(|name| name == "__init__.py") {
+        dir = dir.and_then(|d| d.parent());
+    }
+    for len in (2..=module_parts.len()).rev() {
+        let Some(package_dir) = dir else {
+            return false;
+        };
+        dir = package_dir.parent();
+        let init = package_dir.join("__init__.py");
+        if !probe(&init, probes) {
+            continue;
+        }
+        let Some(text) = read_file(&init) else {
+            return false;
+        };
+        let Ok(tree) = parse_implementation(cache, &init, &text) else {
+            return false;
+        };
+        let name = &module_parts[len - 1];
+        let package = &module_parts[..len - 1];
+        match binds_name(tree.root_node(), &text, name) {
+            Ok(false) => {}
+            Ok(true) => match find_top_level_symbol(tree.root_node(), &text, name) {
+                Ok(Some(PythonSymbol::Import { path, .. }))
+                    if resolve_import_path_from_package(package, &path)
+                        .is_some_and(|t| t.parts == module_parts[..len]) => {}
+                _ => return false,
+            },
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 pub fn resolve_import_path_from_package(
@@ -539,6 +657,17 @@ pub fn follow_import_symbol_once(
             resolve_import_path_from_package(current_package_parts, path)
         }
         PythonSymbol::Class { .. } | PythonSymbol::Function { .. } => None,
+    }
+}
+
+/// The package that a relative import in the module of `target` starts from:
+/// the module itself for an `__init__.py`, else the module's parent.
+fn package_of(target: &ResolvedModuleTarget) -> &[String] {
+    let parts = &target.module_parts;
+    if target.file_path.file_name().is_some_and(|name| name == "__init__.py") {
+        parts
+    } else {
+        &parts[..parts.len().saturating_sub(1)]
     }
 }
 
@@ -583,6 +712,12 @@ pub fn resolve_implementation<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    if start.dots > 0 {
+        let Some((start, roots)) = from_document(&start, search_roots) else {
+            return Ok(None);
+        };
+        return resolve_implementation(start, &roots, read_file, max_depth, cache);
+    }
     let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
     // Cache lookup — only for absolute (dots==0) targets with non-empty parts.
     if start.dots == 0
@@ -611,14 +746,15 @@ where
 
     let mut visited = HashSet::new();
     let mut probes = Probes::new();
-    let mut unreadable = false;
 
     let result = (|| {
         for _ in 0..max_depth {
             if !visited.insert(current.parts.clone()) {
                 return Ok(None);
             }
-            let Some(resolved) = resolve_target_probing(&current, search_roots, &mut probes) else {
+            let Some(resolved) =
+                resolve_target_probing(&current, search_roots, &read_file, cache, &mut probes)
+            else {
                 return Ok(None);
             };
 
@@ -629,8 +765,9 @@ where
                 }));
             }
 
+            // A file that cannot be read (not UTF-8) gives no symbol until
+            // its stamp changes.
             let Some(text) = read_file(&resolved.file_path) else {
-                unreadable = true;
                 return Ok(None);
             };
 
@@ -652,7 +789,7 @@ where
                     }));
                 }
                 PythonSymbol::Import { .. } => {
-                    let Some(mut next) = follow_import_symbol_once(&resolved.module_parts, &symbol) else {
+                    let Some(mut next) = follow_import_symbol_once(package_of(&resolved), &symbol) else {
                         return Ok(None);
                     };
                     next.parts.extend(resolved.symbol_parts.iter().skip(1).cloned());
@@ -664,11 +801,10 @@ where
         Ok(None)
     })();
 
-    // Cache insert — absolute targets only, found or not found. A read that
-    // failed may succeed later, and an error is not a resolution result.
+    // Cache insert — absolute targets only, found or not found. An error is
+    // not a resolution result.
     if start.dots == 0
         && !start.parts.is_empty()
-        && !unreadable
         && let (Some(cache), Ok(resolved)) = (cache, &result)
     {
         let fingerprint = search_roots_fingerprint(search_roots);
@@ -741,19 +877,8 @@ where
     let Some(symbol) = &implementation.symbol else {
         return Ok(None);
     };
-
-    let Some(implementation_text) = read_file(&implementation.target.file_path) else {
-        return Ok(None);
-    };
-
-    let implementation_tree =
-        parse_implementation(cache, &implementation.target.file_path, &implementation_text)?;
-
-    let Some(signature) = extract_callable_signature(
-        implementation_tree.root_node(),
-        &implementation_text,
-        symbol,
-    )?
+    let Some(signature) =
+        callable_signature(&implementation.target.file_path, symbol, &read_file, cache)?
     else {
         return Ok(None);
     };
@@ -780,7 +905,9 @@ where
     };
 
     let arguments = extract_call_arguments(args_node, source_text)?;
-    let bindings = bind_call_arguments(&signature, &arguments);
+    let Some(bindings) = bind_call_arguments(&signature, &arguments) else {
+        return Ok(None);
+    };
 
     Ok(Some(ResolvedCallSignature {
         implementation,
@@ -788,6 +915,45 @@ where
         arguments,
         bindings,
     }))
+}
+
+/// The parameters of `symbol` in `file`, kept in the cache under the stamp
+/// of the file.
+fn callable_signature<F>(
+    file: &std::path::Path,
+    symbol: &PythonSymbol,
+    read_file: &F,
+    cache: Option<&ResolutionCache>,
+) -> Result<Option<PythonCallableSignature>, String>
+where
+    F: Fn(&PathBuf) -> Option<String>,
+{
+    let name = match symbol {
+        PythonSymbol::Class { name } => format!("class {name}"),
+        PythonSymbol::Function { name } => format!("def {name}"),
+        PythonSymbol::Import { .. } => return Ok(None),
+    };
+    let key = (file.to_path_buf(), name);
+    if let Some(cache) = cache
+        && let Some(found) = cache.callables.read().unwrap().get(&key)
+    {
+        return Ok(found.clone());
+    }
+    let epoch = cache.map_or(0, |c| c.epoch.load(Ordering::SeqCst));
+    let stamp = stamp_of(file);
+    let Some(text) = read_file(&key.0) else {
+        return Ok(None);
+    };
+    let tree = parse_implementation(cache, file, &text)?;
+    let found = extract_callable_signature(tree.root_node(), &text, symbol)?;
+    if let Some(cache) = cache {
+        let mut tracked = cache.tracked.write().unwrap();
+        if cache.epoch.load(Ordering::SeqCst) == epoch {
+            tracked.add_stamps(&vec![(key.0.clone(), stamp)]);
+            cache.callables.write().unwrap().insert(key, found.clone());
+        }
+    }
+    Ok(found)
 }
 
 /// Resolve `target` as an imported free function and extract its jaxtyping
@@ -843,7 +1009,7 @@ where
 
     let scopes = extract_jaxtyping_shapes(tree.root_node(), &text)?;
     let root = tree.root_node();
-    let definition = root.named_children(&mut root.walk()).find(|node| {
+    let definition = root.named_children(&mut root.walk()).map(undecorated).find(|node| {
         node.kind() == "function_definition"
             && node.child_by_field_name("name").is_some_and(|n| text[n.byte_range()] == **name)
     });
@@ -869,35 +1035,45 @@ where
     Ok(found)
 }
 
+/// The argument of each parameter that a call binds. `params` marks a bare
+/// `*` and `/`, and a splat parameter with its stars. A splat in the call
+/// can fill any parameter, so it gives `None`.
 pub fn bind_call_arguments(
     signature: &PythonCallableSignature,
     args: &[CallArgument],
-) -> HashMap<String, String> {
+) -> Option<HashMap<String, String>> {
     let mut params = signature.params.as_slice();
     if signature.owner.is_some()
         && matches!(params.first(), Some(first) if first == "self" || first == "cls")
     {
         params = &params[1..];
     }
+    let star = params.iter().position(|p| p.starts_with('*')).unwrap_or(params.len());
+    let slash = params.iter().position(|p| p == "/");
+    let positional: Vec<&String> = params[..star].iter().filter(|p| *p != "/").collect();
+    let positional_only = &params[..slash.unwrap_or(0)];
 
     let mut bindings = HashMap::new();
     let mut positional_index = 0;
 
     for arg in args {
         match arg {
+            CallArgument::Positional { value } if value.starts_with('*') => return None,
             CallArgument::Positional { value } => {
-                if let Some(param) = params.get(positional_index) {
+                if let Some(param) = positional.get(positional_index) {
                     bindings.insert((*param).clone(), value.clone());
                 }
                 positional_index += 1;
             }
             CallArgument::Keyword { name, value } => {
-                bindings.insert(name.clone(), value.clone());
+                if !positional_only.contains(name) {
+                    bindings.insert(name.clone(), value.clone());
+                }
             }
         }
     }
 
-    bindings
+    Some(bindings)
 }
 
 #[cfg(test)]
@@ -1210,6 +1386,86 @@ mod resolve_implementation_tests {
         );
     }
 
+    /// Writes `files` to a root, resolves `target` there, and gives the file
+    /// relative to the root and the symbol.
+    fn resolve_in(files: &[(&str, &str)], target: &[&str]) -> Option<(String, Option<PythonSymbol>)> {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = tmp.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let roots = vec![tmp.path().to_path_buf()];
+        let found = resolve_implementation(self::target(target), &roots, read, 10, None).unwrap()?;
+        let file = found.target.file_path.strip_prefix(tmp.path()).unwrap();
+        Some((file.to_string_lossy().into_owned(), found.symbol))
+    }
+
+    #[test]
+    fn test_resolves_like_python() {
+        let function = |name: &str| Some(PythonSymbol::Function { name: name.to_string() });
+        let class = |name: &str| Some(PythonSymbol::Class { name: name.to_string() });
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str], Option<(&'a str, Option<PythonSymbol>)>);
+        let cases: &[Case] = &[
+            // A relative import of a plain module starts from its package.
+            (
+                &[("pkg/__init__.py", ""), ("pkg/mod.py", "from .x import y"), ("pkg/x.py", "def y(): pass")],
+                &["pkg", "mod", "y"],
+                Some(("pkg/x.py", function("y"))),
+            ),
+            (
+                &[("pkg/sub/mod.py", "from ..x import y"), ("pkg/x.py", "def y(): pass")],
+                &["pkg", "sub", "mod", "y"],
+                Some(("pkg/x.py", function("y"))),
+            ),
+            // A decorated definition is found.
+            (&[("lib.py", "import jax\n@jax.jit\ndef f(x): pass")], &["lib", "f"], Some(("lib.py", function("f")))),
+            (&[("lib.py", "@dataclass\nclass C:\n    x: int")], &["lib", "C"], Some(("lib.py", class("C")))),
+            // CPython takes the package directory before the module file.
+            (
+                &[("foo.py", "def f(): pass"), ("foo/__init__.py", "def g(): pass")],
+                &["foo", "g"],
+                Some(("foo/__init__.py", function("g"))),
+            ),
+            (&[("foo.py", "def f(): pass"), ("foo/__init__.py", "def g(): pass")], &["foo", "f"], None),
+            // A package that binds the name of a submodule to something else.
+            (
+                &[
+                    ("pkg/__init__.py", "from .impl import attention"),
+                    ("pkg/impl.py", "def attention(): pass"),
+                    ("pkg/attention.py", "def f(): pass"),
+                ],
+                &["pkg", "attention", "f"],
+                None,
+            ),
+            (
+                &[("pkg/__init__.py", "attention = 1"), ("pkg/attention.py", "def f(): pass")],
+                &["pkg", "attention"],
+                None,
+            ),
+            (
+                &[("pkg/__init__.py", "from . import attention"), ("pkg/attention.py", "def f(): pass")],
+                &["pkg", "attention", "f"],
+                Some(("pkg/attention.py", function("f"))),
+            ),
+            (
+                &[("pkg/__init__.py", "from .attention import f"), ("pkg/attention.py", "def f(): pass")],
+                &["pkg", "attention", "f"],
+                Some(("pkg/attention.py", function("f"))),
+            ),
+            // `import a.b` and `import a.c` bind `a` once.
+            (
+                &[("lib.py", "import a.b\nimport a.c"), ("a/__init__.py", "def f(): pass")],
+                &["lib", "a", "f"],
+                Some(("a/__init__.py", function("f"))),
+            ),
+        ];
+        for (files, target, expected) in cases {
+            let expected = expected.clone().map(|(file, symbol)| (file.to_string(), symbol));
+            assert_eq!(resolve_in(files, target), expected, "{target:?} in {files:?}");
+        }
+    }
+
     #[test]
     fn test_cycle_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1395,7 +1651,7 @@ mod resolve_python_module_on_disk_tests {
     }
 
     #[test]
-    fn test_module_file_wins_over_package_init() {
+    fn test_package_init_wins_over_module_file() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("foo/bar")).unwrap();
         fs::write(tmp.path().join("foo/bar.py"), "").unwrap();
@@ -1404,7 +1660,7 @@ mod resolve_python_module_on_disk_tests {
         let roots = vec![tmp.path().to_path_buf()];
         let found = resolve_python_module_on_disk(&parts(&["foo", "bar"]), &roots);
 
-        assert_eq!(found, Some(tmp.path().join("foo/bar.py")));
+        assert_eq!(found, Some(tmp.path().join("foo/bar/__init__.py")));
     }
 
     #[test]
@@ -1704,6 +1960,50 @@ mod resolution_cache_tests {
         assert_eq!(cache.map.read().unwrap().len(), 1);
     }
 
+    /// A second lookup of a constructor signature, or of a file that is not
+    /// UTF-8, reads nothing until the file changes.
+    #[test]
+    fn test_cache_hit_reads_no_signature_and_no_unreadable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/linear.py"), "class Linear:\n    def __init__(self, a): pass").unwrap();
+        fs::write(tmp.path().join("pkg/binary.py"), [0xff, 0xfe, 0x00]).unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let read_count = AtomicUsize::new(0);
+        let read = |path: &PathBuf| {
+            read_count.fetch_add(1, Ordering::Relaxed);
+            fs::read_to_string(path).ok()
+        };
+        let code = "x = Linear(3)";
+        let call = CallInfo {
+            variable: "x".to_string(),
+            target: "Linear".to_string(),
+            args_node_range: tree_sitter::Range {
+                start_byte: 10,
+                end_byte: 13,
+                start_point: tree_sitter::Point { row: 0, column: 10 },
+                end_point: tree_sitter::Point { row: 0, column: 13 },
+            },
+        };
+        let imports = HashMap::from([(
+            "Linear".to_string(),
+            ImportPath { dots: 0, module: parts(&["pkg", "linear"]), name: "Linear".to_string() },
+        )]);
+        let cache = new_resolution_cache();
+        for round in 0..3 {
+            if round == 2 {
+                fs::write(tmp.path().join("pkg/binary.py"), "class B: pass").unwrap();
+                cache.revalidate(&[tmp.path().join("pkg/binary.py")]);
+            }
+            read_count.store(0, Ordering::Relaxed);
+            let found = resolve_call_signature(&call, code, &imports, &roots, read, 5, Some(&cache)).unwrap();
+            assert_eq!(found.unwrap().bindings.get("a"), Some(&"3".to_string()));
+            let binary = resolve_implementation(target(&["pkg", "binary", "B"]), &roots, read, 5, Some(&cache));
+            assert_eq!(binary.unwrap().is_some(), round == 2);
+            assert_eq!(read_count.load(Ordering::Relaxed), if round == 1 { 0 } else { 3 - round }, "round {round}");
+        }
+    }
+
     #[test]
     fn test_cache_stats_track_hits_and_misses() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1819,9 +2119,13 @@ mod resolution_cache_tests {
                 symbol: None,
             }),
         );
+        cache.tracked.write().unwrap().generations.insert(PathBuf::from("fake.py"), 1);
+        cache.handled_events.lock().unwrap().insert(PathBuf::from("fake.py"), None);
         assert_eq!(cache.map.read().unwrap().len(), 1);
         clear_resolution_cache(&cache);
         assert_eq!(cache.map.read().unwrap().len(), 0);
+        assert!(cache.tracked.read().unwrap().generations.is_empty());
+        assert!(cache.handled_events.lock().unwrap().is_empty());
     }
 
     #[test]

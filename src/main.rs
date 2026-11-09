@@ -27,7 +27,7 @@ use tree_sitter::{Parser, Tree};
 use ndim_lsp::{
     LayerShapeAnalysis, ResolutionCache, ShapeError, ShapeErrorKind, UnitMemo,
     analyze_layer_shapes, analyze_layer_shapes_with_memo, clear_resolution_cache,
-    first_analysis_difference, first_tree_difference, new_resolution_cache, reparse,
+    first_analysis_difference, first_tree_difference, new_resolution_cache, reparse, with_document,
 };
 
 mod sync;
@@ -719,8 +719,11 @@ impl Backend {
         let text = doc.text.clone();
         let base = self.documents.read().unwrap().get(&uri).and_then(|s| s.committed.clone());
         let had_base = base.is_some();
+        let document = uri.to_file_path().ok();
         let run = tokio::task::spawn_blocking(move || {
-            compute_analysis(&text, base.as_ref(), &roots, &resolution_cache)
+            with_document(document.as_deref(), || {
+                compute_analysis(&text, base.as_ref(), &roots, &resolution_cache)
+            })
         })
         .await;
 
