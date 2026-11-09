@@ -368,11 +368,10 @@ fn visit_try<'t>(node: Node<'t>, src: &Source, out: &mut Vec<Marked<'t>>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "finally_clause" {
-            for (lhs, _, _) in collect_assignment_items(child, text).unwrap_or_default() {
-                finally_writes.extend(written_names(&lhs).into_iter().map(str::to_string));
-            }
+            finally_writes.extend(binders(child, text, true).into_keys());
         }
     }
+    finally_writes.sort_unstable();
     push(
         out,
         node.start_byte(),

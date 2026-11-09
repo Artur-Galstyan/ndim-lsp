@@ -187,6 +187,15 @@ where
         hierarchy,
         plan,
     } = pre;
+    // An annotation dim with the text of a mark would read as marked. The
+    // probe function writes marked dims of the caller on purpose.
+    for scope in scopes.iter_mut().filter(|s| s.function_name.as_deref() != Some(modules::PROBE_FUNCTION)) {
+        for dim in scope.shapes.values_mut().chain(scope.return_shape.as_mut()).flatten() {
+            if has_mark(dim) {
+                *dim = if is_variadic_dim(dim) { "...".to_string() } else { UNKNOWN_DIM.to_string() };
+            }
+        }
+    }
     let pass = PassInput {
         node,
         text,
@@ -619,6 +628,7 @@ impl ScopeLinks<'_> {
 }
 
 struct ScopeLevel<'c> {
+    scope: usize,
     shapes: &'c HashMap<String, Vec<String>>,
     synthetics: Option<&'c HashMap<String, Vec<String>>>,
     locals: &'c HashSet<String>,
@@ -649,11 +659,13 @@ impl ShapeLookup for ScopeShapes<'_> {
             if level.poisoned.contains(name) {
                 return None;
             }
-            if let Some(shape) = level
-                .shapes
-                .get(name)
-                .or_else(|| level.synthetics?.get(name))
-            {
+            if let Some(shape) = level.shapes.get(name) {
+                // A tuple carry is no array.
+                let carry = !ctx.tuple_carries.is_empty()
+                    && ctx.tuple_carries.contains(&(level.scope, name.to_string()));
+                return (!carry).then_some(shape);
+            }
+            if let Some(shape) = level.synthetics.and_then(|s| s.get(name)) {
                 return Some(shape);
             }
             if level.locals.contains(name) {
@@ -735,7 +747,7 @@ impl<'a> ShapeCtx<'a> {
     /// the file does not give, so the error is not proven.
     fn report(&mut self, error: ShapeError) {
         if !self.reads_variadic_dim(error.range) {
-            self.errors.push(error);
+            self.push_error(error);
         }
     }
 
@@ -745,8 +757,41 @@ impl<'a> ShapeCtx<'a> {
         if error.message.contains("rank") || error.message.contains("at least") {
             self.report(error);
         } else {
-            self.errors.push(error);
+            self.push_error(error);
         }
+    }
+
+    /// Add `error` with the names its source reads (`ShapeError::reads`).
+    fn push_error(&mut self, mut error: ShapeError) {
+        if let Some(node) = self.error_source(error.range) {
+            let mut names = HashSet::new();
+            insert_value_names(node, self.text, &mut names);
+            let scope = self.links.scope_index.lookup(node.start_byte());
+            let mut reads: HashSet<String> = HashSet::new();
+            for name in &names {
+                if let Some(shape) = scope.and_then(|scope| self.resolve_shape(name, scope)) {
+                    reads.extend(
+                        shape.iter().flat_map(|dim| dim_symbols(dim)).map(|word| {
+                            word.strip_prefix(FREE_DIM).unwrap_or(word).to_string()
+                        }),
+                    );
+                }
+            }
+            reads.extend(names);
+            error.reads = reads.into_iter().collect();
+            error.reads.sort_unstable();
+        }
+        self.errors.push(error);
+    }
+
+    /// The node of the source of an error at `range`. The range of a method
+    /// call holds its arguments, not its receiver.
+    fn error_source(&self, range: tree_sitter::Range) -> Option<Node<'a>> {
+        let node = self.root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+        Some(match node.parent() {
+            Some(call) if node.kind() == "argument_list" => call,
+            _ => node,
+        })
     }
 
     /// The value of `result`. An error is reported as a mismatch of `variable`.
@@ -760,13 +805,8 @@ impl<'a> ShapeCtx<'a> {
     }
 
     fn reads_variadic_dim(&self, range: tree_sitter::Range) -> bool {
-        let Some(node) = self.root.descendant_for_byte_range(range.start_byte, range.end_byte) else {
+        let Some(node) = self.error_source(range) else {
             return false;
-        };
-        // The range of a method call holds its arguments, not its receiver.
-        let node = match node.parent() {
-            Some(call) if node.kind() == "argument_list" => call,
-            _ => node,
         };
         let mut names = HashSet::new();
         insert_identifiers(node, self.text, &mut names);
@@ -1128,7 +1168,11 @@ impl<'a> ShapeCtx<'a> {
     /// Fold the shape a module-level assignment of `name` just left into the
     /// record `module_global_shape` reads.
     fn note_module_write(&mut self, name: &str) {
-        let now = self.scopes[0].shapes.get(name).cloned();
+        let now = self.scopes[0]
+            .shapes
+            .get(name)
+            .filter(|_| !self.tuple_carries.contains(&(0, name.to_string())))
+            .cloned();
         let entry = self
             .module_writes
             .entry(name.to_string())
@@ -1219,6 +1263,13 @@ impl<'a> ShapeCtx<'a> {
             .contains(name)
     }
 
+    /// The element shape of the tuple carry `name`. `resolve_shape` gives no
+    /// shape for it, because a tuple is no array.
+    fn carry_element(&self, name: &str, scope_idx: usize) -> Option<Vec<String>> {
+        let key = (scope_idx, name.to_string());
+        self.tuple_carries.contains(&key).then(|| self.scopes[scope_idx].shapes.get(name).cloned())?
+    }
+
     /// Look up a shape by name in the given scope, checking both real
     /// user-visible shapes and the synthetic side-channel.
     fn resolve_shape(&self, name: &str, scope_idx: usize) -> Option<Vec<String>> {
@@ -1258,6 +1309,7 @@ impl<'a> ShapeCtx<'a> {
 
     fn scope_level(&self, scope_idx: usize) -> ScopeLevel<'_> {
         ScopeLevel {
+            scope: scope_idx,
             shapes: &self.scopes[scope_idx].shapes,
             synthetics: self.synthetics.get(&scope_idx),
             locals: &self.links.locals[scope_idx],
@@ -1310,7 +1362,6 @@ fn shape_of_expression_kind(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
         }
         "subscript" => shape_of_subscript(node, ctx),
         "binary_operator" => shape_of_binary_operator(node, ctx),
-        "tuple" => shape_of_tuple(node, ctx),
         _ => None,
     };
     let no_size = |dim: &String| dim.contains(UNPROVEN_DIM) || dim.parse::<i64>().is_ok_and(|size| size < 0);
@@ -1330,16 +1381,30 @@ fn shape_of_expression_kind(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
 /// `Rnn`/`RnnCell` arms, where every nested name shares one shape.
 /// Heterogeneous tuples aren't representable this way and stay `Ok(None)`.
 fn shape_of_tuple(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let scope_idx = ctx.links.scope_index.lookup(node.start_byte())?;
     let mut elems = Vec::with_capacity(node.named_child_count());
     for i in 0..node.named_child_count() {
         let child = node.named_child(i as u32)?;
-        elems.push(shape_of_expression(child, ctx)?);
+        elems.push(carry_shape(child, scope_idx, ctx)?);
     }
     let (first, rest) = elems.split_first()?;
     if rest.iter().all(|s| s == first) {
         Some(first.clone())
     } else {
         None
+    }
+}
+
+/// The shared element shape of a tuple carry (a tuple literal, or a name bound
+/// to one), else the shape of `node` as an array.
+fn carry_shape(node: Node, scope_idx: usize, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    match node.kind() {
+        "parenthesized_expression" => carry_shape(node.named_child(0)?, scope_idx, ctx),
+        "tuple" => shape_of_tuple(node, ctx),
+        "identifier" if is_tuple_value(node, scope_idx, ctx) => {
+            ctx.carry_element(node.utf8_text(ctx.text.as_bytes()).ok()?, scope_idx)
+        }
+        _ => shape_of_expression(node, ctx),
     }
 }
 
@@ -1923,7 +1988,8 @@ enum NameCheck {
 /// The result of `check` for a name, with the memo that keeps a chain such as
 /// `b = a + a; c = b + b` linear: each name runs its check one time. A name on
 /// `visiting` gives `on_cycle`. A result that used `on_cycle` depends on the
-/// path to it, so it stays out of the memo.
+/// path to it, so it stays out of the memo. A chain deeper than
+/// `MAX_EXPRESSION_DEPTH` gives `false`: not proven.
 fn checked_name(
     kind: NameCheck,
     key: (usize, String),
@@ -1935,6 +2001,13 @@ fn checked_name(
     if visiting.contains(&key) {
         ctx.name_cycle.set(true);
         return on_cycle;
+    }
+    // A chain of names deeper than an expression proves nothing, so that a
+    // long chain cannot use up the stack. The result depends on the path, so
+    // it stays out of the memo like a cycle.
+    if visiting.len() >= MAX_EXPRESSION_DEPTH {
+        ctx.name_cycle.set(true);
+        return false;
     }
     let memo_key = (kind, key.0, key.1.clone());
     if let Some(known) = ctx.name_checks.borrow().get(&memo_key) {
@@ -3054,7 +3127,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                     ShapeError::mismatch(target, message, args_node.range())
                 };
                 if joins_variadic_shape(&known, &args, &ctx.scope_shapes(scope_idx)) {
-                    ctx.errors.push(error);
+                    ctx.push_error(error);
                 } else {
                     ctx.report(error);
                 }
@@ -3171,6 +3244,25 @@ fn without_scalar_bounds(
         })
         .map(|(_, arg)| arg)
         .collect()
+}
+
+/// The names that `node` reads as values: no keyword of an argument and no
+/// attribute after a dot.
+fn insert_value_names(node: Node, text: &str, out: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        let parent = node.parent();
+        let field = |kind: &str, name: &str| {
+            parent.is_some_and(|p| p.kind() == kind && p.child_by_field_name(name).is_some_and(|c| c.id() == node.id()))
+        };
+        if !field("keyword_argument", "name") && !field("attribute", "attribute") {
+            out.insert(text[node.byte_range()].to_string());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        insert_value_names(child, text, out);
+    }
 }
 
 fn has_internal_name(text: &str) -> bool {
@@ -4516,6 +4608,10 @@ fn with_propagation<T>(
     };
 
     let result = body(&mut ctx)?;
+    // A tuple carry is no array, so a hover shows no shape for it.
+    for (scope, name) in std::mem::take(&mut ctx.tuple_carries) {
+        ctx.scopes[scope].shapes.remove(&name);
+    }
     Ok(((applications, errors, assignment_shapes), result))
 }
 
@@ -4526,9 +4622,7 @@ fn process_value_statements(statements: Vec<Node>, ctx: &mut ShapeCtx) {
         let _ = shape_of_expression(stmt, ctx);
         // Fix up error variable names: for return/yield/assert contexts,
         // there is no LHS variable, so set the variable name to empty.
-        for err in &mut ctx.errors[errors_before..] {
-            err.variable = String::new();
-        }
+        name_errors(ctx, errors_before, "");
     }
 }
 
@@ -4590,7 +4684,13 @@ fn process_assignment_item(lhs: Lhs, rhs_node: Node, assignment_node: Node, ctx:
     if in_class && scope != Some(0) {
         return;
     }
+    let errors_before = ctx.errors.len();
     process_assignment_item_inner(lhs, rhs_node, assignment_node, ctx);
+    // Each error of this statement keeps its variable, also in a statement
+    // that calls this function.
+    for err in &mut ctx.errors[errors_before..] {
+        err.named = true;
+    }
     if let (Some(name), Some(0), false) = (name, scope, in_class) {
         ctx.note_module_write(&name);
     }
@@ -4720,19 +4820,23 @@ fn process_assignment_item_inner(
 
     // Delegate to the recursive evaluator.
     let errors_before = ctx.errors.len();
-    let result = shape_of_expression(rhs_node, ctx);
+    let carry = is_tuple_value(rhs_node, scope_idx, ctx);
+    let result = if carry {
+        carry_shape(rhs_node, scope_idx, ctx)
+    } else {
+        shape_of_expression(rhs_node, ctx)
+    };
 
     // Fix up error variable names: shape_of_expression doesn't know the
     // LHS variable name, so it records errors with placeholder names
     // (the function target or expression text). Replace with the actual
     // LHS name.
-    for err in &mut ctx.errors[errors_before..] {
-        err.variable = lhs_name.clone();
-    }
+    name_errors(ctx, errors_before, &lhs_name);
 
     if let Some(shape) = result {
-        let carry = is_tuple_value(rhs_node, scope_idx, ctx);
-        ctx.record_binding(scope_idx, &lhs_name, shape, display_line, rhs_node.start_byte());
+        // A tuple carry shows no hint: its shape is that of each element.
+        let line = display_line.filter(|_| !carry);
+        ctx.record_binding(scope_idx, &lhs_name, shape, line, rhs_node.start_byte());
         if carry && ctx.scopes[scope_idx].shapes.contains_key(&lhs_name) {
             ctx.tuple_carries.insert((scope_idx, lhs_name));
         }
@@ -4741,6 +4845,15 @@ fn process_assignment_item_inner(
         // binding is stale now (issue #46). Annotated assignments keep
         // their user-written shape.
         ctx.evict_binding(scope_idx, &lhs_name);
+    }
+}
+
+/// Give `variable` to each error from `from` on that no statement inside
+/// (in the body of a called function) named.
+fn name_errors(ctx: &mut ShapeCtx, from: usize, variable: &str) {
+    for err in ctx.errors[from..].iter_mut().filter(|err| !err.named) {
+        err.variable = variable.to_string();
+        err.named = true;
     }
 }
 
@@ -4924,16 +5037,26 @@ fn handle_augmented_assignment(
         return;
     };
     let Some(lhs_shape) = ctx.resolve_shape(name, scope_idx) else {
+        ctx.evict_binding(scope_idx, name);
         return;
     };
-    let Some(rhs_shape) = shape_of_expression(rhs_node, ctx) else {
-        return;
-    };
-
     let op_text = assignment_node
         .child_by_field_name("operator")
         .and_then(|op| op.utf8_text(ctx.text.as_bytes()).ok())
         .unwrap_or("+=");
+    // `x += y` keeps the shape in place for torch and numpy, but a jax array
+    // rebinds to the broadcast result. Only a scalar right side keeps it for both.
+    let rhs_shape = match binop_operand(rhs_node, scope_idx, ctx) {
+        Some(BinopOperand::Shaped(shape)) => shape,
+        Some(BinopOperand::Scalar) if op_text != "@=" => {
+            ctx.scalar_dims.remove(&(scope_idx, name.to_string()));
+            return;
+        }
+        _ => {
+            ctx.evict_binding(scope_idx, name);
+            return;
+        }
+    };
     let result = match op_text {
         "@=" => apply_matmul_shape(&lhs_shape, &rhs_shape, name, "rhs"),
         "-=" => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Sub),
@@ -4943,8 +5066,9 @@ fn handle_augmented_assignment(
         // elementwise-broadcasting for shape purposes.
         _ => apply_elementwise_shape(&lhs_shape, &rhs_shape, BinaryOp::Add),
     };
-    if let Some(Some(shape)) = ctx.check(result, name, assignment_node.range()) {
-        ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte());
+    match ctx.check(result, name, assignment_node.range()) {
+        Some(Some(shape)) => ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte()),
+        _ => ctx.evict_binding(scope_idx, name),
     }
 }
 
@@ -4972,6 +5096,7 @@ fn handle_tuple_assignment(
             None => tuple_rhs_shapes(rhs_node, targets, scope_idx, ctx),
         },
     };
+    let scan_carry = scan_carry_is_tuple(rhs_node, scope_idx, ctx);
     let Some(elem_shapes) = elem_shapes else {
         // Unmodelled multi-output RHS: prior bindings for the targets are
         // stale now (issue #46).
@@ -4980,11 +5105,12 @@ fn handle_tuple_assignment(
         }
         return;
     };
-    for (target, shape) in targets.iter().zip(elem_shapes) {
+    for (i, (target, shape)) in targets.iter().zip(elem_shapes).enumerate() {
         match target {
             TupleTarget::Name(Some(name)) => match shape {
                 Some(shape) => {
-                    ctx.record_binding(scope_idx, name, shape, display_line, rhs_node.start_byte())
+                    let line = display_line.filter(|_| !(scan_carry && i == 0));
+                    ctx.record_binding(scope_idx, name, shape, line, rhs_node.start_byte())
                 }
                 None => ctx.evict_binding(scope_idx, name),
             },
@@ -5010,7 +5136,7 @@ fn handle_tuple_assignment(
     }
     if let Some(TupleTarget::Name(Some(name))) = targets.first()
         && ctx.scopes[scope_idx].shapes.contains_key(name)
-        && scan_carry_is_tuple(rhs_node, scope_idx, ctx)
+        && scan_carry
     {
         ctx.tuple_carries.insert((scope_idx, name.clone()));
     }
@@ -5216,8 +5342,12 @@ fn tuple_literal_shapes(
     let mut shapes: Vec<Option<Vec<String>>> = vec![None; targets.len()];
     for (ei, elem) in elems.iter().enumerate() {
         let errors_before = ctx.errors.len();
-        let shape = shape_of_expression(*elem, ctx);
         let target = target_of(ei);
+        let nested = matches!(target.map(|ti| &targets[ti]), Some(TupleTarget::Nested(_)));
+        let shape = match ctx.links.scope_index.lookup(elem.start_byte()) {
+            Some(scope_idx) if nested => carry_shape(*elem, scope_idx, ctx),
+            _ => shape_of_expression(*elem, ctx),
+        };
         let name = match target.map(|ti| &targets[ti]) {
             Some(TupleTarget::Name(Some(n))) => n.clone(),
             Some(TupleTarget::Nested(inner)) => {
@@ -5225,9 +5355,7 @@ fn tuple_literal_shapes(
             }
             _ => String::new(),
         };
-        for err in &mut ctx.errors[errors_before..] {
-            err.variable = name.clone();
-        }
+        name_errors(ctx, errors_before, &name);
         let Some(ti) = target else { continue };
         // A nested target unpacks its element: only a tuple/list literal
         // shares one shape across its parts, a tensor splits along axis 0.
@@ -5282,10 +5410,10 @@ fn tuple_rhs_shapes(
         // could be either, so it stays unknown.
         "identifier" => {
             let name = rhs.utf8_text(ctx.text.as_bytes()).ok()?;
-            let shape = ctx.resolve_shape(name, scope_idx)?;
-            if ctx.tuple_carries.contains(&(scope_idx, name.to_string())) {
+            if let Some(shape) = ctx.carry_element(name, scope_idx) {
                 return Some((0..n_targets).map(|_| Some(shape.clone())).collect());
             }
+            let shape = ctx.resolve_shape(name, scope_idx)?;
             if targets.iter().any(|t| matches!(t, TupleTarget::Nested(_)))
                 || !name_is_array(rhs, name, scope_idx, ctx, &mut Vec::new())
             {
@@ -5450,8 +5578,8 @@ fn tuple_rhs_shapes(
                     .and_then(|kw| kw.child_by_field_name("value"))
                     .or_else(|| find_positional_arg_node(args_node, 0));
                 let init_node = scan_init_node(args_node, ctx.text)?;
-                let init_shape = shape_of_expression(init_node, ctx)?;
                 let init_is_tuple = is_tuple_value(init_node, scope_idx, ctx);
+                let init_shape = carry_shape(init_node, scope_idx, ctx)?;
                 let xs_node = find_keyword_arg_node(args_node, "xs", ctx.text.as_bytes())
                     .and_then(|kw| kw.child_by_field_name("value"))
                     .or_else(|| find_positional_arg_node(args_node, 2));
@@ -7052,6 +7180,14 @@ fn specialize_callee_call(
     if reads_enclosing_live {
         ctx.call_time.pop();
     }
+    // An error in the body is one of its return statements.
+    let body = func_node.byte_range();
+    for err in ctx.errors[errors_before..].iter_mut().filter(|err| body.contains(&err.range.start_byte)) {
+        if !err.named {
+            err.variable = String::new();
+            err.named = true;
+        }
+    }
 
     if is_first {
         ctx.specialized_scopes.insert(callee_idx);
@@ -7107,32 +7243,26 @@ fn seed_params_from_call(
     let params = without_receiver(all_params);
     let mut seeded = HashMap::new();
     let mut carries = Vec::new();
-    let is_carry = |value: &str| {
-        ctx.tuple_carries
-            .contains(&(caller_scope_idx, value.to_string()))
+    let mut seed = |param: &String, value: &str| {
+        if let Some(shape) = ctx.carry_element(value, caller_scope_idx) {
+            seeded.insert(param.clone(), shape);
+            carries.push(param.clone());
+        } else if let Some(shape) = ctx.resolve_shape(value, caller_scope_idx) {
+            seeded.insert(param.clone(), shape);
+        }
     };
     let mut positional_idx = 0usize;
     for arg in args {
         match arg {
             CallArgument::Positional { value } => {
-                if let Some(param) = params.get(positional_idx)
-                    && let Some(shape) = ctx.resolve_shape(value, caller_scope_idx)
-                {
-                    seeded.insert(param.clone(), shape);
-                    if is_carry(value) {
-                        carries.push(param.clone());
-                    }
+                if let Some(param) = params.get(positional_idx) {
+                    seed(param, value);
                 }
                 positional_idx += 1;
             }
             CallArgument::Keyword { name, value } => {
-                if params.iter().any(|p| p == name)
-                    && let Some(shape) = ctx.resolve_shape(value, caller_scope_idx)
-                {
-                    seeded.insert(name.clone(), shape);
-                    if is_carry(value) {
-                        carries.push(name.clone());
-                    }
+                if params.iter().any(|p| p == name) {
+                    seed(name, value);
                 }
             }
         }
@@ -7947,7 +8077,8 @@ def f(a: Float[Array, "features"], b: Float[Array, "features"]):
     pair = (a, b)
 "#;
         let analysis = analyze_simple(code);
-        assert_eq!(find_shape(&analysis, "pair"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "pair"), None);
+        assert!(analysis.assignment_shapes.is_empty());
     }
 
     #[test]

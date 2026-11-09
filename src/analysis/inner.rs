@@ -104,7 +104,7 @@ impl Frame {
         });
     }
 
-    /// Put every name back and drop the errors that name a changing number.
+    /// Put every name back and drop the errors that read a changing number.
     pub(super) fn restore(&mut self, ctx: &mut ShapeCtx) {
         ctx.name_checks.borrow_mut().clear();
         while let Some(undo) = self.undo.pop() {
@@ -131,15 +131,7 @@ impl Frame {
         }
         let mut kept = self.errors;
         for i in self.errors..ctx.errors.len() {
-            let error = &ctx.errors[i];
-            let names = |text: &str| {
-                text.split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .any(|token| {
-                        let token = token.strip_prefix(FREE_DIM).unwrap_or(token);
-                        self.scalars.iter().any(|s| s == token)
-                    })
-            };
-            if !names(&error.message) && !names(&error.variable) {
+            if !ctx.errors[i].reads.iter().any(|name| self.scalars.contains(name)) {
                 ctx.errors.swap(kept, i);
                 kept += 1;
             }
@@ -253,12 +245,8 @@ fn range_count(args: &[Node], scope_idx: usize, ctx: &ShapeCtx) -> Option<usize>
         [start, stop, step] if step != 0 => (start, stop, step),
         _ => return None,
     };
-    let span = if step > 0 { stop - start } else { start - stop };
-    let count = if span <= 0 {
-        0
-    } else {
-        (span + step.abs() - 1) / step.abs()
-    };
+    let span = if step > 0 { stop.checked_sub(start)? } else { start.checked_sub(stop)? };
+    let count = if span <= 0 { 0 } else { (span - 1) / step.checked_abs()? + 1 };
     usize::try_from(count).ok()
 }
 

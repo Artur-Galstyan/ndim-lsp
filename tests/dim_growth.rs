@@ -336,6 +336,25 @@ fn a_chain_of_names_is_linear_in_time() {
     assert_bounded("names", &measure(&code, stub.path()));
 }
 
+/// A chain of names that runs from the last name to the first fits the stack
+/// of a thread with the default size: a check stops at the depth limit.
+#[test]
+fn a_deep_chain_of_names_fits_the_stack() {
+    let run = std::thread::spawn(|| {
+        let names = 5_000;
+        let mut code = String::from("import jax.numpy as jnp\n");
+        for i in (1..=names).rev() {
+            code.push_str(&format!("x{i} = x{} + 1\n", i - 1));
+        }
+        code.push_str(&format!("x0 = 1\ny = jnp.zeros((3, 4)) * x{names}\nz = jnp.zeros((3, 4)) * x1\n"));
+        let stub = torch_stub();
+        let measured = measure(&code, stub.path());
+        assert!(measured.time <= MAX_TIME, "{:?}", measured.time);
+        assert_eq!(measured.last, Some(vec!["3".to_string(), "4".to_string()]));
+    });
+    run.join().unwrap();
+}
+
 /// One statement with a wide tree of calls stops at the limit of its steps.
 #[test]
 fn a_wide_tree_of_calls_stops_at_the_step_limit() {
