@@ -14,7 +14,7 @@ Legend:
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `jax.vmap` / `equinox.filter_vmap` | ✅ | ✅ | ✅ | Free (`vf = vmap(f); vf(x)`), inline (`vmap(f)(x)`), and attribute (`vmap(self.layer)(x)`) forms; scalar `in_axes`/`out_axes` only. |
+| `jax.vmap` / `equinox.filter_vmap` | ✅ | ✅ | ✅ | Free (`vf = vmap(f); vf(x)`), inline (`vmap(f)(x)`), and attribute (`vmap(self.layer)(x)`) forms; scalar `in_axes`/`out_axes` only. `filter_vmap` takes its options by keyword only; an option the rule does not model (`axis_size`) → `Ok(None)`. |
 | `jax.jit` | ❌ | ❌ | ❌ | Out of scope as a known function. The rebinding `f = jax.jit(f)` keeps `f`. |
 | `jax.grad` | ❌ | ❌ | ❌ | Out of scope: higher-order; output shape depends on the differentiated function, not statically derivable. |
 | `jax.value_and_grad` | ❌ | ❌ | ❌ | Out of scope: same reason as `grad` (returns value + gradient tree). |
@@ -70,7 +70,7 @@ Legend:
 | `jnp.full_like` / `np.full_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.empty_like` / `np.empty_like` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.arange` / `np.arange` | ✅ | ✅ | ✅ | 1D length from args when concrete. |
-| `jnp.linspace` / `np.linspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
+| `jnp.linspace` / `np.linspace` | ✅ | ✅ | ✅ | 1D length from `num`. `retstep=True` (a tuple) → `Ok(None)`. |
 | `jnp.logspace` / `np.logspace` | ✅ | ✅ | ✅ | 1D length from `num`. |
 | `jnp.eye` / `np.eye` | ✅ | ✅ | ✅ | Matrix shape `(N, M?)`. |
 | `jnp.identity` / `np.identity` | ✅ | ✅ | ✅ | Matrix shape `(n, n)`. |
@@ -80,9 +80,9 @@ Legend:
 | `jnp.tril` / `np.tril` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.triu` / `np.triu` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `jnp.meshgrid` / `np.meshgrid` | ✅ | ✅ | ✅ | Tuple LHS, default 'xy' indexing; keyword args skip. |
-| `jnp.indices` / `np.indices` | ✅ | ✅ | ✅ | Prepends rank dimension: `indices((2, 3)).shape == (2, 2, 3)`. |
-| `jnp.bincount` / `np.bincount` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — length is data-dependent (max value / `minlength`), per the "unknown → `Ok(None)`" convention. |
-| `jnp.unique` / `np.unique` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — length is data-dependent. |
+| `jnp.indices` / `np.indices` | ✅ | ✅ | ✅ | Prepends rank dimension: `indices((2, 3)).shape == (2, 2, 3)`. `sparse=True` (a tuple) → `Ok(None)`. |
+| `jnp.bincount` / `np.bincount` / `torch.bincount` | ✅ | ✅ | ✅ | `[?]`: rank 1, the length is data-dependent (`signature_tests.rs`, `data_dependent_sizes`). |
+| `jnp.unique` / `np.unique` | ✅ | ✅ | ✅ | `[?]` for a plain call (`sorted`, `equal_nan` allowed). A `return_*` flag, `axis`, or `size` → `Ok(None)`. |
 | `jnp.select` / `np.select` | ✅ | ✅ | ✅ | Approximated as the shape of `choicelist`'s first array. |
 
 ## JAX NumPy / NumPy shape transforms
@@ -96,7 +96,7 @@ Legend:
 | `jnp.swapaxes` / `np.swapaxes` | ✅ | ✅ | ✅ | Swap two axes. |
 | `jnp.moveaxis` / `np.moveaxis` | ✅ | ✅ | ✅ | Move axes preserving order. |
 | `jnp.expand_dims` / `np.expand_dims` | ✅ | ✅ | ✅ | Insert size-1 axes. |
-| `jnp.squeeze` / `np.squeeze` | ✅ | ✅ | ✅ | Remove size-1 axes. |
+| `jnp.squeeze` / `np.squeeze` | ✅ | ✅ | ✅ | Remove size-1 axes. An axis whose size is not 1 is an error; an axis of unproven size → `Ok(None)`. |
 | `jnp.atleast_1d` / `np.atleast_1d` | ✅ | ✅ | ✅ | Scalars become `(1,)`; multiple positional inputs bind separately on tuple unpacking. |
 | `jnp.atleast_2d` / `np.atleast_2d` | ✅ | ✅ | ✅ | Vectors become `(1, n)`; multiple positional inputs bind separately on tuple unpacking. |
 | `jnp.atleast_3d` / `np.atleast_3d` | ✅ | ✅ | ✅ | Vectors become `(1, n, 1)`, matrices `(m, n, 1)`; multiple positional inputs bind separately on tuple unpacking. |
@@ -134,7 +134,7 @@ Legend:
 | `jnp.vsplit` / `np.vsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=0. |
 | `jnp.dsplit` / `np.dsplit` | ✅ | ✅ | ✅ | Same mechanism, forces axis=2; errors if rank < 3. |
 | `jnp.tile` / `np.tile` | ✅ | ✅ | ✅ | Repeats dimensions. |
-| `jnp.repeat` / `np.repeat` | ✅ | ✅ | ✅ | Repeats along axis or flattened. |
+| `jnp.repeat` / `np.repeat` | ✅ | ✅ | ✅ | Repeats along axis or flattened. An array of counts → `Ok(None)`. |
 | `jnp.kron` / `np.kron` | ✅ | ✅ | ✅ | Kronecker product; elementwise product of dims after left-padding the shorter shape's rank with 1s. |
 
 ## JAX NumPy / NumPy indexing and selection
@@ -153,9 +153,9 @@ Legend:
 | `jnp.sort` / `np.sort` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. |
 | `jnp.top_k` | ✅ | ✅ | ✅ | Tuple-unpacked values and indices replace the selected axis with `k`; a single-name tuple has no tensor shape. |
 | `jnp.searchsorted` / `np.searchsorted` | ✅ | ✅ | ✅ | Shape follows `v` (the values arg, 2nd positional), not `a`. |
-| `jnp.extract` / `np.extract` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — 1D length is data-dependent. |
-| `jnp.compress` / `np.compress` | ✅ | ❌ | ✅ | Classified; conservatively `Ok(None)` — axis length is data-dependent. |
-| `jnp.histogram` / `np.histogram` | ✅ | ✅ | ✅ | Output length = `bins` (int literal), `len(edges) - 1` (literal edge list), or the numpy/jax default (10) when omitted; non-literal `bins` → `Ok(None)`. `histogram2d`/`histogramdd` not classified. |
+| `jnp.extract` / `np.extract` | ✅ | ✅ | ✅ | `[?]`: rank 1, the length is data-dependent. |
+| `jnp.compress` / `np.compress` | ✅ | ✅ | ✅ | `[?]` without `axis` (flattens); with an `axis` → `Ok(None)`. |
+| `jnp.histogram` / `np.histogram` | ✅ | ❌ | ✅ | Returns a `(hist, bin_edges)` tuple, so one name gets `Ok(None)`; tuple unpacking is not modelled. `histogram2d`/`histogramdd` not classified. |
 
 ## JAX NumPy / NumPy reductions
 
@@ -173,13 +173,13 @@ Legend:
 | `jnp.var` / `np.var` | ✅ | ✅ | ✅ | Same axis semantics. |
 | `jnp.all` / `np.all` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `jnp.any` / `np.any` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
-| `jnp.median` / `np.median` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Mean`'s axis/keepdims reduction rule directly (identical shape mechanics). |
-| `jnp.quantile` / `np.quantile` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Mean`'s reduction rule (approximation: doesn't model the extra leading dim when `q` is itself an array, only the scalar-`q` case). |
-| `jnp.percentile` / `np.percentile` | ✅ | ✅ | ✅ | Same as `quantile` (reuses `Mean`). |
+| `jnp.median` / `np.median` | ✅ | ✅ | ✅ | `KnownFunction::Reduction`: its own signature `(a, axis, out, overwrite_input, keepdims)`, so a positional `keepdims` is read. |
+| `jnp.quantile` / `np.quantile` / `torch.quantile` | ✅ | ✅ | ✅ | `KnownFunction::Reduction` with `q`: numpy/jax `(a, q, axis, out, overwrite_input, method, keepdims)`, torch `(input, q, dim, keepdim)`. The shape of `q` leads the result (a number is a scalar, a list has one axis, a name has its shape; a name with no shape → `Ok(None)`). |
+| `jnp.percentile` / `np.percentile` | ✅ | ✅ | ✅ | Same rule and signature as `quantile`. |
 | `jnp.cumsum` / `np.cumsum` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
 | `jnp.cumprod` / `np.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `axis=None` flattening (NumPy flattens to 1D); always preserves input shape. |
 | `jnp.trace` / `np.trace` | ✅ | ✅ | ✅ | Removes two axes, optional offset. |
-| `jnp.count_nonzero` / `np.count_nonzero` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis semantics). |
+| `jnp.count_nonzero` / `np.count_nonzero` | ✅ | ✅ | ✅ | `KnownFunction::Reduction`: `axis` positional, `keepdims` by keyword only. |
 | `jnp.ptp` / `np.ptp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Max`'s reduction rule (identical axis semantics). |
 | `jnp.clip` / `np.clip` / `torch.clip` / `torch.clamp` | ✅ | ✅ | ✅ | `KnownFunction::Clamp` (`apply_known_clamp`): the input broadcasts with every array bound (`min`, `max`, `a_min`, `a_max`, or positional), so a larger bound array makes the result larger. Bounds that are `None` or provable scalars are removed first. A bound with no known shape, or a mismatch, → `Ok(None)`. Audit note: do not re-add as a gap. |
 | `jnp.nan_to_num` / `np.nan_to_num` | ✅ | ✅ | — | Added to `is_shape_preserving_call`'s numpy elementwise match list (shape-preserving). |
@@ -192,15 +192,15 @@ Legend:
 |---|---:|---:|---:|---|
 | `jnp.matmul` / `np.matmul` / `torch.matmul` | ✅ | ✅ | ✅ | Batch matmul broadcasting + inner dim check. |
 | `jnp.dot` / `np.dot` / `torch.dot` | ✅ | ✅ | ✅ | Rank-dependent dot semantics. |
-| `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ✅ | ✅ | Explicit-output equations; matmul/transpose/batched cases tested. |
+| `jnp.einsum` / `np.einsum` / `torch.einsum` | ✅ | ✅ | ✅ | Explicit and implicit output (sorted single labels). Spaces in the subscripts are skipped, each other subscript is one letter. A label of size 1 broadcasts. A repeated output label, a non-letter label, the operand-list form, or a star operand → `Ok(None)`. |
 | `jax.lax.dot` | ✅ | ✅ | ✅ | Dot semantics. |
-| `jax.lax.dot_general` | ✅ | ✅ | ✅ | Currently approximated as matmul. |
+| `jax.lax.dot_general` | ✅ | ✅ | ✅ | `KnownFunction::DotGeneral`: exact for literal `dimension_numbers` `((lc, rc), (lb, rb))`, positional or keyword: batch dims, then the free dims of `lhs`, then of `rhs`. A non-literal value → `Ok(None)`. |
 | `jnp.vdot` / `np.vdot` | ✅ | ✅ | ✅ | Flattened dot — scalar output. |
 | `jnp.tensordot` / `np.tensordot` / `torch.tensordot` | ✅ | ✅ | ✅ | Contract axes. Only int-axes form supported; tuple-of-lists form is a follow-up. |
 | `jnp.outer` / `np.outer` / `torch.outer` | ✅ | ✅ | ✅ | Output `(a, b)`. |
 | `jnp.inner` / `np.inner` | ✅ | ✅ | ✅ | Last-axis contraction. |
 | `jnp.cross` / `np.cross` / `torch.cross` | ✅ | ✅ | ✅ | NumPy/JAX require concrete size-3 vector axes and broadcast batch dims; Torch requires equal input ranks and size-3 vector axes, with distinct default-axis behavior. |
-| `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule — axis/keepdims mechanics are identical to a plain reduction. |
+| `jnp.linalg.norm` / `np.linalg.norm` / `torch.linalg.norm` / `torch.norm` | ✅ | ✅ | ✅ | `NORM`: the signature `(x, ord, axis, keepdims)`, so the second positional is `ord`, not an axis. No axis → scalar. |
 | `jnp.linalg.det` / `np.linalg.det` / `torch.linalg.det` | ✅ | ✅ | ✅ | Square matrix -> batch shape; validates last two dims. |
 | `jnp.linalg.inv` / `np.linalg.inv` / `torch.linalg.inv` | ✅ | ✅ | ✅ | Shape-preserving for square matrices; validates last two dims. |
 | `jnp.linalg.solve` / `np.linalg.solve` / `torch.linalg.solve` | ✅ | ✅ | ✅ | Output shape = `b`'s shape (the right-hand side); `a` validated as square. |
@@ -212,6 +212,12 @@ Legend:
 | `torch.linalg.pinv` / `jnp.linalg.pinv` / `np.linalg.pinv` | ✅ | ✅ | ✅ | Swaps the last two dims: `(..., m, n) -> (..., n, m)`. |
 | `torch.linalg.matrix_rank` / `jnp.linalg.matrix_rank` / `np.linalg.matrix_rank` | ✅ | ✅ | ✅ | Reduces last two dims to scalar (batched); no square requirement. |
 | `torch.linalg.matrix_sqrth` | ✅ | ✅ | ✅ | Preserves the shape of a square matrix or batch of square matrices; rejects known non-square inputs. |
+| `linalg.eigvals` / `eigvalsh` (jnp, np, torch) | ✅ | ✅ | ✅ | `KnownFunction::LinalgEigvals`: a square matrix (or batch) → the shape without the last dim; a non-square input is an error. |
+| `linalg.matrix_power` (jnp, np, torch) | ✅ | ✅ | ✅ | Shape-preserving on a square matrix. |
+| `linalg.multi_dot` (jnp, np, torch) | ✅ | ✅ | ✅ | A literal list of operands, a 1-D first or last operand drops that axis; an inner mismatch is an error. |
+| `linalg.slogdet` (jnp, np, torch) | ✅ | ✅ | ✅ | `(sign, logabsdet)`: tuple unpacking gives the batch shape to each; one name → `Ok(None)`. A non-square input is an error. |
+| `torch.mm` / `torch.mv` / `x.mm` / `x.mv` | ✅ | ✅ | ✅ | `Mm`: two rank-2 operands; `Mv`: rank 2 and rank 1. A rank or inner-dim mismatch is an error. |
+| `torch.addmm` / `torch.baddbmm` | ✅ | ✅ | ✅ | `mm` / `bmm` of the last two operands, and `input` must broadcast to the result. |
 | `torch.fft.*` | ✅ | ✅ | ✅ | Same module-path check as `jnp`/`np` `fft.*` — `fft`/`ifft`/`fft2`/`ifft2`/`fftn`/`ifftn`/`fftshift`/`ifftshift` shape-preserving; `rfft`/`irfft` (last-axis length change) intentionally unclassified. |
 
 ## einops
@@ -233,7 +239,7 @@ Legend:
 |---|---:|---:|---:|---|
 | `torch.tensor` | ✅ | ✅ | ✅ | Shape-preserving for known input shape; literal inference later. |
 | `torch.as_tensor` | ✅ | ✅ | ✅ | Shape-preserving conversion. |
-| `torch.zeros` | ✅ | ✅ | ✅ | Shape from varargs, a tuple or list, or `size=`. A single non-identifier arg is unknown. `torch.rand` and `torch.randn` use the same rule. |
+| `torch.zeros` | ✅ | ✅ | ✅ | Shape from varargs, a tuple or list, or `size=`. A single name gives `[n]` only when the scope proves it an integer, the dims of its one tuple or list binding, else unknown (the same for `jnp.zeros(s)` and `x.reshape(s)`). `torch.rand` and `torch.randn` use the same rule. |
 | `torch.ones` | ✅ | ✅ | ✅ | Same rule as `torch.zeros`. |
 | `torch.full` | ✅ | ✅ | ✅ | Output shape from args. |
 | `torch.empty` | ✅ | ✅ | ✅ | Same rule as `torch.zeros`. |
@@ -252,12 +258,13 @@ Legend:
 | `torch.transpose` | ✅ | ✅ | ✅ | Classified as `KnownFunction::SwapAxes` (with `torch.swapaxes`/`swapdims`): `(input, dim0, dim1)` swaps two dims. An out-of-range dim reports a mismatch with `swapaxes` wording. |
 | `torch.permute` | ✅ | ✅ | ✅ | Permute all dims. |
 | `torch.unsqueeze` | ✅ | ✅ | ✅ | Insert size-1 dim. |
-| `torch.squeeze` | ✅ | ✅ | ✅ | Remove size-1 dims. |
+| `torch.squeeze` | ✅ | ✅ | ✅ | `TorchSqueeze`: removes size-1 dims; a given dim whose size is not 1 stays (torch does not raise). |
 | `torch.broadcast_to` | ✅ | ✅ | ✅ | Output target shape. |
 | `torch.broadcast_tensors` | ✅ | ✅ | ✅ | Tuple-unpacked positional inputs share the broadcast shape; a single-name tuple has no tensor shape. |
 | `torch.atleast_1d` / `torch.atleast_2d` / `torch.atleast_3d` | ✅ | ✅ | ✅ | Multiple positional inputs bind separately on tuple unpacking; single-name tuples have no tensor shape. |
 | `torch.tile` | ✅ | ✅ | ✅ | Repeat dims. |
-| `torch.repeat` | ✅ | ✅ | ✅ | Tensor method and function nuance. |
+| `torch.repeat` | ✅ | ✅ | ✅ | Tensor method only: see the `x.repeat` row. |
+| `torch.repeat_interleave` | ✅ | ✅ | ✅ | numpy `repeat` rule `(input, repeats, dim)`. |
 | `torch.take` | ✅ | ✅ | ✅ | Output follows indices. |
 | `torch.where` | ✅ | ✅ | ✅ | Broadcast condition/x/y. |
 | `torch.meshgrid` | ✅ | ✅ | ✅ | Same rule as numpy meshgrid. |
@@ -266,7 +273,7 @@ Legend:
 | `torch.trace` | ✅ | ✅ | ✅ | 2D -> scalar. |
 | `torch.triu` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Triu` path with `jnp.triu`. |
 | `torch.tril` | ✅ | ✅ | ✅ | Shape-preserving; shares `KnownFunction::Tril` path with `jnp.tril`. |
-| `torch.nn.functional.pad` | ✅ | ✅ | ✅ | Classified via `torch.nn.functional` deep module path; reuses `KnownFunction::Pad` and existing `apply_known_pad` pad-width parser. Note: `apply_known_pad` applies pad pairs in dimension order (dim 0 first), unlike PyTorch's reverse-axis convention; see `torch_nn_functional_pad_tests` in integration_tests.rs. |
+| `torch.nn.functional.pad` | ✅ | ✅ | ✅ | `KnownFunction::TorchPad`: `(left, right)` pairs for the last dims, the last dim first (torch order). An odd length or more pairs than dims is an error; a pad that is not an integer gives that dim `?`; nested pairs or a splat → `Ok(None)`. |
 | `torch.gather` | ✅ | ✅ | ✅ | `KnownFunction::Gather`; output shape matches `index` (always the last positional arg in both the free-function and method forms). |
 | `torch.scatter` / `torch.scatter_add` | ✅ | ✅ | ✅ | `KnownFunction::Scatter`; shape-preserving on `self`/`input` via `apply_known_shape_preserving`. |
 | `torch.take_along_dim` | ✅ | ✅ | ✅ | Reuses `KnownFunction::TakeAlongAxis` directly — identical "output matches `indices`" rule as `jnp.take_along_axis`. |
@@ -276,12 +283,15 @@ Legend:
 | `torch.split` | ✅ | ✅ | ✅ | `KnownFunction::TorchSplit` (distinct from `KnownFunction::ArraySplit`, which `torch.tensor_split` uses); real semantics via `compute_torch_split_shapes` — the 2nd arg is a chunk **size**, not a section count: `ceil(axis_dim / size)` chunks, last one a smaller remainder when it doesn't divide evenly (mirrors `compute_chunk_shapes` with size/count roles swapped). Also accepts a literal list of explicit per-chunk sizes (at most one `-1` entry infers the remainder). Literal axis dim + literal size → exact chunk list. Symbolic axis dim + literal size → count is derived from the LHS tuple arity when known (`a, b, c = x.split(n)`); with no arity hint (single-LHS validate path) → `Ok(None)`. Non-literal, non-list size → always `Ok(None)` (per-chunk size itself unknown). |
 | `torch.narrow` | ✅ | ✅ | ✅ | `KnownFunction::Narrow`; slices `dim` down to `length`. |
 | `torch.select` | ✅ | ✅ | ✅ | `KnownFunction::SelectDim` (distinct from `jnp.select`'s choicelist-based `KnownFunction::Select`); removes `dim`. |
-| `torch.masked_select` | ✅ | ❌ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |
+| `torch.masked_select` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`: `[?]`, rank 1, the length is data-dependent. |
 | `torch.index_select` | ✅ | ✅ | ✅ | `KnownFunction::IndexSelect`; `dim`'s length becomes `len(index)`. |
 | `torch.nn.functional.interpolate` | ✅ | ✅ | ✅ | `KnownFunction::Interpolate`; sets spatial dims from `size`, or scales by `scale_factor` (floor-rounded). |
 | `torch.nn.functional.conv1d` / `conv2d` / `conv3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalConv1d/2d/3d`; same conv formula as the layer forms, channels/kernel derived from the `weight` arg's shape (grouped-conv channel mismatch not validated, matching `jax.lax.conv_general_dilated`'s existing approximation). |
-| `torch.nn.functional.max_pool1d` / `max_pool2d` / `max_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalMaxPool1d/2d/3d`; `stride` defaults to `kernel_size` per torch convention; `dilation` not modelled. |
-| `torch.nn.functional.avg_pool1d` / `avg_pool2d` / `avg_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalAvgPool1d/2d/3d`; same pooling formula/helper as the max-pool functional forms. |
+| `torch.nn.functional.max_pool1d` / `max_pool2d` / `max_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalMaxPool1d/2d/3d`; `stride` defaults to `kernel_size` per torch convention; a literal `dilation` widens the window. `ceil_mode=True`, `return_indices=True` (a tuple), a non-literal dilation, or a window larger than the input → `Ok(None)`. |
+| `torch.nn.functional.avg_pool1d` / `avg_pool2d` / `avg_pool3d` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalAvgPool1d/2d/3d`; same pooling formula/helper as the max-pool functional forms; `ceil_mode=True` → `Ok(None)`. |
+| `torch.nn.functional.linear` | ✅ | ✅ | ✅ | `KnownFunction::Linear`: `weight` is `[out, in]` (or `[in]`, which drops the last dim); `bias` is not read. An `in` mismatch is an error. |
+| `torch.nn.functional.scaled_dot_product_attention` | ✅ | ✅ | ✅ | Output = `query` with the last dim of `value`; query/key last dims must match. A variadic batch → `Ok(None)`. |
+| `torch.nn.functional.mse_loss` / `l1_loss` / `smooth_l1_loss` / `huber_loss` / `binary_cross_entropy` / `binary_cross_entropy_with_logits` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalLoss`: the rule of the loss layer of the same name, with `reduction` read positional or keyword; `size_average`/`reduce` give no shape. |
 | `torch.bmm` | ✅ | ✅ | ✅ | `KnownFunction::Bmm`: both operands rank 3, equal batch dim (a batch of 1 does not broadcast, unlike `matmul`), equal contracted dim → `[b, n, p]`. Rank or dim mismatch is an error. |
 | `torch.nn.functional.cross_entropy` / `nll_loss` | ✅ | ✅ | ✅ | `KnownFunction::CrossEntropy` / `NllLoss`: class dim is axis 0 for an unbatched input and axis 1 otherwise. A target of the input's shape holds probabilities (`cross_entropy` only); a target without the class dim holds class indices. `reduction='none'` → input shape without the class dim, any other valid reduction → scalar. `weight` must be rank 1 with one entry per class. A bad target shape is an error; an unknown shape → `Ok(None)`. |
 | `torch.nn.functional.softmax` / `log_softmax` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
@@ -292,7 +302,7 @@ Legend:
 | `torch.nn.functional.normalize` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `torch.nn.functional.embedding` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalEmbedding`; appends `weight`'s last-axis (embedding) dim to `input`'s shape. |
 | `torch.nn.functional.relu` / `relu6` / `gelu` / `silu` / `sigmoid` / `tanh` / `softplus` / `softsign` / `selu` / `celu` / `elu` / `leaky_relu` / `hardtanh` / `hardswish` / `hardsigmoid` / `mish` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule, same as `softmax`/`log_softmax`/`normalize` above. |
-| `torch.nn.functional.dropout` / `dropout2d` / `dropout3d` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
+| `torch.nn.functional.dropout` / `dropout1d` / `dropout2d` / `dropout3d` / `alpha_dropout` / `feature_alpha_dropout` / `layer_norm` / `batch_norm` / `group_norm` / `instance_norm` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
 | `torch.nn.functional.glu` | ✅ | ✅ | ✅ | `KnownFunction::FunctionalGlu`; halves `dim` (default last axis, must be even-sized): numeric divide-by-2, symbolic `x*2` factor cancellation (via `cancel_product_factor`, shared with `Split`), else opaque `glu(<dim>)` name. Not shape-preserving, unlike the rest of the activation family. |
 | `torch.nn.utils.rnn.pad_sequence` | ✅ | ✅ | ✅ | `KnownFunction::PadSequence`; batch count + trailing dims known from the literal sequence list, padded length emitted as opaque symbolic `pad_len` (data-dependent). |
 
@@ -300,13 +310,14 @@ Legend:
 
 | Function | Classified | Shape rule | Tests | Notes |
 |---|---:|---:|---:|---|
-| `torch.sum` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
+| `torch.sum` | ✅ | ✅ | ✅ | `dim`, `keepdim`, also positional: the torch signature `(input, dim, keepdim)` (`TORCH_REDUCTION`; also `mean`, `prod`, `all`, `any`, `argmax`, `argmin`). |
 | `torch.mean` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
 | `torch.max` | ✅ | ✅ | ✅ | `KnownFunction::TorchMaxMin`: no `dim` → full reduction; `torch.max(a, b)` with a known non-scalar `b` broadcasts (a mismatch stays `Ok(None)`); `dim`/`axis` or an unknown/scalar second argument → `Ok(None)` (a `(values, indices)` tuple has no single shape). |
 | `torch.min` | ✅ | ✅ | ✅ | Same rule as `torch.max`. |
 | `torch.prod` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
-| `torch.std` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
-| `torch.var` | ✅ | ✅ | ✅ | `dim`, `keepdim`. |
+| `torch.std` | ✅ | ✅ | ✅ | `(input, dim, unbiased, keepdim)` (`TORCH_STD_VAR`). |
+| `torch.var` | ✅ | ✅ | ✅ | Same signature as `torch.std`. |
+| `torch.sort` | ✅ | ❌ | ✅ | `TorchSort`: a `(values, indices)` tuple, so one name → `Ok(None)`; tuple unpacking is not modelled. |
 | `torch.all` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `torch.any` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
 | `torch.argmax` | ✅ | ✅ | ✅ | Reduction via `apply_known_reduction`. |
@@ -315,7 +326,7 @@ Legend:
 | `torch.cumprod` | ✅ | ✅ | ✅ | Shape-preserving via `apply_known_shape_preserving`. Does not model `dim=None` flattening; always preserves input shape. |
 | `torch.kthvalue` | ✅ | ✅ | ✅ | `KnownFunction::KthValue`; tuple LHS via `apply_known_kthvalue_shape` — `values`/`indices` share a plain single-axis reduction over `dim` (re-synthesizes `(input, dim=.., keepdim=..)`, dropping `k`, and reuses `apply_known_reduction`). |
 | `torch.median` (with `dim`) / `torch.mode` (with `dim`) | ✅ | ✅ | ✅ | `KnownFunction::MedianDim`; tuple LHS reuses `apply_known_reduction` directly (same `(input, dim, keepdim)` layout as a plain reduction); the no-`dim` scalar form (2 targets but no `dim`/`axis` arg) is skipped as not a real 2-tuple. |
-| `torch.unique` | ✅ | ❌ | ✅ | Reuses `KnownFunction::Unique` directly (classified for `torch` alongside the existing `jnp`/`np` mapping); conservatively `Ok(None)` — length is data-dependent. |
+| `torch.unique` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Unique`: `[?]` for a plain call. |
 
 ## Neural-network layers / modules
 
@@ -323,7 +334,7 @@ Legend:
 |---|---:|---:|---:|---|
 | `equinox.nn.Linear` | ✅ | ✅ | ✅ | Implemented as `LayerKind::Linear`. |
 | `torch.nn.Linear` | ✅ | ✅ | ✅ | Same last-dim transform. |
-| `equinox.nn.Embedding` / `torch.nn.Embedding` | ✅ | ✅ | ✅ | Appends the embedding dim to the input shape. |
+| `equinox.nn.Embedding` / `torch.nn.Embedding` / `flax.linen.Embed` | ✅ | ✅ | ✅ | Appends the embedding dim (`features` for flax) to the input shape. |
 | `flax.linen.Dense` | ✅ | ✅ | ✅ | Channels-last: last dim → features; input width runtime-inferred, nothing to check. |
 | `equinox.nn.Conv1d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. |
 | `equinox.nn.Conv2d` | ✅ | ✅ | ✅ | Channels-first layout only; per-axis tuples not yet supported. `"SAME"` and `"SAME_LOWER"` keep the size at stride 1, `"VALID"` is padding 0, another string or stride is unknown. |
@@ -336,23 +347,23 @@ Legend:
 | `BatchNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; BatchNorm1d/2d/3d enforce min rank (no batch required, matching Conv convention); equinox BatchNorm is rank-agnostic. |
 | `LayerNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; LayerNorm enforces min rank 1. |
 | `GroupNorm` variants | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; GroupNorm enforces min rank 1. |
-| activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; activations accept any rank. |
-| pooling layers | ✅ | ✅ | ✅ | Max/Avg/Adaptive{Max,Avg}Pool 1d/2d/3d, channels-first; conv output formula (adaptive sets spatial dims to output_size). Torch stride default (= kernel_size). |
-| `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Tuple LHS: output = query shape, weights = (…, L, S); default average_attn_weights. Single-assignment LHS (`out = self.attn(q, k, v)`, no tuple unpacking) also binds — `apply_layer_application` still returns `Ok(None)` for this kind (its `(output, weights)` return can't be expressed as one shape), so `shape_of_call`'s direct self-attr layer-call path special-cases `MultiheadAttention` to bind the primary output (query's shape) directly, bypassing `apply_layer_application`. Other attention layers still ❌. |
+| activation functions/modules | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; activations accept any rank. Includes `SiLU`, `LeakyReLU`, `ELU`, `SELU`, `CELU`, `Softplus`, `Mish`, `Hardswish`, `Hardsigmoid`, `Hardtanh`, `ReLU6`, `LogSoftmax`, `Softmin`, `Softsign`, `Tanhshrink`, `Threshold`, `LogSigmoid`, `Softshrink`, `Hardshrink`, `RReLU`, `FeatureAlphaDropout`, and `Softmax2d` (min rank 3). |
+| pooling layers | ✅ | ✅ | ✅ | Max/Avg/Adaptive{Max,Avg}Pool 1d/2d/3d, channels-first; conv output formula (adaptive sets spatial dims to output_size). Torch stride default = kernel_size, equinox stride default 1. torch `MaxPool` `dilation` widens the window; `ceil_mode=True` rounds up and drops a last window that starts in the right padding (integers only); a non-literal `ceil_mode` and `return_indices=True` → unknown. Equinox `use_ceil` is not modelled. |
+| `torch.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Returns `(output, weights)`: tuple unpacking gives output = query shape and weights `(N, L, S)`, or `(N, num_heads, L, S)` with `average_attn_weights=False`, without `N` when unbatched. Reads `batch_first`, `need_weights`, and the extra key positions of `add_bias_kv`/`add_zero_attn`; a non-literal option → unknown. One name gets no shape; `[0]`/`[1]` pick an element. |
 | `flax.linen.avg_pool` | ✅ | ✅ | ✅ | `KnownFunction::FlaxPool`; channels-last, concrete dims only (`apply_known_flax_pool`). `VALID` gives `(d - w)/s + 1`, or 0 when the window is larger. `SAME` gives `ceil(d / s)`. Other padding is unknown. |
 | `flax.linen.max_pool` | ✅ | ✅ | ✅ | Same `KnownFunction::FlaxPool` code path and rule as `avg_pool`, with the same test (`a_flax_pool_follows_its_padding`). |
 | `jax.nn.relu` / `sigmoid` / `gelu` / `silu` / `swish` / `elu` / `leaky_relu` / `selu` / `softmax` / `log_softmax` / `standardize` / `softplus` / `hard_sigmoid` / `hard_silu` / `hard_tanh` / `hard_swish` / `mish` / `celu` / `log_sigmoid` (free functions) | ✅ | ✅ | ⚠️ | Not a `LayerKind`/`KnownFunction` — handled generically as shape-preserving elementwise via `is_shape_preserving_call` (module `["jax", "nn"]`); same code path also covers `flax.linen.<activation>` free functions. Only `jax.nn.softplus` has a dedicated test (`test_jax_nn_softplus_shape_preserving`), exercising the shared match arm; `test_relu_still_shape_preserving` (in `jax_nn_extra_tests`) is a regression check that carving `one_hot` out below didn't disturb this arm. |
 | `jax.nn.one_hot` | ✅ | ✅ | ✅ | Carved out of the generic shape-preserving arm above (it is **not** shape-preserving — it appends `num_classes`): `KnownFunction::OneHot`, `x.shape + [num_classes]` (literal or symbolic `num_classes`). |
 | `jax.nn.dot_product_attention` | ✅ | ✅ | ✅ | `KnownFunction::DotProductAttention` — output = `query`'s shape with the last (head) dim replaced by `value`'s head dim. |
-| `jax.nn.logsumexp` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (identical axis/keepdims mechanics). |
-| `equinox.nn.MultiheadAttention` | ✅ | ✅ | ✅ | **Bug fix**: `classify_layer_call` previously always read the torch `embed_dim` binding, so equinox ctors (real order `(num_heads, query_size, ...)`) silently failed to classify. `known_layer_signature` now branches on the resolved module path so equinox binds `query_size` (stored in the same `LayerKind::MultiheadAttention.feature_dim` field, renamed from `embed_dim`); torch's `(embed_dim, num_heads)` binding is unchanged — verified against the pre-existing torch MHA tests and `corpus/torch_attention.py`'s `nn.MultiheadAttention(512, 8)` shape, none of which changed. |
+| `jax.nn.logsumexp` | ✅ | ✅ | ✅ | `KnownFunction::Reduction`: `(a, axis, b, keepdims, return_sign)`; `return_sign=True` (a tuple) → `Ok(None)`. |
+| `equinox.nn.MultiheadAttention` | ✅ | ✅ | ✅ | Ctor order `(num_heads, query_size, ...)`; one array of shape `(query_seq, output_size)` (default `query_size`). |
 | `torch.nn.Flatten` | ✅ | ✅ | ✅ | Collapses `[start_dim, end_dim]` (negative indices resolved at apply time) into one dim; literal product when concrete, else `d0*d1*...`. Defaults `start_dim=1`, `end_dim=-1`. |
 | `torch.nn.Unflatten` | ✅ | ✅ | ✅ | Expands `dim` into the parsed components of the `sizes` ctor tuple/list. Non-literal `dim` or unparseable `sizes` → unknown. |
 | `equinox.nn.Identity` / `torch.nn.Identity` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`, any rank. |
 | `torch.nn.Upsample` | ✅ | ✅ | ✅ | Rank-agnostic ctor: spatial dims are whatever trails the leading (batch, channel) pair, determined from the actual input rank at apply time. Scales by `scale_factor` (scalar or per-axis tuple) or sets `size` directly; anything unparseable/mismatched-arity is unknown. Requires rank ≥ 3. |
-| `equinox.nn.ConvTranspose1d/2d/3d` / `torch.nn.ConvTranspose1d/2d/3d` | ✅ | ✅ | ✅ | Shared `LayerKind::ConvTranspose`; channels-first, inverse of the conv formula: `out = (in-1)*stride - 2*padding + kernel`. `output_padding`/`dilation` not modelled (assumed 0/1); per-axis tuple kernel/stride/padding refused like Conv. A string padding works for equinox like Conv; torch refuses it, so the torch form is unknown. |
-| `torch.nn.RNN` / `torch.nn.LSTM` / `torch.nn.GRU` | ✅ | ✅ | ✅ | `LayerKind::Rnn`. Direct/non-tuple application (`out = self.rnn(x)`) approximates the real `(output, final_state)` return as just the primary output (last dim → `hidden_size`). Tuple LHS (`out, h = self.gru(x)`, `out, (h, c) = self.lstm(x)`) is now modelled in `analysis.rs`'s `tuple_rhs_shapes` (the `self.<attr>` → `LayerKind::Rnn` arm): element 0 is the same primary-output rule; element 1 (the state — LSTM's nested `(h, c)` binds both names to this one shape via one level of LHS tuple-pattern nesting, `TupleTarget::Nested`) approximates torch's `h_n`/`c_n` by dropping the leading (sequence) axis and replacing the last dim with `hidden_size`. This assumes `batch_first=False` (torch's default; not tracked) and `num_layers * num_directions == 1` (not tracked), so for a batched input it's missing the real leading `num_layers*num_directions` axis torch's actual state carries — a stated simplification, not the exact torch shape. `batch_first` doesn't change the *output* formula (the feature dim is always trailing). `bidirectional`/`num_layers` not modelled anywhere. |
-| `torch.nn.RNNCell` / `torch.nn.GRUCell` / `torch.nn.LSTMCell` / `equinox.nn.LSTMCell` / `equinox.nn.GRUCell` | ✅ | ✅ | ✅ | `LayerKind::RnnCell`: last dim → `hidden_size`, min rank 1 (single step, optionally unbatched). Single-LHS form models just the primary output (`h`, same approximation reasoning as `Rnn`); a tuple LHS (`h, c = self.lstm(x, (h0, c0))`) extends `tuple_rhs_shapes` to bind *both* elements to that same `hidden_size`-last-dim shape (mirrors the `Rnn` arm's `(h, c)` state handling). |
+| `equinox.nn.ConvTranspose1d/2d/3d` / `torch.nn.ConvTranspose1d/2d/3d` | ✅ | ✅ | ✅ | Shared `LayerKind::ConvTranspose`; channels-first: `out = (in-1)*stride - 2*padding + dilation*(kernel-1) + output_padding + 1`. torch refuses an `output_padding` that is not below stride or dilation; equinox orders `(stride, output_padding, padding, dilation)`. Per-axis tuple kernel/stride/padding refused like Conv. A string padding works for equinox like Conv; torch refuses it, so the torch form is unknown. |
+| `torch.nn.RNN` / `torch.nn.LSTM` / `torch.nn.GRU` | ✅ | ✅ | ✅ | `LayerKind::Rnn`. Returns `(output, h_n)` or `(output, (h_n, c_n))`: one name gets no shape (the input is still checked); `[0]`/`[1]` pick an element; tuple unpacking (also of a local layer) binds the parts. `output` has last dim `D*H_out` (`D` 2 when `bidirectional`, `H_out` the LSTM `proj_size` when above 0, else `hidden_size`). The state is `[D*num_layers, N, H_out]` (`c_n` keeps `hidden_size`), without `N` when unbatched; `batch_first` places `N`. A non-literal option gives an unknown dim. A call that binds `nonlinearity`/`bias` at position 4 is not classified. |
+| `torch.nn.RNNCell` / `torch.nn.GRUCell` / `torch.nn.LSTMCell` / `equinox.nn.LSTMCell` / `equinox.nn.GRUCell` | ✅ | ✅ | ✅ | `LayerKind::RnnCell`: last dim → `hidden_size`, min rank 1. `RNNCell`/`GRUCell` give one array. `LSTMCell` gives `(h, c)`: one name gets no shape, and tuple unpacking binds both to the `hidden_size`-last-dim shape. |
 | `torch.nn.InstanceNorm1d/2d/3d` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank enforced like `BatchNorm1d/2d/3d` (channels-first, no batch dim required). |
 | `equinox.nn.RMSNorm` / `torch.nn.RMSNorm` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`; min rank 1, same convention as `LayerNorm`. |
 | `torch.nn.PixelShuffle` | ✅ | ✅ | ✅ | `(*, C*r^2, H, W) -> (*, C, H*r, W*r)`; concrete integer `upscale_factor` required (else unknown), errors if channels aren't evenly divisible by `r^2`. |
@@ -361,9 +372,9 @@ Legend:
 | `torch.nn.MSELoss` / `torch.nn.L1Loss` / `torch.nn.SmoothL1Loss` / `torch.nn.HuberLoss` | ✅ | ✅ | ✅ | `LayerKind::Loss`: input and target (second call argument, `extra_inputs`) must have the same shape. `reduction='none'` gives the input shape, any other valid reduction a scalar. `beta`/`delta` are not read. A symbolic dim mismatch is not an error; an invalid `reduction` literal is. Deprecated `size_average`/`reduce` keep the checks but give no output shape. |
 | `torch.nn.BCELoss` / `torch.nn.BCEWithLogitsLoss` | ✅ | ✅ | ✅ | `LayerKind::Loss`, same rule as `MSELoss`. `weight` and `pos_weight` are not read (weight size is not checked). |
 | `torch.nn.CrossEntropyLoss` / `torch.nn.NLLLoss` | ✅ | ✅ | ✅ | `LayerKind::Loss`: the same class-dim, probability-target, and class-index-target rules as `F.cross_entropy` / `F.nll_loss`. `weight`, `ignore_index`, `label_smoothing` are not read. |
-| `torch.nn.Bilinear` | ✅ | ✅ | ✅ | Only the first tracked positional input (`x1`) is validated/transformed (last dim vs. `in1_features` → `out_features`); `x2`/broadcasting not modelled — the analyzer tracks one positional input per layer call (see `extract_layer_applications`); loss layers are the exception and use `LayerApplication.extra_inputs`. |
+| `torch.nn.Bilinear` | ✅ | ✅ | ✅ | Only the first positional input (`x1`) is validated/transformed (last dim vs. `in1_features` → `out_features`); `x2`/broadcasting not modelled — the analyzer tracks one positional input per layer call; loss layers are the exception and use `LayerApplication.extra_inputs`. |
 | `torch.nn.CosineSimilarity` | ✅ | ✅ | ✅ | Removes the reduced `dim` axis from `x1`'s shape (default `dim=1`); same single-tracked-input limitation as `Bilinear`. Non-literal `dim` → unknown. |
-| `torch.nn.TransformerEncoderLayer` / `torch.nn.TransformerDecoderLayer` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving` (`d_model` unchanged on the primary input). `TransformerDecoderLayer`'s second (`memory`) input isn't tracked (`LayerApplication.extra_inputs` could carry it, but it is not wired). |
+| `torch.nn.TransformerEncoderLayer` / `torch.nn.TransformerDecoderLayer` / `torch.nn.TransformerEncoder` / `torch.nn.TransformerDecoder` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving` (`d_model` unchanged on the primary input). `TransformerDecoderLayer`'s second (`memory`) input isn't tracked (`LayerApplication.extra_inputs` could carry it, but it is not wired). |
 | `torch.nn.AlphaDropout` | ✅ | ✅ | ✅ | Shape-preserving via `LayerKind::ShapePreserving`, any rank — trivial, same family as `Dropout`. |
 | `equinox.nn.MLP` | ✅ | ✅ | ✅ | `LayerKind::Mlp`: last-dim transform `in_size -> out_size`, same rule as `Linear`. |
 | `torch.nn.Sequential` / `equinox.nn.Sequential` | ✅ | ✅ | ✅ | `LayerKind::Sequential { children: Vec<LayerKind> }`. Classification happens at the node level in `layers.rs` (`try_classify_sequential`, hooked into `resolve_layer_kind_for_call` ahead of the normal catalog/disk path): each ctor argument is resolved as its own nested layer-constructor call via `classify_nested_layer_node`, reusing the same catalog-first/disk-fallback resolution recursively — so nested `Sequential`s classify for free. torch's variadic-positional form (`nn.Sequential(l1, l2, ...)`) and equinox's single-list form (`eqx.nn.Sequential([l1, l2, ...])`) are both unwrapped via `sequential_child_nodes`. Any ctor argument that isn't itself a resolvable `call` node (arbitrary callable, `*args` unpacking, an unclassifiable layer) makes the *whole* `Sequential` unclassified (`Ok(None)`), never a partial/guessed result. Application (`apply_layer_kind`'s `Sequential` arm) threads the shape through each child via the same function recursively; an unknown (`Ok(None)`) child makes the chain unknown, and a child's `Err` propagates verbatim with an index-qualified layer label (`"net[1]"`) so a mid-chain mismatch reports as that child's own error. User modules inside a `Sequential` or `ModuleList` field of a user module are handled through fields (`src/analysis/modules.rs`), not through `LayerKind::Sequential`. |
@@ -387,10 +398,10 @@ Legend:
 | `x.moveaxis(...)` | ✅ | ✅ | ✅ | Move axis preserving order. |
 | `x.flatten(...)` | ✅ | ✅ | ✅ | Flatten all dims. |
 | `x.ravel(...)` | ✅ | ✅ | ✅ | Flatten all dims. |
-| `x.squeeze(...)` | ✅ | ✅ | ✅ | Remove size-1 dims. |
+| `x.squeeze(...)` | ✅ | ✅ | ✅ | Remove size-1 dims. In a torch-only file a dim whose size is not 1 stays (`TorchSqueeze`); numpy/jax report an error; no or both imports → unknown unless both agree. |
 | `x.unsqueeze(...)` | ✅ | ✅ | ✅ | Insert size-1 dim (maps to `ExpandDims`). |
 | `x.expand_dims(...)` | ✅ | ✅ | ✅ | Same as `unsqueeze`. |
-| `x.sum(...)` | ✅ | ✅ | ✅ | Reduction; supports `axis`/`dim`/`keepdims`/`keepdim`. |
+| `x.sum(...)` | ✅ | ✅ | ✅ | Reduction; supports `axis`/`dim`/`keepdims`/`keepdim`. Positional slots follow the library of the file (`torch_method_reading`): torch `x.sum(1, True)` keeps the dim, numpy `x.sum(1, None, None, True)`; no or both imports → unknown unless both readings agree. The same for `mean`, `prod`, `std`, `var`, `all`, `any`, `argmax`, `argmin`. |
 | `x.mean(...)` | ✅ | ✅ | ✅ | Reduction. |
 | `x.max(...)` | ✅ | ✅ | ✅ | Reduction. |
 | `x.min(...)` | ✅ | ✅ | ✅ | Reduction. |
@@ -402,10 +413,10 @@ Legend:
 | `x.argmax(...)` | ✅ | ✅ | ✅ | Reduction. |
 | `x.argmin(...)` | ✅ | ✅ | ✅ | Reduction. |
 | `x.argsort(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
-| `x.sort(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
+| `x.sort(...)` | ✅ | ✅ | ✅ | Shape-preserving for numpy/jax. In a torch-only file it is `TorchSort`, a `(values, indices)` tuple → `Ok(None)`. |
 | `x.cumsum(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
 | `x.cumprod(...)` | ✅ | ✅ | ✅ | Shape-preserving. |
-| `x.repeat(...)` | ✅ | ✅ | ✅ | 1 positional arg → numpy repeat; ≥2 → torch tile semantics. `x.repeat_interleave` and `x.tile` too. |
+| `x.repeat(...)` | ✅ | ✅ | ✅ | By the library of the file: numpy `repeat(repeats, axis)`; torch `x.repeat(*sizes)` tiles and needs at least one size per dim (`TorchRepeat`); no or both imports → unknown unless both agree. `x.repeat_interleave` uses the numpy rule in every file. `x.tile` too. |
 | `x.expand(...)` | ✅ | ✅ | ✅ | Maps to broadcast_to; -1 keeps the input dim. `x.broadcast_to` too. |
 | `x.to(...)` | ✅ | ✅ | ✅ | Shape-preserving (dtype/device cast). |
 | `x.astype(...)` | ✅ | ✅ | ✅ | Shape-preserving; `KnownFunction::Astype`. |
@@ -417,8 +428,8 @@ Legend:
 | `x.split(...)` | ✅ | ✅ | ✅ | Method form of real `torch.split` — `KnownFunction::TorchSplit`/`compute_torch_split_shapes` (receiver prepended as positional[0]). Fixed: previously reused `KnownFunction::Split`'s "N equal sections" (jnp) approximation; now uses the real chunk-*size* semantics (see the `torch.split` row above). |
 | `x.gather(...)` | ✅ | ✅ | ✅ | `KnownFunction::Gather`; output shape matches `index`. |
 | `x.scatter(...)` | ✅ | ✅ | ✅ | `KnownFunction::Scatter`; shape-preserving. |
-| `x.masked_select(...)` | ✅ | ❌ | ✅ | `KnownFunction::MaskedSelect`; classified, conservatively `Ok(None)` — length is data-dependent. |
-| `x.masked_fill(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedFill`; shape-preserving. |
+| `x.masked_select(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedSelect`: `[?]`, the length is data-dependent. |
+| `x.masked_fill(...)` / `x.masked_fill_(...)` | ✅ | ✅ | ✅ | `KnownFunction::MaskedFill`; shape-preserving. |
 | `x.index_select(...)` | ✅ | ✅ | ✅ | `KnownFunction::IndexSelect`; dim length becomes `len(index)`. |
 | `x.narrow(...)` | ✅ | ✅ | ✅ | `KnownFunction::Narrow`; slices one dim to `length`. |
 | `x.select(...)` | ✅ | ✅ | ✅ | `KnownFunction::SelectDim`; removes one dim. |
@@ -434,8 +445,10 @@ Legend:
 | `x.cpu(...)` / `x.cuda(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.float(...)` / `long(...)` / `int(...)` / `bool(...)` / `double(...)` / `half(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
 | `x.clamp(...)` / `x.clip(...)` | ✅ | ✅ | ✅ | `KnownFunction::Clamp`: same broadcast-with-bounds rule as `torch.clamp` (see the `jnp.clip` row). |
-| `x.softmax(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Copy`'s shape-preserving rule. |
-| `x.norm(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Sum`'s reduction rule (same convention as `jnp.linalg.norm`/`torch.linalg.norm`); no `dim` → scalar. |
+| `x.softmax(...)` / `log_softmax` / `type_as` / elementwise methods (`exp`, `log`, `sqrt`, `rsqrt`, `abs`, `neg`, `sigmoid`, `tanh`, `relu`, `sin`, `cos`, `square`, `floor`, `ceil`, `round`, `sign`, and their in-place `_` forms) | ✅ | ✅ | ✅ | Reuse `KnownFunction::Copy`'s shape-preserving rule. |
+| `x.t()` | ✅ | ✅ | ✅ | `TorchT`: the transpose of a tensor of rank 2 or less; rank 3 is an error. |
+| `x.mm(...)` / `x.mv(...)` / `x.matmul(...)` | ✅ | ✅ | ✅ | Method forms of `torch.mm`, `torch.mv`, and `matmul`. |
+| `x.norm(...)` | ✅ | ✅ | ✅ | `NORM`, the `linalg.norm` signature: `x.norm(p, dim, keepdim)`, so `x.norm(2)` is a scalar and `x.norm(2, 1)` reduces dim 1. |
 | `x.diagonal(...)` | ✅ | ✅ | ✅ | Reuses `KnownFunction::Diagonal`'s rule (method form of `torch.diagonal`). |
 | `x.tril(...)` / `x.triu(...)` | ✅ | ✅ | ✅ | Reuse `KnownFunction::Tril`/`KnownFunction::Triu`'s shape-preserving rules. |
 | `x.kthvalue(...)` / `x.median(...)` / `x.mode(...)` | ✅ | ✅ | ✅ | Classified by `classify_method_call` (see `src/known_functions.rs`). |
@@ -529,10 +542,9 @@ Open (measured limits, not planned work):
 
 - The name closure over-approximates, so hub names (`__init__`, `forward`) join most statements into one group and an edit there saves only part of the cost.
 - The propagate-pass setup (function nodes, scope links, submodules, `original_shapes`) runs over the whole file on every dirty edit (about 14 ms, including the module field extraction).
-- An edit that moves every position of the file, or dirties more than 60 percent of the bytes, runs in full.
-- The first edit after open builds the memo (about 4 ms more).
+- An edit that dirties more than 60 percent of the bytes runs in full.
+- The first edit after open builds the memo and analyzes every statement (`edit_char_start`). A memo built at open was measured and rejected: open 12 to 17 percent slower, first edit 396 to 41 ms.
 - A file over 4 MiB or 100,000 statements has no memo.
-- An unsaved helper buffer is ignored.
 - Each key can start one analysis, so typing uses more CPU (about 17 percent of one core at 100 ms for each key on the stress file). On a very long analysis the 150 ms ceiling does not stop steady typing from using one core.
 
 ## Open targets (current)
@@ -561,20 +573,20 @@ Still open: tuple unpacking of user-defined helper tuple returns, and heterogene
 - A global or constant below its reader (source order) stays unknown, also in a layer dim. A shape assigned in a global by several writes stays unknown.
 - A comprehension or lambda stored in a name (`ys = [f(x) for x in xs]`, `f = lambda ...`) is not evaluated, nor are set and dict comprehensions, filters or several `for` clauses in `stack`, symbolic lengths, generators, and tuple results of a lambda (`vmap`, `lax.map`, `lax.scan` with a tuple carry).
 - `self.layers.append(...)` in a loop makes the field unknown. Modules in local variables, `zip`, `reversed`, slices, and `nn.ModuleDict` stay unknown.
-- Functional losses (`F.mse_loss`, `F.l1_loss`, `F.binary_cross_entropy`, ...) are not classified. A loss `weight` is not checked.
+- A loss `weight` is not checked.
 - Value statements (`return`, `assert`, bare calls) read the state at the end of the scope, not at their own position. Literal conditions (`while True`, `if TYPE_CHECKING`) are not folded. A context manager that swallows errors is found by name only. A walrus value is not evaluated (its name is unknown).
 - Dynamic rebinding is not visible: `globals()["f"] = g`, `setattr(module, ...)`, or `lib.f = g` from another file.
-- `class_init_signature` takes the first `__init__` of a class, but Python uses the last. `import a.b` records the path `a.b` for the name `a`, so `lib.a.x` can follow the wrong path. Both come from a reading of the code. No test reproduces them yet.
+- `class_init_signature` takes the first `__init__` of a class, but Python uses the last. This comes from a reading of the code. No test reproduces it yet.
 - A callable parameter is not proven: `apply(g, xs)` stays unknown. A real proof needs callable seeding in `specialize_callee_call`. An imported or known function that a comprehension variable shadows is not tested.
 - Rules that give unknown for valid code: a second straight-line definition of an imported name, a rebinding of a method (`m = jax.jit(m)`), `vf = vmap(f); vf = vmap(g)`, and a lazy import through `global`. See items 18a and 22 of `llm.txt` and "Symbol/re-export following".
 - A subclass in another file is not visible, so a base-class `self.m(x)` can show the shape of the base method. `vmap(self.helper)`, `lax.map(self.helper, xs)`, `lax.scan(self.step, ...)`, `A.helper(self, x)`, and `p, q = self.helper(x)` stay unknown.
-- A constant named like an annotation symbol stays a claim, so it conflicts with an integer. `nn.Linear(8, M.OUT)` is unknown.
+- A conflict that rests on a name (a constant named like an annotation symbol, two different names, or a name against an integer) is a warning (`Approximation`), not an error, and gives no shape. `nn.Linear(8, M.OUT)` is unknown.
 - A class body is not specialized for a call site, so a free dim hides a true error inside it (`M(5)` with `h + y` on `[n, 4]`). Two different free dims give an unknown shape.
 - Comment lines make the analysis slow (2,000 comment lines cost about 100 ms).
-- An unsaved buffer of an imported file is ignored.
 - An index from a call that gives a 0-d integer (`i = jnp.argmax(v); x[i]`) is unknown, as the analysis has no dtype. An array index is also unknown: only a list literal gives a size.
 - A `padding` that is an attribute (`self.p`) is unknown, also when the parameter behind it is annotated `int`.
-- `ConvTranspose` ignores `dilation` and `output_padding`, `MaxPool` ignores `dilation`, and an equinox pool uses the torch default stride.
+- Equinox pool `use_ceil` is not modelled. `torch.sort` and `histogram` results are not unpacked.
+- At `62e9ebd`, the diagnostic of `a = x + y` on two annotated parameters has its primary range on the `def` line.
 
 Imported helpers with parameter and return annotations now propagate through `resolve_imported_function_shape` and its signature cache. Lazy body seeding remains same-file only, so imported helpers without return annotations stay unknown.
 

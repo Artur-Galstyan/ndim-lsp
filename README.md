@@ -12,6 +12,20 @@ cargo install --path .
 
 An editor extension starts the server. Both extensions look for `ndim-lsp` on `PATH`.
 
+### Command line
+
+`ndim-lsp check [--shapes] <path>...` analyzes files or directories without an editor and prints one line per diagnostic, like a compiler:
+
+```text
+path:line:column: error|warning: variable: message
+```
+
+`--shapes` also prints the shape of each assignment. A directory walk skips hidden directories, virtual environments, `build`, `dist`, and caches. Imports resolve from the current directory (and its `src` directory) and its site-packages. The exit code is 1 when an error was found, 2 for a usage or read error, and 0 otherwise. Warnings do not change the exit code. A summary goes to stderr.
+
+### Errors and warnings
+
+Only two different integers are a proven conflict, so only they give an error (code `shape-mismatch`). A conflict that rests on a name, for example `n` against `m` or `n` against `4`, can be equal at run time: it gives a warning (code `shape-approximation`) and no result shape. The approximate rules give warnings too.
+
 **VS Code** (extension `ndim-lsp`, in `../ndim-lsp-vscode`). The setting `ndim-lsp.serverPath` is the path to the binary (default `ndim-lsp`). A change to this setting restarts the server.
 
 **Zed** (extension `ndim-lsp-zed`, in `../ndim-lsp-zed`). In your Zed settings:
@@ -32,7 +46,7 @@ An editor extension starts the server. Both extensions look for `ndim-lsp` on `P
 }
 ```
 
-Rebuild the Zed extension to get live changes. The `extension.wasm` file must include `language_server_workspace_configuration`. The `initialization_options` object takes the same keys, and Zed uses it for live changes if `settings` is not set.
+The Zed extension in `../ndim-lsp-zed` is stale (`extension.toml` 0.0.1, `Cargo.toml` 0.0.2, an old `extension.wasm`). Rebuild the Zed extension to get live changes. The `extension.wasm` file must include `language_server_workspace_configuration`. The `initialization_options` object takes the same keys, and Zed uses it for live changes if `settings` is not set.
 
 ### Options
 
@@ -84,9 +98,9 @@ NDIM_GOLDEN_OUT=/tmp/golden.json cargo test --release --test lsp_stress golden_d
 
 `golden_dump` writes every diagnostic and inlay hint. Run it before and after a refactor and compare the two files with `cmp`: a cleanup must leave them identical.
 
-Baseline (the code with free parameter dims, scoped bare names, and tracked import rebinding, release, 5 runs, p50, 22,323-line file): an edit takes about 50 to 80 ms, which is a 20 ms debounce plus about 16 to 44 ms of compute plus about 14 to 16 ms of transport. Typing runs one analysis for each key: `typing_plain` takes 52 ms for each key and gives 12 analyses and 12 publications for 12 keys. The worst case is an edit that moves every position of the file (`edit_char_start`): about 415 ms, 249 ms of it compute, with the full 150 ms debounce. The next edit also waits 150 ms (`edit_char_start_revert`, 189 ms). Cold open takes about 378 ms (366 ms of compute). Before the incremental work an edit took about 410 ms (150 ms debounce plus about 245 ms of full re-analysis).
+Baseline, measured at commit `993040d` (release, 5 runs, p50, 22,323-line file): an edit takes about 50 to 80 ms, which is a 20 ms debounce plus about 16 to 44 ms of compute plus about 14 to 16 ms of transport. Typing runs one analysis for each key. The worst case is the first edit after open (`edit_char_start`): about 415 ms, 249 ms of it compute, because open builds no memo and the first edit analyzes every statement. Cold open takes about 378 ms (366 ms of compute). A memo built at open was measured and rejected: open got 12 to 17 percent slower, and the first edit fell from 396 to 41 ms. The numbers depend on the machine and on the session, so compare only runs of one session.
 
-Control on one input against commit `c6f2860`, two 5-run benchmarks of each code, in turn: cold open compute rises about 2 percent (362 to 368 ms), inside the noise, and small edits and `edit_char_start` do not change. Edits that rebuild layers cost 2 to 4 ms more (`paste_500_lines` 41 to 45 ms). An older control against commit `025e7f2`, the commit before the cost-based debounce, showed `typing_plain` falling from 211 to 58 ms and `edit_char_end` from 195 to 51 ms. The cost is CPU time: at 100 ms for each key, that commit ran 1 analysis for 12 keys and the debounce gives 12. The numbers depend on the machine and on the session, so compare only runs of one session.
+The benchmark, the golden dump, and the 24-file corpus are written by the same authors as the analyzer. Real projects (`ndim-lsp check .`) found false errors that these measures did not, so real code is the main test now (see `llm.txt`).
 
 The debounce column of the benchmark is the value the server chose for the edit. Do not time with `NDIM_VERIFY_INCREMENTAL=1`: it adds a fresh parse and analysis to every edit.
 
@@ -99,7 +113,7 @@ The server uses `TextDocumentSyncKind::INCREMENTAL`. After a change it reuses th
 - The first analysis after open runs in full. A change of the workspace folders drops the memo (it is valid for one set of search roots), so the next analysis redoes the statements, but it still reuses the tree.
 - The debounce depends on the analysis cost of the document, not on the rhythm of the keys. It is half of the average incremental run or twice the last whole analysis, between 20 and 150 ms. A document with no known cost waits 150 ms, also after a failed analysis or a change of the workspace folders. Each key can start one analysis, so typing uses more CPU than a fixed window, but a change waits less.
 - A change message that does not fit the stored text is dropped as a whole. The document then gives no diagnostics or hints until the editor sends a full text.
-- Limits: an edit in a hub (`__init__`, `forward`, other common names) reuses less. An edit that moves the whole file, an edit of an import line, and a statement with a syntax error recompute more. A file over 4 MiB or 100,000 statements runs without the memo.
+- Limits: an edit in a hub (`__init__`, `forward`, other common names) reuses less. The first edit after open, an edit of an import line, and a statement with a syntax error recompute more. A file over 4 MiB or 100,000 statements runs without the memo.
 - Debug switches (server environment): `NDIM_VERIFY_INCREMENTAL=1` compares every incremental result with a fresh one and uses the fresh result on a difference (it logs `incremental mismatch`). `NDIM_NO_PROPAGATE_MEMO=1` turns off the reuse of the propagation pass.
 
 See `llm.txt` for the design.
@@ -128,12 +142,13 @@ See `llm.txt` for the design.
 - [x] `jnp.transpose` (tuple axis permutation)
 - [x] `jnp.expand_dims` (multiple axes insertion, bounds checking)
 - [x] `jnp.squeeze` (multiple axes removal, `size == 1` validation)
-- [x] Reduction ops (`sum`, `mean`, `max`, `min`, `prod`, `std`, `var`) with `keepdims` and multiple axes support
+- [x] Reduction ops (`sum`, `mean`, `max`, `min`, `prod`, `std`, `var`, `median`, `quantile`, `norm`, ...) with `keepdims` and multiple axes, read by the signature of each library (a positional `keepdim` works)
 - [x] Two-operand elementwise functions (`maximum`, `minimum`, `add`, `power`, `arctan2`, ...) broadcast both operands; `clip`/`clamp` broadcast array bounds
-- [x] `torch.bmm`, `F.cross_entropy`, `F.nll_loss`, and the loss layers (`nn.MSELoss`, `L1Loss`, `SmoothL1Loss`, `HuberLoss`, `BCELoss`, `BCEWithLogitsLoss`, `CrossEntropyLoss`, `NLLLoss`)
+- [x] `torch.bmm`, `mm`, `mv`, `addmm`, `baddbmm`, `F.linear`, `F.scaled_dot_product_attention`, `F.cross_entropy`, `F.nll_loss`, the functional losses (`F.mse_loss`, ...), and the loss layers (`nn.MSELoss`, `L1Loss`, `SmoothL1Loss`, `HuberLoss`, `BCELoss`, `BCEWithLogitsLoss`, `CrossEntropyLoss`, `NLLLoss`)
+- [x] `jax.lax.dot_general` with literal dimension numbers; `unique`, `masked_select`, and `bincount` give a 1-D shape of unknown length
 - [x] `jnp.reshape` (dimension flattening/unflattening tracking)
 - [x] `jnp.stack` (and `vstack`, `hstack`, `dstack`, `column_stack`; list and tuple literals, and list comprehensions over a provable array)
-- [x] `jnp.einsum`
+- [x] `jnp.einsum` (spaces in the subscripts are skipped) and `einops.einsum` (space-separated names)
 - [x] `jnp.split`, `jnp.tile`, `jnp.repeat`, `jnp.flatten` (including tuple propagation for `split`)
 - [x] Dynamic `kwargs` handling in function parsing
 
@@ -145,7 +160,7 @@ See `llm.txt` for the design.
 - [x] Convolutional layers (`Conv1d`, `Conv2d`, `Conv3d`) tracking spatial dimension reductions, with `padding="same"`, `padding="valid"`, and `dilation`. A padding name without an integer proof, and a torch padding string that is not lower case, are unknown
 - [x] Attention mechanisms (`MultiheadAttention` for PyTorch and Equinox, plus functional attention rules)
 - [x] Shape-preserving layers (`Dropout{,1d,2d,3d}`, `BatchNorm{,1d,2d,3d}`, `LayerNorm`, `GroupNorm`, `ReLU`, `GELU`, etc.)
-- [x] More layers (transposed convolution, pooling, `Embedding`, RNN/LSTM/GRU, `Flatten`/`Unflatten`, `Upsample`, `Sequential`, einops layers): see `TO_IMPLEMENT.md`
+- [x] More layers (transposed convolution with `output_padding` and `dilation`, pooling with `ceil_mode` and `dilation`, `Embedding`, RNN/LSTM/GRU with `bidirectional`, `num_layers`, `proj_size`, and `batch_first`, `Flatten`/`Unflatten`, `Upsample`, `Sequential`, einops layers): see `TO_IMPLEMENT.md`
 
 ### Static Analysis & AST Tracking
 - [x] Trace shapes through variable assignments (`z = x @ y`)
@@ -175,8 +190,8 @@ See `llm.txt` for the design.
 - [x] Cross-function tracing for same-file and imported helper functions
 
 ### LSP Editor Features
-- [x] **Diagnostics:** Error squiggles on invalid matmul or dimension mismatches
-- [x] **Hover:** Show shapes of variables and arguments on hover
+- [x] **Diagnostics:** Errors for proven mismatches and warnings for conflicts that rest on a name, with the codes `shape-mismatch` and `shape-approximation`
+- [x] **Hover:** Show the shape of a variable or a parameter at the cursor (the assignment that holds there)
 - [x] **Inlay Hints:** Display inferred dimensions inline directly in the editor
 - [x] Inlay hint options: `inlay_hints` turns hints off, and `inlay_hints_max_length` cuts long labels
 - [x] Live settings: `workspace/didChangeConfiguration` applies all options with no restart
@@ -184,7 +199,9 @@ See `llm.txt` for the design.
 - [x] Point two-operand mismatch diagnostics at both conflicting operands
 - [x] Highlight exact conflicting dimension tokens for direct binary operations on annotated variables
 - [x] Diagnostic severity configuration — use `diagnostic_severity` for mismatches and `approximation_severity` for approximate rules
-- [x] Go-to-definition for simple symbolic dimension names within the current function scope
+- [x] Go-to-definition, references, highlights, and rename for simple symbolic dimension names within the current function scope
+- [x] UTF-8 positions when the client offers them (else UTF-16)
+- [x] Command-line mode: `ndim-lsp check <path>...`
 - [x] Safe code action to append `.T` when transposing the right matmul operand proves valid
 
 ### Architecture & Performance
@@ -192,8 +209,8 @@ See `llm.txt` for the design.
 - [x] `tower-lsp` async server backend
 - [x] Recursive AST shape resolution
 - [x] Incremental AST parsing (reusing previous trees on document changes for performance)
-- [x] Resolve imported helpers from files under workspace roots and from site-packages (`$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`)
-- [ ] Track unsaved changes across imported workspace files
+- [x] Resolve imported helpers from files under workspace roots (and a `src` layout) and from site-packages (`$VIRTUAL_ENV`, `$CONDA_PREFIX`, or `<workspace>/.venv` and `venv`), with relative imports of the open document
+- [x] Track unsaved changes across imported workspace files (imports read the editor text of open documents)
 - [x] Cache parsed trees and resolved shapes for repeated requests at the same document version
 - [x] Cache import resolution and function signatures across edits (a saved change to an imported file, or a watched-file event, drops the affected entries and republishes the open documents)
 - [x] Reuse parsed trees and local shape analysis across document edits (per top-level statement memo and propagation replay; see "Incremental analysis")
