@@ -673,7 +673,7 @@ pub(crate) fn multiply_dim(dim: &str, factor: &str) -> String {
     joined_dim(&[factor_text(dim), factor_text(factor)], "*")
 }
 
-fn add_to_dim(dim: &str, amount: isize) -> String {
+pub(crate) fn add_to_dim(dim: &str, amount: isize) -> String {
     if amount == 0 {
         return dim.to_string();
     }
@@ -2032,13 +2032,15 @@ fn apply_known_reshape(
 
 fn resolve_shape_index(dim: &str, shapes: &dyn ShapeLookup) -> Option<String> {
     let dim = dim.trim();
-    let suffix_start = dim.find(".shape[")?;
+    // `x.shape[i]`, or the torch form `x.size(i)`.
+    let (open, close) = if dim.contains(".shape[") { (".shape[", ']') } else { (".size(", ')') };
+    let suffix_start = dim.find(open)?;
     let (ident, rest) = dim.split_at(suffix_start);
     let ident = ident.trim();
     if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
-    let idx_part = rest.strip_prefix(".shape[")?.strip_suffix(']')?;
+    let idx_part = rest.strip_prefix(open)?.strip_suffix(close)?;
     let idx: isize = idx_part.trim().parse().ok()?;
     let shape = shapes.shape(ident)?;
     let resolved = if idx >= 0 {
@@ -2050,17 +2052,55 @@ fn resolve_shape_index(dim: &str, shapes: &dyn ShapeLookup) -> Option<String> {
     Some(resolved.clone())
 }
 
+/// The size that `-1` stands for: the product of the input dims over the
+/// product of the known dims. Equal factors cancel and the integers fold. A
+/// known dim that the input does not have stays as a divisor: `d//heads`.
 fn infer_symbolic_minus_one(input_shape: &[String], known_dims: &[String]) -> Option<String> {
-    let mut remaining: Vec<String> = input_shape.to_vec();
-    for known in known_dims {
-        let pos = remaining.iter().position(|d| d == known)?;
-        remaining.remove(pos);
+    let factors = |dims: &[String]| -> Vec<String> {
+        let plain = |dim: &str| dim.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '*'));
+        dims.iter()
+            .flat_map(|dim| if plain(dim) { dim.split('*').map(str::to_string).collect() } else { vec![dim.clone()] })
+            .collect()
+    };
+    let mut remaining = factors(input_shape);
+    let mut divisors: Vec<String> = Vec::new();
+    for known in factors(known_dims) {
+        match remaining.iter().position(|d| *d == known) {
+            Some(pos) => drop(remaining.remove(pos)),
+            None => divisors.push(known),
+        }
     }
-    if remaining.is_empty() {
-        Some("1".to_string())
+    let fold = |dims: &mut Vec<String>| {
+        let integers = dims.extract_if(.., |dim| dim.parse::<usize>().is_ok()).collect::<Vec<_>>();
+        integers.iter().try_fold(1usize, |product, dim| product.checked_mul(dim.parse().ok()?))
+    };
+    let (above, below) = (fold(&mut remaining)?, fold(&mut divisors)?);
+    if below == 0 {
+        return None;
+    }
+    if above % below == 0 {
+        remaining.extend((above != below).then(|| (above / below).to_string()));
+    } else if remaining.is_empty() {
+        return None;
     } else {
-        Some(flattened_dim(&remaining))
+        remaining.extend((above != 1).then(|| above.to_string()));
+        divisors.push(below.to_string());
     }
+    if divisors.is_empty() {
+        return Some(if remaining.is_empty() { "1".to_string() } else { flattened_dim(&remaining) });
+    }
+    let written = |dim: &String| dim.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'));
+    if remaining.is_empty() || !divisors.iter().all(written) {
+        return None;
+    }
+    if remaining.iter().any(|dim| dim.contains(UNKNOWN_DIM)) {
+        return Some(UNKNOWN_DIM.to_string());
+    }
+    Some(format!(
+        "{}//{}",
+        operand_text(&flattened_dim(&remaining)),
+        operand_text(&flattened_dim(&divisors))
+    ))
 }
 
 fn apply_known_flatten(

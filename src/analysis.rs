@@ -13,7 +13,7 @@ use crate::known_functions::{
     classify_method_call, compute_array_split_shapes, compute_chunk_shapes,
     compute_einops_pack_shape, compute_fixed_axis_split_shapes, compute_split_shapes,
     compute_torch_split_shapes,
-    compute_unbind_shape, multiply_dim, torch_method_reading,
+    add_to_dim, compute_unbind_shape, multiply_dim, torch_method_reading,
 };
 use crate::incremental::{
     NodeRef, PrePass, PropPlan, PropagateOutput, Segment, UnitMemo, UnitRun, unit_nodes,
@@ -3433,7 +3433,7 @@ fn scrub_applications(applications: &mut [LayerApplication], sources: &HashMap<S
 
 /// The dimension an integer expression stands for when it is built from
 /// integer literals, names unpacked from `x.shape`, other plain integer
-/// names, and `*`. `None` for anything else.
+/// names, and `*`, `//`, `+`, `-`. `None` for anything else.
 fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String> {
     let text = ctx.text.get(node.byte_range())?;
     match node.kind() {
@@ -3449,14 +3449,29 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
             .cloned()
             .or_else(|| integer_constant(node, text, ctx)),
         "parenthesized_expression" => scalar_dim_expr(node.named_child(0)?, scope_idx, ctx),
+        // `self.heads` is a name of a size, like in an argument on its own.
+        "attribute" => {
+            let plain = |field: &str| node.child_by_field_name(field).is_some_and(|n| n.kind() == "identifier");
+            (text.starts_with("self.") && plain("object") && plain("attribute")).then(|| text.to_string())
+        }
         "binary_operator" => {
-            let op = node.child_by_field_name("operator")?;
-            if ctx.text.get(op.byte_range())? != "*" {
+            let op = ctx.text.get(node.child_by_field_name("operator")?.byte_range())?;
+            if !matches!(op, "*" | "//" | "+" | "-") {
                 return None;
             }
             let left = scalar_dim_expr(node.child_by_field_name("left")?, scope_idx, ctx)?;
             let right = scalar_dim_expr(node.child_by_field_name("right")?, scope_idx, ctx)?;
-            Some(multiply_dim(&left, &right))
+            let folded = fold_integers(&format!("({left}){op}({right})")).map(|value| value.to_string());
+            folded.or_else(|| match (op, left.parse::<isize>(), right.parse::<isize>()) {
+                ("*", ..) => Some(multiply_dim(&left, &right)),
+                ("//", _, Ok(1)) => Some(left),
+                ("//", ..) => Some(format!("{}//{}", operand_text(&left), operand_text(&right))),
+                ("+", _, Ok(amount)) => Some(add_to_dim(&left, amount)),
+                ("+", Ok(amount), _) => Some(add_to_dim(&right, amount)),
+                ("+", ..) => Some(format!("{left}+{right}")),
+                (_, _, Ok(amount)) => Some(add_to_dim(&left, amount.checked_neg()?)),
+                _ => Some(format!("{left}-{}", factor_text(&right))),
+            })
         }
         _ => None,
     }

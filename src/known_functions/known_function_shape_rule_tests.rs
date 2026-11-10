@@ -114,7 +114,13 @@ fn test_reshape_cases() {
         ("reshape_symbolic_minus_one_flattens_remaining_dims", vec![pos("x"), pos("(c, -1)")], &[("x", &["c", "h", "w"])], Ok(Some(&["c", "h*w"]))),
         ("reshape_shape_index_resolves_to_input_dim", vec![pos("x"), pos("(x.shape[0], -1)")], &[("x", &["c", "h", "w"])], Ok(Some(&["c", "h*w"]))),
         ("reshape_shape_index_negative_resolves", vec![pos("x"), pos("(x.shape[-1], -1)")], &[("x", &["c", "h", "w"])], Ok(Some(&["w", "c*h"]))),
-        ("reshape_symbolic_minus_one_unmatched_known_dim_returns_none", vec![pos("x"), pos("(z, -1)")], &[("x", &["a", "b"])], Ok(None)),
+        ("reshape_minus_one_keeps_an_unmatched_known_dim_as_divisor", vec![pos("x"), pos("(z, -1)")], &[("x", &["a", "b"])], Ok(Some(&["z", "(a*b)//z"]))),
+        ("reshape_minus_one_heads", vec![pos("x"), pos("(b, t, heads, -1)")], &[("x", &["b", "t", "d"])], Ok(Some(&["b", "t", "heads", "d//heads"]))),
+        ("reshape_minus_one_folds_integers", vec![pos("x"), pos("(-1, 64)")], &[("x", &["b", "3", "8", "8"])], Ok(Some(&["b*3", "64"]))),
+        ("reshape_minus_one_cancels_a_product", vec![pos("x"), pos("(b*t, -1)")], &[("x", &["b", "t", "d"])], Ok(Some(&["b*t", "d"]))),
+        ("reshape_minus_one_size_call", vec![pos("x"), pos("(x.size(0), -1)")], &[("x", &["b", "3", "4"])], Ok(Some(&["b", "12"]))),
+        ("reshape_minus_one_integer_remainder_is_unknown", vec![pos("x"), pos("(b, 2, -1)")], &[("x", &["b", "3"])], Ok(None)),
+        ("reshape_minus_one_compound_divisor_is_unknown", vec![pos("x"), pos("(f(n), -1)")], &[("x", &["a", "b"])], Ok(None)),
     ]);
 }
 

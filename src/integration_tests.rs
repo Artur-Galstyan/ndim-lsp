@@ -10150,7 +10150,22 @@ mod tuple_literal_unpack_tests {
         }
         assert_eq!(hint(&a, 3, "n2"), Some(shape(&["b*s", "c"])));
         assert_eq!(hint(&a, 4, "n3"), Some(shape(&["b*s", "c"])));
-        assert_eq!(hint(&a, 5, "n4"), None);
+        assert_eq!(hint(&a, 5, "n4"), Some(shape(&["b*s", "c"])));
+    }
+
+    #[test]
+    fn size_arguments_read_floor_division_sum_and_difference() {
+        let code = "import torch
+class M:
+    def f(self, x: Float[Array, \"b t d\"]):
+        b, t, d = x.shape
+        q = x.view(b, t, self.heads, d // self.heads)
+        r = torch.zeros(b, d // 2, t + 1, t - 1, 7 // 2)
+";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 4, "q"), Some(shape(&["b", "t", "self.heads", "d//self.heads"])));
+        assert_eq!(hint(&a, 5, "r"), Some(shape(&["b", "d//2", "t+1", "t-1", "3"])));
     }
 
     #[test]

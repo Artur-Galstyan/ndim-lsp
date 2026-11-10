@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,194 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,195 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1337,6 +1337,14 @@ Rules added after `29bfb64` (round four):
   from the seeded pass: its names and the dims of the call do not compare.
 - `annotation_dimension_range` skips a name that a lambda or a comprehension
   binds.
+- A size argument reads `*`, `//`, `+`, and `-` over integers, names from
+  `x.shape`, and `self.<name>` (`scalar_dim_expr`): `x.view(b, t, self.heads,
+  d // self.heads)`. A floor division is written `d//heads`.
+- A `-1` in `reshape` is the input product over the known product
+  (`infer_symbolic_minus_one`): equal factors cancel, integers fold, and a
+  known dim that the input does not have stays as a divisor (`d//heads`). A
+  divisor that is no plain name gives no shape. `x.size(i)` reads like
+  `x.shape[i]` there.
 - A binary operator error has its range on the expression of the statement.
   The related place is the annotation dim of the right operand, when both
   operands have an annotation site, else the right operand. With two sites
