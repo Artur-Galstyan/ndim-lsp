@@ -10190,6 +10190,15 @@ mod tuple_literal_unpack_tests {
     }
 
     #[test]
+    fn a_comprehension_of_modules_can_read_its_loop_variable() {
+        let code = "class Block:\n    def __init__(self, dim, key):\n        self.dim = dim\n    def __call__(self, x: Float[Array, \"t d\"]) -> Float[Array, \"t d\"]:\n        return x\nclass Wide:\n    def __init__(self, dim, key):\n        self.dim = dim\n    def __call__(self, x: Float[Array, \"t d\"]) -> Float[Array, \"t dim\"]:\n        return x\nclass M:\n    def __init__(self, keys):\n        self.blocks = [Block(64, k) for k in keys]\n        self.wides = [Wide(d, 0) for d in (4, 5)]\n    def __call__(self, x: Float[Array, \"t 64\"]):\n        for block in self.blocks:\n            x = block(x)\n        y = x\n        for wide in self.wides:\n            w = wide(x)\n        z = w\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 17, "y"), Some(shape(&["t", "64"])));
+        assert_eq!(hint(&a, 20, "z"), None);
+    }
+
+    #[test]
     fn size_arguments_read_floor_division_sum_and_difference() {
         let code = "import torch
 class M:

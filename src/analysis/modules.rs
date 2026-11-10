@@ -347,14 +347,24 @@ fn items_of(
             Some(normalize(held))
         }
         "list_comprehension" | "generator_expression" => {
-            let item = held_of(
+            let mut item = held_of(
                 node.child_by_field_name("body")?,
                 text,
                 import_map,
                 hierarchy,
             )?;
+            // A `key=` argument gives a random key, which no shape reads.
             let mut used = HashSet::new();
-            insert_identifiers(node.child_by_field_name("body")?, text, &mut used);
+            let call = node.child_by_field_name("body")?;
+            insert_identifiers(call.child_by_field_name("function")?, text, &mut used);
+            let arguments = call.child_by_field_name("arguments")?;
+            for argument in arguments.named_children(&mut arguments.walk()) {
+                let key = argument.kind() == "keyword_argument"
+                    && argument.child_by_field_name("name").and_then(|name| text.get(name.byte_range())) == Some("key");
+                if !key {
+                    insert_identifiers(argument, text, &mut used);
+                }
+            }
             let mut bound = HashSet::new();
             let (mut loops, mut filters) = (Vec::new(), false);
             for i in 0..node.named_child_count() {
@@ -369,9 +379,24 @@ fn items_of(
                 }
             }
             // Every element must be the same call: nothing it reads may be
-            // a loop variable.
-            if loops.is_empty() || !used.is_disjoint(&bound) {
+            // a loop variable. A module of the file can read one: that
+            // argument then has no value, so a dim that needs it is unknown.
+            if loops.is_empty() {
                 return None;
+            }
+            if !used.is_disjoint(&bound) {
+                let Held::Module(Module::Local(module)) = &mut item else {
+                    return None;
+                };
+                let reads_loop = |value: &str| {
+                    value.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| bound.contains(word))
+                };
+                for argument in &mut module.ctor_args {
+                    let (CallArgument::Positional { value } | CallArgument::Keyword { value, .. }) = argument;
+                    if reads_loop(value) {
+                        *value = UNKNOWN_DIM.to_string();
+                    }
+                }
             }
             let count = match (loops.as_slice(), filters) {
                 ([only], false) => range_count(only.child_by_field_name("right")?, text),
