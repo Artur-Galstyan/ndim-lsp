@@ -842,6 +842,8 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    /// One more operator that broadcasts like `+`, by its text: `**`, `%`.
+    Elementwise(&'static str),
 }
 
 #[derive(Debug, PartialEq, Clone)]

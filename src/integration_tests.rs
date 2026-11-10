@@ -1538,8 +1538,18 @@ mod additional_edge_case_tests {
         []
     );
     annotation_case!(
-        ann_numpy_ndarray_without_shape_rejected,
+        ann_numpy_ndarray_shape,
         "def f(x: Float[np.ndarray, \"b d\"]): pass",
+        [("x", ["b", "d"])]
+    );
+    annotation_case!(
+        ann_torch_tensor_shape,
+        "def f(x: Float32[Tensor, \"b d\"], y: jaxtyping.Int[torch.Tensor, \"n\"]): pass",
+        [("x", ["b", "d"]), ("y", ["n"])]
+    );
+    annotation_case!(
+        ann_tensor_without_dtype_rejected,
+        "def f(x: Union[Tensor, \"Name\"], y: Annotated[Tensor, \"b d\"]): pass",
         []
     );
     annotation_case!(
@@ -2463,7 +2473,7 @@ mod binary_op_propagation_tests {
     }
 
     #[test]
-    fn test_floor_division_not_checked() {
+    fn test_floor_division_is_checked_like_addition() {
         let tmp = tempfile::tempdir().unwrap();
         let code =
             "def f(x: Float[Array, \"a b\"], y: Float[Array, \"d e\"]):\n    z = x // y";
@@ -2472,7 +2482,48 @@ mod binary_op_propagation_tests {
 
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
-        assert_eq!(analysis.errors.len(), 0, "got {:?}", analysis.errors);
+        assert_eq!(analysis.errors.iter().map(|e| e.kind).collect::<Vec<_>>(), [ShapeErrorKind::Approximation]);
+    }
+
+    #[test]
+    fn test_operators_and_comparisons_broadcast() {
+        let cases = [
+            ("x ** 2", Some(vec!["b", "3"])),
+            ("2 ** x", Some(vec!["b", "3"])),
+            ("x // z", Some(vec!["b", "3"])),
+            ("x % 2", Some(vec!["b", "3"])),
+            ("(x > 0) & (z < 1)", Some(vec!["b", "3"])),
+            ("x == z", Some(vec!["b", "3"])),
+            ("x != w", None),
+            ("0 < x < 1", None),
+            ("x is z", None),
+            ("x in z", None),
+            ("\"%d\" % x", None),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        for (expression, expected) in cases {
+            let code = format!(
+                "def f(x: Float[Array, \"b 3\"], z: Float[Array, \"3\"], w: Float[Array, \"4\"]):\n    y = {expression}\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert!(analysis.errors.is_empty(), "{expression}: {:?}", analysis.errors);
+            assert_eq!(find_shape(&analysis, "y"), expected.map(|dims| shape(&dims)).as_ref(), "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_self_field_resolves_in_its_own_class() {
+        let code = "class A:\n    w: Float[Array, \"3 4\"]\n    def f(self):\n        a = self.w\nclass B:\n    w: Float[Array, \"5\"]\n    def f(self):\n        b = self.w\nclass C(A):\n    def f(self):\n        c = self.w\nclass D:\n    def f(self):\n        d = self.w\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(find_shape(&analysis, "a"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "b"), Some(&shape(&["5"])));
+        assert_eq!(find_shape(&analysis, "c"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "d"), None);
     }
 
     #[test]
@@ -4647,6 +4698,9 @@ mod constructor_coverage_integration_tests {
             ("torch.where(c, a, a)", Some(vec!["3"]), None),
             ("np.where(c, a, -np.inf)", Some(vec!["3"]), None),
             ("np.where(c)", None, None),
+            ("a.where(c, a)", Some(vec!["3"]), None),
+            ("a.where(c > 0, 0.0)", Some(vec!["3"]), None),
+            ("a.where(c, b)", None, Some(ShapeErrorKind::Mismatch)),
         ];
         for (call, expected, kind) in cases {
             let code = format!(

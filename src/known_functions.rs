@@ -963,6 +963,7 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "split" => Some(KnownFunction::TorchSplit),
         "kthvalue" => Some(KnownFunction::KthValue),
         "median" | "mode" => Some(KnownFunction::MedianDim),
+        "where" => Some(KnownFunction::Where),
         _ => None,
     }
 }

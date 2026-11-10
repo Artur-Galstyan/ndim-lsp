@@ -295,7 +295,34 @@ pub fn extract_jaxtyping_shapes(node: Node, text: &str) -> Result<Vec<FunctionSh
     fn contains_array_type(node: Node, text: &str) -> Result<bool, String> {
         Ok(contains_type_name(node, text, "Array")?
             || (contains_type_name(node, text, "NDArray")?
-                && contains_type_name(node, text, "Shape")?))
+                && contains_type_name(node, text, "Shape")?)
+            || contains_library_array(node, text)?)
+    }
+
+    /// `Float[Tensor, "..."]` or `Int32[np.ndarray, "..."]`: a jaxtyping dtype
+    /// with a torch or numpy array as its first argument. The dtype must be
+    /// one of jaxtyping, since `Union[Tensor, "Name"]` is not a shape.
+    fn contains_library_array(node: Node, text: &str) -> Result<bool, String> {
+        const DTYPES: [&str; 12] = [
+            "Shaped", "Bool", "Key", "Num", "Inexact", "Float", "BFloat", "Complex", "Integer", "UInt", "Int", "Real",
+        ];
+        let last = |name: &str| name.trim().rsplit('.').next().unwrap_or_default().to_string();
+        if matches!(node.kind(), "generic_type" | "subscript")
+            && let Some((dtype, arguments)) = node_text(node, text)?.split_once('[')
+            && let Some((array, _)) = arguments.split_once(',')
+            && DTYPES.contains(&last(dtype).trim_end_matches(|c: char| c.is_ascii_digit()))
+            && matches!(last(array).as_str(), "Tensor" | "ndarray")
+        {
+            return Ok(true);
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i as u32)
+                && contains_library_array(child, text)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn point_for_byte(node: Node, text: &str, byte: usize) -> tree_sitter::Point {
@@ -1380,6 +1407,16 @@ impl ClassHierarchy {
                 .collect(),
             named: HashMap::new(),
         }
+    }
+
+    /// Range of the innermost class with `byte`; the whole file if none.
+    pub(crate) fn class_at(&self, byte: usize) -> (usize, usize) {
+        self.classes
+            .iter()
+            .map(|c| c.range)
+            .filter(|r| r.0 <= byte && byte < r.1)
+            .min_by_key(|r| r.1 - r.0)
+            .unwrap_or((0, usize::MAX))
     }
 
     /// First entry defined by the class enclosing `byte` or, failing that, by

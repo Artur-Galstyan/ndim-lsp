@@ -844,6 +844,29 @@ impl<'a> ShapeCtx<'a> {
             .map(|e| self.layer_at(&e.kind, e.byte))
     }
 
+    /// The annotated shape of `self.<field>` in the class enclosing `byte`,
+    /// else in its bases. Same lookup as `self_attr_layer_at`.
+    fn field_shape(&self, field: &str, byte: usize) -> Option<Vec<String>> {
+        let sites: Vec<&ShapeDimensionSite> = self.scopes[0]
+            .dimension_sites
+            .iter()
+            .filter(|site| site.binding.as_deref() == Some(field))
+            .collect();
+        let declarations: Vec<(usize, (usize, usize))> = sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site.axis == 0)
+            .map(|(i, site)| (i, self.hierarchy.class_at(site.range.start_byte)))
+            .collect();
+        let (first, _) = *self.hierarchy.resolve(&declarations, byte, |d| d.1)?;
+        let shape = sites[first..]
+            .iter()
+            .enumerate()
+            .take_while(|(axis, site)| site.axis == *axis)
+            .map(|(_, site)| bounded_dim(site.value.clone()));
+        Some(shape.collect())
+    }
+
     /// The `self.<attr>` field of the class enclosing `byte`, else of its
     /// bases. Same lookup as `self_attr_layer_at`.
     fn submodule_at(&self, attr: &str, byte: usize) -> Option<&SubmoduleField> {
@@ -1369,6 +1392,7 @@ fn shape_of_expression_kind(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
         }
         "subscript" => shape_of_subscript(node, ctx),
         "binary_operator" => shape_of_binary_operator(node, ctx),
+        "comparison_operator" => shape_of_comparison(node, ctx),
         _ => None,
     };
     let no_size = |dim: &String| dim.contains(UNPROVEN_DIM) || dim.parse::<i64>().is_ok_and(|size| size < 0);
@@ -1533,13 +1557,10 @@ fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         .ok()?;
 
     if obj.kind() == "identifier" && obj.utf8_text(ctx.text.as_bytes()).ok()? == "self" {
-        // ponytail: class fields land flat in module scope (scope 0); two
-        // classes with a same-named field resolve last-wins. Add per-class
-        // scoping if bitten.
         if ctx.module_writes.contains_key(field) {
             return None;
         }
-        return ctx.resolve_shape(field, 0);
+        return ctx.field_shape(field, node.start_byte());
     }
 
     // `x.T` (torch): reverses every dim (deprecated for rank > 2 but still
@@ -2516,6 +2537,24 @@ fn transpose_fix(
     })
 }
 
+/// `a < b`, `a == b`: the two operands broadcast. A chain (`a < b < c`), an
+/// `in` or `is` test, and a conflict of the shapes have no shape.
+fn shape_of_comparison(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let (left_node, right_node) = (node.named_child(0)?, node.named_child(1)?);
+    let op = find_binary_op_text(node, &left_node, &right_node, ctx.text)?;
+    if node.named_child_count() != 2 || !matches!(op.as_str(), "<" | ">" | "<=" | ">=" | "==" | "!=") {
+        return None;
+    }
+    let scope_idx = ctx.links.scope_index.lookup(node.start_byte())?;
+    match (binop_operand(left_node, scope_idx, ctx)?, binop_operand(right_node, scope_idx, ctx)?) {
+        (BinopOperand::Scalar, BinopOperand::Scalar) => None,
+        (BinopOperand::Scalar, BinopOperand::Shaped(shape)) | (BinopOperand::Shaped(shape), BinopOperand::Scalar) => Some(shape),
+        (BinopOperand::Shaped(left), BinopOperand::Shaped(right)) => {
+            apply_elementwise_shape(&left, &right, BinaryOp::Add).ok()?
+        }
+    }
+}
+
 fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let left_node = node.child_by_field_name("left")?;
     let right_node = node.child_by_field_name("right")?;
@@ -2529,6 +2568,12 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
         "-" => BinaryOp::Sub,
         "*" => BinaryOp::Mul,
         "/" => BinaryOp::Div,
+        "**" => BinaryOp::Elementwise("**"),
+        "//" => BinaryOp::Elementwise("//"),
+        "%" => BinaryOp::Elementwise("%"),
+        "&" => BinaryOp::Elementwise("&"),
+        "|" => BinaryOp::Elementwise("|"),
+        "^" => BinaryOp::Elementwise("^"),
         _ => return None,
     };
 
@@ -2551,9 +2596,7 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
     let right_name = right_node.utf8_text(ctx.text.as_bytes()).unwrap_or("?");
     let result = match op {
         BinaryOp::MatMul => apply_matmul_shape(&left_shape, &right_shape, left_name, right_name),
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-            apply_elementwise_shape(&left_shape, &right_shape, op)
-        }
+        _ => apply_elementwise_shape(&left_shape, &right_shape, op),
     };
 
     match result {
@@ -8156,6 +8199,7 @@ fn apply_elementwise_shape(
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
+        BinaryOp::Elementwise(symbol) => symbol,
         BinaryOp::MatMul => unreachable!(),
     };
 
