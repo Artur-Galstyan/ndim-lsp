@@ -10154,6 +10154,29 @@ mod tuple_literal_unpack_tests {
     }
 
     #[test]
+    fn shape_index_stands_for_its_dim() {
+        let code = "import torch\nimport jax.numpy as jnp\ndef f(x: Float[Array, \"b t 8\"], v: Float[Array, \"*r 8\"]):\n    n = x.shape[0]\n    l = jnp.ones((n, 3))\n    i = jnp.ones(x.shape[1])\n    m = torch.zeros(x.size(0), x.size(-1) * 2)\n    k = jnp.arange(x.shape[1] + 1)\n    w = jnp.ones(v.shape[0])\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 4, "l"), Some(shape(&["b", "3"])));
+        assert_eq!(hint(&a, 5, "i"), Some(shape(&["t"])));
+        assert_eq!(hint(&a, 6, "m"), Some(shape(&["b", "16"])));
+        assert_eq!(hint(&a, 7, "k"), Some(shape(&["t+1"])));
+        assert_eq!(hint(&a, 8, "w"), Some(shape(&["v.shape[0]"])));
+    }
+
+    #[test]
+    fn method_call_on_an_expression_receiver() {
+        let code = "def f(x: Float[Array, \"b t 8\"], y: Float[Array, \"b t 8\"]):\n    a = (x + y).sum(axis=-1)\n    c = x[0].reshape(-1)\n    e = (-x).transpose(0, 2, 1)\n    m = (x > 0).mean()\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 1, "a"), Some(shape(&["b", "t"])));
+        assert_eq!(hint(&a, 2, "c"), Some(shape(&["t*8"])));
+        assert_eq!(hint(&a, 3, "e"), Some(shape(&["b", "8", "t"])));
+        assert_eq!(hint(&a, 4, "m"), Some(shape(&[])));
+    }
+
+    #[test]
     fn size_arguments_read_floor_division_sum_and_difference() {
         let code = "import torch
 class M:
@@ -16423,7 +16446,7 @@ mod symbolic_slice_tests {
         y_is("jnp.zeros(5)", &["5"]);
         y_is("jnp.zeros((min(k, 2), 2))", &["min(k, 2)", "2"]);
         y_is("jnp.zeros((k, 2))", &["k", "2"]);
-        y_is("jnp.zeros(x.shape[0])", &["x.shape[0]"]);
+        y_is("jnp.zeros(x.shape[0])", &["n"]);
         y_is("x.reshape(-1)", &["n*m"]);
     }
 

@@ -2944,7 +2944,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         //         attribute, issue #31)
         //     Resolve the receiver recursively; if it has a shape, treat the
         //     outer call as a method call on the result.
-        if obj_node.kind() == "call" || obj_node.kind() == "attribute" {
+        if matches!(obj_node.kind(), "call" | "attribute" | "parenthesized_expression" | "subscript") {
             if let Some(receiver_shape) = shape_of_expression(obj_node, ctx) {
                 let receiver_name = ctx.bind_synthetic(
                     receiver_shape,
@@ -3449,6 +3449,7 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
             .cloned()
             .or_else(|| integer_constant(node, text, ctx)),
         "parenthesized_expression" => scalar_dim_expr(node.named_child(0)?, scope_idx, ctx),
+        "subscript" | "call" => shape_index_dim(node, scope_idx, ctx),
         // `self.heads` is a name of a size, like in an argument on its own.
         "attribute" => {
             let plain = |field: &str| node.child_by_field_name(field).is_some_and(|n| n.kind() == "identifier");
@@ -3475,6 +3476,27 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
         }
         _ => None,
     }
+}
+
+/// The dim that `x.shape[i]`, or the torch form `x.size(i)`, reads, for a name
+/// `x` with a shape of a known rank and an integer literal `i`.
+fn shape_index_dim(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String> {
+    let text = |node: Node| ctx.text.get(node.byte_range());
+    let (owner, attribute, index) = match node.kind() {
+        "subscript" => (node.child_by_field_name("value")?, "shape", node.child_by_field_name("subscript")?),
+        _ => {
+            let arguments = node.child_by_field_name("arguments")?;
+            (node.child_by_field_name("function")?, "size", arguments.named_child(0).filter(|_| arguments.named_child_count() == 1)?)
+        }
+    };
+    let object = owner.child_by_field_name("object").filter(|object| object.kind() == "identifier")?;
+    if owner.kind() != "attribute" || text(owner.child_by_field_name("attribute")?)? != attribute {
+        return None;
+    }
+    let shape = ctx.resolve_shape(text(object)?, scope_idx)?;
+    let index: isize = text(index)?.split_whitespace().collect::<String>().parse().ok()?;
+    let at = if index < 0 { shape.len().checked_sub(index.unsigned_abs())? } else { index as usize };
+    shape.get(at).filter(|_| !shape.iter().any(|dim| is_variadic_dim(dim))).cloned()
 }
 
 /// The integer a name stands for when every binding of it, in the scope that
@@ -3549,10 +3571,10 @@ fn integer_literal_of(at: Node, name: &str, ctx: &ShapeCtx) -> Option<String> {
 /// them, written with real dimensions. `None` when it is not one, or when
 /// writing it with real dimensions changes nothing.
 fn dim_list_text(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<String> {
-    if ctx.scalar_dims.is_empty() && ctx.int_names.is_empty() {
+    let source = ctx.text.get(node.byte_range())?;
+    if ctx.scalar_dims.is_empty() && ctx.int_names.is_empty() && !source.contains(".shape[") && !source.contains(".size(") {
         return None;
     }
-    let source = ctx.text.get(node.byte_range())?;
     if !matches!(node.kind(), "tuple" | "list") {
         return scalar_dim_expr(node, scope_idx, ctx).filter(|dim| dim != source);
     }
@@ -3651,6 +3673,16 @@ fn with_size_names(
         && value.chars().all(|c| c.is_alphanumeric() || c == '_')
         && !has_mark(value);
     if !is_name {
+        return Some(args);
+    }
+    // An integer expression that stands for a dim (`x.shape[1]`, or a name
+    // from `a, b = x.shape`) is written as that dim, which is no variable.
+    let written = at.named_child(index as u32).and_then(|node| match node.kind() {
+        "keyword_argument" => node.child_by_field_name("value"),
+        _ => Some(node),
+    });
+    if written.and_then(|node| scalar_dim_expr(node, scope_idx, ctx)).as_deref() == Some(value.as_str()) {
+        *value = format!("({value},)");
         return Some(args);
     }
     if name_is_integer(at, value, ctx, &mut Vec::new()) {
@@ -5038,8 +5070,12 @@ fn process_assignment_item_inner(
     // Delegate to the recursive evaluator.
     let errors_before = ctx.errors.len();
     let carry = is_tuple_value(rhs_node, scope_idx, ctx);
+    // `n = x.shape[0]`: an integer that stands for one dim of `x`.
+    let index_dim = shape_index_dim(rhs_node, scope_idx, ctx);
     let result = if carry {
         carry_shape(rhs_node, scope_idx, ctx)
+    } else if index_dim.is_some() {
+        Some(Vec::new())
     } else {
         shape_of_expression(rhs_node, ctx)
     };
@@ -5054,6 +5090,9 @@ fn process_assignment_item_inner(
         // A tuple carry shows no hint: its shape is that of each element.
         let line = display_line.filter(|_| !carry);
         ctx.record_binding(scope_idx, &lhs_name, shape, line, rhs_node.start_byte());
+        if let Some(dim) = index_dim.filter(|_| ctx.scopes[scope_idx].shapes.contains_key(&lhs_name)) {
+            ctx.scalar_dims.insert((scope_idx, lhs_name.clone()), dim);
+        }
         if carry && ctx.scopes[scope_idx].shapes.contains_key(&lhs_name) {
             ctx.tuple_carries.insert((scope_idx, lhs_name));
         }

@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,195 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,197 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1345,6 +1345,12 @@ Rules added after `29bfb64` (round four):
   known dim that the input does not have stays as a divisor (`d//heads`). A
   divisor that is no plain name gives no shape. `x.size(i)` reads like
   `x.shape[i]` there.
+- `x.shape[i]` and `x.size(i)` stand for the dim in a size expression
+  (`shape_index_dim`), and `n = x.shape[0]` makes `n` a size name like
+  `a, b = x.shape` does. `with_size_names` writes such a dim as `(dim,)`, so
+  the dim is not read as a variable.
+- A method call on a parenthesized expression or a subscript resolves its
+  receiver first: `(x + y).sum(axis=-1)`, `x[0].reshape(-1)`.
 - A binary operator error has its range on the expression of the statement.
   The related place is the annotation dim of the right operand, when both
   operands have an annotation site, else the right operand. With two sites
