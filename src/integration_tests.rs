@@ -10177,6 +10177,19 @@ mod tuple_literal_unpack_tests {
     }
 
     #[test]
+    fn a_name_that_holds_a_module_of_the_file_is_called() {
+        let code = "import jax\nclass Enc:\n    def __call__(self, x: Float[Array, \"8\"]) -> Float[Array, \"16\"]:\n        return x\nclass Sub(Enc):\n    pass\nclass Other:\n    def __call__(self, x: Float[Array, \"8\"]) -> Float[Array, \"4\"]:\n        return x\ndef f(model: Other, base: Enc, xs: Float[Array, \"b 8\"], x: Float[Array, \"8\"]):\n    a = model(x)\n    c = jax.vmap(model)(xs)\n    d = base(x)\n    local = Other()\n    e = jax.vmap(local)(xs)\n    again = Other()\n    again = f\n    g = again(x)\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 10, "a"), Some(shape(&["4"])));
+        assert_eq!(hint(&a, 11, "c"), Some(shape(&["b", "4"])));
+        // `base` can hold a `Sub`.
+        assert_eq!(hint(&a, 12, "d"), None);
+        assert_eq!(hint(&a, 14, "e"), Some(shape(&["b", "4"])));
+        assert_eq!(hint(&a, 17, "g"), None);
+    }
+
+    #[test]
     fn size_arguments_read_floor_division_sum_and_difference() {
         let code = "import torch
 class M:

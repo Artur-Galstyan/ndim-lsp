@@ -1409,6 +1409,11 @@ impl ClassHierarchy {
         }
     }
 
+    /// Whether a class of the file has `class` as a base.
+    pub(crate) fn has_subclass(&self, class: (usize, usize)) -> bool {
+        self.classes.iter().any(|c| c.range == class && !c.subclasses.is_empty())
+    }
+
     /// Range of the innermost class with `byte`; the whole file if none.
     pub(crate) fn class_at(&self, byte: usize) -> (usize, usize) {
         self.classes

@@ -1381,7 +1381,7 @@ fn shape_of_expression(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
 
 fn shape_of_expression_kind(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let shape = match node.kind() {
-        "call" => shape_of_call(node, ctx),
+        "call" => shape_of_call(node, ctx).or_else(|| shape_of_named_module_call(node, ctx)),
         "identifier" => shape_of_identifier(node, ctx),
         "attribute" => shape_of_attribute(node, ctx),
         "unary_operator" => shape_of_unary(node, ctx),
@@ -4483,6 +4483,58 @@ fn constructed_module(
     })
 }
 
+/// The module of this file that the name `name` holds at `at`: its one
+/// binding is `Class(...)`, or it is a parameter with the annotation `Class`
+/// that the body does not bind again. A parameter has no constructor
+/// arguments, so a result that needs one stays unknown, and it can hold a
+/// subclass, so a class with a subclass in the file is not taken.
+fn name_module(at: Node, name: &str, ctx: &ShapeCtx) -> Option<Submodule> {
+    let (owner, binding) = nearest_binding(at, name, ctx);
+    match binding {
+        NameBinding::Values(values) => {
+            let [value] = values[..] else {
+                return None;
+            };
+            constructed_module(value, ctx.text, ctx.imports.at(value.start_byte()), ctx.hierarchy)
+        }
+        NameBinding::Opaque if owner.kind() == "function_definition" => {
+            let scope = function_scope(owner, ctx)?;
+            let (mut values, mut bound) = (Vec::new(), false);
+            let body = owner.child_by_field_name("body")?;
+            if ctx.links.poisoned[scope].contains(name)
+                || !collect_name_values(body, name, ctx.text, &mut values, &mut bound)
+                || bound
+            {
+                return None;
+            }
+            let parameters = owner.child_by_field_name("parameters")?;
+            let text = |node: Node| ctx.text.get(node.byte_range());
+            let parameter = parameters.named_children(&mut parameters.walk()).find(|parameter| {
+                parameter.kind() == "typed_parameter" && parameter.named_child(0).and_then(text) == Some(name)
+            })?;
+            let class = text(parameter.child_by_field_name("type")?)?;
+            if is_imported(ctx.imports.at(parameter.start_byte()), class) {
+                return None;
+            }
+            let class = ctx.hierarchy.class_named(class).filter(|class| !ctx.hierarchy.has_subclass(*class))?;
+            Some(Submodule { class, ctor_args: Vec::new(), byte: parameter.start_byte() })
+        }
+        _ => None,
+    }
+}
+
+/// `model(x)` for a name that holds a module of this file (`name_module`).
+fn shape_of_named_module_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let callee = node.child_by_field_name("function").filter(|callee| callee.kind() == "identifier")?;
+    let name = ctx.text.get(callee.byte_range())?;
+    let module = name_module(callee, name, ctx)?;
+    let args_node = node.child_by_field_name("arguments")?;
+    let scope_idx = ctx.links.scope_index.lookup(node.start_byte())?;
+    let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+    let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+    apply_submodule_call(&module, name, &args, node.start_byte(), scope_idx, args_node.range(), ctx)
+}
+
 fn extract_submodules(
     root: Node,
     text: &str,
@@ -6565,6 +6617,10 @@ fn shape_of_inline_vmap(
     if !callable.contains('.') {
         if bound_in_expression(inner_call, &callable, ctx.text) {
             return None;
+        }
+        if let Some(module) = name_module(inner_call, &callable, ctx) {
+            let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
+            return apply_vmapped_submodule(&module, &callable, &outer_args, &axes, scope_idx, outer_args_node, ctx);
         }
         let outer_args = resolve_call_args(outer_args, outer_args_node, scope_idx, ctx)?;
         let result = apply_vmap_call_chain(
