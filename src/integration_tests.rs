@@ -10199,6 +10199,20 @@ mod tuple_literal_unpack_tests {
     }
 
     #[test]
+    fn a_method_of_a_held_module_is_called() {
+        let code = "class Enc:\n    def __init__(self, dim):\n        self.dim = dim\n    def encode(self, x: Float[Array, \"n 8\"]) -> Float[Array, \"n 16\"]:\n        return x\n    def widen(self, x: Float[Array, \"n 8\"]) -> Float[Array, \"n dim\"]:\n        return x\n    @staticmethod\n    def make(x: Float[Array, \"n 8\"]) -> Float[Array, \"n 2\"]:\n        return x\nclass Top:\n    def __init__(self):\n        self.enc = Enc(32)\n    def f(self, xs: Float[Array, \"b 8\"], model: Enc):\n        a = self.enc.encode(xs)\n        c = self.enc.widen(xs)\n        d = model.encode(xs)\n        e = model.widen(xs)\n        g = model.make(xs)\n        h = self.enc.missing(xs)\n";
+        let a = analyze(code);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(hint(&a, 14, "a"), Some(shape(&["b", "16"])));
+        assert_eq!(hint(&a, 15, "c"), Some(shape(&["b", "32"])));
+        assert_eq!(hint(&a, 16, "d"), Some(shape(&["b", "16"])));
+        // A parameter has no constructor arguments, so `dim` has no value.
+        assert_eq!(hint(&a, 17, "e"), None);
+        assert_eq!(hint(&a, 18, "g"), None);
+        assert_eq!(hint(&a, 19, "h"), None);
+    }
+
+    #[test]
     fn size_arguments_read_floor_division_sum_and_difference() {
         let code = "import torch
 class M:

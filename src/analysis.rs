@@ -887,6 +887,12 @@ impl<'a> ShapeCtx<'a> {
                 (m.class_start, m.class_end)
             })?;
         let defining = (method.class_start, method.class_end);
+        (!self.rebinds_before(module.class, defining)).then_some(method.scope)
+    }
+
+    /// Whether a class before `defining` in the MRO of `class` rebinds a field
+    /// that `defining` writes.
+    fn rebinds_before(&self, class: (usize, usize), defining: (usize, usize)) -> bool {
         let rebinds = |class: (usize, usize)| {
             self.submodules
                 .fields
@@ -895,11 +901,24 @@ impl<'a> ShapeCtx<'a> {
                 .chain(self.aliases.keys())
                 .any(|attr| self.class_writes(attr, class) && self.class_writes(attr, defining))
         };
-        let mro = self.hierarchy.mro(module.class);
-        if mro.iter().take_while(|&&class| class != defining).any(|&c| rebinds(c)) {
-            return None;
-        }
-        Some(method.scope)
+        let mro = self.hierarchy.mro(class);
+        mro.iter().take_while(|&&class| class != defining).any(|&c| rebinds(c))
+    }
+
+    /// Scope of the instance method that `module.<name>(...)` runs, with the
+    /// guards of `module_callee` and `method_callee`.
+    fn module_method(&self, module: &Submodule, name: &str) -> Option<usize> {
+        let methods = self.links.methods.get(name)?;
+        let callee = self.hierarchy.resolve_method(module.class, false, |c| {
+            if self.hierarchy.binds_attr(c, name) || self.class_writes(name, c) {
+                return Some(None);
+            }
+            methods.iter().find(|m| m.0 == c).map(|m| Some(m.1))
+        })?;
+        let instance = matches!(method_kind(self.scope_function_nodes[callee]?, self.text), MethodKind::Instance)
+            && self.scopes[callee].all_params.first().map(String::as_str) == Some("self");
+        let defining = self.links.class_of[callee]?;
+        (instance && !self.links.redefined[callee] && !self.rebinds_before(module.class, defining)).then_some(callee)
     }
 
     /// The method that `receiver.<name>(...)` runs, when `receiver` is the
@@ -1481,9 +1500,13 @@ fn shadowed_locally(at: Node, name: &str, ctx: &ShapeCtx) -> bool {
 }
 
 fn function_scope(function: Node, ctx: &ShapeCtx) -> Option<usize> {
-    ctx.scope_function_nodes
-        .iter()
-        .position(|f| f.is_some_and(|f| f.id() == function.id()))
+    let is_scope = |idx: &usize| ctx.scope_function_nodes[*idx].is_some_and(|f| f.id() == function.id());
+    // The scope at the start of the body is the scope of the function.
+    let by_byte = function
+        .child_by_field_name("body")
+        .and_then(|body| ctx.links.scope_index.lookup(body.start_byte()))
+        .filter(is_scope);
+    by_byte.or_else(|| (0..ctx.scope_function_nodes.len()).find(is_scope))
 }
 
 /// Whether a lambda or a comprehension binds `name` itself: as a parameter,
@@ -2067,11 +2090,7 @@ fn nearest_binding<'t>(at: Node<'t>, name: &str, ctx: &ShapeCtx) -> (Node<'t>, N
         let scope_idx = match owner.kind() {
             "function_definition" => {
                 in_function = true;
-                let found = ctx
-                    .scope_function_nodes
-                    .iter()
-                    .position(|f| f.is_some_and(|f| f.id() == owner.id()));
-                let Some(found) = found else {
+                let Some(found) = function_scope(owner, ctx) else {
                     return (owner, NameBinding::Opaque);
                 };
                 found
@@ -2924,6 +2943,30 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         }
         if is_super {
             return None;
+        }
+
+        // A method of a module of this file that `self.<attr>` or a name holds.
+        let held = match obj_node.kind() {
+            "attribute" => ctx.text.get(obj_node.byte_range()).and_then(|text| text.strip_prefix("self.")).and_then(|attr| {
+                match ctx.submodule_at(attr, call_byte)?.module.clone()? {
+                    Field::One(Module::Local(module)) => Some(module),
+                    _ => None,
+                }
+            }),
+            "identifier" if classify_method_call(&method_name).is_none() => ctx
+                .text
+                .get(obj_node.byte_range())
+                .filter(|name| !is_imported(ctx.imports.at(obj_node.start_byte()), name))
+                .and_then(|name| name_module(obj_node, name, ctx)),
+            _ => None,
+        };
+        if let Some(module) = held
+            && let Some(callee_idx) = ctx.module_method(&module, &method_name)
+        {
+            let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
+            let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+            let display = ctx.text.get(func_node.byte_range())?;
+            return apply_submodule_scope(&module, callee_idx, display, &args, call_byte, scope_idx, args_node.range(), ctx);
         }
 
         // Distinguish between:
@@ -7891,10 +7934,26 @@ fn apply_submodule_call(
     range: tree_sitter::Range,
     ctx: &mut ShapeCtx,
 ) -> Option<Vec<String>> {
+    let callee_idx = ctx.module_callee(module)?;
+    apply_submodule_scope(module, callee_idx, display, args, call_byte, caller_scope, range, ctx)
+}
+
+/// `apply_submodule_call` for the method of the module with the scope
+/// `callee_idx`.
+#[allow(clippy::too_many_arguments)]
+fn apply_submodule_scope(
+    module: &Submodule,
+    callee_idx: usize,
+    display: &str,
+    args: &[CallArgument],
+    call_byte: usize,
+    caller_scope: usize,
+    range: tree_sitter::Range,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<String>> {
     if args.iter().any(|arg| matches!(arg, CallArgument::Positional { value } if value.starts_with('*'))) {
         return None;
     }
-    let callee_idx = ctx.module_callee(module)?;
     let (seeded, carries) = seed_params_from_call(callee_idx, args, caller_scope, ctx);
 
     // An annotated parameter that this call does not bind would leave the

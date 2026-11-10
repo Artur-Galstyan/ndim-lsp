@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,199 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,200 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1360,6 +1360,12 @@ Rules added after `29bfb64` (round four):
   `[Block(64, k) for k in keys]`. That constructor argument then has no
   value, so a dim that needs it is unknown. A `key=` argument is not read at
   all, also for a framework layer.
+- A method of a held module is called like the module: `self.enc.encode(xs)`
+  and `model.encode(xs)` (`ShapeCtx::module_method`, `apply_submodule_scope`).
+  Only an instance method of the file counts. A lookup of a name as a module
+  comes after the import check, and `function_scope` finds a scope by its
+  byte: a linear search there made a file with 30,000 functions too slow
+  (`tests/lsp_debounce.rs` finds this).
 - A binary operator error has its range on the expression of the statement.
   The related place is the annotation dim of the right operand, when both
   operands have an annotation site, else the right operand. With two sites
