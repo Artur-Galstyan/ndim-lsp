@@ -911,10 +911,6 @@ fn one_run(run: usize, rec: &mut Recorder) {
 
     // 6. add a shape error, then revert
     let err_row = site_row(&base, "error-insert");
-    let def_row = base
-        .lines()
-        .position(|l| l.starts_with("def site_error("))
-        .unwrap();
     for (name, line, want_row, word, need_related) in [
         (
             "error_insert_concat",
@@ -926,7 +922,7 @@ fn one_run(run: usize, rec: &mut Recorder) {
         (
             "error_insert_matmul",
             "    bad_mm = a @ b",
-            def_row,
+            err_row + 1,
             "matmul",
             true,
         ),

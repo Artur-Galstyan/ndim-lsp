@@ -2793,9 +2793,9 @@ def unpack_52(x: Float[Array, "b52 n52 24"], m: Float[Array, "8 16"]):
     return qk, u, c1
 
 
-def broken_add_53(p: Float[Array, "n53 d53"], q: Float[Array, "m53 d53"]):  # expected-error: n53 vs m53 (anchored at the annotation)
+def broken_add_53(p: Float[Array, "n53 d53"], q: Float[Array, "m53 d53"]):
     ok = p * 2.0  # expected-shape: ok=[n53, d53]
-    bad = p + q
+    bad = p + q  # expected-error: n53 vs m53
     return ok
 
 
@@ -4762,9 +4762,9 @@ class AttnBlock92(Attn92):
         return o
 
 
-def broken_add_93(p: Float[Array, "n93 d93"], q: Float[Array, "m93 d93"]):  # expected-error: n93 vs m93 (anchored at the annotation)
+def broken_add_93(p: Float[Array, "n93 d93"], q: Float[Array, "m93 d93"]):
     ok = p * 2.0  # expected-shape: ok=[n93, d93]
-    bad = p + q
+    bad = p + q  # expected-error: n93 vs m93
     return ok
 
 
@@ -5159,9 +5159,9 @@ def nested_107(x: Float[Array, "b107 n107 d107"], w: Float[Array, "d107 d107"]):
     return y, h, z
 
 
-def broken_add_108(p: Float[Array, "n108 d108"], q: Float[Array, "m108 d108"]):  # expected-error: n108 vs m108 (anchored at the annotation)
+def broken_add_108(p: Float[Array, "n108 d108"], q: Float[Array, "m108 d108"]):
     ok = p * 2.0  # expected-shape: ok=[n108, d108]
-    bad = p + q
+    bad = p + q  # expected-error: n108 vs m108
     return ok
 
 
@@ -5807,8 +5807,8 @@ def einops_soup_125(x: Float[Array, "b125 n125 16"]):
     return e0
 
 
-def broken_matmul_126(a: Float[Array, "m126 k126"], w: Float[Array, "n126 d126"]):  # expected-error: inner dims k126 vs n126 (anchored at the annotation)
-    c = a @ w
+def broken_matmul_126(a: Float[Array, "m126 k126"], w: Float[Array, "n126 d126"]):
+    c = a @ w  # expected-error: inner dims k126 vs n126
     return c
 
 
@@ -5822,9 +5822,9 @@ def cross_127(x: Float[Array, "b127 d127"], w: Float[Array, "d127 k127"], seq: F
     return p, q, s2
 
 
-def broken_add_128(p: Float[Array, "n128 d128"], q: Float[Array, "m128 d128"]):  # expected-error: n128 vs m128 (anchored at the annotation)
+def broken_add_128(p: Float[Array, "n128 d128"], q: Float[Array, "m128 d128"]):
     ok = p * 2.0  # expected-shape: ok=[n128, d128]
-    bad = p + q
+    bad = p + q  # expected-error: n128 vs m128
     return ok
 
 
@@ -7606,8 +7606,8 @@ def long_chain_165(x: Float[Array, "b165 16 d165"]):
     return v479
 
 
-def broken_matmul_166(a: Float[Array, "m166 k166"], w: Float[Array, "n166 d166"]):  # expected-error: inner dims k166 vs n166 (anchored at the annotation)
-    c = a @ w
+def broken_matmul_166(a: Float[Array, "m166 k166"], w: Float[Array, "n166 d166"]):
+    c = a @ w  # expected-error: inner dims k166 vs n166
     return c
 
 
@@ -9105,8 +9105,8 @@ def lazy_user_185(x: Float[Array, "b185 n185 d185"], y: Float[Array, "n185 d185"
     return a, c, e
 
 
-def broken_matmul_186(a: Float[Array, "m186 k186"], w: Float[Array, "n186 d186"]):  # expected-error: inner dims k186 vs n186 (anchored at the annotation)
-    c = a @ w
+def broken_matmul_186(a: Float[Array, "m186 k186"], w: Float[Array, "n186 d186"]):
+    c = a @ w  # expected-error: inner dims k186 vs n186
     return c
 
 
@@ -10723,9 +10723,9 @@ class EqxModel227(eqx.Module):
         return m
 
 
-def broken_add_228(p: Float[Array, "n228 d228"], q: Float[Array, "m228 d228"]):  # expected-error: n228 vs m228 (anchored at the annotation)
+def broken_add_228(p: Float[Array, "n228 d228"], q: Float[Array, "m228 d228"]):
     ok = p * 2.0  # expected-shape: ok=[n228, d228]
-    bad = p + q
+    bad = p + q  # expected-error: n228 vs m228
     return ok
 
 
@@ -12831,9 +12831,9 @@ class AttnBlock272(Attn272):
         return o
 
 
-def broken_add_273(p: Float[Array, "n273 d273"], q: Float[Array, "m273 d273"]):  # expected-error: n273 vs m273 (anchored at the annotation)
+def broken_add_273(p: Float[Array, "n273 d273"], q: Float[Array, "m273 d273"]):
     ok = p * 2.0  # expected-shape: ok=[n273, d273]
-    bad = p + q
+    bad = p + q  # expected-error: n273 vs m273
     return ok
 
 
@@ -13956,9 +13956,9 @@ class EqxModel312(eqx.Module):
         return m
 
 
-def broken_add_313(p: Float[Array, "n313 d313"], q: Float[Array, "m313 d313"]):  # expected-error: n313 vs m313 (anchored at the annotation)
+def broken_add_313(p: Float[Array, "n313 d313"], q: Float[Array, "m313 d313"]):
     ok = p * 2.0  # expected-shape: ok=[n313, d313]
-    bad = p + q
+    bad = p + q  # expected-error: n313 vs m313
     return ok
 
 
@@ -15917,8 +15917,8 @@ def nested_365(x: Float[Array, "b365 n365 d365"], w: Float[Array, "d365 d365"]):
     return y, h, z
 
 
-def broken_matmul_366(a: Float[Array, "m366 k366"], w: Float[Array, "n366 d366"]):  # expected-error: inner dims k366 vs n366 (anchored at the annotation)
-    c = a @ w
+def broken_matmul_366(a: Float[Array, "m366 k366"], w: Float[Array, "n366 d366"]):
+    c = a @ w  # expected-error: inner dims k366 vs n366
     return c
 
 
@@ -18931,8 +18931,8 @@ def lazy_user_440(x: Float[Array, "b440 n440 d440"], y: Float[Array, "n440 d440"
     return a, c, e
 
 
-def broken_matmul_441(a: Float[Array, "m441 k441"], w: Float[Array, "n441 d441"]):  # expected-error: inner dims k441 vs n441 (anchored at the annotation)
-    c = a @ w
+def broken_matmul_441(a: Float[Array, "m441 k441"], w: Float[Array, "n441 d441"]):
+    c = a @ w  # expected-error: inner dims k441 vs n441
     return c
 
 
@@ -20830,9 +20830,9 @@ def branchy_482(x: Float[Array, "b482 n482 d482"], y: Float[Array, "b482 n482 d4
     return w, q, s
 
 
-def broken_add_483(p: Float[Array, "n483 d483"], q: Float[Array, "m483 d483"]):  # expected-error: n483 vs m483 (anchored at the annotation)
+def broken_add_483(p: Float[Array, "n483 d483"], q: Float[Array, "m483 d483"]):
     ok = p * 2.0  # expected-shape: ok=[n483, d483]
-    bad = p + q
+    bad = p + q  # expected-error: n483 vs m483
     return ok
 
 

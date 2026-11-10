@@ -41,7 +41,7 @@ fn positions_follow_the_editor_line_model() {
         let mut c = Client::start(&root, json!({}));
         let diags = c.open(&uri, &text);
         assert_eq!(diags.len(), 1, "{diags:?}");
-        assert_eq!(start_of(&diags[0]["range"]), pos(&text, "k\"], b"), "{text:?}");
+        assert_eq!(start_of(&diags[0]["range"]), pos(&text, "a @ b"), "{text:?}");
 
         let hints = c.request(
             "textDocument/inlayHint",
@@ -187,7 +187,8 @@ fn utf8_positions_when_the_client_offers_them() {
         let mut c = Client::start(&root, caps);
         assert_eq!(c.init["capabilities"]["positionEncoding"], enc);
         let diags = c.open(&uri, text);
-        assert_eq!(start_of(&diags[0]["range"]), (line, col), "{enc}");
+        assert_eq!(start_of(&diags[0]["range"]), (line + 1, 8), "{enc}");
+        assert_eq!(diags[0]["range"]["end"]["character"], 14 - (byte_col - col), "{enc}");
         let shift = byte_col - col;
         let k = c.at("definition", &uri, line, use_col - shift, json!({}));
         assert_eq!(start_of(&k["range"]), (line, col), "{enc}");
@@ -328,7 +329,7 @@ fn check_mode_prints_diagnostics_like_a_compiler() {
     assert_eq!(
         lines,
         [
-            "bad.py:3:26: error: y: matmul dimension mismatch: a last dim 3 != b second-to-last dim 4",
+            "bad.py:4:9: error: y: matmul dimension mismatch: a last dim 3 != b second-to-last dim 4",
             "bad.py:5: z: [m, 3]",
         ]
     );
@@ -339,7 +340,7 @@ fn check_mode_prints_diagnostics_like_a_compiler() {
     assert_eq!(code, 0, "{out}");
     assert_eq!(
         out.trim(),
-        "names.py:3:26: warning: y: matmul dimension mismatch: a last dim k != b second-to-last dim n"
+        "names.py:4:9: warning: y: matmul dimension mismatch: a last dim k != b second-to-last dim n"
     );
     let (code, _) = check(&root, &[]);
     assert_eq!(code, 2);

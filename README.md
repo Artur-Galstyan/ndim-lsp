@@ -197,7 +197,7 @@ See `llm.txt` for the design.
 - [x] Live settings: `workspace/didChangeConfiguration` applies all options with no restart
 - [x] Show exact shapes and operators in diagnostic error messages
 - [x] Point two-operand mismatch diagnostics at both conflicting operands
-- [x] Highlight exact conflicting dimension tokens for direct binary operations on annotated variables
+- [x] Report a binary operator error on the statement, with the conflicting annotation dimension of the other operand as related information
 - [x] Diagnostic severity configuration — use `diagnostic_severity` for mismatches and `approximation_severity` for approximate rules
 - [x] Go-to-definition, references, highlights, and rename for simple symbolic dimension names within the current function scope
 - [x] UTF-8 positions when the client offers them (else UTF-16)

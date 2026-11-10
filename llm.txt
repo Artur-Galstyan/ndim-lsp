@@ -1289,12 +1289,6 @@ Known limitations / important caveats
 Open defects
 ------------
 
-- The diagnostic of `a = x + y` on two annotated parameters has its primary
-  range on the annotations (the `def` line), not on the statement. A move to
-  the statement is blocked by four things: 13 markers in
-  `bench/stress/stress_main.py` sit on `def` lines and the harness matches by
-  line; `ShapeCtx::report` decides the variadic exemption from the range;
-  `related` holds one entry; and the `reads` of an error would change.
 - The memo at open is not built: it made open 12 to 17 percent slower and the
   first edit 396 to 41 ms faster. The owner decides this trade.
 - Two `TODO`s in `process_assignment_item_inner`: the vmap recording and the layer
@@ -1343,6 +1337,10 @@ Rules added after `29bfb64` (round four):
   from the seeded pass: its names and the dims of the call do not compare.
 - `annotation_dimension_range` skips a name that a lambda or a comprehension
   binds.
+- A binary operator error has its range on the expression of the statement.
+  The related place is the annotation dim of the right operand, when both
+  operands have an annotation site, else the right operand. With two sites
+  the error goes through `push_error`, else through `report`.
 
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the

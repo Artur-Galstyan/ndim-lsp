@@ -2622,31 +2622,15 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
                 right_name,
                 right_shape.join(", ")
             );
-            let (primary_range, related_range) = binary_mismatch_axes(
-                &left_shape,
-                &right_shape,
-                op,
-            )
-            .and_then(|(left_axis, right_axis)| {
+            // The statement has the error. The annotation of the dim of the
+            // right operand, when it has one, is the related place.
+            let annotations = binary_mismatch_axes(&left_shape, &right_shape, op).and_then(|(left_axis, right_axis)| {
                 let scope = &ctx.scopes[scope_idx];
-                let left_range = annotation_dimension_range(
-                    scope,
-                    left_node,
-                    left_axis,
-                    &left_shape[left_axis],
-                    ctx.text,
-                )?;
-                let right_range = annotation_dimension_range(
-                    scope,
-                    right_node,
-                    right_axis,
-                    &right_shape[right_axis],
-                    ctx.text,
-                )?;
-                Some((left_range, right_range))
-            })
-            .unwrap_or((node.range(), right_node.range()));
-            let mut error = ShapeError::mismatch(var_text, message, primary_range)
+                annotation_dimension_range(scope, left_node, left_axis, &left_shape[left_axis], ctx.text)?;
+                annotation_dimension_range(scope, right_node, right_axis, &right_shape[right_axis], ctx.text)
+            });
+            let related_range = annotations.unwrap_or(right_node.range());
+            let mut error = ShapeError::mismatch(var_text, message, node.range())
                 .with_related(related_range, related_message);
             if matches!(op, BinaryOp::MatMul)
                 && let Some(fix) = transpose_fix(
@@ -2660,7 +2644,12 @@ fn shape_of_binary_operator(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String
             {
                 error = error.with_fix(fix);
             }
-            ctx.report(error);
+            // Two dims that the annotations write are right of a variadic dim.
+            if annotations.is_some() {
+                ctx.push_error(error);
+            } else {
+                ctx.report(error);
+            }
             None
         }
     }

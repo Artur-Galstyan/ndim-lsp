@@ -462,7 +462,7 @@ Annotation parsing is outside the built-in-function registry, but it seeds every
 - NumPy-style forms such as `NDArray[Shape["batch, features"], Float]` support qualified names and comma-separated dimensions.
 - Parameter and return annotations support symbolic names and concrete integer dimensions.
 - Same-file and imported helper calls bind annotated parameter dimensions into annotated return shapes.
-- Exact annotation-token ranges drive binary mismatch diagnostics and same-scope definition lookup for simple symbolic dimensions.
+- Exact annotation-token ranges drive the related information of binary mismatch diagnostics (the diagnostic itself is on the statement) and same-scope definition lookup for simple symbolic dimensions.
 - A matmul quick fix appends `.T` only when the analyzer proves that the rank-2 transpose removes the mismatch.
 - Flat symbolic sums and products compare canonically. Full algebra, nested substitution, generics, and `TypeVar` mapping remain open.
 

@@ -2343,8 +2343,8 @@ mod binary_op_propagation_tests {
         assert!(analysis.errors[0].message.contains("matmul dimension mismatch"));
         // variable is empty for return-statement ops
         assert_eq!(analysis.errors[0].variable, "");
-        // The primary range selects the exact conflicting left dimension.
-        assert_eq!(&code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte], "b");
+        // The primary range is the expression of the statement.
+        assert_eq!(&code[analysis.errors[0].range.start_byte..analysis.errors[0].range.end_byte], "x @ y");
     }
 
     #[test]
@@ -9694,7 +9694,7 @@ mod binary_op_related_information_tests {
     }
 
     #[test]
-    fn matmul_mismatch_points_at_exact_annotation_dimensions() {
+    fn matmul_mismatch_is_on_the_statement_with_the_annotation_related() {
         let code = r#"import jax.numpy as jnp
 def f(a: Float[Array, "2 3"], b: Float[Array, "4 5"]):
     y = a @ b"#;
@@ -9704,12 +9704,12 @@ def f(a: Float[Array, "2 3"], b: Float[Array, "4 5"]):
         let err = &analysis.errors[0];
         let (related_range, related_message) = err.related.as_ref().expect("related info");
         assert_eq!(related_message, "other operand `b`: shape [4, 5]");
-        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "3");
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "a @ b");
         assert_eq!(&code[related_range.start_byte..related_range.end_byte], "4");
     }
 
     #[test]
-    fn elementwise_mismatch_points_at_exact_annotation_dimensions() {
+    fn elementwise_mismatch_is_on_the_statement_with_the_annotation_related() {
         let code = r#"import jax.numpy as jnp
 def f(a: Float[Array, "3"], b: Float[Array, "4"]):
     y = a + b"#;
@@ -9719,19 +9719,19 @@ def f(a: Float[Array, "3"], b: Float[Array, "4"]):
         let err = &analysis.errors[0];
         let (related_range, related_message) = err.related.as_ref().expect("related info");
         assert_eq!(related_message, "other operand `b`: shape [4]");
-        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "3");
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "a + b");
         assert_eq!(&code[related_range.start_byte..related_range.end_byte], "4");
     }
 
     #[test]
-    fn matmul_batch_mismatch_points_at_exact_annotation_dimensions() {
+    fn matmul_batch_mismatch_is_on_the_statement_with_the_annotation_related() {
         let code = r#"def f(a: Float[Array, "left_batch rows inner"], b: Float[Array, "right_batch inner cols"]):
     y = a @ b"#;
         let analysis = analyze(code);
         let err = &analysis.errors[0];
         let (related_range, _) = err.related.as_ref().expect("related info");
 
-        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "left_batch");
+        assert_eq!(&code[err.range.start_byte..err.range.end_byte], "a @ b");
         assert_eq!(&code[related_range.start_byte..related_range.end_byte], "right_batch");
     }
 

@@ -571,8 +571,8 @@ def t_errors(i):
         ]
     if which == 1:
         return [
-            f"def broken_matmul_{i}(a: {ann([m, k])}, w: {ann([n, d])}):  # expected-error: inner dims {k} vs {n} (anchored at the annotation)",
-            "    c = a @ w",
+            f"def broken_matmul_{i}(a: {ann([m, k])}, w: {ann([n, d])}):",
+            f"    c = a @ w  # expected-error: inner dims {k} vs {n}",
             "    return c",
             "",
             "",
@@ -587,9 +587,9 @@ def t_errors(i):
         ]
     if which == 3:
         return [
-            f"def broken_add_{i}(p: {ann([n, d])}, q: {ann([m, d])}):  # expected-error: {n} vs {m} (anchored at the annotation)",
+            f"def broken_add_{i}(p: {ann([n, d])}, q: {ann([m, d])}):",
             f"    ok = p * 2.0{es(ok=[n, d])}",
-            "    bad = p + q",
+            f"    bad = p + q  # expected-error: {n} vs {m}",
             "    return ok",
             "",
             "",
