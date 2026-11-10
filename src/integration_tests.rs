@@ -2514,6 +2514,32 @@ mod binary_op_propagation_tests {
     }
 
     #[test]
+    fn test_lambda_parameter_hides_the_annotation_of_the_same_name() {
+        let code = "def f(x: Float[Array, \"n 3\"], y: Float[Array, \"n 4\"], z: Float[Array, \"n 3\"]):\n    r = (lambda x: x + y)(z)\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = parse(code);
+        let roots = vec![tmp.path().to_path_buf()];
+        let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
+        assert_eq!(analysis.errors[0].range.start_point.row, 1);
+    }
+
+    #[test]
+    fn test_seeded_callee_reports_only_integer_conflicts() {
+        let cases = [("jnp.ones(3), jnp.ones(3)", 0), ("v, jnp.ones(3)", 0), ("jnp.ones(3), jnp.ones(4)", 0)];
+        let tmp = tempfile::tempdir().unwrap();
+        for (args, errors) in cases {
+            let code = format!(
+                "import jax.numpy as jnp\ndef callee(x: Float[Array, \"d\"], a):\n    y = x + a\n    return y\ndef caller(v: Float[Array, \"m\"]):\n    r = callee({args})\n"
+            );
+            let tree = parse(&code);
+            let roots = vec![tmp.path().to_path_buf()];
+            let analysis = analyze_layer_shapes(tree.root_node(), &code, &roots, read, 5, None).unwrap();
+            assert_eq!(analysis.errors.len(), errors, "{args}: {:?}", analysis.errors);
+        }
+    }
+
+    #[test]
     fn test_self_field_resolves_in_its_own_class() {
         let code = "class A:\n    w: Float[Array, \"3 4\"]\n    def f(self):\n        a = self.w\nclass B:\n    w: Float[Array, \"5\"]\n    def f(self):\n        b = self.w\nclass C(A):\n    def f(self):\n        c = self.w\nclass D:\n    def f(self):\n        d = self.w\n";
         let tmp = tempfile::tempdir().unwrap();

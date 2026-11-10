@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,188 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,194 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1295,15 +1295,8 @@ Open defects
   `bench/stress/stress_main.py` sit on `def` lines and the harness matches by
   line; `ShapeCtx::report` decides the variadic exemption from the range;
   `related` holds one entry; and the `reads` of an error would change.
-- In a partly annotated callee, `x + a` with `a` seeded as `[3]` gives a false
-  "d vs 3" warning.
-- `annotation_dimension_range` can match an annotation of the outer function
-  when a lambda parameter has the same name.
-- The method form `a.where(c, b)` is unknown.
 - The memo at open is not built: it made open 12 to 17 percent slower and the
   first edit 396 to 41 ms faster. The owner decides this trade.
-- `ponytail:` in `shape_of_attribute`: class fields are in the module scope,
-  so two classes with a same-named field resolve last-wins.
 - Two `TODO`s in `process_assignment_item_inner`: the vmap recording and the layer
   application paths duplicate `shape_of_call`, because it does not know the
   target name.
@@ -1335,6 +1328,21 @@ Rules added after `62e9ebd` (round three):
 - `x.sort()` has a shape only in a file that imports jax and no numpy or torch.
 - `where` checks each pair of operands that has a shape.
 - `tests/robustness.rs` analyzes truncated corpus files and asserts no panic.
+
+Rules added after `29bfb64` (round four):
+- `Float[Tensor, "..."]` and `Float[np.ndarray, "..."]` are array annotations
+  (`contains_library_array`). The head must be a jaxtyping dtype, so
+  `Union[Tensor, "Name"]` is no shape.
+- `**`, `//`, `%`, `&`, `|`, and `^` broadcast and report like `+`
+  (`BinaryOp::Elementwise`). A comparison of two operands broadcasts too, and
+  a conflict there gives no shape and no report (`shape_of_comparison`).
+- The method form `a.where(c, b)` uses the `where` rule.
+- `self.<field>` resolves in the class of the method, then in its bases
+  (`ShapeCtx::field_shape`). A class without the field gets no shape.
+- A specialized callee with named annotations keeps only `Mismatch` errors
+  from the seeded pass: its names and the dims of the call do not compare.
+- `annotation_dimension_range` skips a name that a lambda or a comprehension
+  binds.
 
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the

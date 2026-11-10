@@ -2496,6 +2496,14 @@ fn annotation_dimension_range(
         return None;
     }
     let binding = operand.utf8_text(text.as_bytes()).ok()?;
+    // A lambda or comprehension that binds the name hides the annotation.
+    let mut inner = operand.parent();
+    while let Some(node) = inner.filter(|node| node.kind() != "function_definition") {
+        if inner_scope_binds(node, binding, text) {
+            return None;
+        }
+        inner = node.parent();
+    }
     scope
         .dimension_sites
         .iter()
@@ -7542,6 +7550,18 @@ fn specialize_callee_call(
 
     if is_first {
         ctx.specialized_scopes.insert(callee_idx);
+        let has_names = ctx.original_shapes.get(callee_idx).is_some_and(|declared| {
+            declared.values().flatten().any(|dim| dim.parse::<i64>().is_err())
+        });
+        if !replace_annotations && has_names {
+            // The body mixes the names of its annotations with the dims of
+            // this call, so only two integers prove a conflict.
+            let mut at = 0;
+            ctx.errors.retain(|err| {
+                at += 1;
+                at <= errors_before || err.kind == ShapeErrorKind::Mismatch
+            });
+        }
         // The whole-file pass may already have reported an error inside this
         // body; replaying it must not report it a second time.
         drop_repeated_errors(ctx.errors, errors_before);
