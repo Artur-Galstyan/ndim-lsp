@@ -1845,6 +1845,45 @@ pub(crate) fn self_attr_aliases_from_writes(
     aliases
 }
 
+/// A class field `dim: int` that no method writes is the name of a size:
+/// `self.dim` is `dim`, like after `self.dim = dim` (flax and dataclass
+/// modules have no `__init__`).
+pub(crate) fn add_int_field_aliases(
+    root: Node,
+    text: &str,
+    writes: &[SelfAttrWrite],
+    aliases: &mut HashMap<String, Vec<ScopedSelfAttrAlias>>,
+) {
+    const QUERY_STRING: &str = r#"
+        (class_definition body: (block (expression_statement
+          (assignment left: (identifier) @name type: (type) @type)))) @class
+    "#;
+    static QUERY: LazyLock<Query> = LazyLock::new(|| {
+        Query::new(&tree_sitter_python::LANGUAGE.into(), QUERY_STRING).expect("static query")
+    });
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&QUERY, root, text.as_bytes());
+    while let Some(m) = matches.next() {
+        let capture = |name: &str| {
+            let index = QUERY.capture_index_for_name(name)?;
+            m.captures.iter().find(|capture| capture.index == index).map(|capture| capture.node)
+        };
+        let (Some(name), Some(kind), Some(class)) = (capture("name"), capture("type"), capture("class")) else {
+            continue;
+        };
+        let range = (class.start_byte(), class.end_byte());
+        let name = &text[name.byte_range()];
+        if &text[kind.byte_range()] != "int" || writes.iter().any(|write| write.class == range && write.attr == name) {
+            continue;
+        }
+        aliases.entry(name.to_string()).or_default().push(ScopedSelfAttrAlias {
+            class_start: range.0,
+            class_end: range.1,
+            value: name.to_string(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod class_structure_tests {
     use super::*;

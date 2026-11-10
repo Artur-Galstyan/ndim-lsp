@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,200 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,202 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1370,6 +1370,25 @@ Rules added after `29bfb64` (round four):
   The related place is the annotation dim of the right operand, when both
   operands have an annotation site, else the right operand. With two sites
   the error goes through `push_error`, else through `report`.
+- `find_binary_op_text` finds an operator with no space around it (`x**2`,
+  `a@b`). Before, each such expression had no shape and no check.
+- `@` takes a vector (`apply_matmul_shape`): a vector is a row on the left
+  and a column on the right, and the result drops that axis. Two vectors
+  give `[]`. A variadic vector gives no shape.
+- An index that is an array of integers puts its shape in place of the axis:
+  `x[i]`, `x[:, i]`, `np.eye(k)[labels]` (`is_integer_array`). Proven are
+  `arange`, `argmin`, `argmax`, `argsort`, `randint`, `randperm`,
+  `searchsorted`, an `Int[...]` parameter that the body does not bind again
+  (`sole_typed_parameter`), an item of those, and a name with one such value.
+  Arrays next to each other broadcast. A conflict, an integer or a list with
+  an array, and arrays apart give no shape. All other arrays can be a mask.
+- flax: a class field `dim: int` that no method writes makes `self.dim` the
+  dim `dim` (`add_int_field_aliases`), like `self.dim = dim` in `__init__`.
+- flax: `MultiHeadDotProductAttention`, `MultiHeadAttention`, and
+  `SelfAttention` keep the shape of the query when `out_features` is absent.
+- flax: `self.param(name, init, (sizes))` has the shape of the sizes (the
+  `zeros` rule). `model.apply(variables, x)` runs `__call__(x)` when the
+  class has no `apply` method. With `mutable=` or `method=` it has no shape.
 
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the

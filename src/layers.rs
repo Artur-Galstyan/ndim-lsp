@@ -260,6 +260,12 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
                 .or_else(|| call.bindings.get("embedding_dim"))?
                 .clone(),
         }),
+        // flax attention: `out_features` defaults to the features of the query.
+        "MultiHeadDotProductAttention" | "MultiHeadAttention" | "SelfAttention"
+            if is_flax_module && !call.bindings.contains_key("out_features") =>
+        {
+            Some(LayerKind::ShapePreserving { name: owner.to_string() })
+        }
         name if SHAPE_PRESERVING_LAYERS.contains(&name) => Some(LayerKind::ShapePreserving {
             name: owner.to_string(),
         }),
@@ -794,6 +800,9 @@ fn known_layer_signature(parts: &[String]) -> Option<PythonCallableSignature> {
             "groups",
             "use_bias",
         ],
+        "MultiHeadDotProductAttention" | "MultiHeadAttention" | "SelfAttention" if framework == "flax" => {
+            &["self", "num_heads", "dtype", "param_dtype", "qkv_features", "out_features"]
+        }
         name if SHAPE_PRESERVING_LAYERS.contains(&name) => &["self"],
         "Flatten" => &["self", "start_dim", "end_dim"],
         "Unflatten" => &["self", "dim", "sizes"],

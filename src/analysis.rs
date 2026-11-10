@@ -25,7 +25,7 @@ use crate::layers::{
 use crate::python_ast::{
     ClassHierarchy, SelfAttrWrite, collect_global_names, dim_symbols, directly_in_class,
     extract_call_arguments, insert_identifiers, insert_target_names, only_wrapped,
-    self_attr_aliases_from_writes,
+    add_int_field_aliases, self_attr_aliases_from_writes,
 };
 use crate::resolution::{
     ResolutionCache, bind_call_arguments, resolve_call_target, resolve_imported_function_shape,
@@ -203,13 +203,15 @@ where
             }
         }
     }
+    let mut aliases = self_attr_aliases_from_writes(&self_attr_writes, text);
+    add_int_field_aliases(node, text, &self_attr_writes, &mut aliases);
     let pass = PassInput {
         node,
         text,
         imports: &imports,
         layer_records: &layer_records,
         self_attr_layers: &self_attr_layers,
-        aliases: &self_attr_aliases_from_writes(&self_attr_writes, text),
+        aliases: &aliases,
         self_attr_writes: &self_attr_writes,
         hierarchy: &hierarchy,
         search_roots,
@@ -1664,7 +1666,11 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     let variadic = input_shape.iter().position(|dim| is_variadic_dim(dim));
     let mut past_ellipsis = false;
 
-    for idx in &indices {
+    // Integer arrays next to each other broadcast to one shape, which goes
+    // where the first of them is.
+    let mut arrays: Option<(usize, usize, Vec<String>)> = None;
+
+    for (position, idx) in indices.iter().enumerate() {
         // Before the variadic dim, the axis counts from the start, and after an
         // ellipsis from the end. Elsewhere only a slice of all items is proven.
         let unplaced = variadic.is_some_and(|at| if past_ellipsis { axis <= at } else { axis >= at });
@@ -1708,13 +1714,32 @@ fn shape_of_subscript(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 axis += 1;
                 integers += 1;
             }
+            _ if is_integer_array(*idx, ctx, 0) => {
+                input_shape.get(axis)?;
+                let index_shape = shape_of_expression(*idx, ctx)?;
+                if index_shape.iter().any(|dim| is_variadic_dim(dim)) {
+                    return None;
+                }
+                arrays = Some(match arrays.take() {
+                    None => (out.len(), position, index_shape),
+                    Some((at, last, shape)) if last + 1 == position => {
+                        let both = apply_elementwise_shape(&shape, &index_shape, BinaryOp::Add).ok()??;
+                        (at, position, both)
+                    }
+                    Some(_) => return None,
+                });
+                axis += 1;
+            }
             _ => return None,
         }
     }
-    // With a list, an integer is an array index too, and several array indices
-    // broadcast.
-    if lists > 1 || (lists == 1 && integers > 0) {
+    // With a list or an array, an integer is an array index too, and several
+    // array indices broadcast.
+    if lists > 1 || (lists == 1 && integers > 0) || (arrays.is_some() && lists + integers > 0) {
         return None;
+    }
+    if let Some((at, _, shape)) = arrays {
+        out.splice(at..at, shape);
     }
 
     // Trailing axes not addressed by any index stay as implicit full slices.
@@ -1756,8 +1781,8 @@ fn find_binary_op_text<'a>(
     for i in 0..node.child_count() {
         let child = node.child(i as u32)?;
         if !child.is_named()
-            && child.start_byte() > left_node.end_byte()
-            && child.end_byte() < right_node.start_byte()
+            && child.start_byte() >= left_node.end_byte()
+            && child.end_byte() <= right_node.start_byte()
             && let Ok(t) = child.utf8_text(text.as_bytes()) {
                 return Some(t.trim().to_string());
             }
@@ -2945,6 +2970,18 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             return None;
         }
 
+        // flax: `self.param(name, init, shape)` makes an array of that shape.
+        if method_name == "param"
+            && ctx.text.get(obj_node.byte_range()) == Some("self")
+            && let Some(sizes) = args_node.named_child(2).filter(|sizes| sizes.kind() == "tuple")
+        {
+            let value = ctx.text.get(sizes.byte_range())?.to_string();
+            let size = resolve_call_arg(CallArgument::Positional { value }, sizes, scope_idx, ctx)?;
+            let size = [size];
+            let shape = apply_known_function(&KnownFunction::Zeros, &size, &ctx.scope_shapes(scope_idx)).ok()??;
+            return Some(ctx.with_free_argument_dims(shape, &size, sizes.start_byte()));
+        }
+
         // A method of a module of this file that `self.<attr>` or a name holds.
         let held = match obj_node.kind() {
             "attribute" => ctx.text.get(obj_node.byte_range()).and_then(|text| text.strip_prefix("self.")).and_then(|attr| {
@@ -2960,11 +2997,25 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 .and_then(|name| name_module(obj_node, name, ctx)),
             _ => None,
         };
+        // flax: `model.apply(variables, x)` runs `__call__(x)`. With `mutable`
+        // it gives a pair, and `method` names a different method.
+        let flax_apply = method_name == "apply"
+            && held.as_ref().is_some_and(|module| ctx.module_method(module, "apply").is_none());
+        let target = if flax_apply { "__call__" } else { method_name.as_str() };
         if let Some(module) = held
-            && let Some(callee_idx) = ctx.module_method(&module, &method_name)
+            && let Some(callee_idx) = ctx.module_method(&module, target)
         {
             let raw_args = extract_call_arguments(args_node, ctx.text).ok()?;
-            let args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+            let mut args = resolve_call_args(raw_args, args_node, scope_idx, ctx)?;
+            if flax_apply {
+                let plain = !args.iter().any(|arg| {
+                    matches!(arg, CallArgument::Keyword { name, .. } if name == "mutable" || name == "method")
+                });
+                if !plain || args.len() < 2 || !matches!(args[0], CallArgument::Positional { .. }) {
+                    return None;
+                }
+                args.remove(0);
+            }
             let display = ctx.text.get(func_node.byte_range())?;
             return apply_submodule_scope(&module, callee_idx, display, &args, call_byte, scope_idx, args_node.range(), ctx);
         }
@@ -4541,20 +4592,8 @@ fn name_module(at: Node, name: &str, ctx: &ShapeCtx) -> Option<Submodule> {
             constructed_module(value, ctx.text, ctx.imports.at(value.start_byte()), ctx.hierarchy)
         }
         NameBinding::Opaque if owner.kind() == "function_definition" => {
-            let scope = function_scope(owner, ctx)?;
-            let (mut values, mut bound) = (Vec::new(), false);
-            let body = owner.child_by_field_name("body")?;
-            if ctx.links.poisoned[scope].contains(name)
-                || !collect_name_values(body, name, ctx.text, &mut values, &mut bound)
-                || bound
-            {
-                return None;
-            }
-            let parameters = owner.child_by_field_name("parameters")?;
+            let parameter = sole_typed_parameter(owner, name, ctx)?;
             let text = |node: Node| ctx.text.get(node.byte_range());
-            let parameter = parameters.named_children(&mut parameters.walk()).find(|parameter| {
-                parameter.kind() == "typed_parameter" && parameter.named_child(0).and_then(text) == Some(name)
-            })?;
             let class = text(parameter.child_by_field_name("type")?)?;
             if is_imported(ctx.imports.at(parameter.start_byte()), class) {
                 return None;
@@ -4563,6 +4602,68 @@ fn name_module(at: Node, name: &str, ctx: &ShapeCtx) -> Option<Submodule> {
             Some(Submodule { class, ctor_args: Vec::new(), byte: parameter.start_byte() })
         }
         _ => None,
+    }
+}
+
+/// The typed parameter `name` of `function`, when the body never binds the
+/// name again.
+fn sole_typed_parameter<'t>(function: Node<'t>, name: &str, ctx: &ShapeCtx) -> Option<Node<'t>> {
+    let scope = function_scope(function, ctx)?;
+    let (mut values, mut bound) = (Vec::new(), false);
+    let body = function.child_by_field_name("body")?;
+    if ctx.links.poisoned[scope].contains(name)
+        || !collect_name_values(body, name, ctx.text, &mut values, &mut bound)
+        || bound
+        || !values.is_empty()
+    {
+        return None;
+    }
+    let parameters = function.child_by_field_name("parameters")?;
+    let text = |node: Node| ctx.text.get(node.byte_range());
+    parameters.named_children(&mut parameters.walk()).find(|parameter| {
+        parameter.kind() == "typed_parameter" && parameter.named_child(0).and_then(text) == Some(name)
+    })
+}
+
+/// Whether `node` is provably an array of integers, so not a mask: an index
+/// function such as `argsort`, an `Int[...]` parameter, an item of one of
+/// those, or a name with one such value.
+fn is_integer_array(node: Node, ctx: &ShapeCtx, depth: usize) -> bool {
+    let text = |node: Node| ctx.text.get(node.byte_range());
+    match node.kind() {
+        _ if depth > 4 => false,
+        "call" => node
+            .child_by_field_name("function")
+            .and_then(text)
+            .and_then(|callee| callee.rsplit('.').next())
+            .is_some_and(|tail| {
+                matches!(tail, "arange" | "argmin" | "argmax" | "argsort" | "randint" | "randperm" | "searchsorted")
+            }),
+        "subscript" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| is_integer_array(value, ctx, depth + 1)),
+        "identifier" => {
+            let Some(name) = text(node) else {
+                return false;
+            };
+            match nearest_binding(node, name, ctx) {
+                (_, NameBinding::Values(values)) => {
+                    matches!(values[..], [value] if is_integer_array(value, ctx, depth + 1))
+                }
+                (owner, NameBinding::Opaque) if owner.kind() == "function_definition" => {
+                    sole_typed_parameter(owner, name, ctx)
+                        .and_then(|parameter| parameter.child_by_field_name("type"))
+                        .and_then(text)
+                        .is_some_and(|annotation| {
+                            let head = annotation.split('[').next().unwrap_or("");
+                            let head = head.rsplit('.').next().unwrap_or("").trim_end_matches(|c: char| c.is_ascii_digit());
+                            annotation.contains('[') && matches!(head, "Int" | "UInt" | "Integer")
+                        })
+                }
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -8290,9 +8391,34 @@ fn apply_matmul_shape(
     left_name: &str,
     right_name: &str,
 ) -> Result<Option<Vec<String>>, String> {
-    // Rank < 2: return Ok(None) for v1
-    if left.len() < 2 || right.len() < 2 {
+    if left.is_empty() || right.is_empty() {
         return Ok(None);
+    }
+    // A vector operand is a row on the left and a column on the right. The
+    // result drops the added axis.
+    let (left_vector, right_vector) = (left.len() == 1, right.len() == 1);
+    if left_vector || right_vector {
+        if (left_vector && is_variadic_dim(&left[0])) || (right_vector && is_variadic_dim(&right[0])) {
+            return Ok(None);
+        }
+        let mut row = left.to_vec();
+        if left_vector {
+            row.insert(0, "1".to_string());
+        }
+        let mut column = right.to_vec();
+        if right_vector {
+            column.push("1".to_string());
+        }
+        let Some(mut output) = apply_matmul_shape(&row, &column, left_name, right_name)? else {
+            return Ok(None);
+        };
+        if right_vector {
+            output.pop();
+        }
+        if left_vector {
+            output.remove(output.len() - if right_vector { 1 } else { 2 });
+        }
+        return Ok(Some(output));
     }
 
     // Batch dims broadcast numpy-style: align right, missing or literal-1

@@ -16626,5 +16626,89 @@ mod symbolic_slice_tests {
             assert_eq!(run(result, sizes), Some(shape(&[want])), "{result} {sizes}");
         }
     }
-}
 
+    #[test]
+    fn numpy_style_operators_vectors_and_array_indices() {
+        let head = "import numpy as np\nfrom jaxtyping import Float, Int, Bool\n\
+            def f(x: Float[np.ndarray, \"n d\"], y: Float[np.ndarray, \"n\"], i: Int[np.ndarray, \"m\"], \
+            mask: Bool[np.ndarray, \"n\"], k: int):\n";
+        let cases: [(&str, Option<&[&str]>); 12] = [
+            ("x**2", Some(&["n", "d"])),
+            ("x@x.T", Some(&["n", "n"])),
+            ("x.T @ y", Some(&["d"])),
+            ("y @ x", Some(&["d"])),
+            ("y @ y", Some(&[])),
+            ("x[i]", Some(&["m", "d"])),
+            ("x[:, i]", Some(&["n", "m"])),
+            ("np.eye(k)[np.argmin(x, axis=1)]", Some(&["n", "k"])),
+            ("x[np.arange(x.shape[0]), np.argmax(x, axis=1)]", Some(&["n"])),
+            ("x[mask]", None),
+            ("x[i, 0]", None),
+            ("x[np.arange(x.shape[0]), i]", None),
+        ];
+        for (expression, want) in cases {
+            let source = format!("{head}    r = {expression}\n    return r\n");
+            let got = find_shape(&analyze(&source), "r").cloned();
+            assert_eq!(got, want.map(shape), "{expression}");
+        }
+        let bad = format!("{head}    r = x @ y\n    return r\n");
+        assert!(analyze(&bad).errors.iter().all(|error| error.kind == ShapeErrorKind::Approximation), "two names give a warning");
+        let bad = "import numpy as np\nfrom jaxtyping import Float\n\
+            def f(x: Float[np.ndarray, \"n 3\"], y: Float[np.ndarray, \"4\"]):\n    r = x @ y\n    return r\n";
+        assert!(matches!(&analyze(bad).errors[..], [error] if error.kind == ShapeErrorKind::Mismatch));
+    }
+
+    #[test]
+    fn flax_fields_parameters_attention_and_apply() {
+        let source = r#"import flax.linen as nn
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+
+
+class Block(nn.Module):
+    dim: int
+
+    def setup(self):
+        self.attn = nn.MultiHeadDotProductAttention(num_heads=4)
+        self.wide = nn.SelfAttention(num_heads=4, out_features=32)
+        self.fc = nn.Dense(self.dim)
+
+    def __call__(self, x: Float[Array, "b t dim"]):
+        a = self.attn(x)
+        w = self.wide(x)
+        out = x + self.fc(a)
+        return out
+
+
+class Enc(nn.Module):
+    vocab: int
+    dim: int
+
+    @nn.compact
+    def __call__(self, tokens: Int[Array, "b t"]):
+        e = nn.Embed(self.vocab, self.dim)(tokens)
+        pos = self.param("pos", nn.initializers.zeros, (1, 128, self.dim))
+        h = e + pos[:, : tokens.shape[1]]
+        for _ in range(2):
+            h = Block(self.dim)(h)
+        return h
+
+
+def run(params, x: Float[Array, "b t 8"]):
+    model = Block(8)
+    y = model.apply(params, x)
+    pair = model.apply(params, x, mutable=["stats"])
+    return y
+"#;
+        let analysis = analyze(source);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        let found = |name: &str| analysis.scopes.iter().find_map(|scope| scope.shapes.get(name)).cloned();
+        assert_eq!(found("a"), Some(shape(&["b", "t", "dim"])));
+        assert_eq!(found("w"), None);
+        assert_eq!(found("out"), Some(shape(&["b", "t", "dim"])));
+        assert_eq!(found("pos"), Some(shape(&["1", "128", "dim"])));
+        assert_eq!(found("h"), Some(shape(&["b", "t", "dim"])));
+        assert_eq!(found("y"), Some(shape(&["b", "t", "8"])));
+        assert_eq!(found("pair"), None);
+    }
+}
