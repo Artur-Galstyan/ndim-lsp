@@ -1437,6 +1437,26 @@ writes each source that a test analyzes (up to 20 kB) to `<dir>`. Do not put
 a Python environment below `bench/` or `corpus/`: `incremental_tests` reads
 all `.py` files there.
 
+Outside-truth gate (`oracle/check.py`, a standing gate for each rule change):
+  uv venv --python 3.12 oracle/.venv
+  uv pip install --python oracle/.venv/bin/python numpy torch jax equinox flax jaxtyping einops optax
+  NDIM_DUMP_SOURCES=/tmp/ndim-oracle/src cargo test --lib
+  cargo build --release
+  oracle/.venv/bin/python oracle/check.py /tmp/ndim-oracle/src
+The script runs each source in the real libraries. Each function gets one
+array for each jaxtyping parameter, with a different prime size for each dim
+name. A shape of the tool must equal each shape the name had on that line,
+and an error of the tool on a line that ran to its end is a false error. No
+shape from the tool always passes. Required result: `shapes_wrong` 0 and
+`errors_false` 0. `shapes_from_a_broken_annotation` counts tests whose function
+breaks its own return annotation, which the tool trusts. Result of 2026-11-11
+on the test sources: 7,028 shapes, 1,426 confirmed, 0 wrong, 275 errors, 0
+false. The commit before the soundness fixes gives 15 wrong shapes and 5
+false errors on the same sources. Limits: a method of a class is not called,
+a function with a parameter that has no annotation is skipped, and a source
+that needs a fake module does not run. `NDIM_LSP=<binary>` selects the binary.
+Run it only on folders of plain probe files: it executes each file.
+
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the
 result of 2026-11-10 are in "Current validation baseline"). Each error must be
