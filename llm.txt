@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,208 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,209 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1453,6 +1453,26 @@ Input sources (2026-11-11, each shape checked by `oracle/check.py`):
   377, mujoco 585 to 905. One new diagnostic, and it is true: the warning at
   `noxton/functions/geometry.py:79`, where `q: Float[Array, "w x y z"]`
   (rank 4) meets `jnp.array([1, -1, -1, -1])`. The docstring says `(..., 4)`.
+
+Tuple results (2026-11-11, each shape checked by `oracle/check.py`):
+- `a, b = f(x)` and `a, b = self.m(x)` for a function of this file: the items
+  of the tuple of its one `return` (`apply_seeded_user_tuple`, in
+  `tuple_rhs_shapes`). The body is read with the arguments of the call. A
+  star or a nested target, a count that does not fit, and a transform
+  decorator give no shape. One name for the whole tuple (`p = f(x)`) has no
+  shape, and `-> tuple[...]` is not read: the body gives the items.
+- A fully annotated function with `return <expression>` and no return
+  annotation: the body gives the shape (`apply_user_function` falls back to
+  `apply_seeded_user_function`). Before, only `return <name>` gave one.
+- A `return` with no value makes the result unknown
+  (`collect_own_return_exprs` keeps the statement).
+- torch: `B, T, C = x.size()` is `x.shape` (`shape_attribute_dims`).
+- torch: `values, indices = torch.max(x, dim)`, `torch.min`, `x.max(dim=1)`
+  give two arrays of the reduced shape. `torch.sort(x)` and `x.sort()` give
+  two arrays of the shape of `x`. One name for the pair has no shape.
+- `out, (h, c) = self.lstm(self.emb(tok))`: the input of an RNN layer can be
+  an expression.
+- `oracle/check.py` also calls the methods of a class that needs no argument.
 
 Test rule from the same audit: an expected shape in a test must come from the
 real library, not from the belief of the author. Eight tests asserted a wrong

@@ -7690,13 +7690,11 @@ mod literal_binop_scan_method_tests {
     }
 
     #[test]
-    fn test_self_method_call_non_identifier_return_not_traced() {
-        // `return h + 1` isn't a bare identifier — v1 doesn't trace inline
-        // expressions, so the call stays unshaped rather than guessing.
-        let code = "class M:\n    def forward(self, h: Float[Array, \"d\"]):\n        return h + 1\n\n    def run(self, a: Float[Array, \"d\"]):\n        out = self.forward(a)";
+    fn test_self_method_call_expression_return_is_traced() {
+        let code = "class M:\n    def forward(self, h: Float[Array, \"d\"]):\n        return h + 1\n\n    def run(self, a: Float[Array, \"n\"]):\n        out = self.forward(a)";
         let analysis = analyze(code);
 
-        assert_eq!(find_shape(&analysis, "out"), None);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["n"])));
     }
 
     #[test]
@@ -9958,16 +9956,14 @@ def f(a: Float[Array, \"3 4\"]):
         assert_eq!(find_shape(&analysis, "out"), Some(&shape(&[])));
     }
 
-    /// A fully-annotated same-file function is unaffected by this
-    /// mechanism — it still goes through the older annotation-only path,
-    /// and a non-identifier return still isn't traced (regression check
-    /// mirroring `test_self_method_call_non_identifier_return_not_traced`).
+    /// A fully annotated function with `return <expression>` and no return
+    /// annotation: the body gives the shape.
     #[test]
-    fn test_fully_annotated_function_unaffected_by_seeding() {
+    fn test_fully_annotated_function_expression_return() {
         let code = "class M:\n    def forward(self, h: Float[Array, \"d\"]):\n        return h + 1\n\n    def run(self, a: Float[Array, \"d\"]):\n        out = self.forward(a)";
         let analysis = analyze(code);
 
-        assert_eq!(find_shape(&analysis, "out"), None);
+        assert_eq!(find_shape(&analysis, "out"), Some(&shape(&["d"])));
     }
 
     #[test]
@@ -10004,8 +10000,12 @@ def f(a: Float[Array, \"3 4\"]):
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        for name in ["a", "b", "c", "d", "v", "i"] {
+        // One name holds the pair. The two names of an unpack hold arrays.
+        for name in ["a", "b", "c", "d"] {
             assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        for name in ["v", "i"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["3"])), "{name}");
         }
     }
 
@@ -10034,8 +10034,11 @@ def f(a: Float[Array, \"3 4\"]):
         let analysis = analyze(code);
 
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
-        for name in ["a", "b", "v", "i"] {
+        for name in ["a", "b"] {
             assert_eq!(find_shape(&analysis, name), None, "{name}");
+        }
+        for name in ["v", "i"] {
+            assert_eq!(find_shape(&analysis, name), Some(&shape(&["3"])), "{name}");
         }
     }
 
@@ -16917,6 +16920,94 @@ def run(params, x: Float[Array, "b t 8"]):
         ] {
             let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
             assert_eq!(probe(&line(params, value), "r"), (want, 0), "{value}");
+        }
+    }
+
+    /// Each expected shape here is the shape that the real library gives
+    /// (`oracle/check.py` runs these sources).
+    #[test]
+    fn tuple_results() {
+        let source = r#"import torch
+import torch.nn as nn
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+from torch import Tensor
+
+
+def pair(x: Float[Array, "n d"]):
+    a = x.sum(axis=0)
+    b = x * 2
+    return a, b
+
+
+def expr(x: Float[Array, "n d"]):
+    return jnp.tanh(x) @ x.T
+
+
+def maybe(x: Float[Array, "n d"], flag: bool):
+    if flag:
+        return
+    return x
+
+
+def use(x: Float[Array, "n d"]):
+    pa, pb = pair(x)
+    ex = expr(x)
+    no = maybe(x, False)
+    whole = pair(x)
+    return pa
+
+
+def sizes(t: Float[Tensor, "b s c"], logits: Float[Tensor, "b k"]):
+    B, T, C = t.size()
+    flat = t.view(B * T, C)
+    val, idx = torch.max(logits, 1)
+    v2, i2 = logits.max(dim=1)
+    v3, i3 = torch.min(logits, dim=-1, keepdim=True)
+    srt, order = torch.sort(logits, dim=1)
+    return flat
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(100, 32)
+        self.lstm = nn.LSTM(32, 64, batch_first=True)
+        self.gru = nn.GRU(32, 64, batch_first=True)
+
+    def encode(self, tok: Int[Tensor, "b t"]):
+        e = self.emb(tok)
+        enc, (h, c) = self.lstm(e)
+        return enc, h
+
+    def forward(self, tok: Int[Tensor, "b t"]):
+        out, (hn, cn) = self.lstm(self.emb(tok))
+        o2, h2 = self.gru(self.emb(tok))
+        o3, h3 = self.encode(tok)
+        return out
+"#;
+        let analysis = analyze(source);
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        let found = |name: &str| analysis.scopes.iter().find_map(|scope| scope.shapes.get(name)).cloned();
+        for (name, want) in [
+            ("pa", Some(vec!["d"])),
+            ("pb", Some(vec!["n", "d"])),
+            ("ex", Some(vec!["n", "n"])),
+            ("no", None),
+            ("whole", None),
+            ("flat", Some(vec!["b*s", "c"])),
+            ("val", Some(vec!["b"])),
+            ("i2", Some(vec!["b"])),
+            ("v3", Some(vec!["b", "1"])),
+            ("order", Some(vec!["b", "k"])),
+            ("out", Some(vec!["b", "t", "64"])),
+            ("hn", Some(vec!["1", "b", "64"])),
+            ("h2", Some(vec!["1", "b", "64"])),
+            ("o3", Some(vec!["b", "t", "64"])),
+            ("h3", Some(vec!["1", "b", "64"])),
+        ] {
+            let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
+            assert_eq!(found(name), want, "{name}");
         }
     }
 }

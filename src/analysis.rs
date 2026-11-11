@@ -6067,14 +6067,21 @@ fn tuple_literal_shapes(
 
 /// The dims of `x` for the RHS `x.shape`, when `x` has a known shape.
 fn shape_attribute_dims(rhs: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
-    if rhs.kind() != "attribute" {
+    // torch: `x.size()` with no argument is `x.shape`.
+    let (attribute, name) = match rhs.kind() {
+        "call" if rhs.child_by_field_name("arguments")?.named_child_count() == 0 => {
+            (rhs.child_by_field_name("function")?, "size")
+        }
+        _ => (rhs, "shape"),
+    };
+    if attribute.kind() != "attribute" {
         return None;
     }
-    let attr = rhs.child_by_field_name("attribute")?;
-    if attr.utf8_text(ctx.text.as_bytes()).ok()? != "shape" {
+    let attr = attribute.child_by_field_name("attribute")?;
+    if attr.utf8_text(ctx.text.as_bytes()).ok()? != name {
         return None;
     }
-    shape_of_expression(rhs.child_by_field_name("object")?, ctx)
+    shape_of_expression(attribute.child_by_field_name("object")?, ctx)
 }
 
 /// Compute one shape per element of a tuple-unpacked RHS. Returns `None` if the
@@ -6229,9 +6236,7 @@ fn tuple_rhs_shapes(
                 if n_targets != 2 || hidden_size.contains(UNPROVEN_DIM) || (cell && name != "LSTMCell") {
                     return None;
                 }
-                let args = raw_args()?;
-                let input = positional_values(&args).next()?;
-                let input_shape = ctx.resolve_shape(input, scope_idx)?;
+                let input_shape = shape_of_expression(find_positional_arg_node(args_node, 0)?, ctx)?;
                 if input_shape.len() < if cell { 1 } else { 2 } || crate::layers::dims_provably_mismatch(input_size, input_shape.last()?) {
                     return None;
                 }
@@ -6258,8 +6263,80 @@ fn tuple_rhs_shapes(
                 return Some(vec![Some(output), state]);
             }
 
+            // `a, b = f(x)` and `a, b = self.m(x)`: the items of the tuple
+            // that the one `return` of a function of this file gives.
+            let callee = match func.kind() {
+                "identifier" if !bound_in_expression(args_node, target, ctx.text) => {
+                    find_callee_scope(target, rhs.start_byte(), ctx.links, ctx.scopes)
+                }
+                "attribute" => {
+                    let object = func.child_by_field_name("object")?;
+                    let method = ctx.text.get(func.child_by_field_name("attribute")?.byte_range())?;
+                    (method != "__init__")
+                        .then(|| ctx.method_callee(object, is_super_call(object, ctx.text), method, rhs.start_byte()))
+                        .flatten()
+                }
+                _ => None,
+            };
+            if let Some(callee_idx) = callee {
+                if ctx.is_transformed(callee_idx) {
+                    return None;
+                }
+                let args = resolve_call_args(raw_args()?, args_node, scope_idx, ctx)?;
+                let items = apply_seeded_user_tuple(callee_idx, rhs.start_byte(), &args, scope_idx, ctx)?;
+                return fit_pieces_some(items, targets);
+            }
+
             let resolved = resolve_call_target(target, ctx.imports.at(rhs.start_byte()));
             let known = classify_known_function(&resolved);
+
+            // torch: `values, indices = torch.max(x, dim)` and `x.max(dim=1)`
+            // give two arrays of the reduced shape. `torch.sort(x)` and
+            // `x.sort()` give two arrays of the shape of `x`.
+            let method = (func.kind() == "attribute")
+                .then(|| func.child_by_field_name("attribute").and_then(|name| ctx.text.get(name.byte_range())))
+                .flatten();
+            let receiver = func.child_by_field_name("object").filter(|object| {
+                ctx.text.get(object.byte_range()).is_some_and(|name| !is_imported(ctx.imports.at(object.start_byte()), name))
+            });
+            let torch_pair = match (&known, method, receiver) {
+                (Some(KnownFunction::TorchMaxMin), ..) => Some(("max", None)),
+                (Some(KnownFunction::TorchSort), ..) => Some(("sort", None)),
+                (None, Some("max" | "min"), Some(receiver)) => Some(("max", Some(receiver))),
+                (None, Some("sort"), Some(receiver)) => Some(("sort", Some(receiver))),
+                _ => None,
+            };
+            if let Some((kind, receiver)) = torch_pair {
+                if n_targets != 2 {
+                    return None;
+                }
+                let mut args = resolve_call_args(raw_args()?, args_node, scope_idx, ctx)?;
+                let input = match receiver {
+                    Some(receiver) => {
+                        let shape = shape_of_expression(receiver, ctx)?;
+                        let text = ctx.text.get(receiver.byte_range()).unwrap_or_default();
+                        let name = ctx.bind_synthetic(shape, scope_idx, receiver.start_byte(), text);
+                        args.insert(0, CallArgument::Positional { value: name.clone() });
+                        name
+                    }
+                    None => positional_values(&args).next()?.to_string(),
+                };
+                let shape = if kind == "sort" {
+                    ctx.scope_shapes(scope_idx).shape(&input).cloned()?
+                } else {
+                    let dim = args.iter().skip(1).any(|arg| match arg {
+                        CallArgument::Positional { value } => value.trim().parse::<i64>().is_ok(),
+                        CallArgument::Keyword { name, .. } => name == "dim",
+                    });
+                    if !dim {
+                        return None;
+                    }
+                    let reduction = KnownFunction::Reduction { axis: 1, keepdims: Some(2), q: None };
+                    let result = apply_known_function(&reduction, &args, &ctx.scope_shapes(scope_idx));
+                    ctx.check(result, "", args_node.range())??
+                };
+                return Some(vec![Some(shape.clone()), Some(shape)]);
+            }
 
             // `final_carry, ys = jax.lax.scan(body, init, xs)` — the carry is
             // invariant, so final_carry gets init's shape. `init` is
@@ -6535,6 +6612,12 @@ fn fit_pieces(pieces: Vec<Vec<String>>, targets: &[TupleTarget]) -> Option<Vec<O
         }
     }
     Some(out)
+}
+
+/// `fit_pieces` for items that can have no shape.
+fn fit_pieces_some(items: Vec<Option<Vec<String>>>, targets: &[TupleTarget]) -> Option<Vec<Option<Vec<String>>>> {
+    let plain = targets.iter().all(|target| matches!(target, TupleTarget::Name(_)));
+    (plain && items.len() == targets.len()).then_some(items)
 }
 
 /// The values of the positional arguments, as written.
@@ -7584,6 +7667,10 @@ fn apply_user_function(
     if captures {
         return apply_seeded_user_function(callee_idx, call_byte, args, scope_idx, ctx).map(Some);
     }
+    // `return <expression>` with no return annotation: read the body.
+    if ctx.scopes[callee_idx].return_shape.is_none() {
+        return apply_seeded_user_function(callee_idx, call_byte, args, scope_idx, ctx).map(Some);
+    }
     None
 }
 
@@ -7909,11 +7996,8 @@ fn collect_own_return_exprs<'t>(block: Node<'t>, out: &mut Vec<Node<'t>>) {
             continue;
         };
         match child.kind() {
-            "return_statement" => {
-                if let Some(value) = child.named_child(0) {
-                    out.push(value);
-                }
-            }
+            // A `return` with no value gives `None`: the statement stands for it.
+            "return_statement" => out.push(child.named_child(0).unwrap_or(child)),
             "function_definition" | "class_definition" | "lambda" => continue,
             _ => collect_own_return_exprs(child, out),
         }
@@ -7932,6 +8016,9 @@ fn collect_own_return_exprs<'t>(block: Node<'t>, out: &mut Vec<Node<'t>>) {
 fn trace_specialized_return(body: Node, callee_idx: usize, ctx: &mut ShapeCtx) -> SpecializedReturn {
     let mut returns = Vec::new();
     collect_own_return_exprs(body, &mut returns);
+    if returns.iter().any(|node| node.kind() == "return_statement") {
+        return SpecializedReturn::default();
+    }
 
     match returns.len() {
         0 => SpecializedReturn::default(),
@@ -8234,6 +8321,21 @@ fn apply_seeded_user_function(
     let dims = CalleeDims::new(callee_idx, &seeded, ctx)?;
     let result = specialize_callee_call(callee_idx, seeded, carries, call_byte, false, ctx)?;
     Some(dims.apply(&specialized_single(result)?))
+}
+
+/// `apply_seeded_user_function` for a callee whose one `return` gives a
+/// tuple: the shape of each item.
+fn apply_seeded_user_tuple(
+    callee_idx: usize,
+    call_byte: usize,
+    args: &[CallArgument],
+    caller_scope_idx: usize,
+    ctx: &mut ShapeCtx,
+) -> Option<Vec<Option<Vec<String>>>> {
+    let (seeded, carries) = seed_params_from_call(callee_idx, args, caller_scope_idx, ctx);
+    let dims = CalleeDims::new(callee_idx, &seeded, ctx)?;
+    let items = specialize_callee_call(callee_idx, seeded, carries, call_byte, false, ctx)?.tuple?;
+    Some(items.into_iter().map(|item| item.map(|shape| dims.apply(&shape))).collect())
 }
 
 /// How the dims of a specialized callee, which keeps the annotations of its

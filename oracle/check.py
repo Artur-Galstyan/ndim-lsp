@@ -216,15 +216,13 @@ def run_file(path):
             quiet.close()
 
     guarded(lambda: exec(code, namespace), None)
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) or node.decorator_list:
-            continue
-        function = namespace.get(node.name)
-        if not callable(function):
-            continue
+
+    def call(node, function, bound):
+        """Call one function with an array for each jaxtyping parameter."""
         sizes, values = {}, []
-        parameters = node.args.posonlyargs + node.args.args
-        defaults = [None] * (len(parameters) - len(node.args.defaults)) + node.args.defaults
+        parameters = (node.args.posonlyargs + node.args.args)[bound:]
+        defaults = [None] * (len(parameters) + bound - len(node.args.defaults)) + node.args.defaults
+        defaults = defaults[bound:]
         # Bind the dim names of all annotations first, so an `n: int` gets the size of `n`.
         for parameter in parameters:
             argument(parameter.annotation, parameter.arg, True, source, sizes)
@@ -234,10 +232,27 @@ def run_file(path):
             values.pop()
         if any(value is NotImplemented or value is ... for value in values) or node.args.kwonlyargs or node.args.vararg:
             result["skipped"] += 1
-            continue
+            return
         result["functions"] += 1
         result["bindings"][(node.lineno, node.end_lineno)] = sizes
         guarded(lambda: function(*values), node.lineno)
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and not node.decorator_list and callable(namespace.get(node.name)):
+            call(node, namespace[node.name], 0)
+        elif isinstance(node, ast.ClassDef) and isinstance(namespace.get(node.name), type):
+            # A class that needs no argument: call each plain method of one instance.
+            holder = {}
+            before = len(result["raised"])
+            guarded(lambda: holder.setdefault("it", namespace[node.name]()), None)
+            if "it" not in holder:
+                del result["raised"][before:]
+                continue
+            for method in node.body:
+                if isinstance(method, ast.FunctionDef) and not method.decorator_list and method.name != "__init__":
+                    function = getattr(holder["it"], method.name, None)
+                    if callable(function):
+                        call(method, function, 1)
     returns = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.returns is not None]
     result["annotated"] = r"\b(" + "|".join(map(re.escape, returns)) + r")\b" if returns else r"$^"
     result["trace"] = trace
