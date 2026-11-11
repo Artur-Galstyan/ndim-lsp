@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,209 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,210 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1473,6 +1473,25 @@ Tuple results (2026-11-11, each shape checked by `oracle/check.py`):
 - `out, (h, c) = self.lstm(self.emb(tok))`: the input of an RNN layer can be
   an expression.
 - `oracle/check.py` also calls the methods of a class that needs no argument.
+
+Module state (2026-11-11, each shape checked by `oracle/check.py`):
+- `self.<field>` has the shape of the one value that its class gives it
+  (`self_tensor_shape`): `self.table = torch.zeros(10, 16)`,
+  `self.weight = nn.Parameter(torch.ones(16))`, and
+  `self.register_buffer("mask", ...)` (`registered_buffer`). A field with two
+  writes has no shape. A jaxtyping annotation of the field comes first.
+- `self.eps` is a scalar operand when the class declares `eps: float` (or
+  `int`, `bool`) in its body, or gives it one scalar value (`is_scalar_expr`).
+- `Net().to(device)`, `.eval()`, `.cuda()` construct the module
+  (`constructed_module`).
+- A constructor parameter that the call leaves out has its integer default:
+  `def __init__(self, hidden=32)` or the field `hidden: int = 32`
+  (`callee_names`). A call with a star gets no defaults.
+- jax: `x.at[i].set(v)`, `add`, `multiply`, `divide`, `power`, `min`, `max`,
+  `apply` give the shape of `x`. `get` has no rule.
+- `vmap` takes `in_axes=(0, None)` (`InAxes`): one entry for each positional
+  argument, and `None` leaves the argument as it is. A tuple with another
+  count gives no shape, as jax refuses it.
 
 Test rule from the same audit: an expected shape in a test must come from the
 real library, not from the belief of the author. Eight tests asserted a wrong

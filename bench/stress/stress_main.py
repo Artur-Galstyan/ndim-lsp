@@ -22227,7 +22227,7 @@ def lambdas_512(xs: Float[Array, "3 3 8"], w: Float[Array, "8 7"], v: Float[Arra
     last2, ys2 = jax.lax.scan(lambda c, r: (c, r.sum()), v[0], v)  # expected-shape: last2=[8]; ys2=[3]
     last3, ys3 = jax.lax.scan(lambda c, r: (c, (r, r)), v[0], v)  # expected-shape: last3=[8]; ys3=?
     pair = jax.vmap(lambda r: (r, r))(xs)  # expected-shape: pair=?
-    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=?
+    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=[3, 3, 8]
     bad = jax.vmap(lambda a, b: a + b)(xs, w)  # expected-error: vmap axes 3 and 8 disagree
     return direct, keyword, hides, mapped, mapped2, mapped_axis, mapped_out, twice, closed, looped, last, ys, last2, ys2, last3, ys3, pair, tuple_axes, bad
 
@@ -22271,7 +22271,7 @@ def lambdas_513(xs: Float[Array, "4 3 10"], w: Float[Array, "10 5"], v: Float[Ar
     last2, ys2 = jax.lax.scan(lambda c, r: (c, r.sum()), v[0], v)  # expected-shape: last2=[10]; ys2=[4]
     last3, ys3 = jax.lax.scan(lambda c, r: (c, (r, r)), v[0], v)  # expected-shape: last3=[10]; ys3=?
     pair = jax.vmap(lambda r: (r, r))(xs)  # expected-shape: pair=?
-    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=?
+    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=[4, 3, 10]
     bad = jax.vmap(lambda a, b: a + b)(xs, w)  # expected-error: vmap axes 4 and 10 disagree
     return direct, keyword, hides, mapped, mapped2, mapped_axis, mapped_out, twice, closed, looped, last, ys, last2, ys2, last3, ys3, pair, tuple_axes, bad
 
@@ -22315,7 +22315,7 @@ def lambdas_514(xs: Float[Array, "5 3 12"], w: Float[Array, "12 6"], v: Float[Ar
     last2, ys2 = jax.lax.scan(lambda c, r: (c, r.sum()), v[0], v)  # expected-shape: last2=[12]; ys2=[5]
     last3, ys3 = jax.lax.scan(lambda c, r: (c, (r, r)), v[0], v)  # expected-shape: last3=[12]; ys3=?
     pair = jax.vmap(lambda r: (r, r))(xs)  # expected-shape: pair=?
-    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=?
+    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs)  # expected-shape: tuple_axes=[5, 3, 12]
     bad = jax.vmap(lambda a, b: a + b)(xs, w)  # expected-error: vmap axes 5 and 12 disagree
     return direct, keyword, hides, mapped, mapped2, mapped_axis, mapped_out, twice, closed, looped, last, ys, last2, ys2, last3, ys3, pair, tuple_axes, bad
 

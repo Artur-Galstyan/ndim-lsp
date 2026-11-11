@@ -1073,7 +1073,7 @@ def t_lambdas(i):
         f"    last2, ys2 = jax.lax.scan(lambda c, r: (c, r.sum()), v[0], v){es(last2=[d], ys2=[n])}",
         f"    last3, ys3 = jax.lax.scan(lambda c, r: (c, (r, r)), v[0], v){es(last3=[d], ys3=None)}",
         f"    pair = jax.vmap(lambda r: (r, r))(xs){es(pair=None)}",
-        f"    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs){es(tuple_axes=None)}",
+        f"    tuple_axes = jax.vmap(lambda r: r * 2.0, in_axes=(0,))(xs){es(tuple_axes=[n, 3, d])}",
         f"    bad = jax.vmap(lambda a, b: a + b)(xs, w)  # expected-error: vmap axes {n} and {d} disagree",
         "    return direct, keyword, hides, mapped, mapped2, mapped_axis, mapped_out, twice, closed, looped, last, ys, last2, ys2, last3, ys3, pair, tuple_axes, bad",
         "",

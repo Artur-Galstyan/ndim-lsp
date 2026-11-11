@@ -483,6 +483,8 @@ struct ShapeCtx<'a> {
     /// specialization with `None` rather than looping forever; depth is
     /// additionally capped at `MAX_SPECIALIZATION_DEPTH`.
     active_specializations: Vec<usize>,
+    /// The values of `self` fields that are open now (`self_tensor_shape`).
+    field_reads: Vec<usize>,
     /// How many `shape_of_expression` calls are open.
     expression_depth: usize,
     /// What `MAX_STATEMENT_STEPS` leaves for the statement that runs.
@@ -1285,6 +1287,29 @@ impl<'a> ShapeCtx<'a> {
                 given.insert(name.to_string(), value);
             }
         }
+        // A parameter that the call leaves out has its default, when that is
+        // an integer: `def __init__(self, hidden=32)` or the field `hidden: int = 32`.
+        if positional {
+            let text = |node: Node| self.text.get(node.byte_range());
+            let holder = match init {
+                Some(m) => self.scope_function_nodes[m.scope].and_then(|function| function.child_by_field_name("parameters")),
+                None => self
+                    .root
+                    .descendant_for_byte_range(module.class.0, module.class.1.min(self.text.len()))
+                    .and_then(|class| class.child_by_field_name("body")),
+            };
+            for node in holder.iter().flat_map(|holder| holder.named_children(&mut holder.walk()).collect::<Vec<_>>()) {
+                let node = if node.kind() == "expression_statement" { node.named_child(0).unwrap_or(node) } else { node };
+                let name = node.child_by_field_name("name").or_else(|| node.child_by_field_name("left")).and_then(text);
+                let value = node.child_by_field_name("value").or_else(|| node.child_by_field_name("right")).and_then(text);
+                if let (Some(name), Some(value)) = (name, value)
+                    && value.parse::<u64>().is_ok()
+                    && params.iter().any(|param| param == name)
+                {
+                    given.entry(name.to_string()).or_insert_with(|| value.to_string());
+                }
+            }
+        }
         move |name| {
             if self.submodule_at(name, module.class.0).is_some() {
                 let param = resolve_alias_at(self.aliases, self.hierarchy, name, module.class.0);
@@ -1410,6 +1435,65 @@ impl<'a> ShapeCtx<'a> {
                 && variables(text).any(|name| {
                     self.is_annotation_symbol(name) && !self.scalar_dims.contains_key(&(scope_idx, name.to_string()))
                 })
+        })
+    }
+
+    /// The value of the one plain write `self.<field> = value` of the class
+    /// around `byte`. `None` for a field with two writes or a write of
+    /// another form.
+    fn self_field_value(&self, field: &str, byte: usize) -> Option<Node<'a>> {
+        let class = self.hierarchy.class_at(byte);
+        if class == (0, usize::MAX) {
+            return None;
+        }
+        let mut writes = self.attr_writes.iter().filter(|write| write.attr == field && write.class == class);
+        let only = writes.next()?;
+        writes.next().is_none().then_some(only.value).flatten()
+    }
+
+    /// The value of the one `self.register_buffer("<field>", value)` of the
+    /// class around `byte`.
+    fn registered_buffer(&self, field: &str, byte: usize) -> Option<Node<'a>> {
+        let class = self.hierarchy.class_at(byte);
+        let body = self.text.get(class.0..class.1.min(self.text.len()))?;
+        let found: Vec<usize> = ['"', '\'']
+            .iter()
+            .flat_map(|quote| {
+                let call = format!("self.register_buffer({quote}{field}{quote}");
+                body.match_indices(&call).map(|(at, _)| at).collect::<Vec<_>>()
+            })
+            .collect();
+        let [at] = found[..] else {
+            return None;
+        };
+        if class == (0, usize::MAX) || self.attr_writes.iter().any(|write| write.attr == field && write.class == class) {
+            return None;
+        }
+        let mut node = self.root.descendant_for_byte_range(class.0 + at, class.0 + at)?;
+        while node.kind() != "call" {
+            node = node.parent()?;
+        }
+        find_positional_arg_node(node.child_by_field_name("arguments")?, 1)
+    }
+
+    /// Whether the class around `byte` declares `<field>: int`, `float`, or
+    /// `bool` in its body.
+    fn is_scalar_field(&self, field: &str, byte: usize) -> bool {
+        let class = self.hierarchy.class_at(byte);
+        let Some(body) = self
+            .root
+            .descendant_for_byte_range(class.0, class.1.min(self.text.len()))
+            .filter(|_| class != (0, usize::MAX))
+            .and_then(|node| node.child_by_field_name("body"))
+        else {
+            return false;
+        };
+        let text = |node: Node| self.text.get(node.byte_range());
+        body.named_children(&mut body.walk()).any(|statement| {
+            statement.named_child(0).filter(|node| node.kind() == "assignment").is_some_and(|assignment| {
+                assignment.child_by_field_name("left").and_then(text) == Some(field)
+                    && matches!(assignment.child_by_field_name("type").and_then(text), Some("int" | "float" | "bool"))
+            })
         })
     }
 
@@ -1803,7 +1887,7 @@ fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         if ctx.module_writes.contains_key(field) {
             return None;
         }
-        return ctx.field_shape(field, node.start_byte());
+        return ctx.field_shape(field, node.start_byte()).or_else(|| self_tensor_shape(field, node.start_byte(), ctx));
     }
 
     // `x.T` (torch): reverses every dim (deprecated for rank > 2 but still
@@ -1828,6 +1912,30 @@ fn shape_of_attribute(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     }
 
     None
+}
+
+/// The shape of `self.<field>` from the one value that its class gives it:
+/// `self.table = torch.zeros(10, 16)`, `self.weight = nn.Parameter(...)`, or
+/// `self.register_buffer("mask", ...)`.
+fn self_tensor_shape(field: &str, byte: usize, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
+    let value = ctx.self_field_value(field, byte).or_else(|| ctx.registered_buffer(field, byte))?;
+    // `nn.Parameter(value)` holds the value.
+    let callee = |call: Node| ctx.text.get(call.child_by_field_name("function")?.byte_range());
+    let value = match value.kind() {
+        "call" if callee(value).is_some_and(|name| name.rsplit('.').next() == Some("Parameter")) => {
+            find_positional_arg_node(value.child_by_field_name("arguments")?, 0)?
+        }
+        _ => value,
+    };
+    if ctx.field_reads.contains(&value.start_byte()) {
+        return None;
+    }
+    ctx.field_reads.push(value.start_byte());
+    let errors = ctx.errors.len();
+    let shape = shape_of_expression(value, ctx);
+    ctx.errors.truncate(errors);
+    ctx.field_reads.pop();
+    shape
 }
 
 /// Unary operator: propagate the operand's shape unchanged.
@@ -2402,6 +2510,24 @@ fn is_scalar_expr(
                 })
         }
         "identifier" => name_is_scalar(node, text(node), ctx, visiting),
+        // `self.eps`: a field that the class declares a number, or that gets
+        // one scalar value.
+        "attribute" if text(node).strip_prefix("self.").is_some_and(|field| !field.contains('.')) => {
+            let field = &text(node)[5..];
+            let key = (usize::MAX, text(node).to_string());
+            if visiting.contains(&key) {
+                return false;
+            }
+            if ctx.is_scalar_field(field, node.start_byte()) {
+                return true;
+            }
+            visiting.push(key);
+            let scalar = ctx
+                .self_field_value(field, node.start_byte())
+                .is_some_and(|value| is_scalar_expr(value, ctx, visiting));
+            visiting.pop();
+            scalar
+        }
         "attribute" => {
             let resolved = resolve_call_target(text(node), ctx.imports.at(node.start_byte()));
             let parts: Vec<&str> = resolved.parts.iter().map(String::as_str).collect();
@@ -3104,6 +3230,20 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
         return result;
     }
 
+    // jax: `x.at[index].set(value)` and the other updates give an array of
+    // the shape of `x`.
+    if func_node.kind() == "attribute"
+        && let Some(index) = func_node.child_by_field_name("object").filter(|object| object.kind() == "subscript")
+        && let Some(at) = index.child_by_field_name("value").filter(|value| value.kind() == "attribute")
+        && at.child_by_field_name("attribute").and_then(|name| ctx.text.get(name.byte_range())) == Some("at")
+    {
+        let update = ctx.text.get(func_node.child_by_field_name("attribute")?.byte_range())?;
+        if !matches!(update, "set" | "add" | "subtract" | "multiply" | "mul" | "divide" | "power" | "min" | "max" | "apply") {
+            return None;
+        }
+        return shape_of_expression(at.child_by_field_name("object")?, ctx);
+    }
+
     // ── Call-of-a-call ──
     // `jax.vmap(self.layer)(x)` (inline vmap, issue #35) or a layer
     // constructed and applied in one expression like `nn.Dense(64)(x)`
@@ -3421,7 +3561,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 return apply_inline_vmap_layer(
                     (&callable, &layer),
                     &rest,
-                    0,
+                    InAxes::all(0),
                     0,
                     scope_idx,
                     args_node.range(),
@@ -3436,7 +3576,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 let Some(Field::One(Module::Local(module))) = field else {
                     return None;
                 };
-                return apply_vmapped_submodule(&module, &callable, &rest, &[(0, 0)], scope_idx, args_node, ctx);
+                return apply_vmapped_submodule(&module, &callable, &rest, &[(InAxes::all(0), 0)], scope_idx, args_node, ctx);
             }
             if !callable.contains('.') {
                 if bound_in_expression(args_node, &callable, ctx.text) {
@@ -3444,7 +3584,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
                 }
                 let info = VmapInfo {
                     wrapped: callable,
-                    in_axes: 0,
+                    in_axes: InAxes::all(0),
                     out_axes: 0,
                     site: call_byte,
                 };
@@ -4317,7 +4457,7 @@ struct VmapInfo {
     /// Name of the function being vmapped (bare identifier, e.g. "f").
     wrapped: String,
     /// `in_axes` value — default 0. Only scalar integers are honoured in v1.
-    in_axes: isize,
+    in_axes: InAxes,
     /// `out_axes` value — default 0. Only scalar integers are honoured in v1.
     out_axes: isize,
     /// Where the `vmap` call is: the name means what it means there.
@@ -4359,7 +4499,7 @@ fn is_filter_vmap(resolved: &ResolvedTarget) -> bool {
 /// keyword only. Each is one integer, 0 by default. `None` for any other
 /// value, a splat, or an option that the rule does not model (`axis_size`).
 /// `axis_name` and `spmd_axis_name` do not change a shape.
-fn vmap_axes(args: &[CallArgument], filter: bool) -> Option<(isize, isize)> {
+fn vmap_axes(args: &[CallArgument], filter: bool) -> Option<(InAxes, isize)> {
     let options: &[&str] = if filter {
         &["in_axes", "out_axes", "axis_name"]
     } else {
@@ -4380,11 +4520,59 @@ fn vmap_axes(args: &[CallArgument], filter: bool) -> Option<(isize, isize)> {
         });
         match (positional.get(at).copied(), keyword) {
             (Some(_), Some(_)) => None,
-            (Some(value), None) | (None, Some(value)) => value.parse::<isize>().ok(),
-            (None, None) => Some(0),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => Some("0"),
         }
     };
-    Some((axis(1, "in_axes")?, axis(2, "out_axes")?))
+    Some((InAxes::parse(axis(1, "in_axes")?)?, axis(2, "out_axes")?.parse::<isize>().ok()?))
+}
+
+/// The `in_axes` of a `vmap`: one axis for each argument, or `(0, None)`
+/// with one entry for each positional argument. `None` leaves the argument
+/// as it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InAxes {
+    all: isize,
+    each: Option<([Option<isize>; 8], usize)>,
+}
+
+impl InAxes {
+    fn all(axis: isize) -> Self {
+        InAxes { all: axis, each: None }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Ok(axis) = value.parse::<isize>() {
+            return Some(InAxes::all(axis));
+        }
+        let inner = value.strip_prefix(['(', '['])?.strip_suffix([')', ']'])?;
+        let mut each = [None; 8];
+        let mut count = 0;
+        for item in inner.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            *each.get_mut(count)? = match item {
+                "None" => None,
+                axis => Some(axis.parse::<isize>().ok()?),
+            };
+            count += 1;
+        }
+        (count > 0).then_some(InAxes { all: 0, each: Some((each, count)) })
+    }
+
+    /// Whether the tuple has one entry for each of `count` arguments. jax
+    /// refuses any other count.
+    fn fits(&self, count: usize) -> bool {
+        self.each.is_none_or(|(_, entries)| entries == count)
+    }
+
+    /// The axis of the positional argument `position`: `Some(None)` for an
+    /// argument that is not mapped, `None` when the tuple has no entry.
+    fn at(&self, position: usize) -> Option<Option<isize>> {
+        match self.each {
+            None => Some(Some(self.all)),
+            Some((each, count)) => (position < count).then(|| each[position]),
+        }
+    }
 }
 
 /// Peel the batch dim from a shape at position `axis`.
@@ -4807,6 +4995,15 @@ fn constructed_module(
         return None;
     }
     let name = call.child_by_field_name("function")?;
+    // torch: `Net().to(device)`, `.eval()`, `.cuda()` give the module back.
+    if name.kind() == "attribute"
+        && matches!(
+            name.child_by_field_name("attribute").and_then(|method| text.get(method.byte_range())),
+            Some("to" | "cuda" | "cpu" | "eval" | "train" | "half" | "float" | "double" | "requires_grad_")
+        )
+    {
+        return constructed_module(name.child_by_field_name("object")?, text, import_map, hierarchy);
+    }
     if name.kind() != "identifier" {
         return None;
     }
@@ -5257,6 +5454,7 @@ fn with_propagation<T>(
         name_values: RefCell::new(HashMap::new()),
         scope_function_nodes: &scope_function_nodes,
         active_specializations: Vec::new(),
+        field_reads: Vec::new(),
         expression_depth: 0,
         steps_left: MAX_STATEMENT_STEPS,
         name_checks: Default::default(),
@@ -6909,7 +7107,7 @@ type Peeled<'a> = (Vec<(&'a str, Vec<String>)>, Vec<String>);
 /// level of `axes`, and the size of each axis. Checks that the arguments agree
 /// on every size. `None` when an argument has no shape or there is none.
 fn peel_vmap_args<'a>(
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     args: &'a [CallArgument],
     caller_shapes: &dyn ShapeLookup,
 ) -> Result<Option<Peeled<'a>>, String> {
@@ -6933,10 +7131,21 @@ fn peel_vmap_args<'a>(
     let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
     let mut conflicts = Conflicts::default();
     for &(in_axes, _) in axes {
+        if !in_axes.fits(current.len()) {
+            return Ok(None);
+        }
         let mut level_dim: Option<String> = None;
         let mut next = Vec::with_capacity(current.len());
-        for (name, shape) in &current {
-            match peel_batch_dim(shape, in_axes) {
+        for (position, (name, shape)) in current.iter().enumerate() {
+            // `None` in the tuple: the argument goes to each call as it is.
+            let Some(axis) = in_axes.at(position) else {
+                return Ok(None);
+            };
+            let Some(axis) = axis else {
+                next.push((*name, shape.clone()));
+                continue;
+            };
+            match peel_batch_dim(shape, axis) {
                 Ok((peeled, dim)) => {
                     if let Some(ref existing) = level_dim {
                         if dims_conflict(existing, &dim) {
@@ -6951,15 +7160,17 @@ fn peel_vmap_args<'a>(
                 Err(msg) => {
                     return Err(format!(
                         "vmap: argument '{}' rank insufficient for in_axes={}: {}",
-                        name, in_axes, msg
+                        name, axis, msg
                     ));
                 }
             }
         }
         current = next;
-        // `current` is non-empty (checked above and preserved per level), so
-        // `level_dim` is always `Some` here.
-        batch_dims.push(level_dim.unwrap());
+        // No argument is mapped: jax refuses the call.
+        let Some(level_dim) = level_dim else {
+            return Ok(None);
+        };
+        batch_dims.push(level_dim);
     }
     conflicts.finish()?;
     Ok(Some((current, batch_dims)))
@@ -6975,7 +7186,7 @@ fn peel_vmap_args<'a>(
 /// shapes that an earlier call specialized.
 #[allow(clippy::too_many_arguments)]
 fn apply_vmap_call_chain(
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     wrapped: &str,
     site: usize,
     args: &[CallArgument],
@@ -7116,7 +7327,7 @@ fn shape_of_inline_vmap(
 /// a tuple, or an argument without a shape leaves the result unknown.
 fn vmapped_lambda(
     lambda: Node,
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     args_node: Node,
     scope_idx: usize,
     ctx: &mut ShapeCtx,
@@ -7153,12 +7364,12 @@ fn map_lambda(
     if !is_single_array_argument(xs_node, scope_idx, ctx) {
         return None;
     }
-    batched_lambda(lambda, &[(0, 0)], xs, args_node, scope_idx, ctx)
+    batched_lambda(lambda, &[(InAxes::all(0), 0)], xs, args_node, scope_idx, ctx)
 }
 
 fn batched_lambda(
     lambda: Node,
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     args: &[CallArgument],
     args_node: Node,
     scope_idx: usize,
@@ -7182,7 +7393,7 @@ fn apply_vmapped_submodule(
     module: &Submodule,
     display: &str,
     args: &[CallArgument],
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     scope_idx: usize,
     args_node: Node,
     ctx: &mut ShapeCtx,
@@ -7200,8 +7411,14 @@ fn apply_vmapped_submodule(
     let mut batch_dims = Vec::with_capacity(axes.len());
     for &(in_axes, _) in axes {
         let mut level: Option<String> = None;
-        for shape in &mut shapes {
-            let (peeled, dim) = peel_batch_dim(shape, in_axes).ok()?;
+        if !in_axes.fits(shapes.len()) {
+            return None;
+        }
+        for (position, shape) in shapes.iter_mut().enumerate() {
+            let Some(axis) = in_axes.at(position)? else {
+                continue;
+            };
+            let (peeled, dim) = peel_batch_dim(shape, axis).ok()?;
             if level.as_ref().is_some_and(|l| !dims_canonically_equal(l, &dim)) {
                 return None;
             }
@@ -7314,7 +7531,7 @@ fn tuple_layer_element(node: Node, value: Node, ctx: &mut ShapeCtx) -> Option<Op
 fn collect_vmap_axes<'t>(
     node: Node<'t>,
     ctx: &ShapeCtx,
-) -> Option<(Node<'t>, Vec<(isize, isize)>)> {
+) -> Option<(Node<'t>, Vec<(InAxes, isize)>)> {
     let func_node = node.child_by_field_name("function")?;
     let target = func_node.utf8_text(ctx.text.as_bytes()).ok()?;
     let resolved = resolve_call_target(target, ctx.imports.at(func_node.start_byte()));
@@ -7414,7 +7631,7 @@ fn shape_of_inline_layer(
 fn apply_inline_vmap_layer(
     layer: (&str, &LayerKind),
     outer_args: &[CallArgument],
-    in_axes: isize,
+    in_axes: InAxes,
     out_axes: isize,
     scope_idx: usize,
     range: tree_sitter::Range,
@@ -7432,7 +7649,7 @@ fn apply_inline_vmap_layer(
 fn apply_inline_vmap_layer_chain(
     layer: (&str, &LayerKind),
     outer_args: &[CallArgument],
-    axes: &[(isize, isize)],
+    axes: &[(InAxes, isize)],
     scope_idx: usize,
     range: tree_sitter::Range,
     ctx: &mut ShapeCtx,
@@ -7443,7 +7660,10 @@ fn apply_inline_vmap_layer_chain(
 
     let mut batch_dims: Vec<String> = Vec::with_capacity(axes.len());
     for &(in_axes, _) in axes {
-        let (peeled, dim) = peel_batch_dim(&shape, in_axes).ok()?;
+        if !in_axes.fits(positional_values(outer_args).count()) {
+            return None;
+        }
+        let (peeled, dim) = peel_batch_dim(&shape, in_axes.at(0)??).ok()?;
         batch_dims.push(dim);
         shape = peeled;
     }

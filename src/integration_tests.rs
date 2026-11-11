@@ -10990,7 +10990,10 @@ mod user_submodule_tests {
 
     #[test]
     fn unbound_constructor_parameter_stays_unknown() {
+        // An integer default is the value of a parameter that the call leaves out.
         let a = analyze(&ctor_net("Block()", "self, dim=8"));
+        assert_eq!(find_shape(&a, "y"), Some(&shape(&["b", "8"])));
+        let a = analyze(&ctor_net("Block()", "self, dim=make_dim()"));
         assert_eq!(find_shape(&a, "y"), None);
         let a = analyze(&ctor_net("Block(make_dim())", "self, dim"));
         assert_eq!(find_shape(&a, "y"), None);
@@ -12418,7 +12421,8 @@ mod comprehension_lambda_tests {
 
     #[test]
     fn vmap_of_a_lambda_that_is_not_modelled_is_unknown() {
-        unknown(&["out = jax.vmap(lambda x: x * 2.0, in_axes=(0,))(xs)"], "out");
+        known(&["out = jax.vmap(lambda x: x * 2.0, in_axes=(0,))(xs)"], "out", &["5", "3", "4"]);
+        unknown(&["out = jax.vmap(lambda x: x * 2.0, in_axes=(0, None))(xs)"], "out");
         unknown(&["out = jax.vmap(lambda x: (x, x))(xs)"], "out");
         unknown(&["out = jax.vmap(lambda x: x * 2.0)(lst)"], "out");
         unknown(&["out = jax.vmap(lambda x: x * 2.0)((xs, xs))"], "out");
@@ -17008,6 +17012,182 @@ class Net(nn.Module):
         ] {
             let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
             assert_eq!(found(name), want, "{name}");
+        }
+    }
+
+    /// Each expected shape here is the shape that the real library gives
+    /// (`oracle/check.py` runs these sources).
+    #[test]
+    fn module_state() {
+        type Wants<'a> = &'a [(&'a str, Option<&'a [&'a str]>)];
+        let cases: [(&str, Wants); 3] = [
+            (
+                r#"import torch
+import torch.nn as nn
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+from jaxtyping import Array, Float
+from torch import Tensor
+
+
+class Scale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(16))
+        self.bias = nn.Parameter(torch.zeros(1, 16))
+        self.register_buffer("mask", torch.tril(torch.ones(8, 8)))
+        self.table = torch.zeros(10, 16)
+        self.eps = 1e-5
+        self.scale = 16 ** -0.5
+        self.fc = nn.Linear(16, 16)
+
+    def forward(self, x: Float[Tensor, "b 16"]):
+        a = x * self.weight
+        b = a + self.bias
+        c = b / (b.norm(dim=-1, keepdim=True) + self.eps)
+        d = c * self.scale
+        m = self.mask[:4, :4]
+        t = self.table[:, :8]
+        e = self.fc(x) * self.scale
+        return d
+
+
+class Net(nn.Module):
+    def __init__(self, hidden=32, classes=10):
+        super().__init__()
+        self.fc1 = nn.Linear(8, hidden)
+        self.fc2 = nn.Linear(hidden, classes)
+
+    def forward(self, x: Float[Tensor, "b 8"]):
+        h = self.fc1(x)
+        y = self.fc2(h)
+        return y
+
+
+def run(x: Float[Tensor, "b 8"]):
+    device = torch.device("cpu")
+    net = Net().to(device)
+    y = net(x)
+    net2 = Net()
+    y2 = net2(x)
+    net3 = Net(hidden=64).eval()
+    y3 = net3(x)
+    return y
+
+
+class Norm(eqx.Module):
+    gamma: Float[Array, "d"]
+    eps: float = 1e-6
+
+    def __call__(self, x: Float[Array, "d"]):
+        s = x / (jnp.sqrt(jnp.mean(x**2)) + self.eps)
+        g = s * self.gamma
+        return g
+
+
+def updates(x: Float[Array, "n d"], v: Float[Array, "d"]):
+    a = x.at[0].set(v)
+    b = x.at[:, 1].add(1.0)
+    c = x.at[0, 0].multiply(2.0)
+    d = x.at[0].get()
+    return a
+"#,
+                &[
+                    ("m", Some(&["4", "4"])),
+                    ("t", Some(&["10", "8"])),
+                    ("e", Some(&["b", "16"])),
+                    ("y3", Some(&["b", "10"])),
+                    ("s", Some(&["d"])),
+                    ("g", Some(&["d"])),
+                ],
+            ),
+            (
+                r#"import torch
+import torch.nn as nn
+from jaxtyping import Float
+from torch import Tensor
+
+
+class Net(nn.Module):
+    def __init__(self, hidden=32, classes=10):
+        super().__init__()
+        self.fc1 = nn.Linear(8, hidden)
+        self.fc2 = nn.Linear(hidden, classes)
+
+    def forward(self, x: Float[Tensor, "b 8"]):
+        h = self.fc1(x)
+        y = self.fc2(h)
+        return y
+
+
+class Fixed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(8, 4)
+
+    def forward(self, x: Float[Tensor, "b 8"]):
+        return self.fc(x)
+
+
+def run(x: Float[Tensor, "b 8"]):
+    a = Net(64, 5)(x)
+    net = Net(64, 5)
+    b = net(x)
+    c = Net(hidden=64, classes=5).to("cpu")(x)
+    d = Net()(x)
+    net2 = Net(classes=3)
+    e = net2(x)
+    f = Fixed().to("cpu")
+    g = f(x)
+    return a
+"#,
+                &[("a", Some(&["b", "5"])), ("c", Some(&["b", "5"])), ("d", Some(&["b", "10"])), ("e", Some(&["b", "3"])), ("g", Some(&["b", "4"]))],
+            ),
+            (
+                r#"import jax
+import jax.numpy as jnp
+import equinox as eqx
+from jaxtyping import Array, Float
+
+
+def f(x: Float[Array, "n d"], w: Float[Array, "d k"]) -> Float[Array, "n k"]:
+    return x @ w
+
+
+def g(x: Float[Array, "d"], y: Float[Array, "d"]) -> Float[Array, "d"]:
+    return x + y
+
+
+def mapped(xs: Float[Array, "b n d"], w: Float[Array, "d k"], ys: Float[Array, "n b d"], v: Float[Array, "d"]):
+    a = jax.vmap(f, in_axes=(0, None))(xs, w)
+    b = jax.vmap(f, (0, None))(xs, w)
+    c = jax.vmap(g, in_axes=(0, None))(xs[:, 0], v)
+    d = jax.vmap(g, in_axes=(None, 0))(v, xs[:, 0])
+    e = jax.vmap(f, in_axes=(1, None))(ys, w)
+    h = jax.vmap(g)(xs[:, 0], xs[:, 1])
+    i = jax.vmap(lambda x, w: x @ w, in_axes=(0, None))(xs, w)
+    j = jax.vmap(f, in_axes=[0, None])(xs, w)
+    k = jax.vmap(f, in_axes=(0, None), out_axes=1)(xs, w)
+    return a
+"#,
+                &[
+                    ("a", Some(&["b", "n", "k"])),
+                    ("c", Some(&["b", "d"])),
+                    ("d", Some(&["b", "d"])),
+                    ("e", Some(&["b", "n", "k"])),
+                    ("i", Some(&["b", "n", "k"])),
+                    ("k", Some(&["n", "b", "k"])),
+                ],
+            ),
+        ];
+        for (source, wants) in cases {
+            let analysis = analyze(source);
+            assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+            for (name, want) in wants {
+                let found = analysis.scopes.iter().rev().find_map(|scope| scope.shapes.get(*name)).cloned();
+                assert_eq!(found, want.map(shape), "{name}");
+            }
         }
     }
 }
