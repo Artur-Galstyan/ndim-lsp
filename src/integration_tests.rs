@@ -16869,4 +16869,54 @@ def run(params, x: Float[Array, "b t 8"]):
         let method = format!("{head}class M:\n    @functools.partial(jax.vmap, in_axes=(None, 0))\n    def apply(self, x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n        return x\n\ndef use(x: Float[Array, \"7 3\"]):\n    m = M()\n    r = m.apply(x)\n    return r\n");
         assert_eq!(probe(&method, "r"), (None, 0));
     }
+
+    /// Each expected shape here is the shape that the real library gives
+    /// (`oracle/check.py` runs these sources).
+    #[test]
+    fn array_literals_and_random_samplers() {
+        let head = "import numpy as np\nimport jax\nimport jax.numpy as jnp\nimport torch\nfrom jaxtyping import Array, Float\n\n";
+        let line = |params: &str, value: &str| {
+            format!("{head}def f({params}):\n    key = jax.random.PRNGKey(0)\n    r = {value}\n    return r\n")
+        };
+        let x = "x: Float[Array, \"n d\"]";
+        let none: Option<Vec<&str>> = None;
+        for (params, value, want) in [
+            ("", "jnp.array([[1.0, 0.0], [0.0, 1.0]])", Some(vec!["2", "2"])),
+            ("", "np.array([-1.0, 0.0, 0.5], dtype=np.float32)", Some(vec!["3"])),
+            ("", "jnp.array(3.0)", Some(vec![])),
+            ("", "np.array([])", Some(vec!["0"])),
+            ("", "jnp.array([[[1], [2]], [[3], [4]]])", Some(vec!["2", "2", "1"])),
+            ("", "jnp.array([1e-3, -2.5e4, 1 / 3, np.pi, -jnp.inf])", Some(vec!["5"])),
+            ("", "np.array([[1, 2], [3]])", none.clone()),
+            ("", "np.array([1.0, 2.0], ndmin=2)", none.clone()),
+            ("", "torch.tensor([[1.0, 2.0]])", Some(vec!["1", "2"])),
+            ("", "torch.randn_like(torch.zeros(2, 3))", Some(vec!["2", "3"])),
+            (x, "jnp.asarray(x)", Some(vec!["n", "d"])),
+            ("v: Float[Array, \"d\"]", "jnp.array([v, v, v])", Some(vec!["3", "d"])),
+            ("v: Float[Array, \"d\"], cfg", "jnp.array([v, cfg.w])", none.clone()),
+            ("", "jax.random.normal(key, (2, 3))", Some(vec!["2", "3"])),
+            ("", "jax.random.normal(key, shape=(2, 3))", Some(vec!["2", "3"])),
+            ("", "jax.random.normal(key)", Some(vec![])),
+            ("", "jax.random.bernoulli(key, 0.5, (4, 5))", Some(vec!["4", "5"])),
+            ("", "jax.random.randint(key, (3,), 0, 10)", Some(vec!["3"])),
+            ("", "jax.random.truncated_normal(key, -2.0, 2.0, (5, 6))", Some(vec!["5", "6"])),
+            (x, "jax.random.normal(key, x.shape)", Some(vec!["n", "d"])),
+            (x, "jax.random.bernoulli(key, x)", none.clone()),
+            (x, "jax.random.uniform(key, shape=(x.shape[0], 2))", Some(vec!["n", "2"])),
+            ("", "np.random.randn(3, 4)", Some(vec!["3", "4"])),
+            ("", "np.random.randn()", Some(vec![])),
+            ("", "np.random.normal(size=(3, 4))", Some(vec!["3", "4"])),
+            ("", "np.random.uniform(0.0, 1.0, (2, 5))", Some(vec!["2", "5"])),
+            ("", "np.random.normal(0, 1, 5)", Some(vec!["5"])),
+            ("", "np.random.normal(0.0, 1.0)", Some(vec![])),
+            ("", "np.random.randint(0, 10, 3)", Some(vec!["3"])),
+            ("n: int", "np.random.random(n)", Some(vec!["n"])),
+            (x, "np.random.normal(x, 1.0)", none.clone()),
+            ("*shape", "np.random.standard_normal(shape)", none.clone()),
+            (x, "np.zeros(x.shape)", Some(vec!["n", "d"])),
+        ] {
+            let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
+            assert_eq!(probe(&line(params, value), "r"), (want, 0), "{value}");
+        }
+    }
 }

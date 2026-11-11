@@ -3995,6 +3995,7 @@ fn with_size_names(
             positional.first().copied().filter(|&i| i == 0)
         }
         (KnownFunction::TorchSizeConstructor, false) | (KnownFunction::NewSizeConstructor, true) => only(0),
+        (KnownFunction::Sampler { at, spread: false, .. }, false) => positional.get(*at).copied(),
         (KnownFunction::Reshape | KnownFunction::BroadcastTo, false) => only(1),
         (KnownFunction::Reshape | KnownFunction::BroadcastTo, true) => only(0),
         _ => return Some(args),

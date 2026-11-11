@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,207 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,208 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -27,7 +27,8 @@ Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 - Real code (`ndim-lsp check .`, see "How to continue"), 2026-11-10:
   `~/Workspace/equinox` 109 files, 0 diagnostics; `~/Workspace/mujoco` 284
   files, 0; `~/Workspace/statedict2pytree` 6 files, 0; `~/Workspace/noxton` 61
-  files, exactly 2 errors, both true (the annotation
+  files, exactly 2 errors and 1 warning, all true (the warning is at
+  `noxton/functions/geometry.py:79`; for the errors, the annotation
   `igate_preact: "num_heads seq_len"` is rank 2 but used as rank 3:
   `noxton/nn/xlstm.py:164`, `tests/test_xlstm.py:117`).
 - `bench/jax_compat/check.py` passes 84 shared runtime cases against real
@@ -1428,6 +1429,30 @@ or a wrong shape before):
   `types.rs`), but only an `Approximation`: with a size of 1 the two
   broadcast. A dim with `**` is no flat sum.
 - `2 * (d // 2)` as a size keeps its brackets (`scalar_dim_expr`).
+
+Input sources (2026-11-11, each shape checked by `oracle/check.py`):
+- `array`, `asarray`, `torch.tensor`, `torch.as_tensor` of a nested list or
+  tuple give the shape of the literal (`literal_shape`): `[[1.0, 0.0], [0.0,
+  1.0]]` is `[2, 2]`, a number is `[]`, `[]` is `[0]`. An item is a number
+  (`is_number_text`), `x.shape[i]`, or a name with a known shape (`[v, v]`
+  stacks). A ragged list, a star, a comprehension, an item that is not
+  proven, and `ndmin=` give no shape.
+- `KnownFunction::Sampler { at, numpy, spread }`: `jax.random.normal`,
+  `uniform`, `randint`, `bernoulli`, `truncated_normal`, `gamma`, ... and
+  `np.random.normal`, `uniform`, `randint`, `random`, `standard_normal`, ...
+  give the shape of the size argument (position `at`, `shape=`, `size=`). A
+  size is a tuple or list, `x.shape`, and for numpy one integer literal. A
+  name goes through `with_size_names`, because a name can hold a tuple.
+  `np.random.rand` and `randn` take the sizes one by one. With no size the
+  result is `[]` only when each parameter of the distribution is a number.
+- `zeros(x.shape)`, `ones(x.shape)`, `full(x.shape, v)` give the shape of `x`.
+- `torch.randn_like`, `rand_like`, `randint_like`, `from_numpy` keep the shape.
+- Not done: the keys (`jax.random.key`, `PRNGKey`, `split`), the methods of
+  `np.random.default_rng()`, `jax.random.choice`/`permutation`/`categorical`.
+- Effect on the real projects: shapes in noxton 419 to 611, equinox 87 to
+  377, mujoco 585 to 905. One new diagnostic, and it is true: the warning at
+  `noxton/functions/geometry.py:79`, where `q: Float[Array, "w x y z"]`
+  (rank 4) meets `jnp.array([1, -1, -1, -1])`. The docstring says `(..., 4)`.
 
 Test rule from the same audit: an expected shape in a test must come from the
 real library, not from the belief of the author. Eight tests asserted a wrong

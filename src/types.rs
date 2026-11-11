@@ -1428,6 +1428,10 @@ pub enum KnownFunction {
     MaskedFill,
     Unfold,
     ShapeAs,
+    /// A random sampler: the result has the shape of the size argument, which
+    /// is the positional argument `at` or `shape=`/`size=`. numpy also takes
+    /// one integer, and its `rand`/`randn` take the sizes one by one (`spread`).
+    Sampler { at: usize, numpy: bool, spread: bool },
     /// `x.expand_as(other)`: the shape of `other`, to which `x` broadcasts.
     ExpandAs,
     Item,

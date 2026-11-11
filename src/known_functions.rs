@@ -121,6 +121,7 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
             "broadcast_tensors" => Some(KnownFunction::BroadcastArrays),
             "permute" => Some(KnownFunction::Permute),
             "tensor" => Some(KnownFunction::Array),
+            "randn_like" | "rand_like" | "randint_like" | "from_numpy" => Some(KnownFunction::Copy),
             "as_tensor" => Some(KnownFunction::AsArray),
             "cross" => Some(KnownFunction::TorchCross),
             "gather" => Some(KnownFunction::Gather),
@@ -265,6 +266,26 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
 
     if module == ["jax", "random"] && name == "multinomial" {
         return Some(KnownFunction::RandomMultinomial);
+    }
+    if module == ["jax", "random"] {
+        let at = match name.as_str() {
+            "normal" | "uniform" | "randint" | "exponential" | "gumbel" | "laplace" | "logistic" | "cauchy"
+            | "rademacher" | "bits" => 1,
+            "bernoulli" | "gamma" | "poisson" => 2,
+            "truncated_normal" | "beta" => 3,
+            _ => return None,
+        };
+        return Some(KnownFunction::Sampler { at, numpy: false, spread: false });
+    }
+    if module == ["numpy", "random"] {
+        let sampler = |at| Some(KnownFunction::Sampler { at, numpy: true, spread: false });
+        return match name.as_str() {
+            "rand" | "randn" => Some(KnownFunction::Sampler { at: 0, numpy: true, spread: true }),
+            "random" | "random_sample" | "sample" | "standard_normal" => sampler(0),
+            "uniform" | "normal" | "randint" | "lognormal" | "laplace" | "beta" | "gamma" => sampler(2),
+            "exponential" | "poisson" => sampler(1),
+            _ => None,
+        };
     }
 
     if module == ["jax", "scipy", "special"] && name == "erfcinv" {
@@ -1092,14 +1113,12 @@ fn apply_known_rule(
         KnownFunction::AtLeast2D => apply_known_atleast(args, shapes, 2),
         KnownFunction::AtLeast3D => apply_known_atleast(args, shapes, 3),
         KnownFunction::Zeros | KnownFunction::Ones | KnownFunction::Full | KnownFunction::Empty => {
-            apply_known_shape_constructor(args)
+            apply_known_shape_constructor(args, shapes)
         }
         KnownFunction::ZerosLike
         | KnownFunction::OnesLike
         | KnownFunction::FullLike
         | KnownFunction::EmptyLike
-        | KnownFunction::Array
-        | KnownFunction::AsArray
         | KnownFunction::Roll
         | KnownFunction::Flip
         | KnownFunction::Triu
@@ -1120,6 +1139,8 @@ fn apply_known_rule(
             let length = nth_positional_or_keyword(args, 1, &["n", "s"]).is_some_and(|n| n.trim() != "None");
             if length { Ok(None) } else { apply_known_shape_preserving(args, shapes) }
         }
+        KnownFunction::Array | KnownFunction::AsArray => apply_known_array(args, shapes),
+        KnownFunction::Sampler { at, numpy, spread } => apply_known_sampler(args, shapes, *at, *numpy, *spread),
         KnownFunction::Cumsum | KnownFunction::Cumprod => apply_known_along_axis(args, shapes, true),
         KnownFunction::Argsort | KnownFunction::Sort => apply_known_along_axis(args, shapes, false),
         KnownFunction::Arange => apply_known_arange(args),
@@ -2522,7 +2543,10 @@ fn broadcast_prefix_shapes(
     broadcast_two_shapes(left, right).map_err(|err| format!("{} {}", context, err))
 }
 
-fn apply_known_shape_constructor(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
+fn apply_known_shape_constructor(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+) -> Result<Option<Vec<String>>, String> {
     let Some(first) = args.first() else {
         return Ok(None);
     };
@@ -2531,6 +2555,10 @@ fn apply_known_shape_constructor(args: &[CallArgument]) -> Result<Option<Vec<Str
         CallArgument::Keyword { name, value } if name == "shape" || name == "size" => value,
         CallArgument::Keyword { .. } => return Ok(None),
     };
+    // `zeros(x.shape)`: the shape of `x`.
+    if let Some(array) = value.trim().strip_suffix(".shape") {
+        return Ok(shapes.shape(array).filter(|shape| !shape.iter().any(|dim| is_variadic_dim(dim))).cloned());
+    }
     Ok(parse_shape_value(value))
 }
 
@@ -3660,6 +3688,125 @@ fn apply_known_repeat(
         &flattened_dim(input_shape),
         repeats,
     )]))
+}
+
+/// Whether `text` is a number: a literal, arithmetic on literals, or a
+/// constant such as `np.pi`.
+fn is_number_text(text: &str) -> bool {
+    let text = text.trim();
+    let constant = ["pi", "inf", "nan", "e", "True", "False"]
+        .iter()
+        .any(|name| text == *name || text.trim_start_matches('-').rsplit_once('.').is_some_and(|(_, tail)| tail == *name));
+    constant
+        || (text.contains(|c: char| c.is_ascii_digit())
+            && text.chars().all(|c| c.is_ascii_digit() || "+-*/.eEjJ_ ()".contains(c))
+            && !text.contains("//")
+            && is_balanced(text))
+}
+
+/// The shape of a nested list or tuple of numbers and of arrays with a known
+/// shape: `[[1.0, 0.0], [0.0, 1.0]]` is `[2, 2]`. `None` for a ragged list,
+/// for a star, and for an item that is not proven.
+fn literal_shape(text: &str, shapes: &dyn ShapeLookup, depth: usize) -> Option<Vec<String>> {
+    let text = text.trim();
+    if depth > MAX_RANK {
+        return None;
+    }
+    if let Some(shape) = shapes.shape(text) {
+        return Some(shape.clone());
+    }
+    let shape_index = text.split_once(".shape[").is_some_and(|(_, index)| {
+        index.strip_suffix(']').is_some_and(|index| index.parse::<i64>().is_ok())
+    });
+    if is_number_text(text) || shape_index {
+        return Some(Vec::new());
+    }
+    if !is_pure_literal(text) {
+        return None;
+    }
+    let items: Vec<&str> = split_top_level(sequence_inner(text)?).into_iter().map(str::trim).filter(|item| !item.is_empty()).collect();
+    if items.iter().any(|item| item.starts_with('*') || item.contains(" for ")) {
+        return None;
+    }
+    let Some((first, rest)) = items.split_first() else {
+        return Some(vec!["0".to_string()]);
+    };
+    let inner = literal_shape(first, shapes, depth + 1)?;
+    if inner.iter().any(|dim| is_variadic_dim(dim)) {
+        return None;
+    }
+    for item in rest {
+        if literal_shape(item, shapes, depth + 1)? != inner {
+            return None;
+        }
+    }
+    let mut shape = vec![items.len().to_string()];
+    shape.extend(inner);
+    Some(shape)
+}
+
+/// `array(x)`, `asarray(x)`, `torch.tensor(x)`: the shape of an array, or of
+/// a nested list of numbers. `ndmin=` adds axes, so it gives no shape.
+fn apply_known_array(args: &[CallArgument], shapes: &dyn ShapeLookup) -> Result<Option<Vec<String>>, String> {
+    if args.iter().any(|arg| matches!(arg, CallArgument::Keyword { name, .. } if name == "ndmin")) {
+        return Ok(None);
+    }
+    let Some(input) = nth_positional_or_keyword(args, 0, &["object", "a", "data"]) else {
+        return Ok(None);
+    };
+    Ok(literal_shape(input, shapes, 0))
+}
+
+/// A size argument: a tuple or list of sizes, `x.shape`, and for numpy one
+/// integer.
+fn size_argument(value: &str, shapes: &dyn ShapeLookup, one_integer: bool) -> Option<Vec<String>> {
+    let value = value.trim();
+    if let Some(array) = value.strip_suffix(".shape") {
+        return shapes.shape(array).filter(|shape| !shape.iter().any(|dim| is_variadic_dim(dim))).cloned();
+    }
+    if is_pure_literal(value) {
+        return parse_shape_value(value).filter(|dims| dims.iter().all(|dim| !dim.starts_with('*') && is_balanced(dim)));
+    }
+    // A name can hold a tuple. `with_size_names` writes a proven integer as `(n,)`.
+    (one_integer && value.parse::<u64>().is_ok()).then(|| vec![value.to_string()])
+}
+
+/// A random sampler (`KnownFunction::Sampler`). With no size, the result is
+/// a scalar only when each parameter of the distribution is a number: an
+/// array parameter gives its own shape to the result.
+fn apply_known_sampler(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    at: usize,
+    numpy: bool,
+    spread: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let positional = positional_arg_values(args);
+    if positional.iter().any(|value| value.starts_with('*')) {
+        return Ok(None);
+    }
+    if spread {
+        let sizes = positional.iter().all(|value| is_one_size(value) && !value.contains('.'));
+        return Ok((sizes && args.len() == positional.len()).then_some(positional));
+    }
+    let size = args.iter().find_map(|arg| match arg {
+        CallArgument::Keyword { name, value } if name == "shape" || name == "size" => Some(value.as_str()),
+        _ => None,
+    });
+    match size.or(positional.get(at).map(String::as_str)).filter(|size| size.trim() != "None") {
+        Some(size) => Ok(size_argument(size, shapes, numpy)),
+        None => {
+            // The first argument of jax is the key.
+            let parameters = positional.iter().skip(usize::from(!numpy)).map(String::as_str);
+            let keywords = args.iter().filter_map(|arg| match arg {
+                CallArgument::Keyword { name, value } if !matches!(name.as_str(), "dtype" | "key" | "shape" | "size") => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            });
+            Ok(parameters.chain(keywords).all(is_number_text).then(Vec::new))
+        }
+    }
 }
 
 /// A function that works along one axis and keeps the shape. numpy and jax
