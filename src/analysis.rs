@@ -51,6 +51,22 @@ use inner::{
     scan_lambda_output, shape_of_batched_lambda, shape_of_direct_lambda, shape_of_sum,
 };
 
+/// With `NDIM_DUMP_SOURCES=<dir>`, each source that a test analyzes goes to
+/// that folder. `oracle/check.py` runs them in the real libraries.
+#[cfg(test)]
+fn dump_test_source(text: &str) {
+    use std::hash::{Hash, Hasher};
+    let Some(dir) = std::env::var_os("NDIM_DUMP_SOURCES") else {
+        return;
+    };
+    if text.len() > 20_000 {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let _ = std::fs::write(PathBuf::from(dir).join(format!("t{:016x}.py", hasher.finish())), text);
+}
+
 pub fn analyze_layer_shapes<F>(
     node: Node,
     text: &str,
@@ -62,6 +78,8 @@ pub fn analyze_layer_shapes<F>(
 where
     F: Fn(&PathBuf) -> Option<String>,
 {
+    #[cfg(test)]
+    dump_test_source(text);
     if too_deep(node) {
         return Ok(LayerShapeAnalysis::default());
     }
@@ -390,6 +408,9 @@ fn find_scoped_layer<'a>(
 // recurses into nested calls, chained methods, unary wraps, parenthesised
 // expressions, identifiers, and subscripts.
 
+/// Byte ranges of the values of a name, or `None` (`ShapeCtx::name_values`).
+type NameValues = Option<Vec<(usize, usize)>>;
+
 /// Context shared across recursive shape_of_expression calls within a single
 /// propagate_calls pass.
 struct ShapeCtx<'a> {
@@ -447,6 +468,9 @@ struct ShapeCtx<'a> {
     /// every element. Any other name with a shape is an array only when
     /// `name_is_array` proves it. Dropped when the name is rebound.
     tuple_carries: HashSet<(usize, String)>,
+    /// The byte ranges of the values that plain assignments give a name in a
+    /// scope, in source order. `None` when another form binds the name.
+    name_values: RefCell<HashMap<(usize, String), NameValues>>,
     /// `function_definition` node for each entry of `scopes` (aligned by
     /// index; `None` for the module scope at index 0), precomputed once so
     /// lazy call-site parameter seeding (`specialize_callee_call`) can find
@@ -835,15 +859,175 @@ impl<'a> ShapeCtx<'a> {
         }
     }
 
+    /// The values of `name` in `scope` from the statements before `limit`.
+    /// Only the full scope (`usize::MAX`) is kept for the next call.
+    fn name_values(&self, scope: usize, name: &str, limit: usize) -> NameValues {
+        let key = (scope, name.to_string());
+        if limit == usize::MAX
+            && let Some(known) = self.name_values.borrow().get(&key)
+        {
+            return known.clone();
+        }
+        let body = match self.scope_function_nodes[scope] {
+            Some(function) => function.child_by_field_name("body"),
+            None => Some(self.root),
+        };
+        let (mut values, mut bound) = (Vec::new(), false);
+        let found: NameValues = body
+            .filter(|body| collect_name_values_until(*body, name, self.text, &mut values, &mut bound, limit))
+            .map(|_| values.iter().map(|value| (value.start_byte(), value.end_byte())).collect());
+        if limit == usize::MAX {
+            self.name_values.borrow_mut().insert(key, found.clone());
+        }
+        found
+    }
+
+    /// Whether the value at `range` is `name` itself after a call that gives
+    /// the module back: `model.to(device)`, `model.eval()`,
+    /// `eqx.nn.inference_mode(model)`.
+    fn keeps_module(&self, range: (usize, usize), name: &str) -> bool {
+        let text = |node: Node| self.text.get(node.byte_range());
+        let Some(call) = self.root.descendant_for_byte_range(range.0, range.1).filter(|node| node.kind() == "call")
+        else {
+            return false;
+        };
+        let (Some(function), Some(arguments)) = (call.child_by_field_name("function"), call.child_by_field_name("arguments"))
+        else {
+            return false;
+        };
+        if function.kind() == "attribute" && function.child_by_field_name("object").and_then(text) == Some(name) {
+            let method = function.child_by_field_name("attribute").and_then(text);
+            return matches!(
+                method,
+                Some("to" | "cuda" | "cpu" | "eval" | "train" | "half" | "float" | "double" | "requires_grad_")
+            );
+        }
+        let callee = text(function).and_then(|callee| callee.rsplit('.').next());
+        matches!(callee, Some("inference_mode" | "tree_inference"))
+            && arguments.named_child(0).and_then(text) == Some(name)
+    }
+
+    /// The layer that the plain name `target` holds at the call at
+    /// `call_byte`. Python scope and statement order decide: a parameter or a
+    /// local of a scope between hides an outer layer, a call uses the last
+    /// binding before it, and a name with a binding that is not proven to
+    /// reach the call (two branches, a later binding in the same loop, a
+    /// second binding of an outer name) holds no known layer.
+    fn local_layer(&self, call_byte: usize, target: &str) -> Option<&'a LayerAssignment> {
+        let index = &self.links.scope_index;
+        let last = find_scoped_layer(self.layer_records, self.scopes, index, call_byte, target)?;
+        let call_scope = index.lookup(call_byte)?;
+        let layer_scope = index.lookup(last.byte_position)?;
+        let mut scope = call_scope;
+        while scope != layer_scope {
+            if self.scopes[scope].all_params.iter().any(|param| param == target)
+                || self.links.hiding(scope, self.scopes).contains(target)
+            {
+                return None;
+            }
+            if scope == 0 {
+                break;
+            }
+            scope = self.links.enclosing(scope).unwrap_or(0);
+        }
+        let at = self.root.descendant_for_byte_range(call_byte, call_byte)?;
+        if bound_in_expression(at, target, self.text)
+            || self.scopes[layer_scope].all_params.iter().any(|param| param == target)
+        {
+            return None;
+        }
+        // The body of a class is a scope of its own, and `global` or
+        // `nonlocal` lets any function write the name.
+        let mut around = at.parent();
+        let mut loop_end = None;
+        while let Some(node) = around {
+            match node.kind() {
+                "class_definition" if self.links.class_binds((node.start_byte(), node.end_byte()), target) => {
+                    return None;
+                }
+                "function_definition" | "class_definition" | "module" | "lambda" => break,
+                "for_statement" | "while_statement" => loop_end = Some(node.end_byte()),
+                _ => {}
+            }
+            around = node.parent();
+        }
+        let declared = |line: &str| {
+            let line = line.trim_start();
+            (line.starts_with("global ") || line.starts_with("nonlocal ")) && dim_symbols(line).any(|word| word == target)
+        };
+        if (self.text.contains("global ") || self.text.contains("nonlocal ")) && self.text.lines().any(declared) {
+            return None;
+        }
+        let record_of = |(start, end): (usize, usize)| {
+            let arguments = self.root.descendant_for_byte_range(start, end)?.child_by_field_name("arguments")?;
+            self.layer_records
+                .iter()
+                .find(|record| record.name == target && record.byte_position == arguments.start_byte())
+        };
+        let moved = |values: Vec<(usize, usize)>| -> Vec<(usize, usize)> {
+            values.into_iter().filter(|value| !self.keeps_module(*value, target)).collect()
+        };
+        if layer_scope != call_scope {
+            // The function can run between two bindings of the outer name.
+            let [only] = moved(self.name_values(layer_scope, target, usize::MAX)?)[..] else {
+                return None;
+            };
+            return record_of(only);
+        }
+        // A binding of another form after the call, and outside each loop
+        // around the call, does not reach it.
+        let values = match self.name_values(layer_scope, target, usize::MAX) {
+            Some(values) => values,
+            None => self.name_values(layer_scope, target, loop_end.unwrap_or(call_byte))?,
+        };
+        let values = moved(values);
+        let before: Vec<(usize, usize)> = values.iter().copied().filter(|value| value.1 <= call_byte).collect();
+        let binding = *before.last()?;
+        let value = self.root.descendant_for_byte_range(binding.0, binding.1)?;
+        let mut block = value.parent();
+        while let Some(node) = block.filter(|node| !matches!(node.kind(), "block" | "module")) {
+            block = node.parent();
+        }
+        let reaches = block.is_some_and(|block| block.start_byte() <= call_byte && call_byte < block.end_byte());
+        if !reaches && before.len() > 1 {
+            // Each binding gives the same layer, or each one keeps the shape.
+            let records: Option<Vec<&LayerAssignment>> = before.iter().map(|value| record_of(*value)).collect();
+            let same = records.is_some_and(|records| {
+                records.iter().all(|record| record.kind == records[0].kind)
+                    || records.iter().all(|record| matches!(record.kind, LayerKind::ShapePreserving { .. }))
+            });
+            if !same {
+                return None;
+            }
+        }
+        if let Some(end) = loop_end
+            && values.iter().any(|value| value.1 > call_byte && value.1 <= end)
+        {
+            // A later binding in a loop around the call arrives on the next pass.
+            return None;
+        }
+        record_of(binding)
+    }
+
     /// Resolve `self.<attr>` to the layer bound in the class enclosing `byte`,
     /// else in its bases (MRO order). Unrelated classes never match, and a
     /// base the file does not define ends the search with None.
     fn self_attr_layer_at(&self, attr: &str, byte: usize) -> Option<LayerKind> {
-        self.hierarchy
-            .resolve(self.self_attr_layers.get(attr)?, byte, |e| {
-                (e.class_start, e.class_end)
-            })
-            .map(|e| self.layer_at(&e.kind, e.byte))
+        let entries = self.self_attr_layers.get(attr)?;
+        let found = self.hierarchy.resolve(entries, byte, |e| (e.class_start, e.class_end))?;
+        // Two different layers for one field (the branches of an `if`): the
+        // file does not say which one a call gets.
+        // Layers that all keep the shape are the exception. A write of another
+        // value (`self.fc = make_head()`) also leaves the field unknown.
+        let class = (found.class_start, found.class_end);
+        let own: Vec<&ScopedSelfAttrLayer> =
+            entries.iter().filter(|e| (e.class_start, e.class_end) == class).collect();
+        let keeps_shape = own.iter().all(|e| matches!(e.kind, LayerKind::ShapePreserving { .. }));
+        let writes = self.attr_writes.iter().filter(|write| write.class == class && write.attr == attr).count();
+        if (!keeps_shape && own.iter().any(|e| e.kind != found.kind)) || writes > own.len() {
+            return None;
+        }
+        Some(self.layer_at(&found.kind, found.byte))
     }
 
     /// The annotated shape of `self.<field>` in the class enclosing `byte`,
@@ -920,7 +1104,11 @@ impl<'a> ShapeCtx<'a> {
         let instance = matches!(method_kind(self.scope_function_nodes[callee]?, self.text), MethodKind::Instance)
             && self.scopes[callee].all_params.first().map(String::as_str) == Some("self");
         let defining = self.links.class_of[callee]?;
-        (instance && !self.links.redefined[callee] && !self.rebinds_before(module.class, defining)).then_some(callee)
+        (instance
+            && !self.links.redefined[callee]
+            && !self.rebinds_before(module.class, defining)
+            && !self.is_transformed(callee))
+        .then_some(callee)
     }
 
     /// The method that `receiver.<name>(...)` runs, when `receiver` is the
@@ -1193,6 +1381,36 @@ impl<'a> ShapeCtx<'a> {
                     .collect()
             })
             .contains(name)
+    }
+
+    /// Whether a size argument of the `reshape` at `args` is a name that an
+    /// annotation uses as a dim, with no proven dim of its own. The variable
+    /// is not the dim (jaxtyping does not bind `n: int` to `"n 4"`), so the
+    /// `-1` of the call must not cancel one against the other.
+    fn infers_from_dim_name(&self, known: &KnownFunction, args: Node, values: &[CallArgument], scope_idx: usize) -> bool {
+        if !matches!(known, KnownFunction::Reshape) {
+            return false;
+        }
+        let texts = values.iter().map(|arg| match arg {
+            CallArgument::Positional { value } | CallArgument::Keyword { value, .. } => value.as_str(),
+        });
+        let source = self.text.get(args.byte_range()).unwrap_or("");
+        // A size that is one name can stand for a tuple: read its value too.
+        let inner = source.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')).unwrap_or(source);
+        let named = !inner.contains(['(', '[']);
+        // A field (`self.heads`) is a size of the class, not a variable.
+        fn variables(text: &str) -> impl Iterator<Item = &str> + '_ {
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            text.char_indices()
+                .filter(move |&(at, c)| is_word(c) && !text[..at].ends_with(|before: char| is_word(before) || before == '.'))
+                .map(move |(at, _)| &text[at..at + text[at..].find(|c: char| !is_word(c)).unwrap_or(text.len() - at)])
+        }
+        std::iter::once(source).chain(texts.filter(|_| named)).any(|text| {
+            text.contains("-1")
+                && variables(text).any(|name| {
+                    self.is_annotation_symbol(name) && !self.scalar_dims.contains_key(&(scope_idx, name.to_string()))
+                })
+        })
     }
 
     fn evict_binding(&mut self, scope_idx: usize, name: &str) {
@@ -1840,9 +2058,24 @@ fn collect_name_values<'t>(
     values: &mut Vec<Node<'t>>,
     bound: &mut bool,
 ) -> bool {
+    collect_name_values_until(node, name, text, values, bound, usize::MAX)
+}
+
+/// `collect_name_values` for the statements that start before byte `limit`.
+fn collect_name_values_until<'t>(
+    node: Node<'t>,
+    name: &str,
+    text: &str,
+    values: &mut Vec<Node<'t>>,
+    bound: &mut bool,
+    limit: usize,
+) -> bool {
     let mentions = |n: Node| mentions_name(n, text, &|other| other == name);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= limit {
+            break;
+        }
         match child.kind() {
             "function_definition" | "class_definition" => {
                 if child
@@ -1894,7 +2127,7 @@ fn collect_name_values<'t>(
             }
             _ => {}
         }
-        if !collect_name_values(child, name, text, values, bound) {
+        if !collect_name_values_until(child, name, text, values, bound, limit) {
             return false;
         }
     }
@@ -2828,6 +3061,9 @@ fn shape_of_known_method(
         args
     };
     let args = with_size_names(&known, true, args, args_node, scope_idx, ctx)?;
+    if ctx.infers_from_dim_name(&known, args_node, &args, scope_idx) {
+        return None;
+    }
     let result = apply_method_call_for_backend(&known, receiver, &args, ctx.imports.file(), &ctx.scope_shapes(scope_idx));
     let shape = ctx.check(result, variable, args_node.range())??;
     Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte()))
@@ -3123,7 +3359,7 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
     };
 
     // 1. Layer check
-    if let Some(record) = find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, &target) {
+    if let Some(record) = ctx.local_layer(call_byte, &target) {
         let kind = ctx.layer_at(&record.kind, record.byte_position);
         let Some(CallArgument::Positional { value: input }) = args.first().cloned() else {
             return None;
@@ -3278,6 +3514,9 @@ fn shape_of_call(node: Node, ctx: &mut ShapeCtx) -> Option<Vec<String>> {
             _ => args,
         };
         let args = with_size_names(&known, false, args, args_node, scope_idx, ctx)?;
+        if ctx.infers_from_dim_name(&known, args_node, &args, scope_idx) {
+            return None;
+        }
         let result = apply_known_function(&known, &args, &ctx.scope_shapes(scope_idx));
         return match result {
             Ok(Some(shape)) => Some(ctx.with_free_argument_dims(shape, &args, args_node.start_byte())),
@@ -3558,6 +3797,10 @@ fn scalar_dim_expr(node: Node, scope_idx: usize, ctx: &ShapeCtx) -> Option<Strin
             let right = scalar_dim_expr(node.child_by_field_name("right")?, scope_idx, ctx)?;
             let folded = fold_integers(&format!("({left}){op}({right})")).map(|value| value.to_string());
             folded.or_else(|| match (op, left.parse::<isize>(), right.parse::<isize>()) {
+                // `2 * (d // 2)` is not `2*d//2`.
+                ("*", ..) if left.contains("//") || right.contains("//") => {
+                    Some(format!("{}*{}", operand_text(&left), operand_text(&right)))
+                }
                 ("*", ..) => Some(multiply_dim(&left, &right)),
                 ("//", _, Ok(1)) => Some(left),
                 ("//", ..) => Some(format!("{}//{}", operand_text(&left), operand_text(&right))),
@@ -5010,6 +5253,7 @@ fn with_propagation<T>(
         synthetic_text: HashMap::new(),
         scalar_dims: HashMap::new(),
         tuple_carries: HashSet::new(),
+        name_values: RefCell::new(HashMap::new()),
         scope_function_nodes: &scope_function_nodes,
         active_specializations: Vec::new(),
         expression_depth: 0,
@@ -5216,7 +5460,7 @@ fn process_assignment_item_inner(
             let call_byte = rhs_node.start_byte();
             if !ctx.is_loop_module(func_node, target)
                 && let Some(record) =
-                    find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, call_byte, target)
+                    ctx.local_layer(call_byte, target)
             {
                 let kind = ctx.layer_at(&record.kind, record.byte_position);
                 let args_node = rhs_node.child_by_field_name("arguments");
@@ -5931,7 +6175,7 @@ fn tuple_rhs_shapes(
             let call_layer = match target.strip_prefix("self.") {
                 Some(attr) => ctx.self_attr_layer_at(attr, rhs.start_byte()),
                 None if func.kind() == "identifier" => {
-                    find_scoped_layer(ctx.layer_records, ctx.scopes, &ctx.links.scope_index, rhs.start_byte(), target)
+                    ctx.local_layer(rhs.start_byte(), target)
                         .map(|record| ctx.layer_at(&record.kind, record.byte_position))
                 }
                 None => None,
@@ -7227,6 +7471,53 @@ fn method_kind(function: Node, text: &str) -> MethodKind {
     kind
 }
 
+/// Whether a decorator of `function` can change what a call takes or gives:
+/// a transform (`@jax.vmap`, `@jax.grad`, `@partial(jax.vmap, ...)`,
+/// `@np.vectorize`, `@pytest.fixture`, `@contextmanager`), or a function that
+/// this file defines (`is_local`), which can wrap in any way. The signature
+/// then says nothing about a call.
+fn has_transform_decorator(function: Node, text: &str, is_local: &dyn Fn(&str) -> bool) -> bool {
+    const TRANSFORMS: [&str; 17] = [
+        "vmap", "pmap", "grad", "value_and_grad", "jacfwd", "jacrev", "jacobian", "hessian", "vectorize",
+        "fixture", "contextmanager", "filter_vmap", "filter_pmap", "filter_grad", "filter_value_and_grad",
+        "filter_jacfwd", "filter_jacrev",
+    ];
+    let Some(definition) = function.parent().filter(|p| p.kind() == "decorated_definition") else {
+        return false;
+    };
+    let mut cursor = definition.walk();
+    definition.named_children(&mut cursor).filter(|n| n.kind() == "decorator").any(|decorator| {
+        // The names of the decorator, without the text of its strings.
+        let mut names = Vec::new();
+        let mut stack = vec![decorator];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "string" | "keyword_argument" if node.kind() == "string" => {}
+                "identifier" => names.push(&text[node.byte_range()]),
+                "keyword_argument" => stack.extend(node.child_by_field_name("value")),
+                _ => stack.extend(node.named_children(&mut node.walk())),
+            }
+        }
+        let head = decorator.named_child(0).map(|expression| match expression.kind() {
+            "call" => expression.child_by_field_name("function").unwrap_or(expression),
+            _ => expression,
+        });
+        let local = head
+            .filter(|head| head.kind() == "identifier")
+            .is_some_and(|head| is_local(&text[head.byte_range()]));
+        local || names.iter().any(|name| TRANSFORMS.contains(name))
+    })
+}
+
+impl ShapeCtx<'_> {
+    /// `has_transform_decorator` for the function of scope `callee_idx`.
+    fn is_transformed(&self, callee_idx: usize) -> bool {
+        let is_local = |name: &str| self.scopes.iter().any(|scope| scope.function_name.as_deref() == Some(name));
+        self.scope_function_nodes[callee_idx]
+            .is_some_and(|function| has_transform_decorator(function, self.text, &is_local))
+    }
+}
+
 /// One call of a function of this file.
 struct UserCall<'c, 't> {
     /// The name of the function, for the argument errors.
@@ -7259,6 +7550,9 @@ fn apply_user_function(
     ctx: &mut ShapeCtx,
 ) -> Option<Option<Vec<String>>> {
     let UserCall { name, display, args, args_node, call_byte } = call;
+    if ctx.is_transformed(callee_idx) {
+        return Some(None);
+    }
     if !callee_all_params_annotated(callee_idx, ctx) {
         return apply_seeded_user_function(callee_idx, call_byte, args, scope_idx, ctx).map(Some);
     }

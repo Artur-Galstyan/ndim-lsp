@@ -315,7 +315,8 @@ fn test_arg_max_method_cases() {
 #[rustfmt::skip]
 fn test_cumsum_method_cases() {
     check(KnownFunction::Cumsum, Some("x"), &[
-        ("apply_cumsum_shape_preserving", vec![], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
+        ("apply_cumsum_without_axis_flattens", vec![], &[("x", &["batch", "features"])], Ok(Some(&["batch*features"]))),
+        ("apply_cumsum_with_axis_preserves_shape", vec![pos("0")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
     ]);
 }
 
@@ -892,7 +893,7 @@ fn test_classify_new_indexing_methods() {
     );
     assert_eq!(
         classify_method_call("expand_as"),
-        Some(KnownFunction::ShapeAs)
+        Some(KnownFunction::ExpandAs)
     );
     assert_eq!(classify_method_call("flip"), Some(KnownFunction::Flip));
     assert_eq!(classify_method_call("roll"), Some(KnownFunction::Roll));

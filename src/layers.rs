@@ -76,6 +76,11 @@ fn classify_layer_text(call: &ResolvedCallSignature) -> Option<LayerKind> {
     if call.signature.name != "__init__" {
         return None;
     }
+    // ponytail: equinox `BatchNorm` gives `(output, state)`, so it is no
+    // array layer. Model the pair when the lost shapes matter.
+    if is_equinox_module && owner == "BatchNorm" {
+        return None;
+    }
 
     match owner {
         "Linear" => Some(LayerKind::Linear {
@@ -1232,7 +1237,8 @@ where
     }
     let is_wrapper = target.parts[0] == "equinox"
         && target.parts[1] == "nn"
-        && matches!(target.parts.last().map(String::as_str), Some("SpectralNorm") | Some("WeightNorm"));
+        // `SpectralNorm` gives `(output, state)`, so only `WeightNorm` is transparent.
+        && target.parts.last().map(String::as_str) == Some("WeightNorm");
     if !is_wrapper {
         return Ok(None);
     }
@@ -3322,7 +3328,7 @@ mod table_tests {
             (
                 "spectral norm",
                 "import equinox as eqx\nlayer = eqx.nn.SpectralNorm(eqx.nn.Linear(4, 8), \"weight\", key=None)",
-                &[("layer", linear("4", "8"))],
+                &[],
             ),
             ("weight norm", "import equinox as eqx\nlayer = eqx.nn.WeightNorm(eqx.nn.Conv2d(3, 16, 3))", &[("layer", conv2d_3_16_3())]),
             (

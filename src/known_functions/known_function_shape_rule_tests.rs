@@ -743,7 +743,10 @@ fn test_sort_cases() {
 #[rustfmt::skip]
 fn test_cumsum_cases() {
     check(KnownFunction::Cumsum, None, &[
-        ("cumsum_preserves_shape", vec![pos("x")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
+        ("cumsum_without_axis_flattens", vec![pos("x")], &[("x", &["batch", "features"])], Ok(Some(&["batch*features"]))),
+        ("cumsum_axis_none_flattens", vec![pos("x"), kw("axis", "None")], &[("x", &["2", "3"])], Ok(Some(&["6"]))),
+        ("cumsum_with_axis_preserves_shape", vec![pos("x"), kw("axis", "0")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
+        ("cumsum_of_a_vector_preserves_shape", vec![pos("x")], &[("x", &["n"])], Ok(Some(&["n"]))),
     ]);
 }
 
@@ -751,7 +754,8 @@ fn test_cumsum_cases() {
 #[rustfmt::skip]
 fn test_cumprod_cases() {
     check(KnownFunction::Cumprod, None, &[
-        ("cumprod_preserves_shape", vec![pos("x")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
+        ("cumprod_without_axis_flattens", vec![pos("x")], &[("x", &["batch", "features"])], Ok(Some(&["batch*features"]))),
+        ("cumprod_with_axis_preserves_shape", vec![pos("x"), pos("1")], &[("x", &["batch", "features"])], Ok(Some(&["batch", "features"]))),
     ]);
 }
 

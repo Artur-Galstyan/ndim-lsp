@@ -354,7 +354,7 @@ pub(crate) fn dims_conflict(a: &str, b: &str) -> bool {
                 && is_named_size(a)
                 && is_named_size(b)
                 && !dims_canonically_equal(a, b)
-                && ((is_plain_dim(a) && is_plain_dim(b)) || same_names(a, b))
+                && ((is_plain_dim(a) && is_plain_dim(b)) || same_names(a, b) || exceeds(a, b) || exceeds(b, a))
         }
     }
 }
@@ -367,9 +367,12 @@ pub(crate) const NAMES_ONLY: &str = "\u{1}";
 
 /// Whether the conflict of `a` and `b` rests on a name: two different names,
 /// or a name against an integer. Only two different integers are proven.
+///
+/// `d*2` against `d` (`exceeds`) is here too: with `d` of 1, the two broadcast.
 pub(crate) fn names_conflict(a: &str, b: &str) -> bool {
     let is_int = |dim: &str| dim.parse::<i64>().is_ok();
-    dims_conflict(a, b) && is_plain_dim(a) && is_plain_dim(b) && !(is_int(a) && is_int(b))
+    let plain = is_plain_dim(a) && is_plain_dim(b) && !(is_int(a) && is_int(b));
+    dims_conflict(a, b) && (plain || (!same_names(a, b) && (exceeds(a, b) || exceeds(b, a))))
 }
 
 /// The conflicts that one check finds. A conflict of two different names
@@ -392,6 +395,42 @@ impl Conflicts {
     pub(crate) fn finish(self) -> Result<(), String> {
         self.0.map_or(Ok(()), Err)
     }
+}
+
+/// Whether the flat sum `a` is `b` plus one more size: `d*2` or `d+d` or
+/// `d+k` against `d`. A size is 1 or more, so the two are not equal.
+fn exceeds(a: &str, b: &str) -> bool {
+    let counts = |dim: &str| {
+        let stripped: String = without_outer_brackets(dim).chars().filter(|c| !c.is_whitespace()).collect();
+        if stripped.contains("**") {
+            return None;
+        }
+        let (terms, integers) = flat_sum(&stripped)?;
+        let mut counts: Vec<(String, i64)> = Vec::new();
+        for term in terms {
+            if term.starts_with('-') {
+                return None;
+            }
+            let (count, name) = match term.split_once('*') {
+                Some((count, name)) if count.parse::<i64>().is_ok() => (count.parse().ok()?, name.to_string()),
+                _ => (1, term),
+            };
+            match counts.iter_mut().find(|(known, _)| *known == name) {
+                Some((_, total)) => *total += count,
+                None => counts.push((name, count)),
+            }
+        }
+        (!counts.is_empty() && counts.iter().all(|(_, count)| *count > 0)).then_some((counts, integers))
+    };
+    let (Some((more, more_integers)), Some((fewer, fewer_integers))) = (counts(a), counts(b)) else {
+        return false;
+    };
+    let count_in = |counts: &[(String, i64)], name: &str| {
+        counts.iter().find(|(known, _)| known == name).map_or(0, |(_, count)| *count)
+    };
+    let covers = fewer.iter().all(|(name, count)| count_in(&more, name) >= *count);
+    let extra = more.iter().any(|(name, count)| *count > count_in(&fewer, name));
+    covers && extra && more_integers >= fewer_integers
 }
 
 /// Whether two flat sums have the same terms apart from their integers.
@@ -728,7 +767,11 @@ mod canonicalize_dim_tests {
             ("m", "n/2", false, "m"),
             ("m", "2*n", false, "m"),
             ("m", "ceil(n/2)", false, "m"),
-            ("2*n", "3*n", false, crate::layers::UNPROVEN_DIM),
+            ("2*n", "3*n", true, ""),
+            ("n*2", "n", true, ""),
+            ("n+n", "n", true, ""),
+            ("n+m", "n", true, ""),
+            ("n+m", "n+n", false, crate::layers::UNPROVEN_DIM),
             ("n+1", "m+1", false, crate::layers::UNPROVEN_DIM),
             ("n+1", "n", true, ""),
             ("(n+1)", "n", true, ""),
@@ -1290,6 +1333,8 @@ pub enum KnownFunction {
     Sort,
     Cumsum,
     Cumprod,
+    /// `fft`, `ifft`, `fft2`, `fftn`: the shape of the input, when no length is given.
+    Fft,
     TensorDot,
     Outer,
     Inner,
@@ -1383,6 +1428,8 @@ pub enum KnownFunction {
     MaskedFill,
     Unfold,
     ShapeAs,
+    /// `x.expand_as(other)`: the shape of `other`, to which `x` broadcasts.
+    ExpandAs,
     Item,
     NewConstructor,
     /// `x.new_zeros/new_ones/new_empty`: like `TorchSizeConstructor` after the receiver.

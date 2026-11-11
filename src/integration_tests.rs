@@ -3542,7 +3542,7 @@ mod shape_preserving_layer_tests {
         assert!(analysis.errors.is_empty());
         assert_eq!(
             find_shape(&analysis, "y"),
-            Some(&shape(&["batch", "features"]))
+            None // equinox `BatchNorm` gives `(output, state)`, which is no array
         );
     }
 
@@ -3962,7 +3962,7 @@ mod shape_preserving_layer_tests {
         let analysis = analyze_layer_shapes(tree.root_node(), code, &roots, read, 5, None).unwrap();
 
         assert!(analysis.errors.is_empty());
-        assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["features"])));
+        assert_eq!(find_shape(&analysis, "y"), None);
     }
 
     // ── Unit tests for min_rank_for_shape_preserving via apply_layer_application ──
@@ -9205,10 +9205,11 @@ mod torch_new_builtin_tests {
         let code = "def f(x: Float[Array, \"12\"], other: Float[Array, \"3 4\"]):\n    y = x.view_as(other)\n    z = x.reshape_as(other)\n    w = x.expand_as(other)";
         let analysis = analyze(code);
 
-        assert!(analysis.errors.is_empty());
+        // `[12]` does not broadcast to `[3, 4]`: torch refuses the `expand_as`.
+        assert_eq!(analysis.errors.len(), 1, "{:?}", analysis.errors);
         assert_eq!(find_shape(&analysis, "y"), Some(&shape(&["3", "4"])));
         assert_eq!(find_shape(&analysis, "z"), Some(&shape(&["3", "4"])));
-        assert_eq!(find_shape(&analysis, "w"), Some(&shape(&["3", "4"])));
+        assert_eq!(find_shape(&analysis, "w"), None);
     }
 
     #[test]
@@ -16710,5 +16711,162 @@ def run(params, x: Float[Array, "b t 8"]):
         assert_eq!(found("h"), Some(shape(&["b", "t", "dim"])));
         assert_eq!(found("y"), Some(shape(&["b", "t", "8"])));
         assert_eq!(found("pair"), None);
+    }
+
+    /// The value of `name` in `source`, and the count of errors.
+    fn probe(source: &str, name: &str) -> (Option<Vec<String>>, usize) {
+        let analysis = analyze(source);
+        let found = analysis.scopes.iter().find_map(|scope| scope.shapes.get(name)).cloned();
+        (found, analysis.errors.len())
+    }
+
+    #[test]
+    fn a_layer_name_follows_scope_and_statement_order() {
+        let head = "import torch\nimport torch.nn as nn\nfrom torch import Tensor\nfrom jaxtyping import Float\n\n";
+        // A parameter hides the layer of the module.
+        let hidden = format!("{head}model = nn.Linear(10, 1)\n\ndef f(model: nn.Module, x: Float[Tensor, \"b 20\"]):\n    y = model(x)\n    return y\n");
+        assert_eq!(probe(&hidden, "y"), (None, 0));
+        let seen = format!("{head}model = nn.Linear(10, 1)\n\ndef f(x: Float[Tensor, \"b 10\"]):\n    y = model(x)\n    return y\n");
+        assert_eq!(probe(&seen, "y"), (Some(shape(&["b", "1"])), 0));
+        // A call uses the binding before it.
+        let twice = format!("{head}def f(x: Float[Tensor, \"b 4\"], z: Float[Tensor, \"b 3\"]):\n    lin = nn.Linear(4, 2)\n    y = lin(x)\n    lin = nn.Linear(3, 5)\n    w = lin(z)\n    return y, w\n");
+        assert_eq!(probe(&twice, "y"), (Some(shape(&["b", "2"])), 0));
+        assert_eq!(probe(&twice, "w"), (Some(shape(&["b", "5"])), 0));
+        // Two branches, and a later binding in the loop of the call, prove nothing.
+        let branches = format!("{head}def f(x: Float[Tensor, \"b 4\"], c: bool):\n    if c:\n        lin = nn.Linear(4, 2)\n    else:\n        lin = nn.Linear(4, 3)\n    y = lin(x)\n    return y\n");
+        assert_eq!(probe(&branches, "y"), (None, 0));
+        let looped = format!("{head}def f(x: Float[Tensor, \"b 4\"]):\n    lin = nn.Linear(4, 4)\n    for _ in range(3):\n        y = lin(x)\n        lin = nn.Linear(4, 4)\n    return y\n");
+        assert_eq!(probe(&looped, "y"), (None, 0));
+        // A module name with two bindings is not known inside a function.
+        let outer = format!("{head}lin = nn.Linear(4, 2)\nlin = nn.Linear(4, 3)\n\ndef f(x: Float[Tensor, \"b 4\"]):\n    y = lin(x)\n    return y\n");
+        assert_eq!(probe(&outer, "y"), (None, 0));
+        // A field with a different layer in each branch.
+        let field = format!("{head}class M(nn.Module):\n    def __init__(self, wide):\n        super().__init__()\n        if wide:\n            self.out = nn.Linear(16, 10)\n        else:\n            self.out = nn.Linear(16, 1)\n\n    def forward(self, x: Float[Tensor, \"b 16\"]):\n        y = self.out(x)\n        return y\n");
+        assert_eq!(probe(&field, "y"), (None, 0));
+    }
+
+    #[test]
+    fn rules_that_gave_a_wrong_shape() {
+        let head = "import numpy as np\nimport torch\nimport jax\nimport jax.numpy as jnp\nimport equinox as eqx\nimport functools\nfrom torch import Tensor\nfrom jaxtyping import Array, Float\n\n";
+        let line = |params: &str, value: &str| format!("{head}def f({params}):\n    r = {value}\n    return r\n");
+        let x = "x: Float[np.ndarray, \"n d\"]";
+        for (params, value, want, errors) in [
+            ("", "torch.arange(0, 64, 2)", Some(vec!["32"]), 0),
+            ("", "np.arange(10, 0, -3)", Some(vec!["4"]), 0),
+            ("", "np.arange(5, step=2)", Some(vec!["3"]), 0),
+            ("", "np.arange(0.0, 1.0, 0.1)", Some(vec!["10"]), 0),
+            ("", "np.arange(14.0)", Some(vec!["14"]), 0),
+            ("", "np.arange(0, 0.3, 0.1)", Some(vec!["3"]), 0),
+            ("", "np.arange(3, 3)", Some(vec!["0"]), 0),
+            ("n: int", "np.arange(0.5, n)", None, 0),
+            ("n: int", "np.arange(0, n, 2)", None, 0),
+            ("n: int", "np.arange(1, n)", Some(vec!["n-1"]), 0),
+            (x, "np.cumsum(x)", Some(vec!["n*d"]), 0),
+            (x, "x.cumsum()", Some(vec!["n*d"]), 0),
+            (x, "np.cumsum(x, axis=0)", Some(vec!["n", "d"]), 0),
+            (x, "np.sort(x, axis=None)", Some(vec!["n*d"]), 0),
+            (x, "np.sort(x)", Some(vec!["n", "d"]), 0),
+            (x, "np.fft.fft(x)", Some(vec!["n", "d"]), 0),
+            (x, "np.fft.fft(x, n=16)", None, 0),
+            (x, "np.fft.fft2(x, s=(8, 8))", None, 0),
+            ("", "np.broadcast_to(np.zeros((3, 4)), (4,))", None, 1),
+            ("", "np.broadcast_to(np.zeros((1, 4)), (5, 4))", Some(vec!["5", "4"]), 0),
+            ("", "torch.zeros(3, 64, 1, 1).expand(-1, 32, 7, 7)", None, 1),
+            ("", "torch.zeros(3, 4).view_as(torch.zeros(5, 5))", None, 1),
+            ("", "torch.zeros(3, 4).view_as(torch.zeros(2, 6))", Some(vec!["2", "6"]), 0),
+            ("x: Float[Array, \"b d\"], h: Float[Array, \"b d*2\"]", "h + x", None, 1),
+            ("x: Float[Array, \"b d\"]", "jnp.concatenate([x, x], axis=-1) + x", None, 1),
+        ] {
+            let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
+            assert_eq!(probe(&line(params, value), "r"), (want, errors), "{value}");
+        }
+        // A local with the name of an annotation dim is not that dim.
+        let local = format!("{head}def f(x: Float[np.ndarray, \"n 4\"], w: Float[np.ndarray, \"8 k\"], cfg):\n    n = cfg.n\n    c = x.reshape(n, -1)\n    y = c @ w\n    return y\n");
+        assert_eq!(probe(&local, "c"), (None, 0));
+        let halved = local.replace("n = cfg.n", "n = x.shape[0] // 2");
+        assert_eq!(probe(&halved, "c"), (None, 0));
+        let same = local.replace("n = cfg.n", "n = x.shape[0]");
+        assert_eq!(probe(&same, "c").0, Some(shape(&["n", "4"])));
+    }
+
+    #[test]
+    fn a_transform_decorator_and_a_stateful_layer_give_no_shape() {
+        let head = "import functools\nimport jax\nimport jax.numpy as jnp\nimport equinox as eqx\nfrom jaxtyping import Array, Float\n\n";
+        for decorator in ["@jax.vmap", "@eqx.filter_vmap", "@functools.partial(jax.vmap, in_axes=(0, None))", "@jax.grad"] {
+            let source = format!("{head}{decorator}\ndef one(x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return x * 2\n\ndef use(x: Float[Array, \"8 4\"]):\n    r = one(x)\n    return r\n");
+            assert_eq!(probe(&source, "r"), (None, 0), "{decorator}");
+        }
+        let plain = format!("{head}@jax.jit\ndef one(x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return x * 2\n\ndef use(x: Float[Array, \"4\"]):\n    r = one(x)\n    return r\n");
+        assert_eq!(probe(&plain, "r"), (Some(shape(&["4"])), 0));
+        // equinox `BatchNorm` gives `(output, state)`.
+        let stateful = format!("{head}class B(eqx.Module):\n    conv: eqx.nn.Conv2d\n    bn: eqx.nn.BatchNorm\n\n    def __init__(self, key):\n        self.conv = eqx.nn.Conv2d(3, 16, 3, padding=1, key=key)\n        self.bn = eqx.nn.BatchNorm(16, axis_name=\"batch\")\n\n    def __call__(self, x: Float[Array, \"3 32 32\"], state):\n        out = self.bn(self.conv(x), state)\n        h = out[0]\n        y = self.conv(h)\n        return y\n");
+        assert_eq!(probe(&stateful, "out"), (None, 0));
+        assert_eq!(probe(&stateful, "y"), (None, 0));
+    }
+
+    #[test]
+    fn a_layer_name_keeps_what_the_file_proves() {
+        let head = "import torch\nimport torch.nn as nn\nfrom torch import Tensor\nfrom jaxtyping import Float\n\n";
+        let x = "x: Float[Tensor, \"b 3\"]";
+        // The body of a class binds its own name.
+        let class_body = format!("{head}layer = nn.Linear(3, 4)\n\nclass C:\n    layer = nn.Linear(3, 9)\n    x = torch.zeros(2, 3)\n    out = layer(x)\n");
+        assert_eq!(probe(&class_body, "out"), (None, 0));
+        // `global` lets a function write the name of the module.
+        let global = format!("{head}model = nn.Linear(3, 4)\n\ndef setup():\n    global model\n    model = nn.Linear(5, 6)\n\ndef run(x: Float[Tensor, \"b 5\"]):\n    y = model(x)\n    return y\n");
+        assert_eq!(probe(&global, "y"), (None, 0));
+        // A call that gives the module back keeps the layer.
+        for keep in ["model = model.to(device)", "model = model.eval()", "del model"] {
+            let (first, last) = if keep == "del model" { ("", keep) } else { (keep, "") };
+            let source = format!("{head}def f({x}, device):\n    model = nn.Linear(3, 4)\n    {first}\n    y = model(x)\n    {last}\n    return y\n");
+            assert_eq!(probe(&source, "y"), (Some(shape(&["b", "4"])), 0), "{keep}");
+        }
+        // Two branches with the same layer, and a field that keeps the shape in each branch.
+        let same = format!("{head}def f({x}, c: bool):\n    if c:\n        lin = nn.Linear(3, 4)\n    else:\n        lin = nn.Linear(3, 4)\n    y = lin(x)\n    return y\n");
+        assert_eq!(probe(&same, "y"), (Some(shape(&["b", "4"])), 0));
+        let act = format!("{head}class M(nn.Module):\n    def __init__(self, gelu):\n        super().__init__()\n        if gelu:\n            self.act = nn.GELU()\n        else:\n            self.act = nn.ReLU()\n\n    def forward(self, {x}):\n        y = self.act(x)\n        return y\n");
+        assert_eq!(probe(&act, "y"), (Some(shape(&["b", "3"])), 0));
+        // A field that another value replaces.
+        let replaced = format!("{head}class M(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc = nn.Linear(3, 4)\n        self.fc = make_head(5, 4)\n\n    def forward(self, x: Float[Tensor, \"b 5\"]):\n        y = self.fc(x)\n        return y\n");
+        assert_eq!(probe(&replaced, "y"), (None, 0));
+    }
+
+    #[test]
+    fn review_cases_of_the_soundness_fixes() {
+        let head = "import functools\nimport numpy as np\nimport jax\nimport jax.numpy as jnp\nfrom jaxtyping import Array, Float\n\n";
+        let line = |params: &str, value: &str| format!("{head}def f({params}):\n    r = {value}\n    return r\n");
+        let none: Option<Vec<&str>> = None;
+        for (params, value, want) in [
+            ("", "np.arange(5, step=None)", Some(vec!["5"])),
+            ("", "np.arange(5, None)", Some(vec!["5"])),
+            ("n: int", "np.arange(n, 0)", none.clone()),
+            ("n: int", "np.arange(-1, n)", Some(vec!["n+1"])),
+            ("*args", "np.arange(*args)", none.clone()),
+            ("x: Float[Array, \"3 4\"], ax", "jnp.cumsum(x, ax)", none.clone()),
+            ("x: Float[Array, \"3 4\"], ax", "jnp.sort(x, axis=ax)", none.clone()),
+            ("x: Float[Array, \"3 d\"]", "jnp.zeros((3, 2 * (x.shape[1] // 2)))", Some(vec!["3", "2*(d//2)"])),
+        ] {
+            let want: Option<Vec<String>> = want.map(|dims| dims.iter().map(|dim| dim.to_string()).collect());
+            assert_eq!(probe(&line(params, value), "r"), (want, 0), "{value}");
+        }
+        // A power is no flat sum, and a size of 1 broadcasts: no proven error.
+        let power = line("a: Float[Array, \"n**3 3\"], b: Float[Array, \"n**2 3\"]", "jnp.concatenate([a, b], axis=1)");
+        assert_eq!(analyze(&power).errors.len(), 0);
+        let wider = line("x: Float[Array, \"n\"]", "jnp.concatenate([x, x]) + x");
+        let kinds: Vec<ShapeErrorKind> = analyze(&wider).errors.iter().map(|error| error.kind).collect();
+        assert_eq!(kinds, [ShapeErrorKind::Approximation]);
+        // A parameter with the name of a dim is not the dim.
+        let param = format!("{head}def f(x: Float[Array, \"n 4\"], w: Float[Array, \"8 k\"], n: int):\n    c = x.reshape(n, -1)\n    y = c @ w\n    return y\n");
+        assert_eq!(probe(&param, "c"), (None, 0));
+        let named = param.replace("c = x.reshape(n, -1)", "size = (n, -1)\n    c = x.reshape(size)");
+        assert_eq!(probe(&named, "c"), (None, 0));
+        // A decorator: the name of an argument is no transform, a function of the file can be one.
+        let call = "def use(x: Float[Array, \"4\"]):\n    r = one(x)\n    return r\n";
+        let one = "def one(x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n    return x * 2\n\n";
+        let jit = format!("{head}@functools.partial(jax.jit, static_argnames=[\"use_grad\"])\n{one}{call}");
+        assert_eq!(probe(&jit, "r"), (Some(shape(&["4"])), 0));
+        let user = format!("{head}def batched(f):\n    return jax.vmap(f)\n\n@batched\n{one}{call}");
+        assert_eq!(probe(&user, "r"), (None, 0));
+        let method = format!("{head}class M:\n    @functools.partial(jax.vmap, in_axes=(None, 0))\n    def apply(self, x: Float[Array, \"d\"]) -> Float[Array, \"d\"]:\n        return x\n\ndef use(x: Float[Array, \"7 3\"]):\n    m = M()\n    r = m.apply(x)\n    return r\n");
+        assert_eq!(probe(&method, "r"), (None, 0));
     }
 }

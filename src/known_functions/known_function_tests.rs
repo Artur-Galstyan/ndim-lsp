@@ -450,7 +450,7 @@ known_cases! {
     jnp_quantile, ["jax", "numpy", "quantile"], Some(KnownFunction::Reduction { axis: 2, keepdims: Some(6), q: Some(1) });
     jnp_count_nonzero, ["jax", "numpy", "count_nonzero"], Some(KnownFunction::Reduction { axis: 1, keepdims: None, q: None });
     jnp_ptp_reuses_max, ["jax", "numpy", "ptp"], Some(KnownFunction::Max);
-    jax_numpy_fft_fft_classified, ["jax", "numpy", "fft", "fft"], Some(KnownFunction::Copy);
+    jax_numpy_fft_fft_classified, ["jax", "numpy", "fft", "fft"], Some(KnownFunction::Fft);
     torch_fft_rfft_not_classified, ["torch", "fft", "rfft"], None;
 
     // ── linear algebra classification ──

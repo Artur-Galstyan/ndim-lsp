@@ -221,9 +221,8 @@ pub fn classify_known_function(target: &ResolvedTarget) -> Option<KnownFunction>
     if module == ["jax", "numpy", "fft"] || module == ["numpy", "fft"] || module == ["torch", "fft"]
     {
         return match name.as_str() {
-            "fft" | "ifft" | "fft2" | "ifft2" | "fftn" | "ifftn" | "fftshift" | "ifftshift" => {
-                Some(KnownFunction::Copy) // shape-preserving; reuse the generic pass-through rule
-            }
+            "fft" | "ifft" | "fft2" | "ifft2" | "fftn" | "ifftn" => Some(KnownFunction::Fft),
+            "fftshift" | "ifftshift" => Some(KnownFunction::Copy),
             _ => None,
         };
     }
@@ -940,7 +939,8 @@ pub fn classify_method_call(method: &str) -> Option<KnownFunction> {
         "select" => Some(KnownFunction::SelectDim),
         "topk" => Some(KnownFunction::TopK),
         "unfold" => Some(KnownFunction::Unfold),
-        "view_as" | "reshape_as" | "expand_as" => Some(KnownFunction::ShapeAs),
+        "view_as" | "reshape_as" => Some(KnownFunction::ShapeAs),
+        "expand_as" => Some(KnownFunction::ExpandAs),
         "flip" => Some(KnownFunction::Flip),
         "roll" => Some(KnownFunction::Roll),
         "item" => Some(KnownFunction::Item),
@@ -1100,10 +1100,6 @@ fn apply_known_rule(
         | KnownFunction::EmptyLike
         | KnownFunction::Array
         | KnownFunction::AsArray
-        | KnownFunction::Argsort
-        | KnownFunction::Sort
-        | KnownFunction::Cumsum
-        | KnownFunction::Cumprod
         | KnownFunction::Roll
         | KnownFunction::Flip
         | KnownFunction::Triu
@@ -1119,6 +1115,13 @@ fn apply_known_rule(
         | KnownFunction::PutAlongAxis
         | KnownFunction::Scatter
         | KnownFunction::MaskedFill => apply_known_shape_preserving(args, shapes),
+        // `n=` or `s=` (the second argument) sets the length of the result.
+        KnownFunction::Fft => {
+            let length = nth_positional_or_keyword(args, 1, &["n", "s"]).is_some_and(|n| n.trim() != "None");
+            if length { Ok(None) } else { apply_known_shape_preserving(args, shapes) }
+        }
+        KnownFunction::Cumsum | KnownFunction::Cumprod => apply_known_along_axis(args, shapes, true),
+        KnownFunction::Argsort | KnownFunction::Sort => apply_known_along_axis(args, shapes, false),
         KnownFunction::Arange => apply_known_arange(args),
         KnownFunction::Linspace | KnownFunction::Logspace | KnownFunction::TorchLinspace => {
             apply_known_linspace(function, args, shapes)
@@ -1288,7 +1291,26 @@ fn apply_known_rule(
         KnownFunction::Narrow => apply_known_narrow(args, shapes),
         KnownFunction::SelectDim => apply_known_select_dim(args, shapes),
         KnownFunction::Unfold => apply_known_unfold(args, shapes),
-        KnownFunction::ShapeAs => Ok(shape_arg(args, 1, &["other"], shapes).cloned()),
+        KnownFunction::ShapeAs | KnownFunction::ExpandAs => {
+            let Some(other) = shape_arg(args, 1, &["other"], shapes) else {
+                return Ok(None);
+            };
+            let Some((_, input)) = first_array_arg_shape(args, shapes) else {
+                return Ok(Some(other.clone()));
+            };
+            if matches!(function, KnownFunction::ExpandAs) {
+                refuse_broadcast("expand_as", input, other)?;
+            } else if let (Some(have), Some(want)) = (dim_product(input), dim_product(other))
+                && have != want
+            {
+                return Err(format!(
+                    "cannot view shape [{}] ({have} elements) as [{}] ({want} elements)",
+                    input.join(", "),
+                    other.join(", ")
+                ));
+            }
+            Ok(Some(other.clone()))
+        }
         KnownFunction::Item => Ok(Some(Vec::new())),
         KnownFunction::NewConstructor => {
             Ok(nth_positional_or_keyword(args, 1, &["size", "shape"]).and_then(parse_shape_value))
@@ -2578,18 +2600,61 @@ fn is_balanced(value: &str) -> bool {
     depth == 0
 }
 
+/// `arange(stop)`, `arange(start, stop)`, `arange(start, stop, step)`. A
+/// length with a step, or with a float, is known only for number literals.
 fn apply_known_arange(args: &[CallArgument]) -> Result<Option<Vec<String>>, String> {
-    let values = positional_arg_values(args);
-    if values.is_empty() {
+    let positional = positional_arg_values(args);
+    let keyword = |names: &[&str]| {
+        args.iter().find_map(|arg| match arg {
+            CallArgument::Keyword { name, value } if names.contains(&name.as_str()) => Some(value.trim().to_string()),
+            _ => None,
+        })
+    };
+    if positional.iter().any(|value| value.starts_with('*')) || args.iter().any(|arg| {
+        matches!(arg, CallArgument::Keyword { name, .. } if name.starts_with('*'))
+    }) {
         return Ok(None);
     }
-    if values.len() == 1 {
-        return Ok(Some(vec![values[0].clone()]));
+    // `None` for the stop makes the first argument the stop, and for the step means 1.
+    let positional: Vec<String> = match &positional[..] {
+        [start, stop, rest @ ..] if stop == "None" => std::iter::once(start.clone()).chain(rest.iter().cloned()).take(1).collect(),
+        _ => positional,
+    };
+    let stop_keyword = keyword(&["stop", "end"]).filter(|stop| stop != "None");
+    let (start, stop) = match (positional.len(), stop_keyword) {
+        (0, Some(stop)) => (keyword(&["start"]).unwrap_or_else(|| "0".to_string()), stop),
+        (1, Some(stop)) => (positional[0].clone(), stop),
+        (1, None) => ("0".to_string(), positional[0].clone()),
+        (2.., None) => (positional[0].clone(), positional[1].clone()),
+        _ => return Ok(None),
+    };
+    let step = positional.get(2).cloned().or_else(|| keyword(&["step"])).filter(|step| step != "None");
+    let step = step.unwrap_or_else(|| "1".to_string());
+    // Number literals: numpy, jax, and torch all give `ceil((stop - start) / step)`.
+    if let (Ok(start), Ok(stop), Ok(step)) = (start.parse::<f64>(), stop.parse::<f64>(), step.parse::<f64>()) {
+        let length = ((stop - start) / step).ceil();
+        // Above 2^53 a float does not hold each integer.
+        return Ok((step != 0.0 && length < 9.0e15).then(|| vec![(length.max(0.0) as u64).to_string()]));
     }
-    if let (Ok(start), Ok(stop)) = (values[0].parse::<isize>(), values[1].parse::<isize>()) {
-        return Ok(stop.checked_sub(start).map(|size| vec![size.max(0).to_string()]));
+    // A float next to a name: the length is not a sum of the two.
+    let is_float = |value: &str| value.parse::<isize>().is_err() && value.parse::<f64>().is_ok();
+    if [&start, &stop, &step].into_iter().any(|value| is_float(value)) {
+        return Ok(None);
     }
-    Ok(Some(vec![format!("{}-{}", values[1], values[0])]))
+    if step != "1" {
+        return Ok(None);
+    }
+    if start == "0" {
+        return Ok(Some(vec![stop]));
+    }
+    // `arange(n, 0)` is empty, not `0-n`.
+    if stop.parse::<i64>().is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(vec![match start.parse::<i64>() {
+        Ok(start) if start < 0 => format!("{stop}+{}", start.unsigned_abs()),
+        _ => format!("{stop}-{start}"),
+    }]))
 }
 
 /// `linspace(start, stop, num)`: numpy and jax give `[num, *broadcast(start,
@@ -3473,7 +3538,31 @@ fn apply_known_broadcast_to(
             dim.clone_from(&input_shape[i - offset]);
         }
     }
+    refuse_broadcast("broadcast", input_shape, &target)?;
     Ok(Some(target))
+}
+
+/// An error when two integer literals prove that `input` does not broadcast
+/// to `target`: a longer rank, or a size that is not 1 and not the target.
+fn refuse_broadcast(function: &str, input: &[String], target: &[String]) -> Result<(), String> {
+    if input.iter().chain(target).any(|dim| is_variadic_dim(dim)) {
+        return Ok(());
+    }
+    let message = || {
+        Err(format!("{function}: shape [{}] does not broadcast to [{}]", input.join(", "), target.join(", ")))
+    };
+    let Some(offset) = target.len().checked_sub(input.len()) else {
+        return message();
+    };
+    for (have, want) in input.iter().zip(&target[offset..]) {
+        if let (Ok(have), Ok(want)) = (have.parse::<usize>(), want.parse::<usize>())
+            && have != 1
+            && have != want
+        {
+            return message();
+        }
+    }
+    Ok(())
 }
 
 fn apply_known_broadcast_arrays(
@@ -3571,6 +3660,36 @@ fn apply_known_repeat(
         &flattened_dim(input_shape),
         repeats,
     )]))
+}
+
+/// A function that works along one axis and keeps the shape. numpy and jax
+/// flatten the input when the axis is `None`, which is the default of
+/// `cumsum` and `cumprod` (`flat_default`).
+fn apply_known_along_axis(
+    args: &[CallArgument],
+    shapes: &dyn ShapeLookup,
+    flat_default: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(shape) = apply_known_shape_preserving(args, shapes)? else {
+        return Ok(None);
+    };
+    let flat = match nth_positional_or_keyword(args, 1, &["axis", "dim"]).map(str::trim) {
+        Some("None") => true,
+        Some(axis) if axis.parse::<i64>().is_ok() => false,
+        // A name can hold `None`.
+        Some(_) => return Ok(None),
+        None if args.iter().any(|arg| matches!(arg, CallArgument::Positional { value } if value.starts_with('*'))) => {
+            return Ok(None);
+        }
+        None => flat_default,
+    };
+    if !flat || shape.len() == 1 {
+        return Ok(Some(shape));
+    }
+    if shape.iter().any(|dim| is_variadic_dim(dim)) {
+        return Ok(None);
+    }
+    Ok(Some(vec![flattened_dim(&shape)]))
 }
 
 fn apply_known_shape_preserving(

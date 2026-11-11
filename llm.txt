@@ -9,7 +9,7 @@ Current validation baseline
 ---------------------------
 Measured on the merged tree at `62e9ebd`. `ndim-lsp` is 0.1.1.
 
-- `cargo test --quiet` passes: 2,202 tests pass and seven are ignored
+- `cargo test --quiet` passes: 2,207 tests pass and seven are ignored
   (`bench_large_file`, `bench_repeated_helper_calls`,
   `stress_main_two_thousand_chained_edits`, `lsp_stress_benchmark`,
   `golden_dump`, `golden_has_no_internal_names`, `growth_probe`). The tests
@@ -1389,6 +1389,53 @@ Rules added after `29bfb64` (round four):
 - flax: `self.param(name, init, (sizes))` has the shape of the sizes (the
   `zeros` rule). `model.apply(variables, x)` runs `__call__(x)` when the
   class has no `apply` method. With `mutable=` or `method=` it has no shape.
+
+Soundness fixes after the gap audit of 2026-11-10 (each one gave a false error
+or a wrong shape before):
+- A plain layer name follows Python scope and statement order
+  (`ShapeCtx::local_layer`, `name_values`). A parameter or a local of a scope
+  between hides an outer layer, and so does the body of a class that binds
+  the name. A call uses the last binding before it. No layer is known for:
+  two branches with different layers, a later binding in a loop around the
+  call, a second binding of an outer name, and a name in a `global` or
+  `nonlocal` statement. `model = model.to(device)`, `.eval()`, `.cuda()`,
+  and `inference_mode(model)` keep the layer (`keeps_module`). Branches with
+  the same layer, or with layers that all keep the shape, keep it.
+- A `self` field with two different layers in one class has no layer
+  (`self_attr_layer_at`), and so does a field that another value replaces
+  (`self.fc = make_head()`). Layers that all keep the shape are the exception.
+- `arange`: the step, `start=`/`stop=`/`end=`/`step=`, and float literals
+  give `ceil((stop - start) / step)`, as numpy, jax, and torch do. A step
+  next to a name gives no shape. `arange(n, 0)` gives no shape.
+- `cumsum` and `cumprod` with no axis, and `sort` and `argsort` with
+  `axis=None`, flatten (`apply_known_along_axis`). An axis that is a name can
+  hold `None`, so it gives no shape.
+- `KnownFunction::Fft`: `n=` or `s=` sets the length, so the call has no shape.
+- `expand`, `expand_as`, and `broadcast_to` report an error when integer
+  literals prove that the input does not broadcast (`refuse_broadcast`).
+  `view_as` and `reshape_as` report two different element counts.
+- A function with a transform decorator gives no shape and no check
+  (`has_transform_decorator`): the names `vmap`, `grad`, `jacfwd`, ... as
+  identifiers of the decorator (not in a string, not as the name of a keyword
+  argument), and each decorator that is a function of the file.
+- equinox `BatchNorm` and `SpectralNorm` give `(output, state)`. They are no
+  array layers. `WeightNorm` stays transparent.
+- `reshape` with `-1` gives no shape when a size argument is a variable with
+  the name of an annotation dim and no proven dim (`infers_from_dim_name`).
+  jaxtyping does not bind `n: int` to the dim `n`. A field (`self.heads`) is
+  not such a variable.
+- `d*2`, `d+d`, or `n+m` against `d` or `n` is a conflict (`exceeds` in
+  `types.rs`), but only an `Approximation`: with a size of 1 the two
+  broadcast. A dim with `**` is no flat sum.
+- `2 * (d // 2)` as a size keeps its brackets (`scalar_dim_expr`).
+
+Test rule from the same audit: an expected shape in a test must come from the
+real library, not from the belief of the author. Eight tests asserted a wrong
+behavior as correct (`cumsum` without axis, `expand_as` to a wrong target,
+equinox `BatchNorm` as one array). `NDIM_DUMP_SOURCES=<dir> cargo test --lib`
+writes each source that a test analyzes (up to 20 kB) to `<dir>`. Do not put
+a Python environment below `bench/` or `corpus/`: `incremental_tests` reads
+all `.py` files there.
 
 Real-code check (a standing gate): `cargo build --release`, then run
 `target/release/ndim-lsp check .` inside real projects (the projects and the
